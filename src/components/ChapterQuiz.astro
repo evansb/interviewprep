@@ -1,0 +1,45 @@
+---
+import type { ChapterQuiz } from '../lib/quiz';
+
+interface Props {
+  quiz: ChapterQuiz;
+}
+
+const { quiz } = Astro.props;
+const serializedQuiz = JSON.stringify(quiz).replace(/</g, '\\u003c');
+---
+
+<section class="book-quiz not-content" id="chapter-quiz" data-chapter={quiz.slug} aria-labelledby="quiz-title">
+  <script type="application/json" class="quiz-payload" is:inline set:html={serializedQuiz}></script>
+  <header class="quiz-heading">
+    <div>
+      <p class="quiz-eyebrow">Knowledge check</p>
+      <h2 id="quiz-title">Chapter {quiz.chapter} practice quiz</h2>
+      <p>Work through {quiz.questions.length} questions with immediate explanations. A score of 80% marks this chapter complete.</p>
+    </div>
+    <div class="quiz-score" aria-label="Current quiz score">
+      <strong data-quiz-score>0</strong>
+      <span>correct</span>
+    </div>
+  </header>
+
+  <div class="quiz-meter" aria-hidden="true"><span data-quiz-meter></span></div>
+  <div class="quiz-status-row">
+    <span data-quiz-position>Question 1 of {quiz.questions.length}</span>
+    <span data-quiz-difficulty></span>
+  </div>
+
+  <div data-quiz-question></div>
+  <div class="quiz-feedback" data-quiz-feedback role="status" aria-live="polite" tabindex="-1" hidden></div>
+
+  <nav class="quiz-controls" aria-label="Quiz controls">
+    <button class="quiz-button quiz-button--quiet" type="button" data-quiz-previous>Previous</button>
+    <button class="quiz-button quiz-button--primary" type="button" data-quiz-check disabled>Check answer</button>
+    <button class="quiz-button quiz-button--primary" type="button" data-quiz-next hidden>Next question</button>
+  </nav>
+  <p class="quiz-storage-note" data-quiz-storage-note>Your progress and best score are saved only in this browser.</p>
+</section>
+
+<script>
+  import '../scripts/quiz';
+</script>

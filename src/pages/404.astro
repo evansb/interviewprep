@@ -1,0 +1,41 @@
+---
+const base = import.meta.env.BASE_URL;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="robots" content="noindex" />
+    <title>Page not found | The Low-Latency C++ Interview Bible</title>
+    <link rel="icon" href={`${base}favicon.svg`} />
+    <style>
+      :root { color-scheme: light dark; }
+      * { box-sizing: border-box; }
+      body {
+        display: grid;
+        min-height: 100vh;
+        margin: 0;
+        place-items: center;
+        background: #0b1728;
+        color: #f8f3e8;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+      }
+      main { width: min(90vw, 46rem); padding: 4rem 0; }
+      .code { margin: 0; color: #e6ad4f; font: 700 0.8rem ui-monospace, monospace; letter-spacing: 0.14em; }
+      h1 { max-width: 12ch; margin: 1rem 0; font: 700 clamp(3rem, 10vw, 6rem)/0.98 Georgia, serif; letter-spacing: -0.055em; }
+      p { max-width: 48ch; color: #c7bfb3; font-size: 1.1rem; line-height: 1.7; }
+      a { display: inline-block; margin-top: 1.5rem; padding-bottom: 0.25rem; border-bottom: 2px solid #e6ad4f; color: #f8f3e8; font-weight: 700; text-decoration: none; }
+      a:focus-visible { outline: 3px solid #e6ad4f; outline-offset: 5px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="code">ERROR 404 · ROUTE_NOT_FOUND</p>
+      <h1>This page missed the hot path.</h1>
+      <p>The address does not exist in this edition of the book. Return to the contents and continue from a known chapter.</p>
+      <a href={base}>Return to the book <span aria-hidden="true">→</span></a>
+    </main>
+  </body>
+</html>

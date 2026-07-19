@@ -1,0 +1,28 @@
+---
+import bookMeta from '../generated/book-meta.json';
+
+const groups = bookMeta.groups;
+const chapterByNumber = new Map(bookMeta.chapters.map((chapter) => [chapter.number, chapter]));
+---
+
+<section class="curriculum" aria-labelledby="curriculum-title">
+  <div class="section-kicker">Fourteen-part curriculum</div>
+  <h2 id="curriculum-title">From translation units to trading systems</h2>
+  <p class="curriculum-intro">Move through the material in order, or jump directly to the domain you need to sharpen.</p>
+  <div class="curriculum-grid">
+    {groups.map((group, index) => {
+      const firstNumber = group.chapters[0]?.number;
+      const lastNumber = group.chapters.at(-1)?.number;
+      const first = firstNumber === undefined ? undefined : chapterByNumber.get(firstNumber);
+      const last = lastNumber === undefined ? undefined : chapterByNumber.get(lastNumber);
+      return (
+        <a class="curriculum-card" href={first ? `chapters/${first.slug}/` : '#'}>
+          <span class="curriculum-card__number">{String(index + 1).padStart(2, '0')}</span>
+          <h3>{group.label}</h3>
+          <p>Chapters {first?.number}–{last?.number}</p>
+          <span class="curriculum-card__arrow" aria-hidden="true">→</span>
+        </a>
+      );
+    })}
+  </div>
+</section>

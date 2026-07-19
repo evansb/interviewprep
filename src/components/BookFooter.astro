@@ -1,0 +1,16 @@
+---
+import Default from '@astrojs/starlight/components/Footer.astro';
+import ChapterQuiz from './ChapterQuiz.astro';
+import type { ChapterQuiz as ChapterQuizData } from '../lib/quiz';
+
+const routeId = Astro.locals.starlightRoute.id;
+const slug = routeId.startsWith('chapters/') ? routeId.slice('chapters/'.length) : '';
+const quizFiles = import.meta.glob<ChapterQuizData>('../data/quizzes/*.json', {
+  eager: true,
+  import: 'default',
+});
+const quiz = slug ? quizFiles[`../data/quizzes/${slug}.json`] : undefined;
+---
+
+{quiz && <ChapterQuiz quiz={quiz} />}
+<Default><slot /></Default>

@@ -1,0 +1,26 @@
+{
+  "name": "low-latency-cpp-interview-bible",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "content": "node scripts/generate-content.mjs",
+    "predev": "npm run content",
+    "dev": "ASTRO_TELEMETRY_DISABLED=1 astro dev",
+    "prebuild": "npm run content",
+    "build": "ASTRO_TELEMETRY_DISABLED=1 astro build",
+    "postbuild": "node scripts/verify-build.mjs",
+    "preview": "ASTRO_TELEMETRY_DISABLED=1 astro preview",
+    "check": "npm run content && ASTRO_TELEMETRY_DISABLED=1 astro check",
+    "test": "npm run content && node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "latest",
+    "astro": "latest",
+    "sharp": "latest"
+  },
+  "devDependencies": {
+    "@astrojs/check": "latest",
+    "typescript": "latest"
+  }
+}

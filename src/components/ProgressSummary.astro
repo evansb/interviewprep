@@ -1,0 +1,50 @@
+---
+import bookMeta from '../generated/book-meta.json';
+
+const firstChapter = bookMeta.chapters[0];
+const base = import.meta.env.BASE_URL;
+---
+
+<aside class="progress-summary" data-progress-summary data-base={base} data-first={firstChapter?.slug}>
+  <div>
+    <p class="section-kicker">Your progress</p>
+    <h2 data-progress-heading>Ready when you are</h2>
+    <p data-progress-copy>Progress is stored privately in this browser—no account or tracking required.</p>
+  </div>
+  <div class="progress-summary__meter" aria-label="Book completion">
+    <div><span data-progress-meter></span></div>
+    <strong data-progress-percent>0%</strong>
+  </div>
+  <a class="progress-summary__action" data-progress-action href={`${base}chapters/${firstChapter?.slug}/`}>Start with Chapter 1 <span aria-hidden="true">→</span></a>
+</aside>
+
+<script>
+  import { readProgress } from '../lib/quiz';
+
+  function hydrateProgress() {
+    const root = document.querySelector<HTMLElement>('[data-progress-summary]');
+    if (!root) return;
+    const progress = readProgress();
+    const complete = Object.values(progress.chapters).filter((chapter) => chapter.completed).length;
+    const percent = Math.round((complete / 60) * 100);
+    const base = root.dataset.base || '/';
+    const first = root.dataset.first || '';
+    const slug = progress.lastRead || first;
+    const heading = root.querySelector<HTMLElement>('[data-progress-heading]')!;
+    const copy = root.querySelector<HTMLElement>('[data-progress-copy]')!;
+    const meter = root.querySelector<HTMLElement>('[data-progress-meter]')!;
+    const label = root.querySelector<HTMLElement>('[data-progress-percent]')!;
+    const action = root.querySelector<HTMLAnchorElement>('[data-progress-action]')!;
+    heading.textContent = complete ? `${complete} of 60 chapters mastered` : 'Ready when you are';
+    copy.textContent = complete
+      ? 'Keep building recall—the next chapter and every saved quiz are waiting.'
+      : 'Progress is stored privately in this browser—no account or tracking required.';
+    meter.style.width = `${percent}%`;
+    label.textContent = `${percent}%`;
+    action.href = `${base}chapters/${slug}/`;
+    action.firstChild!.textContent = progress.lastRead ? 'Continue reading ' : 'Start with Chapter 1 ';
+  }
+
+  hydrateProgress();
+  document.addEventListener('astro:page-load', hydrateProgress);
+</script>

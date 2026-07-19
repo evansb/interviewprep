@@ -1,0 +1,1041 @@
+# The Low-Latency C++ Interview Bible — Page Inventory
+
+> Canonical, deduplicated, fundamentals-first page structure for the MkDocs site.
+> Each linked leaf is one planned content page; grouping pages are navigational only.
+
+## C++ Foundations
+
+- **Chapter 1: Build and translation model**
+  - Translation units
+  - Header inclusion and include guards
+  - Preprocessor macros and conditional compilation
+  - Phases of translation
+  - Declarations and definitions
+  - One Definition Rule
+  - Linkage
+  - Storage duration
+  - Inline functions and variables
+  - Name mangling and extern C
+  - Static and dynamic libraries
+  - Symbol visibility and weak symbols
+- **Chapter 2: Types and conversions**
+  - Fundamental types and fixed-width integers
+  - Integer promotions and usual arithmetic conversions
+  - Signed and unsigned arithmetic
+  - Integer overflow
+  - IEEE 754 floating point
+  - Subnormal floating-point values
+  - NaN and infinity
+  - Fast-math optimizations
+  - Character types and encodings
+  - Scoped and unscoped enumerations
+  - Boolean conversions and null pointers
+  - Const and volatile qualification
+  - References
+  - Pointers and arrays
+  - Array-to-pointer and function-to-pointer decay
+  - Auto type deduction
+  - Decltype and decltype(auto)
+  - Explicit C++ casts
+- **Chapter 3: Object representation and layout**
+  - Object and value representation
+  - Padding and indeterminate values
+  - Size and alignment
+  - Member layout and tail padding
+  - Trivial and trivially-copyable types
+  - Standard-layout types
+  - Implicit-lifetime types
+  - Type punning and strict aliasing
+  - Endianness and byte swapping
+  - Pointer arithmetic and provenance
+  - Layout compatibility and offsetof
+  - ABI-safe wire and shared-memory layouts
+- **Chapter 4: Expressions and functions**
+  - Value categories
+  - Expression sequencing
+  - Order of evaluation
+  - Undefined unspecified and implementation-defined behavior
+  - Common sources of undefined behavior
+  - Function overload resolution
+  - Argument-dependent lookup
+  - Default arguments
+  - Function pointers
+  - Pointers to members
+  - Callable wrappers and std::invoke
+  - Compile-time function evaluation
+  - Standard attributes
+  - Return-type deduction
+  - C variadic functions
+  - C++ variadic templates
+  - Calling conventions and parameter passing
+  - Namespaces and name lookup
+- **Chapter 5: Object lifetime and initialization**
+  - Storage and object lifetime
+  - Placement new
+  - std::launder and explicit lifetime APIs
+  - Initialization forms
+  - Aggregate initialization
+  - Most vexing parse
+  - Temporary materialization and lifetime extension
+  - RAII
+  - Construction and destruction order
+  - Static initialization order fiasco
+  - Empty-base optimization
+  - no_unique_address
+  - Union active-member rules
+  - Destruction through base pointers
+  - Sized aligned and destroying delete
+- **Chapter 6: Classes and polymorphism**
+  - Special member functions
+  - Rule of zero three and five
+  - Defaulted and deleted functions
+  - Converting and explicit constructors
+  - Delegating and inherited constructors
+  - Member initializer lists
+  - Ref-qualified member functions
+  - Static class members
+  - Bit-fields packing and alignment
+  - Access control and inheritance
+  - Virtual dispatch and vtables
+  - Abstract classes and pure virtual functions
+  - Virtual destructors
+  - Override and final
+  - Object slicing
+  - Multiple and virtual inheritance
+  - Covariant return types
+  - RTTI and dynamic_cast
+  - Static polymorphism with CRTP
+  - Type erasure
+
+## Memory and Resource Management
+
+- **Chapter 7: Raw allocation**
+  - new and delete
+  - Array new and delete
+  - Overloading allocation functions
+  - Aligned allocation
+  - malloc calloc realloc and free
+  - Allocation failure handling
+  - Arena and bump allocators
+  - Stack allocators
+  - Free-list and slab allocators
+  - Object pools
+  - Fixed-size block allocators
+  - General-purpose allocator implementations
+  - Internal and external fragmentation
+  - Huge-page-backed arenas
+- **Chapter 8: Allocator-aware C++**
+  - C++ allocator requirements
+  - Allocator-aware containers
+  - Allocator propagation and equality
+  - scoped_allocator_adaptor
+  - Polymorphic memory resources
+  - Monotonic memory resources
+  - Pool memory resources
+  - Allocation-free hot paths
+- **Chapter 9: Ownership**
+  - Unique ownership with unique_ptr
+  - Custom smart-pointer deleters
+  - Shared ownership and control blocks
+  - make_shared allocation behavior
+  - Weak ownership
+  - Shared-ownership cycles
+  - enable_shared_from_this
+  - shared_ptr aliasing constructor
+  - Weak-pointer retention after make_shared
+  - Intrusive reference counting
+  - Smart-pointer costs on hot paths
+- **Chapter 10: Moves copies and errors**
+  - RVO and NRVO
+  - Move operations that fall back to copying
+  - Noexcept move operations
+  - Move-only types
+  - Exception handling and stack unwinding
+  - Exception-safety guarantees
+  - Zero-cost exception implementations
+  - Disabling exceptions
+  - Error codes
+  - Optional return values
+  - Expected return values
+  - Termination and abort
+  - Scope guards
+
+## Standard Library
+
+- **Chapter 11: Sequence containers**
+  - std::array
+  - std::vector
+  - Vector growth and capacity
+  - std::deque
+  - std::list and std::forward_list
+  - std::inplace_vector and fixed-capacity vectors
+  - Small-vector optimization
+  - Container iterator invalidation
+- **Chapter 12: Associative containers**
+  - Ordered maps and sets
+  - Unordered maps and sets
+  - Hash-table collision resolution
+  - Load factors and rehashing
+  - Open addressing
+  - Robin Hood hashing
+  - Flat hash maps
+  - Flat maps and sets
+- **Chapter 13: Strings and non-owning views**
+  - std::string
+  - Small-string optimization
+  - std::string_view
+  - std::span
+  - std::mdspan
+  - Character conversion with from_chars and to_chars
+- **Chapter 14: Algorithms and ranges**
+  - Sorting algorithms in the standard library
+  - Selection and partial-sorting algorithms
+  - Binary-search algorithms
+  - Partitioning algorithms
+  - Transformation and accumulation algorithms
+  - Algorithm complexity guarantees
+  - Iterator categories
+  - Custom comparators and projections
+  - Range concepts
+  - Lazy range views
+  - Range view lifetimes
+  - Parallel algorithms and execution policies
+- **Chapter 15: Vocabulary and utility types**
+  - Pair and tuple
+  - std::apply and std::tie
+  - std::optional
+  - std::variant and visitation
+  - std::any
+  - std::bitset
+  - Standard bit-manipulation utilities
+  - std::simd
+  - Random engines and distributions
+  - std::chrono durations and time points
+  - Standard clocks
+  - Calendar and timezone library
+- **Chapter 16: Formatting and I/O**
+  - Iostream architecture and cost
+  - C stdio
+  - std::format and std::print
+  - Locale costs
+  - Asynchronous logging
+
+## Generic and Modern C++
+
+- **Chapter 17: Templates**
+  - Function class variable and alias templates
+  - Template argument deduction
+  - Forwarding references and reference collapsing
+  - Class template argument deduction
+  - Non-type template parameters
+  - Full and partial specialization
+  - Template instantiation
+  - Two-phase name lookup
+  - Dependent names and disambiguators
+  - Explicit instantiation and extern template
+  - SFINAE
+  - Detection idiom and void_t
+  - Concepts and constraints
+  - Constraint subsumption
+  - Parameter packs and pack expansion
+  - Fold expressions
+  - Perfect forwarding
+  - Tag dispatch
+  - if constexpr
+  - Compile-time type traits
+  - Expression templates
+  - Template code bloat and compile-time cost
+- **Chapter 18: Lambdas and callable objects**
+  - Lambda capture modes
+  - Init-capture
+  - Capturing this and star-this
+  - Lambda closure types
+  - Captureless lambda conversion
+  - Mutable lambdas
+  - Generic lambdas
+  - Constexpr lambdas
+  - Dangling lambda captures
+  - Small-object optimization in callable wrappers
+- **Chapter 19: Modern language facilities**
+  - Move semantics
+  - Guaranteed copy elision
+  - Range-based for loops
+  - Structured bindings
+  - Three-way comparison
+  - Modules
+  - Coroutines
+  - Coroutine promise types and frames
+  - Coroutine suspension and allocation
+  - std::generator
+  - Deducing this
+  - Constant initialization and constinit
+  - Contracts
+  - Static reflection
+- **Chapter 20: Modern asynchronous C++**
+  - Futures and promises
+  - Packaged tasks
+  - std::async
+  - Cooperative cancellation
+  - Senders and receivers
+  - Coroutine-based asynchronous I/O
+
+## Algorithms and Data Structures
+
+- **Chapter 21: Core data structures**
+  - Arrays and dynamic arrays
+  - Linked lists
+  - Stacks queues and deques
+  - Circular buffers
+  - Intrusive lists
+  - Indexed and free lists
+  - Hash tables
+  - Binary search trees
+  - AVL trees
+  - Red-black trees
+  - Binary heaps and priority queues
+  - Tries
+  - Skip lists
+  - B-trees and B+ trees
+  - Disjoint-set union
+  - Graph representations
+  - Segment trees
+  - Fenwick trees
+  - Bloom filters
+  - LRU caches
+- **Chapter 22: Algorithmic techniques**
+  - Two pointers
+  - Sliding windows
+  - Binary search
+  - Binary search on the answer
+  - Sorting properties and tradeoffs
+  - Recursion and backtracking
+  - Divide and conquer
+  - Dynamic programming
+  - Greedy algorithms
+  - Bit-manipulation techniques
+  - Monotonic stacks and queues
+  - Prefix sums
+  - Sweep-line algorithms
+  - Interval algorithms
+  - Breadth-first and depth-first search
+  - Shortest paths
+  - Topological sorting
+  - Finite-state machines
+  - Table-driven parsing
+- **Chapter 23: Complexity and numerical correctness**
+  - Asymptotic notation
+  - Best average and worst-case complexity
+  - Amortized analysis
+  - Space-time tradeoffs
+  - Cache complexity
+  - Cache-oblivious algorithms
+  - Numerical stability
+  - Floating-point comparison
+  - Kahan summation
+  - Fixed-point price arithmetic
+  - Scale conversion and rounding
+  - Checked and saturating arithmetic
+  - Sentinel-value hazards
+  - Decimal conversion and tick precision
+
+## Concurrency and the C++ Memory Model
+
+- **Chapter 24: Threads and synchronization**
+  - std::thread and std::jthread
+  - Joining and detaching threads
+  - Thread-local storage
+  - Thread creation and thread pools
+  - Mutexes
+  - Reader-writer mutexes
+  - RAII lock wrappers
+  - Deadlock-free multi-locking
+  - Condition variables
+  - Spurious and lost wakeups
+  - C++ semaphores
+  - Latches and barriers
+  - One-time initialization
+  - Atomic wait and notification
+  - Spin-then-park synchronization
+  - Futex-backed and adaptive mutexes
+  - Deadlock
+  - Livelock
+  - Priority inversion
+  - Lock convoys
+- **Chapter 25: C++ memory model**
+  - Data races
+  - Atomic types and lock freedom
+  - std::atomic_ref
+  - Atomic read-modify-write operations
+  - Compare-exchange loops
+  - Spurious compare-exchange failure
+  - Sequential consistency
+  - Acquire and release ordering
+  - Relaxed ordering
+  - Consume ordering
+  - Happens-before and synchronizes-with
+  - Modification order and coherence
+  - Release sequences
+  - Atomic fences
+  - Fence-atomic synchronization
+  - Compiler barriers and CPU fences
+  - Safe publication
+  - Double-checked locking
+  - Memory-model litmus tests
+  - Atomic tearing and alignment
+  - Volatile is not synchronization
+  - Atomic shared pointers
+- **Chapter 26: Lock-free programming**
+  - Obstruction-free lock-free and wait-free progress
+  - Linearizability and linearization points
+  - SPSC queues
+  - MPSC queues
+  - MPMC queues
+  - Bounded lock-free ring buffers
+  - Queue wraparound and sequence counters
+  - Queue backpressure policies
+  - Seqlocks
+  - ABA problem
+  - Tagged pointers
+  - Memory reclamation
+  - Hazard pointers
+  - Epoch-based reclamation
+  - Read-copy-update
+  - False sharing
+  - Cache-line padding
+
+## Computer Architecture
+
+- **Chapter 27: CPU execution**
+  - CPU pipeline fundamentals
+  - Superscalar execution
+  - Out-of-order execution and retirement
+  - Instruction-level parallelism
+  - Reorder buffers and reservation stations
+  - Register renaming
+  - Micro-ops and the micro-op cache
+  - Speculative execution
+  - Branch prediction
+  - Branch-target buffers
+  - Branch-misprediction recovery
+  - Execution ports and port contention
+  - Instruction latency and throughput
+  - Data control and structural hazards
+  - Front-end bandwidth and instruction-cache pressure
+  - Machine clears
+  - Hardware multithreading and SMT contention
+  - Spectre-class mitigations
+- **Chapter 28: Caches**
+  - Cache hierarchy
+  - Cache-line organization
+  - Cache associativity and address decomposition
+  - Cache replacement policies
+  - Write-back and write-through caches
+  - Write allocation policies
+  - Cache coherence protocols
+  - True sharing and cache-line bouncing
+  - Compulsory capacity and conflict misses
+  - Cache thrashing
+  - Cache warming
+  - Hardware prefetchers
+  - Software prefetching and prefetch distance
+  - Non-temporal stores
+  - Cache coloring and way partitioning
+  - Instruction TLB behavior
+- **Chapter 29: Memory and NUMA**
+  - DRAM channels ranks banks and rows
+  - Row-buffer behavior
+  - Memory controllers
+  - Memory-level parallelism
+  - Memory bandwidth and latency
+  - Load-store queues
+  - Store buffers
+  - Memory disambiguation
+  - Store-to-load forwarding
+  - Read for ownership
+  - Write combining
+  - Split-line and split-page accesses
+  - x86 TSO
+  - Weak hardware memory ordering
+  - Hardware memory barriers
+  - Locked instructions and atomic operations
+  - NUMA topology
+  - First-touch allocation
+  - Remote-memory access
+  - CPU interconnects
+  - Thread memory and NIC NUMA locality
+  - PCIe and DMA
+  - IOMMU
+  - Intel DDIO
+- **Chapter 30: Latency reference**
+  - CPU and memory latency numbers
+  - Synchronization and syscall latency numbers
+  - Network latency and serialization numbers
+  - Latency numbers as estimates not constants
+
+## Linux and Operating Systems
+
+- **Chapter 31: Processes threads and scheduling**
+  - Processes and address spaces
+  - Process states
+  - fork and copy-on-write
+  - exec and process replacement
+  - Process reaping zombies and orphans
+  - Linux clone and task sharing
+  - Process groups sessions and daemons
+  - Kernel and user threads
+  - Linux NPTL
+  - Pthreads
+  - Thread stacks and guard pages
+  - Fibers and user-space scheduling
+  - Context switches
+  - Linux fair scheduling
+  - Real-time scheduling policies
+  - Scheduler run queues and wakeup latency
+  - CPU affinity
+  - CPU topology-aware pinning
+  - Core isolation
+  - Housekeeping CPUs
+  - Busy polling versus blocking
+  - Real-time scheduling operational hazards
+- **Chapter 32: Virtual memory**
+  - Virtual and physical addresses
+  - Process address-space layout
+  - Multi-level page tables
+  - Page faults
+  - Demand paging
+  - Copy-on-write faults
+  - Translation lookaside buffers
+  - Page walks
+  - TLB shootdowns
+  - Explicit huge pages
+  - Transparent huge pages
+  - Anonymous and file-backed mmap
+  - Shared and private mappings
+  - madvise
+  - Memory locking
+  - Page prefaulting
+  - Swapping
+  - Memory overcommit and the OOM killer
+  - Heap growth with brk and mmap
+  - Address-space layout randomization
+  - Stack growth and guard pages
+  - Page cache
+  - Working sets
+  - RSS VSZ and PSS
+  - Procfs memory maps
+  - NUMA memory policies
+  - Automatic NUMA balancing
+  - Shared-memory truncation and SIGBUS
+  - Durable versus visible mapped writes
+- **Chapter 33: IPC and signals**
+  - Pipes and FIFOs
+  - POSIX and System V message queues
+  - UNIX-domain sockets
+  - POSIX and System V shared memory
+  - Process-shared synchronization
+  - POSIX and System V semaphores
+  - Futexes
+  - eventfd
+  - signalfd
+  - timerfd
+  - Lock-free interprocess queues
+  - Signal delivery and disposition
+  - sigaction
+  - Signal masks
+  - Async-signal safety
+  - Alternate signal stacks
+  - Core-dump signals and crash handlers
+- **Chapter 34: System calls and I/O**
+  - User mode and kernel mode
+  - System-call entry
+  - Mode switches versus context switches
+  - vDSO
+  - System-call overhead
+  - strace and ltrace
+  - Blocking and non-blocking I/O
+  - Synchronous and asynchronous I/O
+  - select and poll
+  - epoll
+  - Edge-triggered and level-triggered readiness
+  - kqueue
+  - io_uring
+  - Scatter-gather I/O
+  - sendfile splice and zero-copy file I/O
+  - Direct I/O
+  - File descriptors and descriptor tables
+  - Descriptor duplication
+  - Short reads and writes
+  - EINTR and EAGAIN handling
+  - io_uring registered resources
+  - io_uring polling modes
+- **Chapter 35: Time and low-latency tuning**
+  - Linux clock sources
+  - Monotonic realtime and raw clocks
+  - TSC synchronization and monotonicity
+  - Timer facilities
+  - Timer wheels
+  - NTP synchronization
+  - PTP synchronization
+  - PTP hardware clocks
+  - Clock steps slews and leap seconds
+  - Sysctl procfs and sysfs tuning
+  - CPU frequency governors
+  - Turbo boost
+  - CPU C-states and P-states
+  - IRQ affinity
+  - Softirqs and kernel workqueues
+  - Kernel command-line isolation options
+  - PREEMPT_RT
+  - cyclictest
+  - Transparent-huge-page latency spikes
+  - cgroups and namespaces
+  - eBPF ftrace and bpftrace
+  - PCIe topology for device locality
+
+## Networking Fundamentals
+
+- **Chapter 36: Ethernet and IP**
+  - OSI and TCP-IP models
+  - Encapsulation and protocol headers
+  - Ethernet frames
+  - Ethernet on-wire overhead
+  - MAC addressing
+  - ARP
+  - VLAN tagging
+  - MTU and jumbo frames
+  - Network byte order
+  - Internet checksums
+  - IPv4 addressing and CIDR
+  - IPv6 fundamentals
+  - IP headers
+  - IP fragmentation
+  - TTL and hop limits
+  - Switching and routing
+  - NAT
+  - ICMP ping and traceroute
+- **Chapter 37: UDP and multicast**
+  - UDP semantics and datagrams
+  - UDP headers and checksums
+  - Application-level loss recovery
+  - Sequence-number gap detection
+  - IP multicast groups
+  - IGMP
+  - Source-specific multicast
+  - Multicast NIC filtering
+  - IGMP snooping and queriers
+  - Multicast routing failures
+  - Reliable multicast patterns
+  - Retransmission channels
+  - Snapshot recovery
+  - Redundant multicast feeds
+- **Chapter 38: TCP**
+  - TCP byte-stream semantics
+  - TCP three-way handshake
+  - TCP connection teardown
+  - TCP sequence and acknowledgement numbers
+  - TCP flow control
+  - TCP congestion control
+  - Slow start and congestion avoidance
+  - Fast retransmit and recovery
+  - Reno CUBIC and BBR
+  - RTT estimation and retransmission timeout
+  - Selective acknowledgements
+  - Nagle algorithm
+  - Delayed acknowledgements
+  - TCP_NODELAY QUICKACK and CORK
+  - TCP head-of-line blocking
+  - TCP keepalive
+  - TIME_WAIT
+  - Bandwidth-delay product
+  - Bufferbloat
+  - TCP message framing
+  - TCP half-close and reconnect behavior
+- **Chapter 39: Switching behavior**
+  - Store-and-forward switching
+  - Cut-through switching
+  - Serialization delay
+  - Switch output-port contention
+  - Network microbursts
+  - Shallow and deep switch buffers
+  - Switch head-of-line blocking
+  - ECMP and LAG hashing
+  - Packet reordering
+  - Redundant network paths
+  - Ethernet flow control and PFC
+
+## Performance Engineering
+
+- **Chapter 40: Compiler optimization**
+  - Compiler optimization levels
+  - CPU architecture and tuning flags
+  - Link-time optimization
+  - Inlining heuristics
+  - Forced inline and noinline attributes
+  - Branch probability hints
+  - Restrict and alias analysis
+  - Strict-aliasing optimizations
+  - Profile-guided optimization
+  - AutoFDO
+  - BOLT post-link optimization
+  - Dead-code elimination
+  - Constant folding and propagation
+  - Common-subexpression elimination
+  - Loop unrolling
+  - Automatic vectorization
+  - Escape analysis
+  - Interprocedural optimization
+  - Identical-code folding
+  - Section garbage collection
+  - Optimization remarks and missed-optimization reports
+- **Chapter 41: Assembly binaries and ABI**
+  - Reading x86-64 assembly
+  - x86-64 registers flags and addressing
+  - Common compiler assembly idioms
+  - AArch64 assembly fundamentals
+  - System V AMD64 calling convention
+  - Stack alignment and the red zone
+  - Caller-saved and callee-saved registers
+  - Structure parameter and return ABI
+  - Tail calls
+  - ELF sections and segments
+  - ELF symbols and relocations
+  - PLT GOT and position-independent code
+  - Dynamic linking
+  - Binary inspection tools
+  - Debug information and symbolization
+  - Stack unwinding and frame pointers
+  - Code layout and cold splitting
+- **Chapter 42: CPU-conscious optimization**
+  - Data-oriented design
+  - Array-of-structures versus structure-of-arrays
+  - Branchless programming
+  - Conditional moves
+  - Lookup-table optimization
+  - SIMD intrinsics
+  - Loop tiling and blocking
+  - Software pipelining
+  - Alignment for cache lines and SIMD
+  - Dependency chains and critical paths
+  - Partial-register and false dependencies
+  - AVX-SSE transition penalties
+  - SIMD frequency downclocking
+  - Non-temporal memory access
+- **Chapter 43: Measurement and profiling**
+  - Latency versus throughput
+  - Tail-latency percentiles
+  - Coordinated omission
+  - Histograms and HDR Histogram
+  - Correct quantile aggregation
+  - Benchmark warmup
+  - Outliers and jitter sources
+  - Benchmark isolation
+  - CPU affinity and frequency control for benchmarks
+  - NUMA-aware benchmarking
+  - Google Benchmark barriers
+  - RDTSC and RDTSCP timing
+  - TSC-to-time calibration
+  - perf stat
+  - perf record report and annotate
+  - Flame graphs
+  - Hardware performance counters
+  - PMU multiplexing skid and sampling bias
+  - Top-down microarchitecture analysis
+  - Cachegrind and Callgrind
+  - Intel VTune
+  - LIKWID and Intel PCM
+  - Allocation profiling
+  - Lock-contention profiling
+  - Off-CPU profiling
+  - Probe effects
+- **Chapter 44: Build and analysis tooling**
+  - Compiler Explorer
+  - AddressSanitizer
+  - UndefinedBehaviorSanitizer
+  - ThreadSanitizer
+  - MemorySanitizer
+  - LeakSanitizer
+  - Valgrind Memcheck
+  - Static analysis
+  - Compiler warnings
+  - CMake target model
+  - Public private and interface dependencies
+  - Reducing C++ compile times
+  - Precompiled headers and unity builds
+  - PIMPL
+  - Reproducible and hermetic builds
+  - Dependency pinning and build provenance
+  - ABI compatibility and symbol versioning
+
+## Trading-Grade Networking
+
+- **Chapter 45: Socket programming**
+  - Socket lifecycle
+  - Binding listening accepting and connecting
+  - Datagram send and receive
+  - Stream send and receive
+  - Socket shutdown and close
+  - Socket address and port reuse
+  - Socket buffer sizing
+  - Busy-poll socket options
+  - Socket timestamp options
+  - Non-blocking socket event loops
+  - Batched datagram syscalls
+  - BPF socket filters
+  - Partial TCP I/O
+  - recvmsg ancillary data
+  - Linux socket error queue
+  - MSG_ZEROCOPY
+  - Zero-copy completion ownership
+- **Chapter 46: Linux network stack**
+  - Kernel receive path
+  - Kernel transmit path
+  - NIC DMA descriptor rings
+  - Interrupt-driven packet processing
+  - NAPI polling
+  - Interrupt coalescing tradeoffs
+  - sk_buff
+  - Socket receive and send queues
+  - GRO and LRO
+  - GSO and TSO
+  - Checksum offload
+  - Receive-side scaling
+  - RPS RFS and XPS
+  - Flow steering
+  - Per-queue interrupt affinity
+  - NIC and kernel packet-drop accounting
+- **Chapter 47: Kernel bypass and RDMA**
+  - Kernel-bypass motivation and tradeoffs
+  - DPDK poll-mode drivers
+  - DPDK huge-page memory
+  - OpenOnload
+  - ef_vi
+  - TCPDirect
+  - VMA
+  - AF_XDP and XDP
+  - PACKET_MMAP and AF_PACKET
+  - User-space TCP-IP stacks
+  - Busy-poll NIC loops
+  - Zero-copy receive
+  - Descriptor ownership and completion queues
+  - Memory registration and pinning
+  - RDMA queue pairs and completion queues
+  - RDMA memory regions
+  - One-sided and two-sided RDMA
+  - RoCE and InfiniBand
+- **Chapter 48: NICs acceleration and measurement**
+  - FPGA-based NICs
+  - FPGA order entry
+  - SmartNICs
+  - NIC hardware timestamping
+  - PTP grandmaster clocks
+  - FPGA and kernel-bypass hybrids
+  - tcpdump and Wireshark
+  - Packet capture with libpcap
+  - Software and hardware timestamp selection
+  - One-way versus round-trip latency
+  - Clock synchronization error
+  - Packet-loss and jitter measurement
+  - NIC ring sizing
+  - Packets-per-second limits
+  - Offered load and goodput
+
+## Market Microstructure and Trading
+
+- **Chapter 49: Market fundamentals**
+  - Bid ask and spread
+  - Market depth and liquidity
+  - Queue position
+  - Price-time priority
+  - Pro-rata allocation
+  - Maker-taker fees and rebates
+  - Tick sizes
+  - Lot sizes and contract multipliers
+  - Instrument symbology
+  - Reference-data changes
+  - Continuous trading
+  - Opening and closing auctions
+  - Trading halts and price bands
+  - Locked and crossed markets
+- **Chapter 50: Orders and matching**
+  - Market orders
+  - Limit orders
+  - Stop orders
+  - Pegged orders
+  - Post-only orders
+  - Immediate-or-cancel orders
+  - Fill-or-kill orders
+  - Good-till-cancelled and dated orders
+  - Order lifecycle state machine
+  - Cancel replace and fill races
+  - Late acknowledgements
+  - Duplicate execution messages
+  - Limit-order-book representation
+  - Price-level data structures
+  - Order queues at a price level
+  - Best-bid-offer maintenance
+  - Add cancel modify and execute events
+  - Matching-engine design
+- **Chapter 51: Exchange protocols**
+  - FIX session layer
+  - FIX application messages
+  - FAST encoding
+  - ITCH market data
+  - OUCH order entry
+  - Simple Binary Encoding
+  - Binary message framing
+  - Allocation-free parsing
+  - Zero-copy deserialization
+  - Protocol endianness and alignment
+  - Schema and version evolution
+  - Untrusted length and count validation
+  - Checksums and CRCs
+  - Protocol sequence numbers
+  - Gap-fill and replay protocols
+
+## Low-Latency Trading Systems
+
+- **Chapter 52: Architecture and latency**
+  - Tick-to-trade and wire-to-wire latency
+  - Market-data strategy and order-gateway pipeline
+  - Feed handlers
+  - Book builders
+  - Market-data normalization
+  - Colocation and cross-connects
+  - Hot warm and cold paths
+  - Single-writer event loops
+  - Staged pipeline architectures
+  - Inter-stage queue costs
+  - Per-stage latency budgets
+  - Critical-path analysis
+  - Batching tradeoffs
+  - Throughput-latency curves
+  - Bounded queues and backpressure
+  - Overload shedding
+- **Chapter 53: Market-data correctness**
+  - Incremental market-data feeds
+  - Snapshot feeds
+  - Snapshot-plus-delta recovery
+  - Feed sequence-gap recovery
+  - Market-data packet duplicate suppression
+  - Redundant A-B feed arbitration
+  - Deterministic feed merge rules
+  - Stale-market detection
+  - Deterministic market-data replay
+- **Chapter 54: Order gateways**
+  - Trading-session logon and logout
+  - Session heartbeats
+  - Session sequence reset
+  - Resend and replay
+  - Reconnect behavior
+  - Client and exchange order identifiers
+  - Order-correlation tables
+  - Idempotent order state transitions
+  - Duplicate suppression
+  - Disconnect recovery
+  - Exchange rate limits
+  - Message throttling
+  - Cancel on disconnect
+  - Drop copy
+  - Post-trade reconciliation
+  - At-least-once processing
+- **Chapter 55: Hot-path techniques**
+  - Hot-path preallocation
+  - Hot-path object pools
+  - Busy-spin event loops
+  - Isolated-core thread pinning
+  - Lock avoidance
+  - System-call avoidance
+  - Allocation-free logging
+  - Compile-time hot-path specialization
+  - Avoiding virtual dispatch
+  - Fixed-layout serialization
+  - Reducing power-state jitter
+- **Chapter 56: Reliability and risk**
+  - Write-ahead trading journals
+  - Crash-consistent sequence checkpoints
+  - Startup and replay recovery
+  - Active-passive redundancy
+  - Leader fencing
+  - Split-brain avoidance
+  - State convergence after failover
+  - Heartbeats and watchdogs
+  - Fail-open versus fail-closed behavior
+  - Burst capacity planning
+  - Queue-watermark alarms
+  - Graceful degradation
+  - Pre-trade price collars
+  - Fat-finger and notional limits
+  - Position and credit limits
+  - Maximum order quantity
+  - Runaway-strategy detection
+  - Trading kill switches
+  - Mass cancel
+  - Self-trade prevention
+  - Duplicate-order protection
+  - Risk-state consistency
+
+## Testing Debugging and Operations
+
+- **Chapter 57: Testing**
+  - Unit testing
+  - Property-based testing
+  - Differential testing
+  - Model-based testing
+  - Deterministic random seeds and reproducers
+  - Fuzzing native code
+  - Protocol-vector tests
+  - Malformed-message fuzzing
+  - Concurrency stress and soak testing
+  - Randomized scheduler testing
+  - Memory-model model checking
+  - Deterministic simulation
+  - Virtual clocks
+  - Recorded packet replay
+  - Fault injection
+  - Load burst and soak testing
+  - Failover testing
+  - Hardware-in-the-loop testing
+  - Loopback latency testing
+- **Chapter 58: Native debugging**
+  - GDB and LLDB fundamentals
+  - Breakpoints and watchpoints
+  - Debugging optimized code
+  - Core dumps
+  - std::stacktrace
+  - Postmortem register and stack analysis
+  - DWARF and split debug information
+  - Build IDs and symbol servers
+  - Deadlock diagnosis
+  - Livelock and CPU-spin diagnosis
+  - Memory-corruption diagnosis
+  - Heap debugging
+  - Crash-handler limitations
+- **Chapter 59: Observability**
+  - Metrics types and semantics
+  - High-cardinality metrics
+  - Per-core metrics aggregation
+  - Latency histograms in production
+  - Structured and binary logging
+  - Lock-free logging queues
+  - Log sampling and drop accounting
+  - Sequence and timestamp event correlation
+  - Clock-domain uncertainty
+  - Health checks and heartbeats
+  - Watchdogs and stall detectors
+  - Tail-latency alerting
+  - Flight-recorder ring buffers
+- **Chapter 60: Deployment and operations**
+  - Reproducible deployment artifacts
+  - Immutable configuration
+  - Staged rollout and rollback
+  - Feature and venue kill switches
+  - Startup dependency ordering
+  - Readiness versus liveness
+  - Startup warmup and cache priming
+  - Safe shutdown and draining
+  - Configuration and reference-data validation
+  - Atomic configuration updates
+  - Audit trails
+  - Resource limits and descriptor exhaustion
+  - Disk and log-retention failures
+  - Capacity headroom
