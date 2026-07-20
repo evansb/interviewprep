@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-06-classes-and-polymorphism",
+  "questions": [
+    {
+      "id": "6-q01",
+      "prompt": "Which single declaration is enough to suppress the compiler's implicit move constructor and move assignment operator?",
+      "options": [
+        "A user-declared default constructor, since it counts as one of the copy-control members.",
+        "A user-declared destructor, even one written as `~T() = default;` inside the class body.",
+        "A user-declared destructor, but only if it has a non-empty body that actually does work.",
+        "A user-declared `operator==`, which since C++20 joined the set of special member functions."
+      ],
+      "correctIndex": 1,
+      "explanation": "The rule is phrased on 'user-declared', not 'user-defined', so `~T() = default;` written in the class still kills both move operations. That is exactly why the 'only if it has a non-empty body' option is the tempting near-miss — writing `= default` is not consequence-free. `operator==` is defaultable since C++20 but is not a special member, and the default constructor has no effect on move generation.",
+      "sourceAnchor": "61-special-member-functions",
+      "difficulty": "recall"
+    },
+    {
+      "id": "6-q02",
+      "prompt": "`struct Buffer { std::vector<char> data; ~Buffer() { log(\"destroyed\"); } };` — what happens on `v.push_back(Buffer{})` into a `std::vector<Buffer>`?",
+      "options": [
+        "The move constructor is still generated but is not `noexcept`, so `vector` copies only on reallocation.",
+        "`push_back` moves anyway, because the temporary is an rvalue and binds directly to a `Buffer&&`.",
+        "No move constructor exists, so the element is copied: a heap allocation and a byte copy per push.",
+        "The compiler warns about the suppressed move and falls back to a memberwise `memcpy` of the object."
+      ],
+      "correctIndex": 2,
+      "explanation": "The logging destructor is user-declared, so no move constructor is generated and overload resolution falls back to the copy constructor, which deep-copies the `vector<char>`. The 'binds to `Buffer&&`' answer is the trap: an rvalue argument cannot select a move constructor that does not exist. There is no diagnostic at all — that silence is what makes this the classic accidental performance bug.",
+      "sourceAnchor": "61-special-member-functions",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q03",
+      "prompt": "What does an implicitly generated copy constructor actually do?",
+      "options": [
+        "Memberwise copy of bases then members in declaration order; `memcpy` only when the type is trivially copyable.",
+        "A byte-wise `memcpy` of the whole object, which is why padding bytes are copied along with the members.",
+        "Memberwise copy of members then bases in reverse declaration order, mirroring what the destructor does.",
+        "Memberwise copy in the order the members appear in the class's member-initializer lists."
+      ],
+      "correctIndex": 0,
+      "explanation": "The implicit copy is specified as memberwise, bases first and then members in declaration order; a compiler may lower it to `memcpy` only when the type is trivially copyable. The `memcpy` option is the common shortcut belief and it is backwards — `memcpy` is a permitted optimization of memberwise copy, not its definition. Reverse order applies to destruction, not copying.",
+      "sourceAnchor": "61-special-member-functions",
+      "difficulty": "recall"
+    },
+    {
+      "id": "6-q04",
+      "prompt": "`class Session { std::unique_ptr<Connection> conn_; std::vector<Order> orders_; std::string venue_; };` declares no special members. What is `Session`?",
+      "options": [
+        "Copyable and movable: the compiler defaults the copy operations even with a move-only member present.",
+        "Automatically move-only, correctly moving and destroying, with `noexcept` moves if the members' moves are.",
+        "Neither copyable nor movable, because a move-only member implicitly deletes all of the copy and move ops.",
+        "Copyable but not movable, because no move constructor is generated unless one is written explicitly."
+      ],
+      "correctIndex": 1,
+      "explanation": "This is the Rule of Zero payoff: the implicit copy operations are defined as deleted because `unique_ptr` is not copyable, while the implicit moves are generated and are `noexcept` since the members' moves are. The 'copyable and movable' option confuses `= default` with 'always works' — a defaulted copy whose implicit definition is ill-formed is silently deleted, not an error at the class definition.",
+      "sourceAnchor": "62-rule-of-zero-three-and-five",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q05",
+      "prompt": "Copy-and-swap (`T& operator=(T rhs) { swap(*this, rhs); return *this; }`) is idiomatic — where is it the wrong choice?",
+      "options": [
+        "For self-assignment, which it handles incorrectly by swapping an object with itself and losing its state.",
+        "For a raw resource handle, because it cannot release the old resource before acquiring the new one.",
+        "For a container-like class on a hot path: it always constructs a full copy instead of reusing capacity.",
+        "For any class with a `noexcept` move constructor, since the by-value parameter blocks move assignment."
+      ],
+      "correctIndex": 2,
+      "explanation": "Copy-and-swap's by-value parameter means every assignment materializes a whole new buffer, even when the target already has enough capacity to assign in place — an unnecessary allocation for a vector-like type in a loop. Self-assignment is the tempting wrong answer because it inverts the truth: copy-and-swap is self-assignment-safe by construction, which is one of its main selling points. The by-value parameter also enables move assignment rather than blocking it.",
+      "sourceAnchor": "62-rule-of-zero-three-and-five",
+      "difficulty": "trap"
+    },
+    {
+      "id": "6-q06",
+      "prompt": "`struct A { A() = default; };` versus `struct B { B(); }; B::B() = default;` — what is the observable difference?",
+      "options": [
+        "Both stay trivial; the only difference is that `B`'s definition sits outside the header, helping compile times.",
+        "`B` stays trivial and `A` does not, because defaulting inside the class body counts as providing a body.",
+        "Neither is trivial: `= default` always makes the function user-provided regardless of where it is written.",
+        "`A` stays trivially default constructible and `A a{}` zero-initializes; `B`'s constructor is user-provided."
+      ],
+      "correctIndex": 3,
+      "explanation": "Defaulting on the first declaration leaves the function not user-provided, preserving triviality and the zero-initialization behaviour of `A a{}`; defaulting out of line makes it user-provided and loses both. The 'both stay trivial' option captures the real motivation for out-of-line defaulting (keeping the definition out of the header, as PIMPL does) but misses that triviality and inlining are the price paid for it.",
+      "sourceAnchor": "63-defaulted-and-deleted-functions",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q07",
+      "prompt": "Given `void process(double);` and `void process(int) = delete;`, what does the call `process(1)` do?",
+      "options": [
+        "It selects the deleted `process(int)` and is a compile error — deleted functions still take part in overload resolution.",
+        "It removes `process(int)` from the overload set, so the call quietly converts the `int` argument to `double`.",
+        "It makes `process(int)` private in effect, so only members and friends of the enclosing scope may call it.",
+        "It defers the diagnostic to link time, producing an undefined-symbol error rather than a compile error."
+      ],
+      "correctIndex": 0,
+      "explanation": "Participating in overload resolution is the whole point of `= delete`: `process(int)` is the exact match, wins, and only then does selecting it become an error. The 'removed from the overload set' answer describes what people assume deletion means, and would defeat the purpose — the intent is precisely to stop the silent int-to-double conversion. Link-time errors are what the old private-and-undefined trick gave you.",
+      "sourceAnchor": "63-defaulted-and-deleted-functions",
+      "difficulty": "recall"
+    },
+    {
+      "id": "6-q08",
+      "prompt": "`struct P { explicit P(int, int); };` — which of `P p{1,2};` and `P q = {1,2};` compiles?",
+      "options": [
+        "Both compile; `explicit` only ever affects constructors that are callable with exactly one argument.",
+        "`q` compiles and `p` does not, since braces on a direct initializer require a non-explicit constructor.",
+        "Neither compiles: an explicit constructor can only be invoked with parentheses, never with braces.",
+        "`p` compiles as direct-list-initialization; `q` does not, because copy-list-init rejects explicit constructors."
+      ],
+      "correctIndex": 3,
+      "explanation": "`explicit` bans copy-initialization forms, and `P q = {1,2};` is copy-list-initialization, so it is rejected while the direct-list form `P p{1,2}` is fine. The 'only single-argument constructors' option is the pre-C++11 intuition — brace initialization is exactly why `explicit` on multi-argument constructors became meaningful.",
+      "sourceAnchor": "64-converting-and-explicit-constructors",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q09",
+      "prompt": "What can you still do with a type whose only conversion is `explicit operator bool() const`?",
+      "options": [
+        "Use it in contextual conversions such as `if (p)`, `!p`, `&&` and `?:`, but not in `int x = p;`.",
+        "Use it wherever an arithmetic type is expected, but not where a class type is expected instead.",
+        "Nothing implicit at all, so even `if (p)` has to be written as `if (static_cast<bool>(p))`.",
+        "Everything a non-explicit one allows; `explicit` is only ever meaningful on constructors."
+      ],
+      "correctIndex": 0,
+      "explanation": "Contextual conversion to `bool` deliberately ignores `explicit`, which is why `optional`, `unique_ptr` and the stream types all use this idiom and still work in `if` and `while`. The 'even `if (p)` needs a cast' answer is the natural over-reading of `explicit` and is what makes the idiom look impossible; before C++11 the safe-bool idiom existed precisely because this carve-out did not.",
+      "sourceAnchor": "64-converting-and-explicit-constructors",
+      "difficulty": "recall"
+    },
+    {
+      "id": "6-q10",
+      "prompt": "A delegating constructor's target completes, and then the delegating constructor's own body throws. What happens to the object?",
+      "options": [
+        "Its destructor does not run, exactly as when a non-delegating constructor's body throws an exception.",
+        "The target constructor is re-entered so its cleanup can run, and then the exception propagates outward.",
+        "Its destructor runs, because the object's lifetime began the moment the target constructor completed.",
+        "Only the members named in the delegating constructor's own mem-init list are destroyed on the way out."
+      ],
+      "correctIndex": 2,
+      "explanation": "Delegation shifts the start of the object's lifetime to the completion of the target constructor, so a later throw unwinds a fully constructed object and the destructor runs. The 'its destructor does not run' answer states the rule for ordinary constructors correctly and applies it to the wrong case — that contrast is exactly what makes this a favourite interview detail. A delegating constructor also cannot have its own mem-init entries at all.",
+      "sourceAnchor": "65-delegating-and-inherited-constructors",
+      "difficulty": "trap"
+    },
+    {
+      "id": "6-q11",
+      "prompt": "`struct Base { Base(int); }; struct Derived : Base { using Base::Base; int extra_; };` then `Derived d{1};`. What is the state of `extra_`?",
+      "options": [
+        "Value-initialized to 0, because the inherited constructor value-initializes the whole derived part.",
+        "Copy-initialized from the argument `1`, the same value that was forwarded to the `Base` constructor.",
+        "Ill-formed code: a class with its own data members may not inherit its base's constructors.",
+        "Left default-initialized and therefore indeterminate — inherited constructors do not touch derived members."
+      ],
+      "correctIndex": 3,
+      "explanation": "An inherited constructor runs the base constructor and applies NSDMIs; a derived member without an NSDMI is simply default-initialized, which for an `int` means indeterminate. The 'value-initialized to 0' option is the dangerous assumption — writing `int extra_ = 0;` would make it true, and its absence is the whole hazard. This is why inherited constructors are recommended only for thin wrappers that add no state.",
+      "sourceAnchor": "65-delegating-and-inherited-constructors",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q12",
+      "prompt": "A class declares `int a;` then `int b;` and its constructor's list reads `: b(x), a(b)`. What actually happens?",
+      "options": [
+        "`a` is initialized first from an uninitialized `b` — initialization follows declaration order, not list order.",
+        "`b` is initialized first because the written list order governs, so `a` receives a well-defined value.",
+        "The compiler silently reorders the list and initializes `b` first, which is what `-Wreorder` reports.",
+        "Both orders are permitted, because the standard leaves member initialization order unspecified here."
+      ],
+      "correctIndex": 0,
+      "explanation": "Members are always initialized in declaration order, so `a(b)` runs first and reads an indeterminate `b`. The 'compiler reorders the list' option gets the outcome half-right but inverts the mechanism: nothing is reordered, the list order is simply ignored, and `-Wreorder` warns that the written order misleadingly differs from the real one. The order is fully specified, not unspecified.",
+      "sourceAnchor": "66-member-initializer-lists",
+      "difficulty": "trap"
+    },
+    {
+      "id": "6-q13",
+      "prompt": "`class C { int a = 0; int b = 0; C(int x) : a(x) {} };` — after `C c{7};`, what are `a` and `b`?",
+      "options": [
+        "`a` is 0 and `b` is 0, because an NSDMI always takes precedence over a mem-init-list entry.",
+        "`a` is 7 and `b` is indeterminate: naming any member in the mem-init list disables every NSDMI.",
+        "`a` is 7 and `b` is 0: the list wins where both exist, and the NSDMI covers members the list omits.",
+        "Ill-formed code: a member that has an NSDMI may not also appear in a constructor's mem-init list."
+      ],
+      "correctIndex": 2,
+      "explanation": "The mem-init list and NSDMIs compose per member: the list wins for `a`, and `b`, which the list never mentions, gets its NSDMI. The 'NSDMIs are disabled' option misreads the interaction as all-or-nothing, which would destroy the main benefit of NSDMIs — supplying defaults once so that adding a member does not silently break some constructor.",
+      "sourceAnchor": "66-member-initializer-lists",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q14",
+      "prompt": "`Buffer` declares `const std::vector<char>& get() const&` and `std::vector<char> get() &&`. What does `auto c = Buffer{}.get();` do?",
+      "options": [
+        "The `const&` overload runs and copies `data_`, since `auto` deduces a value and so forces a copy.",
+        "The `&&` overload runs and moves `data_` out, so constructing `c` performs no heap allocation.",
+        "The call is ambiguous: a temporary binds equally well to a `const&`-qualified and an `&&`-qualified member.",
+        "The `&&` overload runs, but `c` dangles into the buffer of the temporary that has already been destroyed."
+      ],
+      "correctIndex": 1,
+      "explanation": "The implicit object argument is an rvalue, and `&&` beats `const&` for it, so the move-out overload steals `data_` and `c` is built without allocating. The ambiguity option is plausible because `const&` really does bind to rvalues — but binding and winning are different things, and the ref-qualified overload is the better match. Nothing dangles: `c` owns the moved-from buffer outright.",
+      "sourceAnchor": "67-ref-qualified-member-functions",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q15",
+      "prompt": "A class has `void f() &;` and also a plain unqualified `void f();`. What is the status of that code?",
+      "options": [
+        "Ill-formed: once any overload of a name is ref-qualified, every overload of that name must be too.",
+        "Allowed; the unqualified overload simply acts as the fallback when neither `&` nor `&&` matches.",
+        "Allowed only if the unqualified overload is also `const`, which lets it bind to rvalue objects.",
+        "Ill-formed only when the two overloads differ in return type as well as in ref-qualification."
+      ],
+      "correctIndex": 0,
+      "explanation": "The standard forbids mixing ref-qualified and unqualified overloads of the same name outright; it is a hard rule, not a tie-breaking one. The 'fallback' option is how people expect overloading to behave by analogy with `const`, where qualified and unqualified versions coexist happily — that analogy is exactly what breaks here.",
+      "sourceAnchor": "67-ref-qualified-member-functions",
+      "difficulty": "recall"
+    },
+    {
+      "id": "6-q16",
+      "prompt": "In C++14, `struct Foo { static constexpr int kMax = 1000; };` and a call `f(Foo::kMax)` where `f` takes `const int&` produces 'undefined reference to `Foo::kMax`'. Why?",
+      "options": [
+        "`constexpr` implies internal linkage, so every TU gets its own `kMax` and their addresses compare unequal.",
+        "A `constexpr` value has no address at all, so passing one by reference is ill-formed in every standard.",
+        "Binding it to a reference ODR-uses it, and before C++17 that required a separate out-of-line definition.",
+        "The compiler substitutes the literal `1000` and binds the reference to a temporary, which then dangles."
+      ],
+      "correctIndex": 2,
+      "explanation": "Binding to a reference takes the object's address, which ODR-uses it and demands a definition — something C++17's implicit inlining of `constexpr` static data members later supplied automatically. The 'temporary' option is tempting because a `constexpr` value really does get constant-folded in most uses, but ODR-use forces real storage instead, and its absence is a link error rather than a dangling reference.",
+      "sourceAnchor": "68-static-class-members",
+      "difficulty": "trap"
+    },
+    {
+      "id": "6-q17",
+      "prompt": "Why is a static member function the standard way to write a trampoline for a C callback API?",
+      "options": [
+        "It is implicitly `extern \"C\"`, so its calling convention already matches what a C API expects.",
+        "It has no `this`, so its address is a plain function pointer rather than a pointer-to-member.",
+        "It is stored in the class's vtable, so the C API can dispatch to it through that vtable slot.",
+        "It is implicitly `inline`, so the compiler can emit a C-compatible stub at each registration site."
+      ],
+      "correctIndex": 1,
+      "explanation": "Without an implicit object parameter, `&Handler::trampoline` has ordinary function-pointer type, which is what `register_callback` can store; the object travels separately as a `void*` context. The `extern \"C\"` option confuses linkage with the shape of the type — language linkage affects name mangling, not whether a pointer-to-member is required. Static member functions cannot be `virtual`, so they are never in the vtable.",
+      "sourceAnchor": "68-static-class-members",
+      "difficulty": "recall"
+    },
+    {
+      "id": "6-q18",
+      "prompt": "Two threads write `flags.ready` and `flags.priority`, adjacent bit-fields in the same storage unit, with no synchronization. Is this a data race?",
+      "options": [
+        "No: distinct named bit-fields are distinct memory locations under the C++11 memory model.",
+        "No, as long as both fields are `unsigned`, since unsigned writes cannot tear on x86 hardware.",
+        "Yes: adjacent bit-fields form one memory location, and each write read-modify-writes that unit.",
+        "Yes, but only on big-endian ABIs, where fields are allocated MSB-first within the storage unit."
+      ],
+      "correctIndex": 2,
+      "explanation": "Writing a bit-field is a load-mask-or-store of the whole enclosing unit, so two threads touching adjacent fields are writing the same memory location and can lose each other's updates. The 'distinct memory locations' answer is the natural reading of the memory model and is exactly the wrong one — the standard makes adjacent bit-fields a single location, and a zero-width unnamed field is what splits them apart.",
+      "sourceAnchor": "69-bit-fields-packing-and-alignment",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q19",
+      "prompt": "What is wrong with declaring `int b : 1;`?",
+      "options": [
+        "Its signedness is implementation-defined, so it may hold only 0 and −1; write `signed`/`unsigned` explicitly.",
+        "It is always unsigned, because one bit cannot represent both a sign bit and a value bit at once.",
+        "It is always signed, so the only representable values are −1 and 0 on every conforming implementation.",
+        "It is ill-formed: bit-fields of width 1 must be declared `bool` or `unsigned` in standard C++."
+      ],
+      "correctIndex": 0,
+      "explanation": "Plain `int` in a bit-field has implementation-defined signedness, so on a compiler that treats it as signed the field stores only 0 and −1, and `b == 1` never holds. The 'always signed' option describes the bad outcome accurately but states it as a guarantee — the real problem is that you cannot rely on either behaviour, which is why the fix is to spell out `signed` or `unsigned`, or use `bool b : 1;`.",
+      "sourceAnchor": "69-bit-fields-packing-and-alignment",
+      "difficulty": "recall"
+    },
+    {
+      "id": "6-q20",
+      "prompt": "A colleague proposes describing a network wire format with a bit-field struct. What is the correct objection?",
+      "options": [
+        "Bit-fields are fine for wire formats once the struct is `#pragma pack(1)`, which pins the allocation order.",
+        "Bit-fields are fine provided every field is `unsigned`, which fixes the allocation direction to LSB-first.",
+        "Bit-fields are unusable because you cannot read one without taking its address, and that is undefined.",
+        "Allocation order within the unit and straddling are ABI-defined, so use explicit shifts and masks instead."
+      ],
+      "correctIndex": 3,
+      "explanation": "Which end of the storage unit fields are allocated from, and whether a field may straddle a unit boundary, are both implementation-defined — SysV and MSVC genuinely differ — so the same struct decodes differently across toolchains. The `#pragma pack(1)` option is the most tempting because packing does remove padding, but it controls padding only and says nothing about bit allocation order. Reading a bit-field never requires its address; taking the address is what is forbidden.",
+      "sourceAnchor": "69-bit-fields-packing-and-alignment",
+      "difficulty": "trap"
+    },
+    {
+      "id": "6-q21",
+      "prompt": "In the NVI idiom a public non-virtual base function calls a virtual that derived classes override as `private`. How can that possibly work?",
+      "options": [
+        "It is ill-formed: dispatching to a private override is an access violation, caught at run time.",
+        "Access is checked on the name at the call site, so dispatching to a private override is fine.",
+        "It works only because the base declares the derived class a `friend`, which NVI does as part of the idiom.",
+        "It works, but the override must be `protected`; a `private` virtual function cannot be overridden at all."
+      ],
+      "correctIndex": 1,
+      "explanation": "Access control applies to the name being used, and the base names its own virtual, which it is allowed to call; virtual dispatch then lands in the derived override regardless of that override's access. The 'must be protected' option is the widespread belief and is false — a private virtual is overridable, it just cannot be called by name from the derived class. No friendship is involved.",
+      "sourceAnchor": "610-access-control-and-inheritance",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q22",
+      "prompt": "After C++20, what remains a legitimate reason to choose private inheritance over holding the type as a member?",
+      "options": [
+        "Only to obtain the empty base optimization, which composition still cannot achieve in any C++ version.",
+        "Only to expose an is-a relationship internally while hiding the pointer conversion from derived classes.",
+        "Only to override one of the base's virtuals or reach its protected members; size is now covered otherwise.",
+        "Only to avoid the vptr composition would add, since a member subobject carries a vtable of its own."
+      ],
+      "correctIndex": 2,
+      "explanation": "Overriding a virtual and reaching protected members are things a member subobject simply cannot do, so they are what is left. The empty base optimization option was the strongest historical argument, which is exactly why it is the tempting distractor — `[[no_unique_address]]` in C++20 lets a member be size-free too, retiring that motivation. A member does not gain a vptr merely by being a member.",
+      "sourceAnchor": "610-access-control-and-inheritance",
+      "difficulty": "recall"
+    },
+    {
+      "id": "6-q23",
+      "prompt": "In the Itanium C++ ABI, what sits in the vtable immediately before the virtual function slots?",
+      "options": [
+        "A pointer to the base class's vtable and the object's size in bytes, used by `operator delete`.",
+        "An offset-to-top value and a pointer to the class's `type_info`, which `dynamic_cast` and `typeid` read.",
+        "A reference count for the vtable and a pointer to the translation unit holding the key function.",
+        "The class's alignment and a bitmask recording which slots the most-derived class has overridden."
+      ],
+      "correctIndex": 1,
+      "explanation": "The vptr points just past two entries: offset-to-top, used to recover the most-derived address under multiple inheritance, and the `type_info*` that RTTI reads. The 'size for `operator delete`' option is plausible because sized deallocation is real, but the size comes from the deleting destructor variant in the slots, not from a header field. Vtables are `.rodata` constants and are never reference counted.",
+      "sourceAnchor": "611-virtual-dispatch-and-vtables",
+      "difficulty": "recall"
+    },
+    {
+      "id": "6-q24",
+      "prompt": "A shared library adds a new virtual function in the middle of an existing class's declarations and ships a rebuild. What happens to already-compiled callers?",
+      "options": [
+        "Every subsequent slot index shifts, so old callers dispatch through the wrong slot — a silent ABI break.",
+        "Nothing breaks: slot indices are recomputed by the dynamic linker each time the library is loaded.",
+        "Only that class's own vtable grows; derived classes keep their indices, so existing callers stay correct.",
+        "The compiler appends the new virtual at the end regardless of where it is declared, preserving the ABI."
+      ],
+      "correctIndex": 0,
+      "explanation": "Slots are assigned in declaration order and baked into caller code as fixed indices, so inserting one shifts everything after it and old binaries call the wrong function. The 'compiler appends at the end' option describes the discipline library authors adopt by hand — appending virtuals — and mistakes it for something the compiler does for you. Nothing is recomputed at load time; the index is already in the caller's instruction stream.",
+      "sourceAnchor": "611-virtual-dispatch-and-vtables",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q25",
+      "prompt": "An interviewer asks what a virtual call really costs in a tight loop. Which framing is the strongest answer?",
+      "options": [
+        "The vptr load, a dependent load off the object and therefore a guaranteed cache miss at every call.",
+        "The indirect call itself, costing 15–20 cycles at every site regardless of what the branch predictor does.",
+        "The lost inlining — no constant propagation, no cross-call CSE, and no vectorization of a merged body.",
+        "The vtable lookup, which walks the inheritance graph to locate the most-derived override at run time."
+      ],
+      "correctIndex": 2,
+      "explanation": "A predicted virtual call is only a handful of cycles; the real damage is that the callee's body cannot be inlined, which blocks all the downstream optimizations and is routinely an order of magnitude larger in a loop. The '15–20 cycles' figure is the tempting one because it is a real number from the chapter — but it is the megamorphic mispredict cost, not the price of a monomorphic call site. Vtable dispatch is one indexed load, not a graph walk; that describes `dynamic_cast`.",
+      "sourceAnchor": "611-virtual-dispatch-and-vtables",
+      "difficulty": "trap"
+    },
+    {
+      "id": "6-q26",
+      "prompt": "`struct I { virtual ~I() = 0; };` compiles. What else does the program require?",
+      "options": [
+        "A definition such as `I::~I() = default;`, because every derived destructor calls the base destructor.",
+        "Nothing more; a pure virtual destructor is the one pure virtual that never needs a definition at all.",
+        "At least one other pure virtual function, since a destructor alone cannot make a class abstract.",
+        "A `protected` access specifier, because otherwise a pure virtual destructor cannot be declared pure."
+      ],
+      "correctIndex": 0,
+      "explanation": "Destructors chain unconditionally — a derived destructor always calls the base's — so a pure virtual destructor is the one pure virtual whose definition is mandatory rather than optional. The 'never needs a definition' option inverts exactly this: any pure virtual *may* have a body, but the destructor *must*, or you get a link error. One pure virtual, destructor included, is enough to make the class abstract.",
+      "sourceAnchor": "612-abstract-classes-and-pure-virtual-functions",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q27",
+      "prompt": "A base class constructor calls one of its own pure virtual functions. What is observed at run time?",
+      "options": [
+        "It dispatches to the derived override, since the object under construction already has the derived type.",
+        "It is a compile error, because the compiler knows the exact dynamic type inside a constructor body.",
+        "It calls `__cxa_pure_virtual` and aborts: at that stage the derived override does not exist yet.",
+        "It is a no-op returning a value-initialized result, because the vtable slot is still null at that point."
+      ],
+      "correctIndex": 2,
+      "explanation": "The vptr is installed stage by stage, so inside the base constructor it points at the base's vtable, whose pure-virtual slot holds `__cxa_pure_virtual` — the runtime aborts. The 'dispatches to the derived override' answer is the intuition that causes the bug in the first place; construction has not reached the derived stage, and the derived members it would touch do not exist yet. It is UB that implementations happen to diagnose loudly.",
+      "sourceAnchor": "612-abstract-classes-and-pure-virtual-functions",
+      "difficulty": "trap"
+    },
+    {
+      "id": "6-q28",
+      "prompt": "`~Base` is non-virtual. What happens with `std::shared_ptr<Base> p = std::make_shared<Derived>();` when `p` drops its last reference?",
+      "options": [
+        "Undefined behaviour, just as with `delete base_ptr`, because the deleter follows the pointer's static type.",
+        "It works only if `Base` and `Derived` are the same size, so `operator delete` gets a matching size argument.",
+        "It works because `shared_ptr` applies `dynamic_cast<void*>` to recover the most-derived address first.",
+        "`Derived` is destroyed correctly: the control block holds a deleter captured from the constructing expression."
+      ],
+      "correctIndex": 3,
+      "explanation": "`shared_ptr` type-erases the deleter at construction, when the concrete type is still `Derived`, so the correct destructor runs despite the non-virtual base destructor — this is precisely where `unique_ptr<Base>` fails, since its deleter is a fixed template parameter. The 'UB just like `delete base_ptr`' option is right about the rule and wrong about this type. Note the asymmetry is fragile: `shared_ptr<Base> p{static_cast<Base*>(new Derived)}` erases the wrong type and is UB again.",
+      "sourceAnchor": "613-virtual-destructors",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q29",
+      "prompt": "A polymorphic base is used through references but is never owned or deleted via a base pointer. What is the right destructor configuration?",
+      "options": [
+        "`protected: ~T() = default;` — non-virtual and free, and deletion through a base pointer stops compiling.",
+        "`public: virtual ~T() = default;` — the only safe configuration for any class that declares a virtual.",
+        "`private: ~T() = default;` — which blocks derived destructors as well as outside deletion, as intended.",
+        "`public: ~T() = delete;` — which prevents destruction through any path, base pointer or otherwise."
+      ],
+      "correctIndex": 0,
+      "explanation": "A protected non-virtual destructor makes `delete base_ptr` a compile error while letting derived classes destroy themselves, so you get the safety with no vptr cost. The 'always public virtual' option is the reflex the chapter argues against: `virtual` on a destructor costs 8 bytes, trivial copyability, register passing and `memcpy` paths, so it belongs only where deletion through a base pointer genuinely happens. `private` would break derived destructors.",
+      "sourceAnchor": "613-virtual-destructors",
+      "difficulty": "recall"
+    },
+    {
+      "id": "6-q30",
+      "prompt": "`struct B { virtual void f(int) const; }; struct E : B { void f(int); };` — no `override` is written. What is the effect of a call `b.f(1)` through a `B&` bound to an `E`?",
+      "options": [
+        "`E::f` overrides anyway, because `const` is not part of the signature used to match overrides.",
+        "`E::f` overrides, but calls through `B&` on a const object dispatch back to `B::f` instead.",
+        "`B::f` runs: `E::f` differs in constness, so it hides rather than overrides, entirely silently.",
+        "The program is ill-formed, since a non-const member may not shadow a const member of a base."
+      ],
+      "correctIndex": 2,
+      "explanation": "The `const` qualifier is part of the function type, so `E::f` never overrides — it declares an unrelated function that hides the name, and dispatch through `B&` reaches `B::f`. Writing `override` turns this into the compile error the 'the program is ill-formed' answer imagines, which is precisely why the advice is to write it always. The same silent hiding arises from mismatched parameters, ref-qualifiers, and (since C++17) `noexcept`.",
+      "sourceAnchor": "614-override-and-final",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q31",
+      "prompt": "How does `noexcept` interact with overriding a virtual function?",
+      "options": [
+        "A `noexcept` override of a non-`noexcept` virtual is allowed; the reverse direction is not.",
+        "A non-`noexcept` override of a `noexcept` virtual is allowed; the reverse direction is not.",
+        "It must match exactly in both directions, since C++17 made `noexcept` part of the function type.",
+        "It is ignored entirely when matching overrides, exactly as it was before C++17 made it part of the type."
+      ],
+      "correctIndex": 0,
+      "explanation": "Strengthening the guarantee is safe, so an override may add `noexcept` where the base virtual lacked it; weakening it would break callers relying on the base's promise, so that is rejected. The 'must match exactly' option follows from `noexcept` being part of the type since C++17, but overriding deliberately allows this one-way relaxation rather than requiring identity.",
+      "sourceAnchor": "614-override-and-final",
+      "difficulty": "recall"
+    },
+    {
+      "id": "6-q32",
+      "prompt": "`struct Base { int a; virtual void f(); }; struct Derived : Base { int b; void f() override; }; Derived d; Base b = d;` — which `f` does `b.f()` call?",
+      "options": [
+        "`Derived::f`, because the vptr is copied along with the base subobject by the memberwise copy.",
+        "`Base::f`, because `Base`'s copy constructor ran and wrote `Base`'s vptr — `b` is genuinely a `Base`.",
+        "`Base::f`, but only because `f` was not redeclared `virtual` in the derived class as well.",
+        "The behaviour is undefined, since copying a polymorphic object into a base value is not permitted."
+      ],
+      "correctIndex": 1,
+      "explanation": "The constructor invoked is `Base::Base(const Base&)`, and every constructor installs its own class's vptr, so the sliced object dispatches to `Base::f` forever after. The 'vptr is copied' option is the heart of the misconception: the vptr is not a member and is never copied — it is set by whichever constructor runs. Slicing is well-defined, which is what makes it dangerous rather than diagnosable.",
+      "sourceAnchor": "615-object-slicing",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q33",
+      "prompt": "What is the complete answer to 'exactly what is lost when an object is sliced?'",
+      "options": [
+        "The derived data members only; the vptr survives, so virtual calls still reach the derived override.",
+        "The dynamic type only; the derived members are copied into padding at the end of the base subobject.",
+        "The derived data members and the dynamic type, so virtual dispatch resolves to the base thereafter.",
+        "Nothing at all when the base is polymorphic — slicing only affects non-polymorphic base classes."
+      ],
+      "correctIndex": 2,
+      "explanation": "Both halves are needed for full credit: the derived members are not copied, and the base's copy constructor overwrites the vptr so polymorphism is gone too. The 'members only, vptr survives' option is the usual half-answer and would imply a sliced object could still behave like a `Derived`, which it cannot. This is also why `catch (std::exception e)` by value loses the derived exception's `what()`.",
+      "sourceAnchor": "615-object-slicing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "6-q34",
+      "prompt": "`struct A { int a; virtual void f(); }; struct B { int b; virtual void g(); }; struct C : A, B {}; C* c = new C; B* p = c;` — how do `(void*)p` and `(void*)c` compare?",
+      "options": [
+        "Equal: a derived-to-base conversion never changes the address, it only changes the static type.",
+        "Equal, because `B` is a polymorphic base and so its subobject is also placed at offset zero.",
+        "Different: converting to the second base applies a pointer adjustment past `A`'s subobject.",
+        "Different only if `C` declares its own data members, which push `B`'s subobject past offset zero."
+      ],
+      "correctIndex": 2,
+      "explanation": "`C` lays out `A`'s subobject (vptr plus `a`) first and `B`'s after it, so the compiler adds the offset when converting and the two pointers genuinely differ. The 'never changes the address' option holds under single inheritance, which is where the intuition comes from, and it is exactly why `reinterpret_cast` between related pointers is wrong here while `static_cast` is right. `C`'s own members are laid out after both bases and do not affect this.",
+      "sourceAnchor": "616-multiple-and-virtual-inheritance",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q35",
+      "prompt": "`struct L : virtual Base {}; struct R : virtual Base {}; struct D : L, R {};` — which pair of statements is correct?",
+      "options": [
+        "`static_cast` from `Base*` to `D*` works, since the vbase offset is a compile-time constant; only the initialization order changes.",
+        "`static_cast` from `Base*` to `D*` is ill-formed, and the most-derived class `D` initializes the shared `Base`.",
+        "`static_cast` from `Base*` to `D*` works but yields a stale offset, and the nearest base initializes `Base`.",
+        "`static_cast` and `dynamic_cast` are both ill-formed here, and each intermediate class initializes `Base`."
+      ],
+      "correctIndex": 1,
+      "explanation": "A virtual base's offset depends on the most-derived type and is only discoverable at run time, so downcasting from it requires `dynamic_cast`; and `D`, as the most-derived class, is what initializes the shared `Base`, making `L` and `R`'s mem-init entries for it inert. The 'compile-time constant offset' option is the whole misconception — if the offset were fixed there would be no vbase-offset load and no reason for the restriction.",
+      "sourceAnchor": "616-multiple-and-virtual-inheritance",
+      "difficulty": "trap"
+    },
+    {
+      "id": "6-q36",
+      "prompt": "`Shape` declares `virtual std::unique_ptr<Shape> clone() const;` and `Circle` writes `std::unique_ptr<Circle> clone() const override;`. What happens?",
+      "options": [
+        "It compiles: `unique_ptr` is covariant here because `Circle*` converts implicitly to `Shape*`.",
+        "It compiles but silently hides the base function rather than overriding it, which `override` permits.",
+        "It compiles only when `Shape`'s destructor is virtual, which is what makes the two smart pointers related.",
+        "It fails to compile: covariance covers pointers and references only, and the two templates are unrelated types."
+      ],
+      "correctIndex": 3,
+      "explanation": "Covariant return types are defined for pointers and references to classes related by accessible inheritance; `unique_ptr<Circle>` and `unique_ptr<Shape>` are two unrelated class types no matter how their parameters relate, so the return type simply mismatches. The 'compiles because `Circle*` converts' option applies covariance one level too deep — convertibility of the template argument is not covariance of the template. The NVI workaround is a private raw covariant `do_clone` wrapped by a non-virtual `clone`.",
+      "sourceAnchor": "617-covariant-return-types",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q37",
+      "prompt": "A `dynamic_cast` that works inside the main binary returns null when the object comes from a `dlopen`ed plugin. What is the cause and the fix?",
+      "options": [
+        "The vtable is duplicated per shared object, so the vptr no longer points into the main binary's `.rodata`.",
+        "Duplicate `type_info` objects under hidden visibility compare unequal; export them or use `RTLD_GLOBAL`.",
+        "`dynamic_cast` cannot cross a shared-library boundary at all by design, so null is the specified result.",
+        "The dynamic linker rewrites the offset-to-top field to zero on load, so the downcast cannot be computed."
+      ],
+      "correctIndex": 1,
+      "explanation": "With `-fvisibility=hidden` or `RTLD_LOCAL` each module gets its own `type_info` for the same class, and the runtime's pointer-then-name comparison fails, so the cast reports no match. The 'duplicated vtable' option is close to the truth in spirit — symbols really are duplicated — but the vtable is not what `__dynamic_cast` compares; the `type_info` identity is. The fix is symbol visibility for the key function and typeinfo, or loading with `RTLD_GLOBAL`.",
+      "sourceAnchor": "618-rtti-and-dynamic_cast",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q38",
+      "prompt": "Why is `dynamic_cast` banned outright in most low-latency codebases?",
+      "options": [
+        "It calls `__dynamic_cast`, which walks the hierarchy comparing `type_info` — 30–100+ ns and not constant time.",
+        "It is a single load and compare of the vptr against the target class's vtable address — a few cycles.",
+        "It is a table lookup indexed by the target's slot number, so its cost is fixed by the hierarchy's depth.",
+        "It is resolved entirely at compile time whenever both types are complete, and costs nothing at run time."
+      ],
+      "correctIndex": 0,
+      "explanation": "The Itanium implementation is a real function call that chases pointers through the inheritance graph and may fall back to `strcmp` on type names, so its cost depends on hierarchy shape and is unbounded in the worst case. The 'load and compare the vptr' option describes an optimization a compiler can sometimes make for a final leaf class, not the general operation — and it is why people underestimate the cost. The standard replacements are a virtual function, `std::variant`, or an LLVM-style kind tag.",
+      "sourceAnchor": "618-rtti-and-dynamic_cast",
+      "difficulty": "recall"
+    },
+    {
+      "id": "6-q39",
+      "prompt": "A candidate says CRTP is faster than virtual dispatch. What is the actual source of the speedup?",
+      "options": [
+        "Avoiding the indirect call itself, the dominant cost at roughly 15–20 cycles per dispatch on modern cores.",
+        "Allowing heterogeneous containers without a vptr, since every derived type still shares one base type.",
+        "Inlining across the dispatch boundary, which then enables constant propagation, DCE and vectorization.",
+        "Reducing binary size, because one template instantiation replaces the per-class vtables and their thunks."
+      ],
+      "correctIndex": 2,
+      "explanation": "Resolving the call at compile time lets the callee's body be inlined into the caller, and it is the optimizations unlocked by that merge — constant propagation, dead-branch elimination, vectorization — that produce the routine 2–10x wins. The 'avoiding the indirect call' option names a real but tiny saving and is the answer that signals a shallow grasp. CRTP actually increases binary size and makes heterogeneous containers impossible, since each instantiation is a distinct type.",
+      "sourceAnchor": "619-static-polymorphism-with-crtp",
+      "difficulty": "application"
+    },
+    {
+      "id": "6-q40",
+      "prompt": "You genuinely need type erasure on a hot path. Which structure should you sketch?",
+      "options": [
+        "An inheritance-based `Concept`/`Model` pair, whose heap block keeps the erased object off the hot object.",
+        "`std::function`, whose small-buffer optimization stores any callable holding up to four pointers inline.",
+        "A `dynamic_cast` against a shared `Concept` base, avoiding one vtable slot per erased operation.",
+        "A manual vtable plus inline storage: one indirect call, no allocation, and no cold-cache hop to a heap model."
+      ],
+      "correctIndex": 3,
+      "explanation": "A `const VTable*` beside a fixed `alignas(8) std::byte buf[32]` gives runtime polymorphism with a single indirect call, no allocation and no pointer chase into a cold heap block — and it works under `-fno-rtti`. The `std::function` option is tempting but its buffer is only ~16 bytes in libstdc++ and ~24 in libc++, so three captured pointers already allocate. The plain `Concept`/`Model` form is correct but pays exactly the allocation and cache miss you are trying to avoid.",
+      "sourceAnchor": "620-type-erasure",
+      "difficulty": "application"
+    }
+  ]
+}

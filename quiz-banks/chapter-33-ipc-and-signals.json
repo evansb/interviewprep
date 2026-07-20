@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-33-ipc-and-signals",
+  "questions": [
+    {
+      "id": "33-q01",
+      "prompt": "What is `PIPE_BUF` on Linux, and what does it guarantee?",
+      "options": [
+        "4096 bytes — a write of at most that size is never interleaved with another writer's data.",
+        "65536 bytes — a write of at most that size is never interleaved with another writer's data.",
+        "4096 bytes — the largest amount a single `read()` on a pipe is allowed to return.",
+        "65536 bytes — the point above which a write returns `EAGAIN` instead of blocking."
+      ],
+      "correctIndex": 0,
+      "explanation": "`PIPE_BUF` is 4096 on Linux and governs write atomicity only: below it, a write lands as one contiguous chunk; above it, the kernel may split it and another writer's bytes may appear in the middle. The 65536 figure is the tempting confusion — that is the default capacity of the pipe's kernel ring buffer (16 pages), a completely separate quantity that says nothing about atomicity. Reads are not bounded by `PIPE_BUF` either, and a full pipe blocks or returns `EAGAIN` regardless of write size.",
+      "sourceAnchor": "331-pipes-and-fifos",
+      "difficulty": "recall"
+    },
+    {
+      "id": "33-q02",
+      "prompt": "A parent `fork()`s a child, keeps the read end of a pipe, and forgets to close its own copy of the write end. The child writes some data and exits. What does the parent's `read()` do after consuming that data?",
+      "options": [
+        "It blocks forever, because EOF requires every write descriptor in every process to be closed.",
+        "It returns 0 immediately, because the only process that actually wrote to the pipe has exited.",
+        "It fails with `EPIPE`, because the writing peer terminated without closing the descriptor.",
+        "It returns 0 after a kernel timeout, because the pipe detects that no writer is scheduled."
+      ],
+      "correctIndex": 0,
+      "explanation": "`fork()` duplicates descriptors, so the parent's own write fd keeps the pipe's writer count above zero and the reader never sees end-of-file — the classic pipeline hang. The reasoning that the child's exit is enough is the tempting near-miss: the premise that the writer exited is true, but the kernel counts open write descriptors, not writing processes. `EPIPE` and `SIGPIPE` are what a *writer* sees when readers are gone, which is the mirror image of this situation.",
+      "sourceAnchor": "331-pipes-and-fifos",
+      "difficulty": "trap"
+    },
+    {
+      "id": "33-q03",
+      "prompt": "A server writes responses into a pipe whose reader has already closed its end. What happens with the default signal disposition, and what is the standard fix?",
+      "options": [
+        "`SIGPIPE` kills the process; ignore `SIGPIPE` at startup and handle `EPIPE` from the write.",
+        "The write returns `EPIPE` and the process survives; check the return value and drop the client.",
+        "`SIGPIPE` is raised but its default action is to be ignored; check `errno` for `ECONNRESET`.",
+        "The write blocks until a new reader opens the pipe; use `O_NONBLOCK` to get `EAGAIN` instead."
+      ],
+      "correctIndex": 0,
+      "explanation": "`SIGPIPE`'s default disposition is Term, so an unprepared server dies silently on a disconnected peer; `signal(SIGPIPE, SIG_IGN)` (or `send(..., MSG_NOSIGNAL)` on sockets) converts the event into an ordinary `EPIPE` return. The answer claiming the write simply returns `EPIPE` describes what happens only *after* you have ignored or blocked the signal — it states the end state while skipping the step that produces it. Nothing here blocks: with no reader at all the pipe cannot be drained, so waiting is not an option the kernel offers.",
+      "sourceAnchor": "331-pipes-and-fifos",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q04",
+      "prompt": "You are choosing a message queue for a daemon built around an `epoll` event loop. Which factor decides between POSIX `mq_*` and System V `msgget`?",
+      "options": [
+        "A POSIX queue descriptor is a real file descriptor and is pollable; a System V queue identifier is not.",
+        "A System V queue descriptor is a real file descriptor and is pollable; a POSIX queue identifier is not.",
+        "Both are pollable, but only System V queues preserve message boundaries under concurrent senders.",
+        "Neither is pollable, so both require a dedicated reader thread plus an eventfd to reach the loop."
+      ],
+      "correctIndex": 0,
+      "explanation": "On Linux `mq_open` returns a genuine fd usable with `select`/`poll`/`epoll`, while System V queues are addressed by a `key_t`-derived integer identifier that no polling interface accepts — which alone disqualifies them from event-loop designs. The claim that neither is pollable is the plausible trap, since it correctly describes System V and correctly describes System V semaphores, but it wrongly generalizes to the POSIX API. Message-boundary preservation is not a differentiator: both are datagram-oriented.",
+      "sourceAnchor": "332-posix-and-system-v-message-queues",
+      "difficulty": "recall"
+    },
+    {
+      "id": "33-q05",
+      "prompt": "A POSIX message queue has `mq_msgsize` of 8192. Your reader calls `mq_receive` with a 1024-byte buffer for messages you know are only 200 bytes long. What happens?",
+      "options": [
+        "Every call fails with `EMSGSIZE`; the buffer must be at least `mq_msgsize` regardless of message size.",
+        "Each call succeeds and returns 200 bytes, because the buffer comfortably exceeds the actual message.",
+        "Each call succeeds but truncates silently, so messages over 1024 bytes lose their tail without error.",
+        "The first call succeeds and later ones fail once a message larger than 1024 bytes reaches the head."
+      ],
+      "correctIndex": 0,
+      "explanation": "`mq_receive` validates the buffer against the queue's configured `mq_msgsize` attribute, not against the message actually waiting, so an undersized buffer fails immediately with `EMSGSIZE` even for a tiny message. The 'succeeds and returns 200 bytes' answer applies real-message reasoning that the API deliberately does not use. Truncation is likewise never on the table — POSIX queues refuse rather than shorten, which is why sizing the buffer from `mq_getattr` is the correct idiom.",
+      "sourceAnchor": "332-posix-and-system-v-message-queues",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q06",
+      "prompt": "Which pair of capabilities is unique to UNIX-domain sockets among Linux IPC mechanisms?",
+      "options": [
+        "Passing an open file descriptor via `SCM_RIGHTS` and reading kernel-verified peer credentials.",
+        "Passing an open file descriptor via `SCM_RIGHTS` and applying strict priority ordering to messages.",
+        "Reading kernel-verified peer credentials and delivering messages atomically as a group operation.",
+        "Applying strict priority ordering to messages and reversing a dead process's queue adjustments."
+      ],
+      "correctIndex": 0,
+      "explanation": "`SCM_RIGHTS` hands the receiver a new descriptor referring to the same open file description, and `SO_PEERCRED`/`SCM_CREDENTIALS` deliver a pid/uid/gid the kernel vouches for and a client cannot forge — together the basis of privilege-separated daemons and zero-downtime restarts. Priority ordering is the distinguishing feature of POSIX message queues, not sockets, which makes any option pairing it with fd passing wrong. Group-atomic operations and death-time reversal belong to System V semaphores (`semop` vectors and `SEM_UNDO`).",
+      "sourceAnchor": "333-unix-domain-sockets",
+      "difficulty": "recall"
+    },
+    {
+      "id": "33-q07",
+      "prompt": "A worker calls `recvmsg` with a `msg_control` buffer too small for the three descriptors the supervisor sent via `SCM_RIGHTS`. What is the outcome?",
+      "options": [
+        "The excess descriptors are closed by the kernel and `MSG_CTRUNC` is set in `msg_flags`.",
+        "The excess descriptors stay queued in the socket buffer and arrive on the next `recvmsg` call.",
+        "The call fails with `EMSGSIZE` and the whole message, payload included, remains in the queue.",
+        "The excess descriptors are delivered anyway, since the kernel grows the control buffer as needed."
+      ],
+      "correctIndex": 0,
+      "explanation": "The kernel discards what will not fit by closing those descriptors outright and records the loss only in the `MSG_CTRUNC` flag, so a receiver that never inspects `msg_flags` loses descriptors completely silently. The 'they stay queued for the next call' answer is the seductive one — it is how you might wish a byte stream behaved, but ancillary data is attached to a specific message and is destroyed with it. Nothing here produces an error return, which is exactly what makes the bug so hard to notice.",
+      "sourceAnchor": "333-unix-domain-sockets",
+      "difficulty": "trap"
+    },
+    {
+      "id": "33-q08",
+      "prompt": "A colleague argues that an `AF_UNIX` `SOCK_DGRAM` channel needs an application-level retransmit scheme because datagrams can be dropped. Is that right?",
+      "options": [
+        "No — local datagram sockets are reliable and ordered; loss occurs only if the receive queue overflows.",
+        "Yes — local datagram sockets inherit UDP's best-effort semantics, so silent loss and reordering happen.",
+        "No — local datagram sockets are reliable, but they may reorder, so sequence numbers remain necessary.",
+        "Yes — local datagram sockets are reliable within a host but drop messages whenever a page is reclaimed."
+      ],
+      "correctIndex": 0,
+      "explanation": "`AF_UNIX` has no protocol stack at all: `SOCK_DGRAM` there is reliable, ordered, and boundary-preserving, so the only failure mode is a full receive queue, which the sender observes rather than suffering silently. The UDP analogy is the trap — the type name is shared but the semantics are not, since there is no network, no routing, and nothing to lose a packet in. If you additionally want connection orientation alongside message boundaries, `SOCK_SEQPACKET` is the better default.",
+      "sourceAnchor": "333-unix-domain-sockets",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q09",
+      "prompt": "A shared-memory order book stores `Node*` pointers linking entries within the same `MAP_SHARED` segment. Both processes map the segment successfully. What is wrong?",
+      "options": [
+        "The segment can map at a different virtual address in each process, so a stored pointer is meaningless in the peer.",
+        "Pointers into a `MAP_SHARED` segment are fine, but the pages must be pre-faulted before either process dereferences one.",
+        "The kernel refuses to fault in a page whose contents are pointers unless the mapping was created with `MAP_FIXED`.",
+        "Pointers work only while both processes are on the same NUMA node, because remote nodes use different address widths."
+      ],
+      "correctIndex": 0,
+      "explanation": "`mmap` picks whatever address range is free in each address space, so a pointer written by the producer names an address that in the consumer may be unmapped or, worse, mapped to something else entirely — store offsets or indices instead. The pre-faulting answer is tempting because first touch genuinely matters, but it decides NUMA placement, not address agreement. `MAP_FIXED` would make addresses match, yet the chapter explicitly rejects it as fragile against ASLR and library mappings rather than treating it as a kernel requirement.",
+      "sourceAnchor": "334-posix-and-system-v-shared-memory",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q10",
+      "prompt": "You place a `std::atomic<MyStruct>` in a shared segment where `is_always_lock_free` is false, and both processes compile with the same toolchain. What actually happens?",
+      "options": [
+        "The implementation falls back to a process-local lock table, so there is no cross-process atomicity at all.",
+        "The implementation falls back to a lock table stored in the object itself, so atomicity holds but costs a mutex.",
+        "The compiler rejects the code, because non-lock-free atomics may not be placed in a `MAP_SHARED` mapping.",
+        "The operations work atomically but tear across cache lines whenever the struct spans a 64-byte boundary."
+      ],
+      "correctIndex": 0,
+      "explanation": "libstdc++ hashes the object's *address* into a lock table that lives in each process's own address space, so two processes take two different locks and serialize against nobody — the updates race with no diagnostic whatsoever. The 'lock lives in the object' answer is the dangerous one: it would in fact make the scheme work, which is precisely why people assume it, but the standard library keeps the lock outside the object so that `sizeof` and layout are unaffected. Hence `static_assert(std::atomic<T>::is_always_lock_free)` is mandatory rather than advisory.",
+      "sourceAnchor": "334-posix-and-system-v-shared-memory",
+      "difficulty": "trap"
+    },
+    {
+      "id": "33-q11",
+      "prompt": "A peer process calls `ftruncate` to shrink the `shm_open` file your reader has mapped. Your reader then loads from an address past the new end. What fault do you get, and what prevents it?",
+      "options": [
+        "`SIGBUS`, because the page is mapped but backed by no file content; seal the fd with `F_SEAL_SHRINK`.",
+        "`SIGSEGV`, because shrinking the file unmaps the tail of the region; seal the fd with `F_SEAL_SHRINK`.",
+        "`SIGBUS`, because the mapping's permissions are revoked by the truncation; remap with `PROT_READ` only.",
+        "`SIGSEGV`, because the kernel invalidates the page tables on truncation; re-`mmap` after every size change."
+      ],
+      "correctIndex": 0,
+      "explanation": "The mapping itself survives truncation — the virtual addresses stay valid — but there is no longer file content behind those pages, and accessing a mapped page beyond end-of-file is defined to raise `SIGBUS`, not `SIGSEGV`. That distinction is the whole point: `SIGSEGV` means the address is not mapped, and reaching for it here is the natural but wrong instinct. `memfd_create` with `MFD_ALLOW_SEALING` plus `F_SEAL_SHRINK` lets the receiver prove the sender cannot pull the backing store out from under it.",
+      "sourceAnchor": "334-posix-and-system-v-shared-memory",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q12",
+      "prompt": "You `pthread_mutex_init` a mutex that lives inside a `MAP_SHARED` segment using default attributes, and it appears to work in testing. What is the status of that code?",
+      "options": [
+        "It is undefined behaviour: the default `PTHREAD_PROCESS_PRIVATE` lets the implementation cache process-local state inside the object.",
+        "It is correct: on Linux every pthread mutex is a futex on the underlying word, so the sharing attribute changes nothing at all.",
+        "It is correct but slow: the default attribute forces the kernel slow path on every lock, costing a futex syscall each time.",
+        "It is undefined behaviour: a mutex may only be initialized by the process that created the mapping, whatever attribute is set."
+      ],
+      "correctIndex": 0,
+      "explanation": "`PTHREAD_PROCESS_PRIVATE` is the default and it licenses the implementation to store addresses or thread identifiers that mean nothing in another address space, so you must call `pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED)`. The 'it's all futexes anyway' answer is the most convincing wrong one: the futex mechanism genuinely does work across address spaces, but the attribute is what disables the process-local caching optimizations layered on top of it. Symptoms are the worst kind — the code passes tests and misbehaves rarely under load.",
+      "sourceAnchor": "335-process-shared-synchronization",
+      "difficulty": "recall"
+    },
+    {
+      "id": "33-q13",
+      "prompt": "A `pthread_mutex_lock` on a robust process-shared mutex returns `EOWNERDEAD`. Your code logs the error and returns failure without locking further. What is the consequence?",
+      "options": [
+        "You do hold the lock, and unlocking without `pthread_mutex_consistent` makes it permanently `ENOTRECOVERABLE`.",
+        "You do not hold the lock, so the mutex stays owned by the dead process and every later locker also gets `EOWNERDEAD`.",
+        "You do hold the lock, and the kernel marks it consistent automatically once the dead task's robust list is walked.",
+        "You do not hold the lock, but the next `pthread_mutex_lock` from any process will succeed cleanly with a zero return."
+      ],
+      "correctIndex": 0,
+      "explanation": "`EOWNERDEAD` is a success-with-warning: the lock has been transferred to you and the protected invariant may be broken, so you must repair it and call `pthread_mutex_consistent()` before unlocking. Treating it as generic failure and unlocking anyway poisons the mutex into `ENOTRECOVERABLE` for every process forever, which is why the diagnostic signature is a system that deadlocks only after a peer segfaults. The answer claiming you never acquired the lock inverts the contract — that reading is exactly what produces the bug.",
+      "sourceAnchor": "335-process-shared-synchronization",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q14",
+      "prompt": "In an interview, what is the strongest argument for a single-writer shared-memory ring over a robust process-shared mutex on a market-data path?",
+      "options": [
+        "There is no shared mutable lock state, so a crashed writer merely stops advancing a sequence and readers see staleness.",
+        "A robust mutex needs a futex syscall on every lock and unlock, whereas the ring's publish is a single atomic RMW.",
+        "The ring guarantees message delivery to every reader, whereas a mutex-protected buffer may drop messages under load.",
+        "Robust mutexes require every participant to run at the same scheduling priority, which a trading system cannot arrange."
+      ],
+      "correctIndex": 0,
+      "explanation": "The crash-consistency argument beats the latency argument because it is structural: a frozen sequence number degrades into detectable staleness, whereas any design with shared lock state has a state that a dying process can leave inconsistent. The syscall-cost answer contains a real half-truth — contention does cost roughly 1–5 µs — but it misstates the uncontended case, since a robust mutex acquired without contention stays in user space, and the ring's publish is a plain release store rather than an RMW. Delivery guarantees actually run the other way: the standard fan-out policy overwrites slow readers.",
+      "sourceAnchor": "335-process-shared-synchronization",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q15",
+      "prompt": "Why is a semaphore the right primitive for signalling between processes but the wrong one for mutual exclusion?",
+      "options": [
+        "It has no owner, so anyone may post it — which rules out priority inheritance, robustness, and deadlock detection.",
+        "It has no owner, so it cannot be placed in shared memory at all — only named semaphores work across processes.",
+        "Its counter is bounded by `SEM_VALUE_MAX`, so a mutual-exclusion protocol overflows it under sustained contention.",
+        "Its wait operation is always a syscall, so mutual exclusion would pay a kernel round-trip on every acquisition."
+      ],
+      "correctIndex": 0,
+      "explanation": "Ownerlessness is exactly what makes a semaphore correct for producer/consumer handoff — the poster need not be the waiter — and exactly what disqualifies it for locking, since every ownership-based safety mechanism has nothing to attach to. The 'always a syscall' answer is a real property of System V semaphores (~1 µs) but plainly false for POSIX ones, whose uncontended path is a single user-space atomic at roughly 15–25 ns. An unnamed POSIX semaphore placed in a shared segment with `sem_init(&s, 1, v)` works fine across processes.",
+      "sourceAnchor": "336-posix-and-system-v-semaphores",
+      "difficulty": "recall"
+    },
+    {
+      "id": "33-q16",
+      "prompt": "A watchdog uses `sem_timedwait(s, &abs_deadline)` with a five-second timeout. Operators report that it occasionally waits far longer or fires instantly. What is the likely cause?",
+      "options": [
+        "`sem_timedwait` deadlines are on `CLOCK_REALTIME`, so an NTP step moves them; use `sem_clockwait` with `CLOCK_MONOTONIC`.",
+        "`sem_timedwait` deadlines are relative, so recomputing the struct each loop accumulates drift; convert to an absolute deadline.",
+        "`sem_timedwait` returns `EINTR` on a signal and the retry restarts the full five seconds; loop against a saved absolute deadline.",
+        "`sem_timedwait` rounds its deadline to the timer tick, so a low `CONFIG_HZ` kernel quantizes the wait; raise the tick rate."
+      ],
+      "correctIndex": 0,
+      "explanation": "The deadline is an absolute `CLOCK_REALTIME` timestamp, so any wall-clock discontinuity — an NTP step or a `settimeofday` — lengthens or shortens the wait, matching the symptom of errors in both directions; glibc's `sem_clockwait` with `CLOCK_MONOTONIC` is immune. The `EINTR` answer names a genuine trap that does require a retry loop, but a naive retry can only make the wait longer, never shorter, so it cannot explain the instant returns. The deadline is absolute, not relative, which rules out the drift story outright.",
+      "sourceAnchor": "336-posix-and-system-v-semaphores",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q17",
+      "prompt": "Why must the comparison in `futex(&word, FUTEX_WAIT, expected, ...)` happen inside the kernel rather than in user space before the call?",
+      "options": [
+        "Otherwise a waker can change the word and issue `FUTEX_WAKE` in the gap, so the waiter enqueues afterwards and sleeps forever.",
+        "Otherwise the user-space read may be reordered past the syscall by the compiler, so the kernel observes a stale value.",
+        "Otherwise the kernel cannot derive the futex key, since the key is computed from the value stored in the word.",
+        "Otherwise two waiters can read the same value simultaneously and both enqueue, doubling the eventual wake count."
+      ],
+      "correctIndex": 0,
+      "explanation": "The kernel takes the hash-bucket lock, re-reads the word, and enqueues only if it still equals `expected` — that atomic compare-then-sleep is the entire trick, and without it the waker's update plus `FUTEX_WAKE` can slip into the window and hit an empty queue, producing the lost wakeup. The compiler-reordering answer sounds sophisticated but a syscall is a compiler barrier, so it is not the hazard being closed. Futex keys come from `(mm, address)` or `(inode, offset)`, never from the word's contents.",
+      "sourceAnchor": "337-futexes",
+      "difficulty": "recall"
+    },
+    {
+      "id": "33-q18",
+      "prompt": "In Drepper's three-state futex mutex, what does encoding the state as 0/1/2 rather than 0/1 buy you?",
+      "options": [
+        "`unlock` can skip the `FUTEX_WAKE` syscall entirely whenever the state shows no waiter ever queued.",
+        "`lock` can skip the initial compare-exchange whenever the state shows a waiter is already queued.",
+        "It lets the kernel distinguish a reader-held from a writer-held lock, which is what `FUTEX_WAIT_BITSET` selects on.",
+        "It records the owner's thread ID in the low bits, which is what priority inheritance needs to boost the holder."
+      ],
+      "correctIndex": 0,
+      "explanation": "State 2 means 'there may be waiters', so an uncontended `unlock` that observes state 1 knows nobody is parked and returns without ever entering the kernel — that is what keeps the uncontended lock/unlock pair near 20 ns instead of paying a syscall each time. The claim about skipping the acquire compare-exchange has it backwards: the fast-path CAS is the cheapest possible acquisition and is always attempted first. Owner-TID tracking in the word is real, but it belongs to `FUTEX_LOCK_PI`, a separate mechanism from this three-state encoding.",
+      "sourceAnchor": "337-futexes",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q19",
+      "prompt": "Two processes map the same page of a `MAP_SHARED` segment at different virtual addresses and both futex-wait on the same word. Why does the kernel match them up?",
+      "options": [
+        "For a shared mapping the futex key is derived from the inode and page offset, not from the virtual address.",
+        "For a shared mapping the futex key is the physical page frame number, which the kernel resolves on every wait.",
+        "The kernel canonicalizes both addresses against the first mapper's base, which is why one process must map first.",
+        "Shared futexes are keyed by address like private ones, so the two processes must use `MAP_FIXED` to agree."
+      ],
+      "correctIndex": 0,
+      "explanation": "The shared key `(inode, page offset)` names the same backing object regardless of where each process mapped it, which is precisely what makes cross-process futexes work; private mappings instead use `(mm, virtual address)`, and `FUTEX_PRIVATE_FLAG` selects that cheaper derivation. The `MAP_FIXED` answer is the one people reach for by analogy with pointer sharing, but it would be a requirement only if the key were address-based, which for shared mappings it is not. A raw page frame number would break under page migration and is not what the kernel stores.",
+      "sourceAnchor": "337-futexes",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q20",
+      "prompt": "A thread writes the value 1 to an eventfd 10,000 times while the consumer is asleep in `epoll_wait`. What does the consumer observe?",
+      "options": [
+        "One readable event, and one 8-byte read returning 10000 while resetting the counter to zero.",
+        "One readable event, and one 8-byte read returning 1, with the remaining 9,999 events still queued.",
+        "Ten thousand readable events, each requiring its own 8-byte read returning 1 to make progress.",
+        "One readable event, and a read that fails with `EAGAIN` because the counter saturated during the burst."
+      ],
+      "correctIndex": 0,
+      "explanation": "An eventfd is a single 64-bit counter, so writes accumulate into it and a default-mode read drains the whole accumulated value at once and zeroes it — the automatic coalescing that makes it strictly better than a self-pipe for wakeups. The 'read returns 1, rest stay queued' answer describes `EFD_SEMAPHORE` mode, which is the opt-in behaviour you choose only when you need exactly one wakeup per item. Saturation happens near `UINT64_MAX - 1`, nowhere near ten thousand.",
+      "sourceAnchor": "338-eventfd",
+      "difficulty": "recall"
+    },
+    {
+      "id": "33-q21",
+      "prompt": "An event loop uses a level-triggered epoll on a blocking eventfd created with flags of 0. What is the specific hazard?",
+      "options": [
+        "A spurious wakeup leads to a read on a zero counter, which blocks and stalls the entire loop.",
+        "A spurious wakeup leads to a read on a zero counter, which returns 0 and is misread as an end-of-file.",
+        "Level-triggered mode re-reports the fd forever, since a blocking eventfd never clears its readable state.",
+        "Writes from the notifying thread fail with `EINVAL` because a blocking eventfd requires 4-byte transfers."
+      ],
+      "correctIndex": 0,
+      "explanation": "Without `EFD_NONBLOCK`, a read that finds the counter at zero puts the whole event-loop thread to sleep inside what was supposed to be a non-blocking drain, which is why the flag is effectively mandatory. The 'returns 0 as EOF' answer is the plausible-sounding alternative but eventfd has no end-of-file concept — it blocks rather than returning short. Reading does clear the readable state normally, and eventfd transfers must be exactly 8 bytes whether or not the fd blocks.",
+      "sourceAnchor": "338-eventfd",
+      "difficulty": "trap"
+    },
+    {
+      "id": "33-q22",
+      "prompt": "A service creates a signalfd for `SIGTERM` and reads it in its event loop, but never calls `sigprocmask`. What is the observed behaviour?",
+      "options": [
+        "The process usually dies on `SIGTERM`'s default action, because signalfd only sees signals that are pending.",
+        "The signalfd read always works, because creating the fd implicitly adds the listed signals to the thread's mask.",
+        "The signalfd read always fails with `EINVAL`, because an unblocked signal set is rejected at creation time.",
+        "The process handles `SIGTERM` correctly but also runs the default action afterwards, terminating on exit from the loop."
+      ],
+      "correctIndex": 0,
+      "explanation": "signalfd draws from the *pending* set, and a signal is only pending if it is blocked — leave it unblocked and the default disposition runs first, killing the process, with just enough of a race window to make it look intermittent in testing. The 'creation implicitly blocks' answer is the intuitive design people assume, and its plausibility is exactly why this is the number-one signalfd bug; the call does not touch the mask. Since the mask is per-thread and inherited by `pthread_create`, block in `main()` before spawning anything.",
+      "sourceAnchor": "339-signalfd",
+      "difficulty": "trap"
+    },
+    {
+      "id": "33-q23",
+      "prompt": "A team proposes replacing their `SIGSEGV` crash handler with a signalfd read so they can `malloc` and log freely. Why does this fail?",
+      "options": [
+        "Blocking a synchronous fault signal makes the kernel force the default kill-and-core action instead of queuing it.",
+        "Blocking a synchronous fault signal is permitted, but `signalfd_siginfo` omits `si_addr`, so the report is useless.",
+        "signalfd delivers only process-directed signals, and a fault is thread-directed, so the read never returns.",
+        "The faulting thread is suspended until the read completes, which deadlocks whenever the reader is that same thread."
+      ],
+      "correctIndex": 0,
+      "explanation": "`SIGSEGV`, `SIGBUS`, `SIGFPE`, and `SIGILL` are generated by the faulting instruction itself, and since returning to that instruction would loop forever, the kernel refuses to leave them merely pending and forces `SIG_DFL` — so blocking them is precisely what you must not do. The `si_addr` answer is a genuinely tempting near-miss because it grants the wrong premise: signalfd's fixed 128-byte structure does in fact carry the faulting address, so information loss is not the objection. Crash handling still needs `sigaction` plus an alternate stack.",
+      "sourceAnchor": "339-signalfd",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q24",
+      "prompt": "A strategy re-arms a `timerfd` for 1 ms after each read using a relative `it_value` and `it_interval` of zero. Over an hour the firings fall progressively behind wall clock. Why?",
+      "options": [
+        "Each re-arm restarts from 'now', which is already late by the wakeup latency, so the error accumulates every period.",
+        "Relative timers are evaluated against `CLOCK_REALTIME`, so NTP slew stretches each interval by a small fixed factor.",
+        "The kernel rounds every relative expiry up to the next scheduler tick, adding a constant quantization error per period.",
+        "Reading the timerfd resets an internal epoch, so the next expiry is measured from the read rather than from the arming."
+      ],
+      "correctIndex": 0,
+      "explanation": "The wakeup latency between the scheduled expiry and the moment your code re-arms is silently folded into the next period, and repeating that a million times is what produces the accumulating drift; the fixes are `TFD_TIMER_ABSTIME` with `base + n*period`, or a nonzero `it_interval` which the kernel re-arms from the scheduled expiry rather than from delivery. The NTP answer misattributes the clock: this timer was created on `CLOCK_MONOTONIC`, which neither steps nor slews. Tick quantization is a jitter source, not a one-directional accumulator.",
+      "sourceAnchor": "3310-timerfd",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q25",
+      "prompt": "A periodic `timerfd` read returns the value 7. What does that tell you?",
+      "options": [
+        "Seven expirations have elapsed since the last read, so six deadlines were missed.",
+        "Seven expirations have elapsed since the timer was armed, so the loop is on schedule.",
+        "Seven nanoseconds of slack remained on the current period when the read completed.",
+        "Seven separate timerfds became readable, which is the count `epoll_wait` reported."
+      ],
+      "correctIndex": 0,
+      "explanation": "The 8-byte read returns the number of expirations accumulated since the previous read and then resets that count to zero, so any value above 1 is a free, built-in missed-deadline counter and the standard way to detect a loop falling behind. The 'since it was armed' reading is the natural misinterpretation but would make the value monotonically increasing and therefore useless as an overrun signal. The value is a count of expirations, never a duration or a descriptor tally.",
+      "sourceAnchor": "3310-timerfd",
+      "difficulty": "recall"
+    },
+    {
+      "id": "33-q26",
+      "prompt": "A process must act exactly at the wall-clock instant of the 09:30:00 exchange open. Which timerfd configuration survives an NTP step correctly?",
+      "options": [
+        "An absolute `CLOCK_REALTIME` timer with `TFD_TIMER_CANCEL_ON_SET`, so a clock jump makes the read return `ECANCELED`.",
+        "An absolute `CLOCK_MONOTONIC` timer computed once at startup, since a monotonic clock is immune to NTP entirely.",
+        "A relative `CLOCK_REALTIME` timer refreshed every second, so at most one second of clock error can accumulate.",
+        "An absolute `CLOCK_BOOTTIME` timer, since including suspend time is what keeps a wall-clock deadline accurate."
+      ],
+      "correctIndex": 0,
+      "explanation": "A wall-clock deadline genuinely belongs on `CLOCK_REALTIME`, and `TFD_TIMER_CANCEL_ON_SET` turns a discontinuous clock change into an `ECANCELED` read so you recompute the deadline instead of firing at the wrong instant. The `CLOCK_MONOTONIC` answer states a true property — that clock really is immune to NTP — but draws the wrong conclusion: an offset computed once at startup is pinned to the *old* wall-clock mapping and will fire at the wrong wall time after a step. `CLOCK_BOOTTIME` is monotonic-plus-suspend and equally unrelated to wall time.",
+      "sourceAnchor": "3310-timerfd",
+      "difficulty": "recall"
+    },
+    {
+      "id": "33-q27",
+      "prompt": "An SPSC shared-memory ring puts `write_seq` and `read_seq` adjacently in one 64-byte cache line. Throughput is far below expectation. What is happening?",
+      "options": [
+        "Every producer publish invalidates the consumer's copy of the line it polls, turning a ~40 ns handoff into ~200 ns.",
+        "The two counters can be updated in a single atomic operation, which forces the CPU to lock the bus on every publish.",
+        "The consumer's acquire load must now order against the producer's store, adding a memory fence the padded layout avoids.",
+        "Sharing a line makes the two atomics non-lock-free, so libstdc++ silently falls back to a process-local lock table."
+      ],
+      "correctIndex": 0,
+      "explanation": "This is textbook false sharing: the counters are logically independent but coherence works at cache-line granularity, so the producer's store to `write_seq` steals the line the consumer is spinning on and the consumer re-fetches it every iteration. The fence answer is the plausible-sounding alternative but ordering requirements come from the memory ordering you requested, not from layout, and on x86-64 TSO acquire/release compile to plain `mov` either way. Lock-freedom depends on the type's size, never on where the object sits.",
+      "sourceAnchor": "3311-lock-free-interprocess-queues",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q28",
+      "prompt": "In a bounded SPSC interprocess ring, the consumer process segfaults while the producer keeps publishing market data. What happens, and what is the standard remedy?",
+      "options": [
+        "`read_seq` stops advancing and the producer stalls once full; use an overwrite policy or heartbeat deregistration.",
+        "`read_seq` stops advancing and the producer overwrites unread slots automatically once the ring wraps around.",
+        "The kernel notices the last reader is gone and returns `EPIPE` from the producer's next publish attempt.",
+        "The producer stalls, but the shared mapping's reference count drops and `write_seq` is reset by the kernel."
+      ],
+      "correctIndex": 0,
+      "explanation": "A bounded ring's back-pressure is exactly what turns a dead consumer into a permanently blocked producer, since nothing advances `read_seq` and the fullness test never clears — which is why market-data fan-out uses a Disruptor-style overwrite policy where lapped readers are dropped and forced to re-snapshot. The 'overwrites automatically' answer confuses that deliberate design choice with default behaviour; a plain bounded SPSC ring refuses to overwrite by construction. Shared memory is passive memory, so there is no kernel involvement to produce an error or reset anything.",
+      "sourceAnchor": "3311-lock-free-interprocess-queues",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q29",
+      "prompt": "A producer writes a slot's payload and then publishes with `write_seq.store(w + 1, std::memory_order_relaxed)`. On x86-64 the consumer never observes a torn payload in testing. Is the code correct?",
+      "options": [
+        "No — the relaxed store gives the compiler licence to hoist the publish above the payload writes, whatever the hardware does.",
+        "Yes — x86-64 is TSO, so stores are never reordered and the release ordering is redundant on this architecture.",
+        "No — but only because relaxed stores are not guaranteed atomic, so the sequence number itself can be observed torn.",
+        "Yes — provided the slot is smaller than a cache line, since a single-line store is architecturally indivisible."
+      ],
+      "correctIndex": 0,
+      "explanation": "Memory ordering constrains the compiler as well as the hardware: `relaxed` permits the optimizer to move the sequence-number store ahead of the payload stores, publishing a slot the consumer may read before it is filled — and no amount of x86 store ordering repairs an instruction sequence the compiler already reordered. The TSO answer is the most tempting because its premise is true and it explains why the bug hides in testing; it just stops one level too low in the stack. `release` is free on x86-64 at the instruction level, so there is no reason to omit it.",
+      "sourceAnchor": "3311-lock-free-interprocess-queues",
+      "difficulty": "trap"
+    },
+    {
+      "id": "33-q30",
+      "prompt": "A daemon spawns hundreds of short-lived children and its `SIGCHLD` handler calls `waitpid(-1, &st, WNOHANG)` exactly once. Zombies accumulate. Why?",
+      "options": [
+        "Signals 1–31 live in a pending bitmask, so simultaneous `SIGCHLD`s coalesce; the handler must loop until `waitpid` returns 0.",
+        "`WNOHANG` returns immediately without reaping, so the handler must drop the flag and let `waitpid` block until a child is reaped.",
+        "`SIGCHLD` is blocked during its own handler, so any child exiting inside the handler is never reported at all.",
+        "The handler is registered per thread, so children forked from other threads deliver `SIGCHLD` to a thread that never reaps."
+      ],
+      "correctIndex": 0,
+      "explanation": "Standard signals are represented as a bitmask rather than a queue, so a thousand rapid `SIGCHLD`s collapse into a single delivery and a single reap leaves the rest as zombies — the fix is `while (waitpid(-1, &st, WNOHANG) > 0);`. The 'signal is blocked during its handler' answer states a true fact about implicit masking but draws the wrong conclusion: that signal is merely marked pending and is delivered once on return, which would be sufficient if the handler had reaped everything available. Dispositions are process-wide, not per thread.",
+      "sourceAnchor": "3312-signal-delivery-and-disposition",
+      "difficulty": "recall"
+    },
+    {
+      "id": "33-q31",
+      "prompt": "A process has an isolated `SCHED_FIFO` trading thread and several housekeeping threads, none of which block any signals. An operator sends `SIGTERM` with `kill(pid, ...)`. Which thread runs the handler?",
+      "options": [
+        "Any one thread that does not have it blocked, chosen arbitrarily — possibly the latency-critical one.",
+        "The main thread, because process-directed signals are always delivered to the thread group leader.",
+        "Every thread in turn, because the disposition table is process-wide and the handler is shared.",
+        "The thread that most recently entered an interruptible syscall, because it is cheapest to unwind."
+      ],
+      "correctIndex": 0,
+      "explanation": "A process-directed signal is delivered to exactly one arbitrarily chosen thread with that signal unblocked, which is why an unlucky delivery can interrupt the hot thread and cost it 1.5–4 µs plus possible `EINTR` handling. The 'every thread' answer conflates two separate things: the *disposition* is indeed process-wide and shared, but delivery is still a single event to a single thread. The correct idiom is to block everything in `main()` before spawning and centralize handling in a `sigwait` thread or a signalfd.",
+      "sourceAnchor": "3312-signal-delivery-and-disposition",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q32",
+      "prompt": "You install every handler with `SA_RESTART` and still see `EINTR` from `epoll_wait` and `nanosleep`. Is this a bug in your installation code?",
+      "options": [
+        "No — timeout-bearing calls are never restarted, because the kernel cannot resume a partially elapsed timeout.",
+        "Yes — `SA_RESTART` covers all interruptible syscalls, so an `EINTR` means the flag was lost by a later `sigaction`.",
+        "No — `SA_RESTART` applies only to signals with `SA_SIGINFO` cleared, so the three-argument handler form disables it.",
+        "Yes — `SA_RESTART` must be set on the signal being delivered and on `SIGCONT`, or restart is silently skipped."
+      ],
+      "correctIndex": 0,
+      "explanation": "`poll`, `select`, `epoll_wait`, `nanosleep`, `sem_wait`, and anything else carrying a timeout are excluded from automatic restart, since restarting from scratch would silently extend the timeout the caller asked for — so `EINTR` loops remain mandatory on those calls no matter what flags you set. The 'flag was lost' answer is the natural first suspicion and sends people auditing installation code that is in fact correct. `SA_RESTART` and `SA_SIGINFO` are independent flags with no interaction.",
+      "sourceAnchor": "3312-signal-delivery-and-disposition",
+      "difficulty": "trap"
+    },
+    {
+      "id": "33-q33",
+      "prompt": "A `SIGSEGV` handler receives `siginfo_t` with `si_code == SEGV_ACCERR`. What does that distinguish, and why does it matter?",
+      "options": [
+        "The address is mapped but the access was not permitted — a write to read-only or guard memory, not a wild pointer.",
+        "The address is not mapped at all — a null or wild pointer dereference, as opposed to a permission violation.",
+        "The access was misaligned for the hardware, which on x86-64 can only occur with explicit alignment checking enabled.",
+        "The faulting instruction was itself unmapped, meaning an indirect call jumped outside any executable mapping."
+      ],
+      "correctIndex": 0,
+      "explanation": "`SEGV_ACCERR` means the page exists but the access violated its protection — a write to a read-only mapping or a guard page — while `SEGV_MAPERR` is the not-mapped case that a null or wild pointer produces, and recording which one occurred is the first thing a crash handler should do. Swapping the two is the single most common error here, and it inverts your entire diagnosis of the crash. Misalignment is signalled by `SIGBUS` with `BUS_ADRALN`, a different signal entirely.",
+      "sourceAnchor": "3313-sigaction",
+      "difficulty": "recall"
+    },
+    {
+      "id": "33-q34",
+      "prompt": "What does the third argument to an `SA_SIGINFO` handler, the `ucontext_t*`, let you do that `siginfo_t` alone does not?",
+      "options": [
+        "Read and even modify the saved register set, so returning from the handler can resume at a different instruction.",
+        "Read the saved register set, though the kernel discards any modifications when `rt_sigreturn` restores the frame.",
+        "Read the full call stack of the interrupted thread, already unwound into an array of return addresses.",
+        "Read the signal mask that was in effect at generation time, which `rt_sigreturn` will otherwise not restore."
+      ],
+      "correctIndex": 0,
+      "explanation": "`uc_mcontext.gregs[REG_RIP]`, `REG_RSP` and friends hold the full saved state at the fault point, and because `rt_sigreturn` restores from that structure, writing to it redirects execution — the mechanism behind JIT deoptimization, instruction emulation, and skip-the-faulting-instruction recovery. The read-only variant is the tempting near-miss: the reading half is right and the restore path is real, but it is exactly that restore path which makes modifications take effect. There is no pre-unwound stack in the structure — a backtrace still has to be derived from RIP and RSP.",
+      "sourceAnchor": "3313-sigaction",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q35",
+      "prompt": "A supervisor blocks `SIGTERM`, then `fork`s and `execve`s a helper. Operators report the helper cannot be killed with `SIGTERM` or Ctrl-C. What is going on?",
+      "options": [
+        "The signal mask is inherited across `fork` and preserved across `execve`; reset it to empty between the two.",
+        "Pending signals are inherited across `execve`, so the helper starts with a stuck pending `SIGTERM` it cannot clear.",
+        "The supervisor's handler dispositions survive `execve`, so the helper inherits a handler that ignores `SIGTERM`.",
+        "`execve` resets the mask but not the process group, so the terminal delivers Ctrl-C only to the supervisor."
+      ],
+      "correctIndex": 0,
+      "explanation": "The mask survives both `fork` and `execve`, so a program that never touches signals itself can start life with `SIGTERM` blocked and appear immune to it — hence the rule that you reset the mask to empty in the child between fork and exec. The pending-signals answer inverts the actual rule: pending signals are precisely the thing that *is* cleared, in the child on `fork` and again on `exec`. Dispositions do not survive `execve` either — caught signals revert to `SIG_DFL` in the new image, since the handler's code no longer exists.",
+      "sourceAnchor": "3314-signal-masks",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q36",
+      "prompt": "Code blocks `SIGTERM`, sets a flag from its handler, then does `if (!got_signal) poll(fds, n, -1);`. What is wrong, and what fixes it?",
+      "options": [
+        "A signal arriving between the test and the sleep is lost until the next event; `ppoll` unmasks and sleeps atomically.",
+        "A signal arriving between the test and the sleep is lost until the next event; making the flag `volatile sig_atomic_t` fixes it.",
+        "`poll` with an infinite timeout is never interrupted by a signal, so the flag can never be read; add a finite timeout.",
+        "The handler cannot set a flag while its own signal is blocked, so the test always sees a stale value; unblock first."
+      ],
+      "correctIndex": 0,
+      "explanation": "The window between evaluating the flag and entering the sleep is a genuine lost-wakeup race, and `ppoll`/`pselect`/`epoll_pwait`/`sigsuspend` exist precisely because only the kernel can perform the unmask-and-sleep as one indivisible step. The `volatile sig_atomic_t` answer is the most tempting because that qualifier really is required for a handler-set flag, but correct typing does nothing about a race whose two halves are both in the main thread. The structure is identical to the futex compare-then-sleep problem.",
+      "sourceAnchor": "3314-signal-masks",
+      "difficulty": "trap"
+    },
+    {
+      "id": "33-q37",
+      "prompt": "A `SIGUSR1` handler calls `fprintf(stderr, ...)`. It passes every test and CI run, then hangs a production process once a quarter. Explain the failure.",
+      "options": [
+        "stdio holds non-reentrant `FILE*` locks, so a signal landing inside a stdio critical section self-deadlocks the thread.",
+        "stdio buffers are flushed on handler return, so a signal landing during a flush corrupts the buffer and spins forever.",
+        "`stderr` is unbuffered, so the handler's write races the main thread's write and one of them blocks on the terminal.",
+        "The handler runs with `SIGUSR1` blocked, so a second `SIGUSR1` during the `fprintf` is dropped and the loop stalls."
+      ],
+      "correctIndex": 0,
+      "explanation": "If the signal interrupts the same thread while it already holds the `FILE*` lock, the handler's attempt to take that non-reentrant lock waits for a lock only the interrupted code can release — an immediate self-deadlock whose window is narrow enough to hide for months. The signature is a hung thread parked in `__lll_lock_wait` reached from a signal frame. The 'unbuffered stderr races' answer describes interleaved output, which is untidy but not a hang, and misses that the hazard is lock reentrancy rather than buffering. The safe pattern is a flag plus a `write()` to an eventfd.",
+      "sourceAnchor": "3315-async-signal-safety",
+      "difficulty": "application"
+    },
+    {
+      "id": "33-q38",
+      "prompt": "Why must a signal handler that calls `write()` save and restore `errno`?",
+      "options": [
+        "The syscall may overwrite `errno`, silently corrupting the error handling of the code it interrupted.",
+        "`errno` is a per-process global, so a handler on one thread would otherwise clobber every other thread's value.",
+        "`write()` from a handler is only async-signal-safe when `errno` is zero on entry, per the POSIX list.",
+        "The kernel restores registers on `sigreturn` but leaves thread-local storage untouched, corrupting the handler's own state."
+      ],
+      "correctIndex": 0,
+      "explanation": "The interrupted code may be sitting between a failed syscall and its `errno` check, and a handler that performs any syscall of its own can overwrite the value in between — so `int saved = errno; ...; errno = saved;` bracketing every handler is mandatory. The per-process claim is the tempting wrong reason: modern `errno` is thread-local, which is exactly why the hazard is confined to the interrupted thread rather than being a cross-thread problem. Async-signal-safety of `write()` is unconditional and has nothing to do with `errno`'s incoming value.",
+      "sourceAnchor": "3315-async-signal-safety",
+      "difficulty": "recall"
+    },
+    {
+      "id": "33-q39",
+      "prompt": "A team calls `sigaltstack()` in every thread and installs a `SIGSEGV` handler with `sa_flags = SA_SIGINFO | SA_RESTART`. Stack-overflow crashes still produce no diagnostics. Why?",
+      "options": [
+        "Without `SA_ONSTACK` the handler runs on the exhausted thread stack, so building the frame faults again and the process dies.",
+        "Without `SA_RESETHAND` the handler re-enters itself on the second fault, so the recursion exhausts the alternate stack.",
+        "`sigaltstack` must be called once per process, not per thread, so the repeated registrations overwrote each other.",
+        "`SA_SIGINFO` handlers cannot use an alternate stack, because the `ucontext_t` must be built on the original stack."
+      ],
+      "correctIndex": 0,
+      "explanation": "Registering an alternate stack is inert unless the handler is installed with `SA_ONSTACK` — the flag is what actually switches stacks at delivery — so the kernel still tries to push a signal frame onto a stack with no room, faults while delivering, forces `SIG_DFL`, and kills the process with no handler having run. The per-thread claim in one distractor is backwards: `sigaltstack` really is per-thread, which is why calling it in every thread was the one thing this team got right. Correct recipe: guard page, per-thread `sigaltstack` of 32–64 KiB, and `SA_ONSTACK`.",
+      "sourceAnchor": "3316-alternate-signal-stacks",
+      "difficulty": "trap"
+    },
+    {
+      "id": "33-q40",
+      "prompt": "A crash handler writes a fixed-size record and a `backtrace_symbols_fd` dump, then calls `_exit(1)`. Postmortem engineers complain. What should the last step be instead?",
+      "options": [
+        "Restore `SIG_DFL` for the signal and `raise()` it, so the kernel dumps core from the original faulting context.",
+        "Call `abort()`, so `SIGABRT` produces a core dump whose register state matches the original fault exactly.",
+        "Return from the handler normally, so the faulting instruction re-executes and the kernel dumps core on the retry.",
+        "Call `exit(1)` rather than `_exit(1)`, so `atexit` handlers flush the log before the kernel writes the core."
+      ],
+      "correctIndex": 0,
+      "explanation": "`_exit` terminates cleanly and therefore destroys the core dump, whereas resetting to the default disposition and re-raising lets the kernel produce a real core from the original fault context — equivalently, install with `SA_RESETHAND`. The `abort()` answer is close enough to be tempting and does yield a core, but it is a core of `SIGABRT` raised inside the handler, so the register state and RIP are the handler's rather than the fault's. `exit()` is worse than `_exit()` in a handler, since it runs `atexit` handlers and flushes stdio from an async-signal-unsafe context.",
+      "sourceAnchor": "3317-core-dump-signals-and-crash-handlers",
+      "difficulty": "application"
+    }
+  ]
+}

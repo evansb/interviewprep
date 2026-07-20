@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-45-socket-programming",
+  "questions": [
+    {
+      "id": "45-q01",
+      "prompt": "Why is `socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)` preferred over `socket()` followed by `fcntl(F_SETFL, O_NONBLOCK)`?",
+      "options": [
+        "It saves two syscalls and closes a real race in which a concurrent `fork`+`exec` leaks the descriptor to the child.",
+        "It is the only portable way to obtain a non-blocking socket, because `fcntl` on socket descriptors is a Linux extension.",
+        "It makes every descriptor returned by `accept` inherit both flags, which the `fcntl` sequence cannot arrange.",
+        "It defers allocation of the file-descriptor table entry until `bind`, which is what removes the setup cost."
+      ],
+      "correctIndex": 0,
+      "explanation": "The syscall saving is minor; the `CLOEXEC` race is the substantive part — between `socket()` and `fcntl()` another thread can fork and exec, and the descriptor escapes. The claim about accepted descriptors inheriting the flags is the tempting one and is exactly backwards: accepted sockets do not inherit `O_NONBLOCK`, which is why `accept4` exists. The flags in the type field are Linux extensions, not the portable option.",
+      "sourceAnchor": "451-socket-lifecycle",
+      "difficulty": "recall"
+    },
+    {
+      "id": "45-q02",
+      "prompt": "A server's accept queue overflows while `net.ipv4.tcp_abort_on_overflow` is left at its default of 0. What does the client observe?",
+      "options": [
+        "The connection appears to succeed, then the first request stalls about a second while the server retransmits its SYN-ACK.",
+        "The `connect` call fails immediately with `ECONNREFUSED`, so the client can fail over to another server without delay.",
+        "The excess connections spill onto the SYN queue instead, which is sized separately and absorbs the burst silently.",
+        "The kernel grows the accept queue up to `net.core.somaxconn` on demand, so overflow only occurs above that ceiling."
+      ],
+      "correctIndex": 0,
+      "explanation": "With `tcp_abort_on_overflow=0` the kernel drops the client's final ACK rather than resetting, so the client's state machine says ESTABLISHED while the server has nothing — the classic one-second stall until a SYN-ACK retransmit is absorbed. The immediate `ECONNREFUSED` answer describes the `tcp_abort_on_overflow=1` behaviour, which fails fast by sending RST. The accept queue is sized once at `listen` to `min(backlog, somaxconn)`; it is not grown on demand.",
+      "sourceAnchor": "451-socket-lifecycle",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q03",
+      "prompt": "Code calls `bind()` and only afterwards sets `SO_REUSEPORT` with `setsockopt`. What happens?",
+      "options": [
+        "The `setsockopt` returns success and has no useful effect, because the option is only consulted during `bind`.",
+        "The `setsockopt` fails with `EINVAL`, which is how this ordering mistake is normally caught in testing.",
+        "The `setsockopt` succeeds and takes effect at the following `listen`, so ordering matters only for datagram sockets.",
+        "The `setsockopt` succeeds and rebinds the socket into the reuseport group, costing one extra port-table update."
+      ],
+      "correctIndex": 0,
+      "explanation": "This is a silent failure: the option is examined when the address is claimed, so setting it later leaves the socket outside the reuseport group while every return code says everything worked. The `EINVAL` answer is tempting because a loud error is what a careful API would do, but Linux does not report it. `SO_REUSEADDR` and `SO_RCVBUF` have the same before-`bind` requirement.",
+      "sourceAnchor": "451-socket-lifecycle",
+      "difficulty": "trap"
+    },
+    {
+      "id": "45-q04",
+      "prompt": "A non-blocking `connect()` has returned `-1` with `errno == EINPROGRESS`. How does the event loop learn whether the connection actually succeeded?",
+      "options": [
+        "Wait for the descriptor to become writable, then read `SO_ERROR` with `getsockopt`, since writability alone means only that the attempt finished.",
+        "Wait for the descriptor to become writable; a failed connect reports readability rather than writability, so writability by itself means success.",
+        "Call `connect()` a second time on the same descriptor, which returns 0 on success or the underlying error code on failure.",
+        "Watch only for `EPOLLERR` on the descriptor, because a connect that failed never causes the socket to become writable at all."
+      ],
+      "correctIndex": 0,
+      "explanation": "A refused or timed-out connect makes the socket writable exactly as a successful one does, so the readiness event carries no verdict; `getsockopt(SOL_SOCKET, SO_ERROR)` fetches and clears the pending error and is the only way to tell them apart. The 'writable means connected' answer is the single most common non-blocking-connect bug. Re-calling `connect` does not yield a clean verdict either — it reports state such as `EALREADY` or `EISCONN`.",
+      "sourceAnchor": "452-binding-listening-accepting-and-connecting",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q05",
+      "prompt": "What does calling `connect()` on a UDP socket actually do?",
+      "options": [
+        "It sends nothing; it pins the peer so `send` skips a per-datagram route lookup, filters inbound by source, and surfaces ICMP errors as `ECONNREFUSED`.",
+        "It performs a lightweight handshake so that later `send` calls can report whether the destination port is currently open.",
+        "It sends nothing and only filters inbound datagrams by source, since a datagram socket caches no route and still looks one up per send.",
+        "It sends nothing but disables ICMP error reporting for the socket, which is why unconnected sockets are preferred for liveness probing."
+      ],
+      "correctIndex": 0,
+      "explanation": "Storing the peer address buys three things at once: the ~100–200 ns route lookup is skipped, inbound datagrams are cheaply filtered, and ICMP port-unreachable becomes visible as `ECONNREFUSED` on the next `recv`. The 'filters but still looks up a route' answer has a true premise — connect really is only bookkeeping — but the conclusion is wrong, because the cached destination is precisely what removes the lookup. Connect also inverts the ICMP claim: unconnected sockets are the ones that discard those errors silently.",
+      "sourceAnchor": "452-binding-listening-accepting-and-connecting",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q06",
+      "prompt": "An event loop sets `O_NONBLOCK` on its listening socket and then uses `accept()`. Reads on accepted connections sometimes block the whole thread. Why?",
+      "options": [
+        "The accepted descriptor does not inherit `O_NONBLOCK` from the listener, so it must come from `accept4` or be set explicitly.",
+        "The accepted descriptor inherits every file-status flag from the listener but loses them again the first time `epoll_ctl` re-arms it.",
+        "The accepted descriptor inherits `O_NONBLOCK` but not socket options such as `SO_RCVBUF`, whose default forces a blocking read.",
+        "The accepted descriptor inherits nothing whatsoever, so `TCP_NODELAY` and `SO_RCVBUF` must also be reapplied after every accept."
+      ],
+      "correctIndex": 0,
+      "explanation": "`O_NONBLOCK` is a property of the open file description, and `accept` creates a brand new one, so the flag is absent on the connection — a perennial bug whose symptom is exactly a stalled event loop. The 'inherits nothing at all' answer overshoots: most socket options, including `SO_RCVBUF` and (on Linux, non-portably) `TCP_NODELAY`, do propagate from the listener. `SO_RCVBUF` sizing has no bearing on whether a call blocks.",
+      "sourceAnchor": "452-binding-listening-accepting-and-connecting",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q07",
+      "prompt": "A 1500-byte UDP datagram arrives and the feed handler calls `recvfrom` with a 1000-byte buffer. What happens?",
+      "options": [
+        "1000 bytes are returned and the remaining 500 are discarded; `MSG_TRUNC` in `msg_flags` is the only evidence it occurred.",
+        "1000 bytes are returned and the remaining 500 stay queued, to be delivered by the following `recvfrom` call.",
+        "The call fails with `EMSGSIZE` and leaves the datagram queued so the caller can retry with a correctly sized buffer.",
+        "The kernel allocates a bounce buffer and returns the full 1500-byte length, splitting the payload across two reads."
+      ],
+      "correctIndex": 0,
+      "explanation": "Datagram sockets are message-preserving, so one `recvfrom` consumes exactly one datagram whether or not it fits — the overflow is thrown away, and only `MSG_TRUNC` in the returned `msg_flags` says so. The 'remainder stays queued' answer imports stream semantics, and is precisely the assumption that silently corrupts feed parsing. Passing `MSG_TRUNC` as an *input* flag to `recvmsg` makes the return value the true datagram length so a retry can be sized.",
+      "sourceAnchor": "453-datagram-send-and-receive",
+      "difficulty": "recall"
+    },
+    {
+      "id": "45-q08",
+      "prompt": "A UDP heartbeat consumer treats a `recv` return value of 0 as \"peer closed\" and tears the session down. What is wrong?",
+      "options": [
+        "A zero-length datagram is legal and returns 0, which is not end-of-file — that meaning belongs to stream sockets only.",
+        "A datagram socket returns 0 exactly when the peer has closed, so the handling is right but must be paired with `IP_RECVERR`.",
+        "The kernel discards zero-length datagrams before queueing, so a return of 0 always does indicate a shut-down socket.",
+        "A return of 0 means the supplied buffer was too small, and the datagram itself is still queued awaiting a larger read."
+      ],
+      "correctIndex": 0,
+      "explanation": "There is no connection state on an unconnected datagram socket to report a close through, so 0 simply means an empty datagram was delivered — and empty datagrams are a perfectly ordinary heartbeat encoding. The 'kernel discards zero-length datagrams' answer is the plausible-sounding one and is false: they are queued and delivered like any other. The 0-means-EOF rule applies to `recv` on TCP, where it signals a received FIN.",
+      "sourceAnchor": "453-datagram-send-and-receive",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q09",
+      "prompt": "Two market-data multicast groups use the same UDP port, and a socket bound to `INADDR_ANY` joins one of them. What is observed?",
+      "options": [
+        "The socket receives traffic for that port from every joined group on every interface, so the two feeds cross-talk.",
+        "The socket receives only the joined group on the interface named by `imr_interface`, so cross-talk cannot arise from this setup.",
+        "The socket receives nothing until the group address is also bound, because `INADDR_ANY` excludes multicast destinations.",
+        "The socket receives one copy of each datagram per joined group, so a single packet is delivered repeatedly to that socket."
+      ],
+      "correctIndex": 0,
+      "explanation": "Binding the wildcard address means the port is the only demultiplexing key the kernel applies, so every group joined on every interface lands in the same receive queue — a real and confusing production bug when two feeds share a port number. The `imr_interface` answer is tempting because that field genuinely should be set explicitly, but it selects which interface joins the group; it does not narrow what a wildcard-bound socket accepts. The fixes are to bind the group address itself, attach a BPF filter, or label packets with `IP_PKTINFO`.",
+      "sourceAnchor": "453-datagram-send-and-receive",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q10",
+      "prompt": "In a non-blocking TCP read loop, how should the four outcomes of `recv` — a positive count, 0, `EINTR`, and `EAGAIN` — be handled?",
+      "options": [
+        "Consume and continue on a positive count, treat 0 as an orderly peer close, retry on `EINTR`, and leave the loop on `EAGAIN`.",
+        "Consume and continue on a positive count, treat 0 as a close, and retry on both `EINTR` and `EAGAIN`, since each means no data moved yet.",
+        "Consume and continue on a positive count, leave the loop on `EINTR` because the kernel restarts socket reads itself, and retry on `EAGAIN`.",
+        "Consume and continue on a positive count, treat 0 as equivalent to `EAGAIN` and retry, since closure is reported only via `ECONNRESET`."
+      ],
+      "correctIndex": 0,
+      "explanation": "`EAGAIN` means the receive queue is drained and is the loop's normal exit, whereas `EINTR` means a signal arrived before any data moved and the call must simply be reissued. Retrying `EAGAIN` is the tempting near-miss and turns the reader into a spin loop that never returns to the event loop. Interrupted syscalls are only restarted automatically when the handler was installed with `SA_RESTART`, so `EINTR` must still be handled.",
+      "sourceAnchor": "454-stream-send-and-receive",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q11",
+      "prompt": "`send()` on an established TCP socket returns the full byte count. What has been established?",
+      "options": [
+        "That the bytes are in the kernel's send buffer — nothing about whether the peer received them or its application read them.",
+        "That the peer's TCP stack acknowledged the bytes, though the peer application may not yet have called `recv` on them.",
+        "That the bytes were delivered to the peer application's receive call, which is what makes application-level acks redundant.",
+        "That the bytes have left the NIC, because the sending thread performs the transmit inline down to the driver's doorbell write."
+      ],
+      "correctIndex": 0,
+      "explanation": "A successful `send` is a statement about local buffering only, which is exactly why order-entry protocols require application-level acknowledgement rather than trusting the return value. The inline-transmit answer is the strongest distractor because its premise is true — the sending thread really does drive the transmit path to the doorbell when the windows allow — but that is a latency fact, not a guarantee: if the congestion or receive window is closed the data simply sits in the write queue and `send` still reports success.",
+      "sourceAnchor": "454-stream-send-and-receive",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q12",
+      "prompt": "What is the correct relationship between `EAGAIN` and `EWOULDBLOCK`?",
+      "options": [
+        "They are the same value on Linux, but POSIX does not require it, so portable code tests both or uses the Linux value knowingly.",
+        "They are distinct on Linux: `EAGAIN` means the queue was empty while `EWOULDBLOCK` means the socket lock was contended.",
+        "POSIX guarantees they are identical on every conforming platform, so checking either one alone is always sufficient.",
+        "`EWOULDBLOCK` is returned only by `send` and `EAGAIN` only by `recv`, so the direction of the call disambiguates them."
+      ],
+      "correctIndex": 0,
+      "explanation": "On Linux the two macros expand to the same number, so a single comparison works there; POSIX merely permits that identity rather than mandating it, which is why portable code checks both. The 'POSIX guarantees identical' answer inverts the standard's actual position — it is the permission that is standardised, not the equality. Neither errno is tied to a particular direction of transfer or to lock contention.",
+      "sourceAnchor": "454-stream-send-and-receive",
+      "difficulty": "recall"
+    },
+    {
+      "id": "45-q13",
+      "prompt": "How do `close(fd)` and `shutdown(fd, how)` differ on a TCP socket?",
+      "options": [
+        "`close` drops one descriptor reference and FINs only when the last one goes; `shutdown` acts on the connection at once and can close a single direction.",
+        "`shutdown` releases the descriptor along with the connection, so a subsequent `close` on the same number fails with `EBADF`.",
+        "`close` always sends a FIN immediately, while `shutdown` only marks the socket and defers the FIN until the final close runs.",
+        "`shutdown` decrements the socket's reference count, which is exactly how a `dup`'d or `fork`'d descriptor keeps the connection alive."
+      ],
+      "correctIndex": 0,
+      "explanation": "The distinction is descriptor versus connection: a socket kept alive by `dup` or `fork` survives a `close` and emits no FIN, whereas `shutdown(SHUT_WR)` sends FIN immediately and affects every descriptor referring to that socket. The 'close always FINs immediately' answer is the common half-truth — it holds only in the single-reference case, which is why it survives casual testing. `shutdown` never frees the descriptor, so a `close` is still required.",
+      "sourceAnchor": "455-socket-shutdown-and-close",
+      "difficulty": "recall"
+    },
+    {
+      "id": "45-q14",
+      "prompt": "A socket is configured with `SO_LINGER` set to `l_onoff = 1, l_linger = 0` and then closed. What does `close` do?",
+      "options": [
+        "It sends an RST, discards anything still queued, and skips `TIME_WAIT` — correct only once the peer is known to have everything.",
+        "It blocks until the send queue drains and is acknowledged, then sends FIN, which is why it is unsafe on an event-loop thread.",
+        "It returns at once and lets the kernel drain the queue in the background, while still skipping the `TIME_WAIT` interval.",
+        "It sends a FIN immediately and halves the `TIME_WAIT` interval to thirty seconds on the side that closed first."
+      ],
+      "correctIndex": 0,
+      "explanation": "Linger-on with a zero timeout is the abortive close: RST rather than FIN, queued data thrown away, and no `TIME_WAIT` for that socket — which is why using it as a blanket cure for `TIME_WAIT` accumulation corrupts protocols. The blocking-until-drained answer describes the `l_linger = N > 0` form, the variant that can stall a hot-path thread for seconds. The default `l_onoff = 0` is what returns at once and drains in the background, but it does produce `TIME_WAIT`.",
+      "sourceAnchor": "455-socket-shutdown-and-close",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q15",
+      "prompt": "`close()` returns `-1` with `errno == EINTR` in a multithreaded server. What is the correct response?",
+      "options": [
+        "Accept it and move on — Linux has already closed the descriptor, so retrying may close a number handed to another thread.",
+        "Retry the call in a loop until it returns 0, because an interrupted close has not yet released any kernel state.",
+        "Call `shutdown` next, because the descriptor is closed but the connection is stranded in `CLOSE_WAIT` until it is torn down.",
+        "Treat it as impossible, because a handler installed with `SA_RESTART` makes the kernel restart an interrupted close silently."
+      ],
+      "correctIndex": 0,
+      "explanation": "Linux releases the descriptor before it can report `EINTR`, so the number is immediately available for reuse — retrying is a use-after-free on the fd number and can silently close an unrelated socket opened by another thread. The retry-in-a-loop answer is what the usual EINTR discipline suggests and is exactly the trap here; `close` is the documented exception to that rule. `EBADF` from `close` similarly signals a double-close bug rather than something to retry.",
+      "sourceAnchor": "455-socket-shutdown-and-close",
+      "difficulty": "trap"
+    },
+    {
+      "id": "45-q16",
+      "prompt": "Two threads bind sockets to the same address:port with `SO_REUSEPORT`, and one of them is closed during a rolling restart. What is the failure mode?",
+      "options": [
+        "The group is re-hashed, so in-flight SYNs for the departing socket are dropped and existing UDP flows are remapped to other members.",
+        "The departing socket's accept queue is migrated to the surviving members, so latency rises but no connection is ever lost.",
+        "The kernel blocks the close until the departing socket's accept queue has drained, so a restart stalls rather than dropping.",
+        "Established TCP connections owned by the departing socket are re-hashed onto other members and continue there transparently."
+      ],
+      "correctIndex": 0,
+      "explanation": "Group membership feeds the hash, so removing a member changes the mapping for everything: connections mid-handshake are lost and UDP flows land on a different socket than they did a moment earlier — resets and datagram loss timed exactly to the restart. The queue-migration answer is what one wishes the kernel did; nothing migrates. The fix is a `SO_ATTACH_REUSEPORT_EBPF` steering program that stops directing traffic to the departing socket before it closes.",
+      "sourceAnchor": "456-socket-address-and-port-reuse",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q17",
+      "prompt": "What is the difference between `SO_REUSEADDR` and `SO_REUSEPORT`?",
+      "options": [
+        "`SO_REUSEADDR` relaxes the `TIME_WAIT` restriction on `bind`; `SO_REUSEPORT` forms a hash-load-balanced group with per-socket queues.",
+        "`SO_REUSEADDR` lets two live TCP listeners share one port, while `SO_REUSEPORT` merely relaxes the `TIME_WAIT` bind restriction.",
+        "Both permit two live TCP listeners on one port, differing only in whether the kernel or the accepting thread chooses the socket.",
+        "`SO_REUSEPORT` need only be set by the first binder, after which later binders join the existing group membership automatically."
+      ],
+      "correctIndex": 0,
+      "explanation": "`SO_REUSEADDR` is about rebinding a port that still has sockets in `TIME_WAIT` — which is why every server should set it before `bind` — and for TCP it emphatically does not let two live listeners coexist. The 'REUSEADDR shares a port' answer is the standard conflation and simply swaps the two options' roles. Every binder in a `SO_REUSEPORT` group must set the flag: if the first one does not, the rest get `EADDRINUSE`.",
+      "sourceAnchor": "456-socket-address-and-port-reuse",
+      "difficulty": "recall"
+    },
+    {
+      "id": "45-q18",
+      "prompt": "Two processes each bind a socket to the same address:port to consume the same feed. What determines whether they load-balance or both see every datagram?",
+      "options": [
+        "Unicast UDP is load-balanced to one socket by 4-tuple hash, whereas multicast gives every socket bound to the group a copy.",
+        "Both cases are load-balanced by the 4-tuple hash, so a second consumer of one feed necessarily sees only about half the datagrams.",
+        "Both cases fan a copy out to every group member, which is why `SO_REUSEPORT` never load-balances datagram sockets at all.",
+        "Multicast is load-balanced and unicast fans out, because group membership is tracked per socket rather than per port."
+      ],
+      "correctIndex": 0,
+      "explanation": "The reuse options mean different things for the two delivery models: for unicast UDP the kernel hashes each datagram to exactly one socket, but multicast delivery is inherently a fan-out, so every joined socket gets a copy — which is what you want when two processes consume the same feed. The 'both load-balance' answer applies the unicast rule uniformly and would make redundant feed consumers impossible. Getting this distinction right is a standard discriminator.",
+      "sourceAnchor": "456-socket-address-and-port-reuse",
+      "difficulty": "trap"
+    },
+    {
+      "id": "45-q19",
+      "prompt": "Code sets `SO_RCVBUF` to 1 MB and a following `getsockopt` reports 2 MB. Why?",
+      "options": [
+        "Linux stores twice the requested value to account for `sk_buff` metadata overhead, and reports the doubled figure back.",
+        "The kernel adds `net.core.rmem_default` to every explicit request, so the reported figure includes the default on top.",
+        "`getsockopt` reports the receive buffer plus the socket's forward allocation, which normally happens to equal it.",
+        "The kernel doubles the request only when it would otherwise exceed `net.core.rmem_max`, clamping and re-expanding it."
+      ],
+      "correctIndex": 0,
+      "explanation": "Linux sets `sk_rcvbuf = 2 * requested` on the theory that roughly half the charged memory is `sk_buff` overhead rather than payload, and it reports that stored value. Note the corollary that catches people out: because the overhead is charged per skb, 2 MB of charge may hold only a few hundred kilobytes of 64-byte datagram payloads. The `rmem_max` answer inverts the relationship — that sysctl is a ceiling applied to the request, not a trigger for doubling.",
+      "sourceAnchor": "457-socket-buffer-sizing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "45-q20",
+      "prompt": "A team pins `SO_RCVBUF` on a long-haul TCP socket and throughput drops below what the link should sustain. What is the mechanism?",
+      "options": [
+        "Setting it explicitly disables TCP receive auto-tuning, so the buffer no longer grows to match the bandwidth-delay product.",
+        "Setting it only seeds auto-tuning with a floor, so the kernel keeps growing the buffer and overshoots the delay product.",
+        "Setting it is ignored entirely for TCP, because `net.ipv4.tcp_rmem` always takes precedence over the per-socket value.",
+        "Setting it disables auto-tuning only when the value exceeds `net.core.rmem_max`, which is why modest values stay safe."
+      ],
+      "correctIndex": 0,
+      "explanation": "An explicit `SO_RCVBUF` pins the buffer and switches off `tcp_moderate_rcvbuf` growth for that socket, so on a high-BDP WAN path the advertised window caps the flow. The 'seeds a floor' answer is appealing because auto-tuning does use the `tcp_rmem` triple that way, but an explicit setsockopt opts the socket out rather than adjusting the range. In colo, where the delay product is tiny, pinning is harmless and buys predictability — the pessimisation is WAN-specific.",
+      "sourceAnchor": "457-socket-buffer-sizing",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q21",
+      "prompt": "A market-data receiver is given a 64 MB `SO_RCVBUF` \"so it never drops\". What is the real consequence?",
+      "options": [
+        "A slow reader builds a deep queue, so the data eventually read is stale by the queue depth divided by the drain rate.",
+        "The kernel falls back to per-packet page allocation above a threshold, adding a fault to the cost of every datagram.",
+        "The socket's drop counter rises anyway, because the accounting overhead is charged against the same enlarged limit.",
+        "The reader's wakeup is delayed, because the kernel defers it until the queue has reached an internal watermark."
+      ],
+      "correctIndex": 0,
+      "explanation": "Buffering is not free for market data: bytes sitting in the receive queue are prices that have already moved, and acting on them is worse than having dropped them and known you were behind. The correct sizing absorbs the worst expected microburst over the worst expected scheduling delay and no more, with occupancy tracked via `SIOCINQ` so depth raises an alarm. The drop-counter answer sounds mechanical and plausible but inverts the effect — a larger buffer reduces `UdpRcvbufErrors`, it just replaces loss with staleness.",
+      "sourceAnchor": "457-socket-buffer-sizing",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q22",
+      "prompt": "What does `SO_BUSY_POLL` actually eliminate from the receive path?",
+      "options": [
+        "The interrupt, softirq and wakeup sequence — the application thread runs NAPI itself, taking a receive from ~15 µs to ~3–5 µs.",
+        "The kernel protocol stack — the thread reads descriptors from the NIC ring directly, which is what brings it near kernel-bypass latency.",
+        "The copy to user space — the thread polls the ring and maps the packet buffer in place, so no `copy_to_user` is performed.",
+        "The socket lock — the polling thread owns the receive queue exclusively, so it never contends with the softirq handler."
+      ],
+      "correctIndex": 0,
+      "explanation": "Busy polling replaces sleeping with `napi_busy_loop()` on the socket's NAPI instance, so a packet arriving in the window is processed inline with no interrupt, no softirq scheduling and no context switch. The 'removes the stack' answer is the one to reject explicitly: the full kernel receive path still runs, which is exactly why kernel bypass still buys another 2–4 µs. It also does not remove contention — busy polling and the NAPI softirq compete for the same ring, which is what `SO_PREFER_BUSY_POLL` addresses.",
+      "sourceAnchor": "458-busy-poll-socket-options",
+      "difficulty": "recall"
+    },
+    {
+      "id": "45-q23",
+      "prompt": "`SO_BUSY_POLL` is enabled on a freshly created socket, yet the very first receive shows the usual ~15 µs wakeup latency. Why?",
+      "options": [
+        "`sk_napi_id` is populated only after a packet has been received on the socket, so the socket has to be warmed at startup.",
+        "The option takes effect only once `net.core.busy_read` is also raised, and that sysctl requires a reboot to be applied.",
+        "The first receive is served from the socket backlog queue, which the busy-poll path deliberately bypasses on every call.",
+        "The kernel requires one full NAPI budget of packets before enabling polling, so warming demands a sustained burst."
+      ],
+      "correctIndex": 0,
+      "explanation": "Busy polling needs to know *which* NAPI instance to poll, and that association is learned from the last packet received on the socket — with no packet yet, there is nothing to poll and the thread sleeps normally. The standard remedy is to send and receive a warmup packet during startup. The sysctl answer is plausible because `net.core.busy_read` really is the global default for this option, but it is a default that the per-socket setsockopt already overrides, and no reboot is involved.",
+      "sourceAnchor": "458-busy-poll-socket-options",
+      "difficulty": "trap"
+    },
+    {
+      "id": "45-q24",
+      "prompt": "With `SO_TIMESTAMPING` enabled for both hardware directions, where do RX and TX timestamps appear?",
+      "options": [
+        "RX stamps arrive as ancillary data on the ordinary data `recvmsg`; TX stamps arrive later on the error queue.",
+        "Both arrive as ancillary data on the data path, the TX stamp riding along with the next inbound packet's control messages.",
+        "RX stamps arrive on the error queue while TX stamps are written into the ancillary buffer supplied to the `sendmsg` call.",
+        "Both arrive on the error queue, which is the reason `IP_RECVERR` must be enabled before any timestamping can work."
+      ],
+      "correctIndex": 0,
+      "explanation": "The asymmetry follows from causality: an inbound packet has already been stamped by the time `recvmsg` returns it, but at the moment `send` returns the packet has not been transmitted, so the PHY stamp can only be posted asynchronously — the kernel puts it on the socket's error queue for a `recvmsg(MSG_ERRQUEUE)` to reap. The 'TX stamp in the sendmsg ancillary buffer' answer is the intuitive one and is impossible for exactly that reason. `IP_RECVERR` governs ICMP error reporting, not timestamp delivery.",
+      "sourceAnchor": "459-socket-timestamp-options",
+      "difficulty": "recall"
+    },
+    {
+      "id": "45-q25",
+      "prompt": "Code subtracts `ts[2]` from an `SCM_TIMESTAMPING` cmsg against a `clock_gettime(CLOCK_REALTIME)` reading to compute receive latency. What is wrong?",
+      "options": [
+        "`ts[2]` is in the NIC's PHC time domain, so it needs `phc2sys` discipline or a `PTP_SYS_OFFSET_PRECISE` read before it is comparable.",
+        "`ts[2]` is in `CLOCK_REALTIME` just as `ts[0]` is, so the subtraction is sound and any residue is ordinary hardware jitter.",
+        "`ts[2]` is a raw count of NIC cycles, so dividing it by the link rate is the conversion step that has been omitted here.",
+        "`ts[2]` is the deprecated legacy slot and the hardware stamp lives in `ts[1]`, which is why the difference comes out as zero."
+      ],
+      "correctIndex": 0,
+      "explanation": "The three-slot array is `ts[0]` software in `CLOCK_REALTIME`, `ts[1]` legacy and unused, `ts[2]` raw hardware in the PHC domain — mixing domains injects the PHC-to-system offset, typically tens to hundreds of nanoseconds and unbounded if `phc2sys` is not running. The 'both in CLOCK_REALTIME' answer is the frequently-shipped bug, because the arithmetic produces a believable-looking number rather than an obvious error. The slot ordering is also worth memorising: it is `ts[1]`, not `ts[2]`, that is dead.",
+      "sourceAnchor": "459-socket-timestamp-options",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q26",
+      "prompt": "Why is `epoll_wait` O(1) in the number of watched descriptors while `poll` is O(N)?",
+      "options": [
+        "The kernel keeps a per-instance ready list that wake callbacks push descriptors onto, so `epoll_wait` merely drains it.",
+        "The kernel holds the watch set in a red-black tree and binary-searches it on each wait, which is logarithmic rather than linear.",
+        "The descriptor set is copied into the kernel once at `epoll_ctl` time and then scanned there instead of in user space.",
+        "The kernel keeps descriptors ordered by recent activity, so the hot ones are scanned first and the cost amortises to constant."
+      ],
+      "correctIndex": 0,
+      "explanation": "Readiness is pushed, not polled: each watched socket's wake callback links it onto the epoll instance's ready list, so the wait call does work proportional to the number of *ready* descriptors, not watched ones. The 'copied in once and scanned in the kernel' answer identifies a genuine `poll` cost — the per-call set copy — but removing the copy still leaves an O(N) scan, so it does not explain the complexity change. `select` additionally caps out at `FD_SETSIZE`, corrupting the stack beyond 1024 descriptors.",
+      "sourceAnchor": "4510-non-blocking-socket-event-loops",
+      "difficulty": "recall"
+    },
+    {
+      "id": "45-q27",
+      "prompt": "Under `EPOLLIN | EPOLLET`, a handler stops reading because its application buffer filled, leaving bytes in the socket. What happens next?",
+      "options": [
+        "No further edge is generated for that socket, so the connection goes permanently silent while its neighbours stay healthy.",
+        "The next `epoll_wait` reports it again, because edge triggering still re-arms whenever unread data remains in the queue.",
+        "The kernel demotes the descriptor to level-triggered after one missed drain, so throughput suffers but nothing hangs.",
+        "The receive queue fills and the kernel resets the connection, which makes the mistake loud and straightforward to diagnose."
+      ],
+      "correctIndex": 0,
+      "explanation": "Edge triggering reports the *transition* to readable; data already sitting in the queue produces no new transition, so a partial read that is never resumed loses the descriptor forever. The 're-arms while data remains' answer describes level-triggered behaviour precisely and is the confusion this contract exists to test. The signature is one connection silent under load with the rest fine, which is why the discipline is to loop until `EAGAIN`.",
+      "sourceAnchor": "4510-non-blocking-socket-event-loops",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q28",
+      "prompt": "An event loop registers `EPOLLOUT` for every connection at setup and leaves it armed. What is the symptom?",
+      "options": [
+        "`epoll_wait` returns instantly and forever on any writable socket, so the loop burns 100% CPU while performing no work.",
+        "The kernel rate-limits repeated writable reports, so the waste is bounded to roughly one spurious wakeup per round trip.",
+        "`EPOLLOUT` is edge-like even under level triggering, being reported only on the transition to writable, so nothing is wasted.",
+        "The send buffer is treated as permanently full, so subsequent writes fail with `EAGAIN` until the flag is cleared again."
+      ],
+      "correctIndex": 0,
+      "explanation": "A connected socket with room in its send buffer is writable essentially all the time, so under level triggering the wait call has an event to report on every iteration — the diagnostic signature is `strace` showing `epoll_wait` returning immediately with no intervening `recv` calls. The 'reported only on transition' answer is the tempting one and confuses the two triggering modes. The correct design arms `EPOLLOUT` only while a partial write is pending and disarms it once the buffer flushes.",
+      "sourceAnchor": "4510-non-blocking-socket-event-loops",
+      "difficulty": "trap"
+    },
+    {
+      "id": "45-q29",
+      "prompt": "A team adds `EPOLLEXCLUSIVE` to the listening socket's event mask to cure a thundering herd. What must they know about it?",
+      "options": [
+        "It is a hint — the kernel may still wake more than one waiter — and it forbids `EPOLL_CTL_MOD` on that descriptor afterwards.",
+        "It guarantees that exactly one waiter is woken, and the mask can still be adjusted later with `EPOLL_CTL_MOD` as load changes.",
+        "It gives each waiting thread its own accept queue, which is what removes the shared wake-up point from the design entirely.",
+        "It applies to accepted connection sockets rather than the listener, serialising each connection's handler across the thread pool."
+      ],
+      "correctIndex": 0,
+      "explanation": "`EPOLLEXCLUSIVE` (Linux 4.5) blunts the herd rather than eliminating it, and locks the registration so the mask cannot be modified afterwards — useful, but a weaker remedy than the alternative. The 'own accept queue per thread' answer describes `SO_REUSEPORT`, which is the stronger and standard modern fix because there is no shared wake-up point at all. Serialising a single descriptor across a thread pool is what `EPOLLONESHOT` does.",
+      "sourceAnchor": "4510-non-blocking-socket-event-loops",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q30",
+      "prompt": "A feed handler replaces `recvfrom` with a blocking `recvmmsg` for 64 datagrams to \"reduce latency\". What actually happens?",
+      "options": [
+        "Tail latency worsens, because a batch that is not already queued makes the call wait for datagrams that have not arrived yet.",
+        "First-datagram latency halves, because the socket lock is taken once for the whole batch instead of once per datagram.",
+        "Latency is bounded safely, because the `timeout` argument is evaluated before the first datagram and caps the wait exactly.",
+        "Per-datagram cost falls with payload size, because the batched form eliminates the copy rather than the syscall overhead."
+      ],
+      "correctIndex": 0,
+      "explanation": "Batching amortises syscall entry — roughly 300–500 ns down to 160–200 ns per datagram — but only over datagrams that are already sitting in the queue; asking for 64 when 1 has arrived means blocking for 63 that may be milliseconds away. The socket-lock answer has a true premise (the lock genuinely is taken once) but the conclusion fails because that saving cannot apply to a datagram that has not arrived. The timeout claim is also wrong: it is checked only *between* datagrams, never before the first. Use `MSG_DONTWAIT` after a readiness signal, or `MSG_WAITFORONE` if you must block.",
+      "sourceAnchor": "4511-batched-datagram-syscalls",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q31",
+      "prompt": "Where does a cBPF program attached with `SO_ATTACH_FILTER` run, and what is the cost of making it slow?",
+      "options": [
+        "In softirq on the receiving CPU before the skb is queued, so a slow filter delays every later packet on that queue.",
+        "In the context of the reading thread just before `copy_to_user`, so its cost is charged to the application's own budget.",
+        "Before skb allocation on the receive path, which is what makes it strictly cheaper than XDP for an equivalent match.",
+        "Once per socket at attach time, building a match table so that the steady-state per-packet cost is a single hash lookup."
+      ],
+      "correctIndex": 0,
+      "explanation": "The filter is evaluated on the receive path in softirq context on whichever CPU processed the packet, which is exactly why it saves a copy and a wakeup for rejected traffic — and why its cost lands on every subsequent packet in that queue. The XDP answer inverts the hierarchy: XDP is the one that runs before skb allocation and is strictly cheaper; a socket filter is the tier you use when you still want a normal socket. cBPF is translated to eBPF and JIT-compiled, so a simple header match is typically 20–80 ns of native code.",
+      "sourceAnchor": "4512-bpf-socket-filters",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q32",
+      "prompt": "Every packet for one instrument must be handled by one specific worker core, without NIC flow steering. What mechanism achieves it?",
+      "options": [
+        "`SO_ATTACH_REUSEPORT_EBPF`, whose program returns the index of the reuseport group member that should receive each packet.",
+        "`SO_ATTACH_FILTER` on each worker's socket, accepting only that instrument, which the kernel then uses to route the packet.",
+        "`SO_REUSEPORT` plus a fixed source port, which makes the 4-tuple hash constant for that instrument's traffic and pins it.",
+        "An eBPF filter that rewrites the destination port to a value the kernel maps to the intended worker's receive queue."
+      ],
+      "correctIndex": 0,
+      "explanation": "A reuseport BPF program is a *steering* program, not a filter: it replaces the default 4-tuple hash with an explicit choice of group member, so any header field — symbol, session, whatever — can decide the destination socket and hence the core. The per-socket accept-filter answer is the appealing near-miss and misreads what a socket filter does: it decides how many bytes of a packet a socket accepts, after the packet has already been assigned to that socket, so a rejected packet is dropped rather than redirected.",
+      "sourceAnchor": "4512-bpf-socket-filters",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q33",
+      "prompt": "A non-blocking writer already has bytes buffered from an earlier short `send`, and new data arrives. What must it do?",
+      "options": [
+        "Append the new data to the buffer, because sending it directly would place it on the wire ahead of the pending bytes.",
+        "Send the new data directly whenever the socket is writable, since the kernel orders it behind whatever is already buffered.",
+        "Send the new data directly as long as it is smaller than the pending buffer, which the kernel then coalesces in order.",
+        "Replace the pending buffer with the new data, since a framed stream protocol lets the receiver resynchronise on the next frame."
+      ],
+      "correctIndex": 0,
+      "explanation": "Once anything is buffered the socket is in the PENDING state and every subsequent byte must go through the buffer, or the stream interleaves and the peer's parser sees garbage. The 'kernel orders it behind the buffer' answer is the dangerous one: the application's pending buffer is in user space and entirely invisible to the kernel, which only orders what it has been given. The matching discipline is to disarm `EPOLLOUT` once the buffer fully flushes and return to IDLE.",
+      "sourceAnchor": "4513-partial-tcp-io",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q34",
+      "prompt": "Why should every `send` on a TCP socket carry `MSG_NOSIGNAL`?",
+      "options": [
+        "Without it, writing to a socket whose peer has closed raises `SIGPIPE`, whose default disposition terminates the process.",
+        "Without it, `send` blocks until the peer reopens the connection, which stalls a single-threaded event loop indefinitely.",
+        "Without it, `send` returns `EPIPE` but leaves the socket in a state where subsequent writes silently appear to succeed.",
+        "Without it, the kernel queues the data and raises `SIGPIPE` only later, when `close` is finally called on the descriptor."
+      ],
+      "correctIndex": 0,
+      "explanation": "The flag converts the signal into a plain `EPIPE` return, which is the difference between a handled error and a trading process disappearing mid-session. The alternatives — ignoring `SIGPIPE` globally, or `SO_NOSIGPIPE` on BSD and macOS — are coarser or non-portable. The 'returns EPIPE anyway' answer is the reason this gets missed: developers who happen to have `SIGPIPE` ignored process-wide see exactly that behaviour and conclude the flag is redundant.",
+      "sourceAnchor": "4513-partial-tcp-io",
+      "difficulty": "trap"
+    },
+    {
+      "id": "45-q35",
+      "prompt": "A control buffer for `recvmsg` is sized with `CMSG_LEN(sizeof(timespec[3]))` and timestamps intermittently fail to appear. What is the defect?",
+      "options": [
+        "`CMSG_SPACE` is the macro that sizes a buffer, padding included; `CMSG_LEN` under-allocates and truncates, which only `MSG_CTRUNC` reveals.",
+        "`CMSG_LEN` sizes buffers and `CMSG_SPACE` fills `cmsg_len`; the two have been swapped, which over-allocates but is otherwise harmless.",
+        "The two macros compute the same value on Linux, so the distinction only bites when the code is ported to a BSD control buffer.",
+        "`CMSG_SPACE` is for send-side buffers and `CMSG_LEN` for receive-side ones, which is why the receive path never needs padding."
+      ],
+      "correctIndex": 0,
+      "explanation": "`CMSG_SPACE(n)` includes the header plus trailing alignment padding and is what you reserve; `CMSG_LEN(n)` is header plus data only and is what you store in `cmsg_len`. Under-allocating silently drops the last control message, and the only signal is `MSG_CTRUNC` in `msg_flags`, which almost nobody checks. The 'same value on Linux' answer is the comfortable assumption that makes the bug survive review — the padding is real, and hand-rolled offsets break for the same reason.",
+      "sourceAnchor": "4514-recvmsg-ancillary-data",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q36",
+      "prompt": "A redundant A/B feed sends two multicast groups to the same UDP port, and a wildcard-bound socket must label each datagram with its group. What provides that?",
+      "options": [
+        "Enabling `IP_PKTINFO`, whose cmsg carries `ipi_addr` and `ipi_ifindex` — the destination address and arrival interface per datagram.",
+        "Reading `recvfrom`'s source address, since a multicast datagram carries the group it was addressed to as its source address.",
+        "Setting `SO_BINDTODEVICE` on the socket, which records the arrival interface in a control message on every receive.",
+        "Enabling `IP_RECVTTL`, whose control message reports the group address because multicast TTL is scoped per group."
+      ],
+      "correctIndex": 0,
+      "explanation": "The kernel normally discards the destination address once demultiplexing is done, so a wildcard-bound socket cannot otherwise tell which group a datagram was addressed to; `IP_PKTINFO` preserves it, which is exactly what A/B arbitration needs. The `recvfrom` source-address answer is the natural first guess and is wrong because the source is the sender's unicast address, not the group. The same cmsg also lets a UDP server reply from the address it was addressed on, rather than one chosen by the routing table.",
+      "sourceAnchor": "4514-recvmsg-ancillary-data",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q37",
+      "prompt": "A `sendto` loop to a UDP order-entry endpoint keeps returning success long after the peer process has died. How is the death detected?",
+      "options": [
+        "Set `IP_RECVERR` on a connected socket: the ICMP port-unreachable then surfaces as `ECONNREFUSED` or in detail on the error queue.",
+        "Check the return value of `sendto` against the payload length, since a dead peer causes a short send once the route ages out.",
+        "Poll the socket for `EPOLLHUP`, which the kernel raises on a datagram socket as soon as an ICMP error arrives for it.",
+        "Read `SO_ERROR` periodically with `getsockopt`, which accumulates ICMP errors for unconnected datagram sockets by design."
+      ],
+      "correctIndex": 0,
+      "explanation": "Without `IP_RECVERR` the kernel discards the ICMP port-unreachable and `sendto` reports success forever — the failure mode is 'everything looks fine and nothing happens', which is the worst possible one in a trading system. Both the connected socket and the option matter: an unconnected socket has no peer to attribute the ICMP error to. The short-send answer misstates datagram semantics entirely — `sendto` is all-or-nothing, never partial.",
+      "sourceAnchor": "4515-the-linux-socket-error-queue",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q38",
+      "prompt": "A level-triggered event loop begins spinning at 100% CPU with `epoll_wait` returning instantly and no data available. Which cause fits?",
+      "options": [
+        "`EPOLLERR` is set and unmasked, and nothing drains the error queue, so the readiness condition persists on every wait.",
+        "`EPOLLERR` is set but was never registered in the event mask, so the loop wakes on an event it cannot decode or clear.",
+        "The error queue has overflowed and the kernel promotes the descriptor to edge-triggered, which duplicates every wakeup.",
+        "The error queue shares the receive queue, so a pending error blocks normal reads and every `recv` returns `EAGAIN` at once."
+      ],
+      "correctIndex": 0,
+      "explanation": "`EPOLLERR` is reported unconditionally and cannot be masked, so an undrained error queue is a permanently satisfied readiness condition — the fix is a `recvmsg(fd, &msg, MSG_ERRQUEUE)` to consume it. The 'never registered in the mask' answer is the plausible-sounding inversion: registration is irrelevant precisely because the flag cannot be masked out. Note also that the error and receive queues are independent — draining one never consumes the other — so the blocked-reads explanation is wrong.",
+      "sourceAnchor": "4515-the-linux-socket-error-queue",
+      "difficulty": "trap"
+    },
+    {
+      "id": "45-q39",
+      "prompt": "An engineer proposes `MSG_ZEROCOPY` for 60-byte order messages on the critical path. What is the correct assessment?",
+      "options": [
+        "It is strictly worse than the copy: page pinning plus the completion notification cost more than copying, below roughly 10 KB.",
+        "It is a clear win, since removing `copy_from_user` removes the only per-message cost that scales with the number of sends.",
+        "It is neutral, because the kernel automatically falls back to copying for payloads under a page and no notification is posted.",
+        "It is a win only if `SO_ZEROCOPY` is left unset, which suppresses the completion traffic while still avoiding the copy."
+      ],
+      "correctIndex": 0,
+      "explanation": "`get_user_pages` pinning, the completion record, and the extra `recvmsg(MSG_ERRQUEUE)` are fixed per-send costs that dwarf 60 bytes of copying; the kernel documentation puts the break-even near 10 KB. The automatic-fallback answer is the seductive one: the kernel does sometimes fall back to copying and flags it with `SO_EE_CODE_ZEROCOPY_COPIED`, but that happens under memory pressure or DMA constraints, not as a size-based optimisation, and it is not neutral because you still paid for the machinery. `SO_ZEROCOPY` is mandatory before the flag does anything at all.",
+      "sourceAnchor": "4516-msg_zerocopy",
+      "difficulty": "application"
+    },
+    {
+      "id": "45-q40",
+      "prompt": "After `send(fd, buf, len, MSG_ZEROCOPY)` returns, the application immediately overwrites `buf` with the next order. Packet loss later triggers a retransmission. What does the peer see?",
+      "options": [
+        "The second order's bytes carried under the first order's sequence numbers — silent wire corruption with no error anywhere.",
+        "The first order's bytes intact, because the kernel copied the payload into an skb before `send` returned the byte count.",
+        "A retransmission dropped by the kernel with `ENOBUFS` reported on the error queue, since the pinned pages were modified.",
+        "The first order's bytes intact, because the pinned pages are marked copy-on-write and the overwrite forks a private copy."
+      ],
+      "correctIndex": 0,
+      "explanation": "The buffer belongs to the kernel until a completion appears on the error queue with `ee_origin == SO_EE_ORIGIN_ZEROCOPY`, and for TCP that is only after acknowledgement, because until then the pages may be retransmitted from. The copy-on-write answer is the most seductive because the mechanism exists elsewhere in the kernel, but `MSG_ZEROCOPY` uses `get_user_pages` pinning with no write protection at all. The symptom is an exchange reporting an order you never sent, appearing only under loss and unreproducible in a clean lab.",
+      "sourceAnchor": "4517-zero-copy-completion-ownership",
+      "difficulty": "trap"
+    }
+  ]
+}

@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-27-cpu-execution",
+  "questions": [
+    {
+      "id": "27-q01",
+      "prompt": "Modern x86-64 cores use 15–20 pipeline stages rather than the textbook five. What does the extra depth actually buy, and what does it cost?",
+      "options": [
+        "Shorter per-stage work permits a higher clock frequency; the price is a 15–20-cycle flush on every mispredict.",
+        "More stages let more instructions retire per cycle, which is why retire width grew from four to eight.",
+        "Each stage holds several instructions at once, pushing IPC above the core's decode width.",
+        "Depth shortens an individual instruction's fetch-to-retire latency, cutting its total cycle count."
+      ],
+      "correctIndex": 0,
+      "explanation": "Depth is a frequency play: dividing the work into more, smaller stages shortens the critical path per stage and therefore the clock period. The claim that depth raises retire width is the tempting near-miss — retire width is a separate design parameter, and a deeper pipe retires no faster per cycle. Depth in fact increases an instruction's end-to-end latency, and it lengthens the mispredict flush because the flush is roughly the stage count between fetch and branch resolution.",
+      "sourceAnchor": "271-cpu-pipeline-fundamentals",
+      "difficulty": "recall"
+    },
+    {
+      "id": "27-q02",
+      "prompt": "A 3 GHz core with a ~20-stage pipeline mispredicts a branch whose correct path is already hot in L1i. Roughly how much wall-clock time is wasted?",
+      "options": [
+        "About 5–7 ns, since the flush costs roughly the 15–20 stages between fetch and branch resolution.",
+        "About 0.3 ns, since only the single cycle in which the branch resolved has to be discarded.",
+        "About 80 ns, since the front end must refill the entire instruction queue from the L2 cache.",
+        "About 250 ns, since a flush forces the core to re-read the correct path from main memory."
+      ],
+      "correctIndex": 0,
+      "explanation": "Mispredict penalty tracks pipeline depth, so 15–20 cycles at 3 GHz lands at roughly 5–7 ns when the correct path is hot. The single-cycle answer confuses the resolution event with the refill: everything younger than the branch is squashed and the whole front end must be re-driven. The memory-latency figures apply only when the correct path also misses to L2/L3/DRAM, which is a separate, additive cost.",
+      "sourceAnchor": "271-cpu-pipeline-fundamentals",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q03",
+      "prompt": "Why is retirement kept strictly in program order even though execution is not?",
+      "options": [
+        "Architectural state must be updated in program order for precise exceptions and speculation rollback to work.",
+        "Dependent µops read their operands from the architectural register file, which must be written in order.",
+        "The scheduler selects ready µops oldest-first, and that ordering can only be maintained at retirement.",
+        "The store buffer drains strictly FIFO, and only in-order retirement can keep loads matched to it."
+      ],
+      "correctIndex": 0,
+      "explanation": "In-order retirement is what lets the machine say 'everything before instruction N happened and nothing after it did', which is the definition of a precise exception and the exact mechanism used for mispredict flushes and machine clears. The register-file answer is the most seductive because it sounds like forwarding, but dependents read speculative rename registers, not architectural ones — that indirection is precisely why speculation is safe. Oldest-first selection happens in the scheduler and is independent of retirement order.",
+      "sourceAnchor": "271-cpu-pipeline-fundamentals",
+      "difficulty": "recall"
+    },
+    {
+      "id": "27-q04",
+      "prompt": "Of the pipeline stages that set superscalar width, which is usually the practical ceiling on sustained throughput?",
+      "options": [
+        "Rename/allocate width, since it is the narrowest of the sustained stages on most designs.",
+        "Retire width, which is 8 µops/cycle on Golden Cove and therefore gates everything upstream.",
+        "Fetch bandwidth in bytes per cycle, which always yields fewer instructions than decode can absorb.",
+        "Execution port count, because a µop cannot be allocated unless a free port exists that cycle."
+      ],
+      "correctIndex": 0,
+      "explanation": "The chapter's tables show rename/allocate as the narrowest sustained stage — Skylake's famous '4-wide' number is its rename width, and Golden Cove renames 6 while retiring 8. That comparison is exactly why the retire-width answer fails: a stage wider than rename cannot be the binding constraint. Allocation is also decoupled from port availability; a µop allocates into the ROB and scheduler and waits there for a port.",
+      "sourceAnchor": "272-superscalar-execution",
+      "difficulty": "recall"
+    },
+    {
+      "id": "27-q05",
+      "prompt": "A profiling change inserts one instruction between a loop's `cmp` and its `jne`. Why does throughput regress?",
+      "options": [
+        "It breaks macro-fusion, so the compare and branch now cost two fused-domain µops instead of one.",
+        "It forces the branch from port 6 onto port 0, doubling the dispatch cost of every iteration.",
+        "It adds a partial-flags merge µop, because any instruction between them must rewrite EFLAGS.",
+        "It evicts the loop from the µop cache, because the DSB refuses regions containing a taken branch."
+      ],
+      "correctIndex": 0,
+      "explanation": "Macro-fusion requires the compare and the conditional jump to be adjacent; separating them costs an extra fused-domain µop, which is allocation bandwidth spent for nothing on every iteration. The port answer is the plausible mis-attribution: branches do have a primary and a secondary port, but nothing about fusion moves them, and the branch still prefers its primary port. Nor does an inserted instruction necessarily touch flags, and the DSB caches taken branches perfectly well.",
+      "sourceAnchor": "272-superscalar-execution",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q06",
+      "prompt": "A load misses to DRAM at ~250 cycles on a core with a 512-entry ROB allocating 6 µops/cycle. What happens?",
+      "options": [
+        "The window drains in about 85 cycles and allocation then stalls with roughly 165 cycles of the miss left.",
+        "The miss is fully hidden, because 512 in-flight entries comfortably exceed the 250-cycle latency.",
+        "Retirement stalls but allocation continues, so the front end keeps feeding the back end throughout.",
+        "The load holds its scheduler entry for all 250 cycles, so the scheduler fills long before the ROB."
+      ],
+      "correctIndex": 0,
+      "explanation": "The ROB is a µop budget, not a cycle budget: at 6 µops/cycle a 512-entry window is consumed in about 85 cycles, after which allocation blocks with most of the miss still outstanding. The 'fully hidden' answer commits exactly that unit error, comparing entries against cycles. Allocation cannot outrun retirement either — the missing load sits at the head of the ROB, so nothing older retires and no entries are recycled.",
+      "sourceAnchor": "273-out-of-order-execution-and-retirement",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q07",
+      "prompt": "On real workloads, which in-flight resource most often exhausts before the reorder buffer does?",
+      "options": [
+        "Load and store buffers and the scheduler, all of which are far smaller than the ROB.",
+        "The ROB itself, since every µop occupies an entry from allocation all the way to retirement.",
+        "The physical register file, which cannot free a register until its architectural name is reused.",
+        "The branch order buffer, which is consumed by every branch whether it is taken or not."
+      ],
+      "correctIndex": 0,
+      "explanation": "The resource table makes the point numerically: against a 512-entry ROB, Golden Cove has 192 load-buffer, 114 store-buffer and 205 scheduler entries, so store-heavy or dependency-dense code hits those walls first — which is why `RESOURCE_STALLS.SB` is such a common signature. The 'ROB always first' answer is true about occupancy but false about capacity, and that is where the inference breaks. Branch order buffer pressure is real but only binds on deeply nested branchy code.",
+      "sourceAnchor": "273-out-of-order-execution-and-retirement",
+      "difficulty": "trap"
+    },
+    {
+      "id": "27-q08",
+      "prompt": "FP addition has latency 4 and throughput 2/cycle. How many independent accumulators does a `sum += a[i]` reduction need to saturate the machine?",
+      "options": [
+        "Eight, because the accumulator count needed is latency multiplied by throughput.",
+        "Four, because the accumulator count needed equals the instruction's latency in cycles.",
+        "Two, because the accumulator count needed equals the per-cycle throughput of the unit.",
+        "Sixteen, because two accumulators are needed per cycle of latency to cover the writeback."
+      ],
+      "correctIndex": 0,
+      "explanation": "The rule is accumulators = latency × throughput, so 4 × 2 = 8 independent chains are needed to keep both FP pipes busy every cycle. Answering with the latency alone (four) is the classic half-remembered version: four accumulators issue one add per cycle and leave one of the two pipes idle, capturing only half the available throughput. The same formula gives 8 for FMA on Skylake, which is latency 4 at 2/cycle.",
+      "sourceAnchor": "274-instruction-level-parallelism",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q09",
+      "prompt": "Why will the compiler not split a `double` reduction into multiple accumulators by default, when it will happily do so for an `int` reduction?",
+      "options": [
+        "Floating-point addition is not associative, so reassociating changes results; it needs `-ffast-math`.",
+        "Floating-point registers cannot be renamed independently, so extra accumulators would serialize anyway.",
+        "The vector unit has only one FP accumulator port, so extra accumulators could not be dispatched.",
+        "The accumulator might alias the array through a pointer, which the compiler cannot rule out."
+      ],
+      "correctIndex": 0,
+      "explanation": "Splitting a reduction reorders the additions, and because FP addition is not associative that changes the numeric result, so the transform is illegal without explicit permission. Integer addition is associative, which is why the same optimizer performs the split freely there. The aliasing answer is the plausible-sounding decoy — a local accumulator's address is not taken, so aliasing is not what blocks this; the semantics of FP arithmetic are.",
+      "sourceAnchor": "274-instruction-level-parallelism",
+      "difficulty": "trap"
+    },
+    {
+      "id": "27-q10",
+      "prompt": "How does a dependence carried across loop iterations differ in cost from one contained within a single iteration?",
+      "options": [
+        "A loop-carried chain caps throughput at chain latency per iteration; an intra-iteration one is largely overlapped.",
+        "Both cost the same, because the scheduler cannot see past the backward branch to overlap iterations.",
+        "An intra-iteration chain is worse, because it must resolve before that iteration's stores may retire.",
+        "Neither matters once the body fits in the loop buffer, which replays µops without rechecking operands."
+      ],
+      "correctIndex": 0,
+      "explanation": "The out-of-order window spans many iterations, so a chain confined inside one iteration overlaps with neighbouring iterations and largely disappears; a chain that threads from iteration to iteration cannot be overlapped and sets a hard floor of one iteration per chain latency. The 'scheduler cannot see past the branch' answer inverts the whole point of speculation — the front end predicts the backward branch and keeps allocating, which is exactly what makes the overlap possible. Pointer chasing and running sums are the canonical loop-carried cases.",
+      "sourceAnchor": "274-instruction-level-parallelism",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q11",
+      "prompt": "When is a µop's reservation-station entry released, compared with its reorder-buffer entry?",
+      "options": [
+        "The RS entry frees at dispatch to a port; the ROB entry is held until the µop retires.",
+        "Both entries free at dispatch, since the ROB only tracks µops still awaiting execution.",
+        "The RS entry is held until writeback completes; the ROB entry frees as soon as it dispatches.",
+        "Both entries are held until retirement, which is why the two structures are sized identically."
+      ],
+      "correctIndex": 0,
+      "explanation": "A µop enters both structures at allocation, leaves the scheduler the moment it is dispatched, and occupies its ROB slot until it and everything older has completed. That asymmetry explains the observed behaviour: a 250-cycle load ties up one ROB entry for the whole miss while its own RS entry is freed almost immediately — but its dependents sit in the RS for the duration, which is why dependency-dense code exhausts the scheduler first. The 'both free at dispatch' answer would make in-order retirement impossible.",
+      "sourceAnchor": "275-reorder-buffers-and-reservation-stations",
+      "difficulty": "recall"
+    },
+    {
+      "id": "27-q12",
+      "prompt": "Why does an L1 miss cost more than the raw L1-to-L2 latency difference suggests when the load feeds a long dependent chain?",
+      "options": [
+        "The scheduler speculatively wakes dependents assuming an L1 hit, so on a miss they must be re-dispatched.",
+        "The dependents wait quietly in the scheduler until the fill arrives, so the cost is exactly the latency gap.",
+        "The load is re-issued from the reorder buffer, which requires a full pipeline flush on every L1 miss.",
+        "Every L1 miss raises a memory-ordering machine clear, adding a fixed 20–30 cycles to the miss."
+      ],
+      "correctIndex": 0,
+      "explanation": "Speculative wake-up fires the dependents on the assumption that the load hits L1 in 4–5 cycles; when the tag check says otherwise, those dependents are replayed, so `uops_dispatched` exceeds `uops_retired` and the effective penalty exceeds the latency delta. The 'wait quietly' answer describes a non-speculative scheduler and is the intuitive but wrong model. Machine clears are triggered by ordering violations and disambiguation failures, not by ordinary cache misses.",
+      "sourceAnchor": "275-reorder-buffers-and-reservation-stations",
+      "difficulty": "trap"
+    },
+    {
+      "id": "27-q13",
+      "prompt": "Which hazards does register renaming actually eliminate?",
+      "options": [
+        "WAR and WAW only; RAW dependences remain and constitute the critical path.",
+        "RAW and WAR; WAW is instead resolved by the in-order retirement of the reorder buffer.",
+        "All three register hazards, which is why the critical path of x86 code is set by port pressure.",
+        "WAW only; WAR still requires the scheduler to delay the writer until the reader has dispatched."
+      ],
+      "correctIndex": 0,
+      "explanation": "WAR and WAW are naming collisions forced by having only 16 architectural registers, and giving each write a fresh physical register makes them vanish entirely. RAW is a real data flow — the consumer genuinely needs the producer's value — so no amount of renaming shortens it, and it is what interviewers mean by the critical path. The 'all three' answer is the most attractive because renaming feels total, but it would imply that a serial dependency chain runs at port throughput rather than latency, which linked-list traversal plainly refutes.",
+      "sourceAnchor": "276-register-renaming",
+      "difficulty": "recall"
+    },
+    {
+      "id": "27-q14",
+      "prompt": "A hot loop loads a byte with `mov al, [rdi]` and shows an unexplained dependency stall. What is happening, and what is the fix?",
+      "options": [
+        "The 8-bit write must merge with the old `rax`, creating a false dependence; use `movzx` instead.",
+        "The 8-bit load is microcoded and issued from the MSROM; use a 32-bit load and mask the result.",
+        "Sub-register writes are not renamed at all, so the write serializes on the reorder buffer head.",
+        "The byte load is split into two accesses when it straddles a line; align the buffer to 64 bytes."
+      ],
+      "correctIndex": 0,
+      "explanation": "Writing only the low 8 bits leaves the upper bits of the destination live, so the core must merge with the previous value — on Haswell and later via an extra merge µop, on older cores via a multi-cycle partial-register stall. `movzx` writes the full register (and 32-bit writes zero-extend), so there is nothing to merge and no false dependence. The microcode answer is the tempting mis-attribution: microcoded flows do exist and do hurt, but a plain byte load is a single ordinary µop, and the stall here is a naming artefact rather than a decode one.",
+      "sourceAnchor": "276-register-renaming",
+      "difficulty": "trap"
+    },
+    {
+      "id": "27-q15",
+      "prompt": "`perf stat` on a hot loop shows `idq.mite_uops` far exceeding `idq.dsb_uops`. What is the diagnosis and the fix?",
+      "options": [
+        "The loop is missing the µop cache and using legacy decode; shrink the body, align to 32 B, or unroll less.",
+        "The loop is missing L1i and refilling from L2; use huge pages for `.text` and split hot from cold code.",
+        "The loop is being replayed by the loop stream detector, which delivers fewer µops than legacy decode.",
+        "The loop is microcode-bound in the MSROM; replace the `rep`-string operations with a scalar byte loop."
+      ],
+      "correctIndex": 0,
+      "explanation": "MITE is the legacy decode path, so a high MITE-to-DSB ratio means the loop's µops are being re-decoded every iteration instead of streaming from the µop cache — typically because a 32-byte region exceeds the 18-µop cap or the body straddles boundaries awkwardly. Instruction-cache misses are a real front-end problem with real fixes, but they show up in `frontend_retired.l1i_miss` and `icache_16b.ifdata_stall`, not in the MITE counter. Microcode delivery has its own counter as well, and the loop stream detector is the fastest path, not a slower one.",
+      "sourceAnchor": "277-micro-ops-and-the-micro-op-cache",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q16",
+      "prompt": "You increase a loop's unroll factor from 4 to 16 and throughput drops. What is the most likely front-end explanation?",
+      "options": [
+        "The larger body no longer fits the µop cache's per-region budget, so it falls back to legacy decode.",
+        "Unrolling lengthens the loop-carried dependency chain in proportion to the unroll factor.",
+        "Unrolling removes the compare from beside the branch, so macro-fusion no longer applies.",
+        "The loop buffer rejects bodies containing more than four backward branches, forcing a flush."
+      ],
+      "correctIndex": 0,
+      "explanation": "The µop cache indexes by 32-byte region with at most three ways of six µops each, so a fat unrolled body can exceed the 18-µop cap for a region and become uncacheable, pushing the loop onto the slower legacy decoder and inflating the instruction-cache footprint at the same time. The dependency-chain answer inverts the mechanism: unrolling with separate accumulators shortens the effective chain per element, which is the whole reason to unroll. Unrolling also reduces the number of compare/branch pairs rather than separating them.",
+      "sourceAnchor": "277-micro-ops-and-the-micro-op-cache",
+      "difficulty": "trap"
+    },
+    {
+      "id": "27-q17",
+      "prompt": "Where do the results of speculatively executed instructions live before they are known to be correct?",
+      "options": [
+        "In rename registers, the store buffer and the reorder buffer — never in architectural state.",
+        "In architectural registers, with the reorder buffer keeping the old values for rollback.",
+        "In the L1 data cache, which is invalidated wholesale if the speculation turns out to be wrong.",
+        "In the scheduler entries, which are retained until the branch that guarded them resolves."
+      ],
+      "correctIndex": 0,
+      "explanation": "Speculative results are confined to renamed physical registers, the store buffer and ROB entries, and retirement is the commit point at which they become architectural — a store is not even visible to other cores until it retires and drains. The 'write architecturally and keep an undo copy' model is the intuitive alternative and is exactly what real cores avoid, because rollback would then be proportional to the work done. Note the cache is the one place a speculative effect genuinely does persist: a speculatively filled line survives the rollback, which is the entire basis of Spectre.",
+      "sourceAnchor": "278-speculative-execution",
+      "difficulty": "recall"
+    },
+    {
+      "id": "27-q18",
+      "prompt": "x86's memory model forbids load–load reordering, yet the core executes loads out of order with respect to each other. How is the model upheld?",
+      "options": [
+        "By detection and rollback: a snoop invalidating a speculatively read line triggers a memory-ordering machine clear.",
+        "By serializing loads in the load buffer, which issues them strictly in program order to the cache.",
+        "By forwarding every load through the store buffer in order, which transitively orders the loads.",
+        "By fencing implicitly at each cache-line boundary, which bounds how far loads may be reordered."
+      ],
+      "correctIndex": 0,
+      "explanation": "The core speculates that no one observes the reordering and checks at retirement whether another core invalidated a line it read early; if so it flushes with `MACHINE_CLEARS.MEMORY_ORDERING`. This is why total store order is nearly free when a line is uncontended and expensive under active sharing. The in-order load buffer answer describes a design that would satisfy the model but would also throw away memory-level parallelism — precisely the cost real cores refuse to pay.",
+      "sourceAnchor": "278-speculative-execution",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q19",
+      "prompt": "What does the geometric spread of history lengths in a TAGE-family predictor provide?",
+      "options": [
+        "Correlation with branches that occurred hundreds of branches ago, with the longest matching tag winning.",
+        "A guarantee that any repeating pattern is learned within two executions of the branch.",
+        "Immunity to aliasing, because each history length gets its own privately indexed table.",
+        "Prediction of indirect branch targets, which the tagged tables supply directly at fetch time."
+      ],
+      "correctIndex": 0,
+      "explanation": "Tables indexed by progressively longer histories let a branch correlated with something 80 branches back still be predicted, and the tagged design means a long-history entry only overrides the short-history one when it has proven itself. The aliasing answer is the strongest decoy: the tables are indexed by hashed PC, so two hot branches genuinely can collide and interfere, which is one more reason code size matters. Targets come from the branch-target buffer and the indirect predictor, not from the direction tables.",
+      "sourceAnchor": "279-branch-prediction",
+      "difficulty": "recall"
+    },
+    {
+      "id": "27-q20",
+      "prompt": "What does `if (cond) [[unlikely]]` (or `__builtin_expect(cond, 0)`) actually do?",
+      "options": [
+        "It steers code layout and optimization decisions; the hardware predictor is untouched.",
+        "It writes an initial bias into the predictor entry for that branch at first execution.",
+        "It converts the branch into a `cmov`, removing the branch and its mispredict risk entirely.",
+        "It marks the branch as low-confidence so the front end will not speculate past it."
+      ],
+      "correctIndex": 0,
+      "explanation": "These hints move the cold path out of line so the common case falls through, and they influence inlining and optimization budgets — they emit no instruction that the branch predictor can read. The 'seeds the predictor' answer is the one nearly everyone reaches for, and it fails because there is no architectural interface for writing predictor state from user code; only profile-guided optimization supplies the compiler with real frequencies. Layout still matters a great deal, since it drives instruction-cache and branch-target-buffer pressure.",
+      "sourceAnchor": "279-branch-prediction",
+      "difficulty": "trap"
+    },
+    {
+      "id": "27-q21",
+      "prompt": "A hot path dispatches through a virtual call site that sees five derived types in random order. Where does the cost actually come from?",
+      "options": [
+        "Indirect-branch misprediction at the polymorphic site, costing a full flush of roughly 17–20 cycles.",
+        "The vtable pointer load, which is an extra memory access on the critical path of every call.",
+        "The inability to macro-fuse an indirect call, which consumes an extra allocation slot each time.",
+        "Return-stack corruption, since an indirect call pushes no matching entry for the eventual `ret`."
+      ],
+      "correctIndex": 0,
+      "explanation": "A monomorphic site predicts its target perfectly and is nearly free; scrambling five targets makes the indirect predictor useless and buys a full pipeline flush per call. The vtable-load answer is the standard folklore and is the most tempting because the load is genuinely there — but it is an L1 hit of about five cycles that the out-of-order window normally hides completely, so it is not what you measure. Devirtualization, `final`, CRTP, or sorting work by type all attack the misprediction rather than the load.",
+      "sourceAnchor": "2710-branch-target-buffers",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q22",
+      "prompt": "Why does a fiber library's stack switch cost more than the handful of register moves it performs?",
+      "options": [
+        "The `ret` no longer matches a `call`, so the return stack mispredicts in a burst after every switch.",
+        "The switch invalidates the entire branch-target buffer, so all subsequent branches re-steer.",
+        "Changing the stack pointer forces the store buffer to drain, serializing the core at the switch.",
+        "Each switch raises a self-modifying-code machine clear because the stack shares a page with code."
+      ],
+      "correctIndex": 0,
+      "explanation": "The return address stack is a small LIFO that assumes well-nested `call`/`ret` pairs; a stack switch, `longjmp`, exception unwind, or coroutine resume breaks that pairing, so returns mispredict until the structure resynchronizes. That is the concrete answer to why coroutines and fibers are not free even when they avoid allocation. The store-buffer answer is plausible-sounding but wrong: writing `rsp` is an ordinary register write and forces no drain, and nothing about a stack switch modifies code.",
+      "sourceAnchor": "2710-branch-target-buffers",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q23",
+      "prompt": "A large switch-driven handler shows high `BACLEARS` and front-end re-steer cycles but a *low* branch-miss rate. What does that combination indicate?",
+      "options": [
+        "Branch-target-buffer capacity misses: directions are predicted correctly, but targets are not known early.",
+        "A saturated direction predictor whose tables are aliasing between two equally hot conditional branches.",
+        "Return-stack underflow from recursion deeper than the structure's 16–32 entries.",
+        "Denormal inputs raising floating-point assists, which the front end reports as re-steer cycles."
+      ],
+      "correctIndex": 0,
+      "explanation": "The two counters split cleanly: mispredicted direction shows up as branch misses, while 'the front end did not know there was a branch here, or where it went' shows up as re-steers, and a large hot code footprint overflows the target buffer exactly that way. The direction-aliasing answer is the tempting one because aliasing is real, but it would raise the branch-miss rate, which is stipulated to be low — that is where the inference breaks. Basic-block reordering with BOLT or PGO attacks this directly by making hot paths fall through.",
+      "sourceAnchor": "2710-branch-target-buffers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "27-q24",
+      "prompt": "What is the published branch-mispredict penalty on recent Intel, AMD Zen, Neoverse and Apple cores?",
+      "options": [
+        "Roughly 13–20 cycles across all four families, which is about 5–7 ns at 3 GHz.",
+        "Roughly 40–60 cycles on x86 and about 13 on ARM, reflecting the deeper x86 pipeline.",
+        "Roughly 3–5 cycles, since checkpointed rename maps make recovery nearly immediate.",
+        "Roughly 100–200 cycles, since the flush also invalidates the µop cache and the L1i."
+      ],
+      "correctIndex": 0,
+      "explanation": "The figures cluster tightly — about 15–20 on Skylake-and-later Intel, 13–19 on Zen, roughly 13 on Neoverse and about 15 on Apple — because they all track comparable pipeline depths. The very low answer confuses one component with the total: checkpointing the rename map does make the map restore roughly a single cycle, but the refetch, re-decode and re-rename of the correct path still cost the bulk of the penalty. The 100–200-cycle range belongs to self-modifying-code machine clears, not to branch recovery.",
+      "sourceAnchor": "2711-branch-misprediction-recovery",
+      "difficulty": "recall"
+    },
+    {
+      "id": "27-q25",
+      "prompt": "A mispredicted branch's condition depends on a load that misses to DRAM. How does that change the effective cost of the mispredict?",
+      "options": [
+        "It adds the DRAM latency, because the machine spent that entire wait executing down the wrong path.",
+        "It removes the cost, because the flush overlaps the DRAM miss that was already stalling the core.",
+        "It leaves the cost unchanged, because the published penalty already averages in memory stalls.",
+        "It halves the cost, because the front end has time to prefetch both targets during the miss."
+      ],
+      "correctIndex": 0,
+      "explanation": "The branch cannot resolve until its operand arrives, so everything the core did in those ~250 cycles was wrong-path work that is then thrown away — the useful-work loss is the miss latency plus the flush, not the flush alone. The 'overlaps and is therefore free' answer is the most tempting because overlap does hide many costs, but it fails here: the overlapped work is exactly the work being discarded. The effective penalty grows further if the correct path must itself be refetched from L2 or beyond.",
+      "sourceAnchor": "2711-branch-misprediction-recovery",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q26",
+      "prompt": "Under what circumstances is replacing a branch with `cmov` a pessimization?",
+      "options": [
+        "When the branch is well predicted, since `cmov` turns a free control dependence into a data dependence.",
+        "When the branch is badly predicted, since `cmov` must still evaluate the condition before selecting.",
+        "When either arm has side effects, since `cmov` executes both arms and commits both results.",
+        "When the condition is a comparison, since `cmov` cannot read flags and needs an extra materializing µop."
+      ],
+      "correctIndex": 0,
+      "explanation": "A correctly predicted branch costs essentially nothing and lets the machine run ahead speculatively, whereas `cmov` cannot be speculated past — it waits for the condition and lengthens the critical path by its 1–2 cycles on every iteration. Breakeven sits around a 5–10% misprediction rate, above which the certain small cost beats the probabilistic ~18-cycle one. The 'badly predicted' answer inverts the tradeoff, and side effects are a correctness constraint on using `cmov` at all rather than a performance argument.",
+      "sourceAnchor": "2711-branch-misprediction-recovery",
+      "difficulty": "trap"
+    },
+    {
+      "id": "27-q27",
+      "prompt": "A loop issues one load, one FMA, one `add` and a fused compare-and-branch per iteration, with a single FMA accumulator. What is the binding constraint?",
+      "options": [
+        "The loop-carried FMA dependency at latency 4; no port is saturated at one iteration per cycle.",
+        "The load ports, since one load per iteration already consumes the available load bandwidth.",
+        "The branch port, since the taken branch must dispatch every iteration and cannot be overlapped.",
+        "Allocation width, since four µops per iteration exceeds what rename can sustain per cycle."
+      ],
+      "correctIndex": 0,
+      "explanation": "Enumerating the ports shows plenty of headroom — two loads per cycle available for one, two FMA pipes for one, several ALUs for the `add` — so the floor is set by the single accumulator chained through a 4-cycle FMA. Blaming the load ports is the common misread: one load against a 2/cycle capability is 50% utilization, not saturation. Unrolling to eight accumulators removes the chain and moves the loop to its real ceiling, FMA-port-bound at 2/cycle.",
+      "sourceAnchor": "2712-execution-ports-and-port-contention",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q28",
+      "prompt": "An AVX2 kernel dominated by `vpshufb` runs at one shuffle per cycle on Intel while several ALUs sit idle. Why?",
+      "options": [
+        "Vector shuffles issue only on port 5 on Intel, so shuffle-heavy code is port-bound regardless of idle ALUs.",
+        "Shuffles have a 4-cycle latency, so a shuffle chain cannot exceed one result every four cycles.",
+        "Shuffles are microcoded on Intel and come from the MSROM, which delivers one µop per cycle.",
+        "Shuffles cross the integer/vector domain, adding a bypass delay that limits them to 1/cycle."
+      ],
+      "correctIndex": 0,
+      "explanation": "Only one port services vector shuffles on Intel, so the kernel is structurally capped at one per cycle no matter how much other execution capacity is free — this is port contention, distinct from any dependency. The latency answer is the classic latency-versus-throughput confusion: `vpshufb` has 1-cycle latency and 1-cycle reciprocal throughput, and the ceiling here comes from the port, not the chain. AMD spreads shuffles across more pipes, which is exactly why shuffle-heavy tuning does not port between vendors.",
+      "sourceAnchor": "2712-execution-ports-and-port-contention",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q29",
+      "prompt": "Rewriting a Skylake hot loop's stores from `[rax + disp]` to `[rax + rbx*4]` costs throughput even though the µop count is unchanged. Why?",
+      "options": [
+        "The dedicated store-address port handles only simple addressing, so indexed stores compete with loads.",
+        "Scaled-index addressing makes the store microcoded, so it is delivered from the MSROM instead.",
+        "Indexed store addresses cannot be forwarded, so every dependent load takes a forwarding failure.",
+        "The scaled index forces the store into the slower of the two store-data ports, halving store bandwidth."
+      ],
+      "correctIndex": 0,
+      "explanation": "Skylake's dedicated store-address port accepts only base-plus-displacement forms, so an indexed store address must be computed on the general address-generation ports that also serve loads — the loop loses load bandwidth even though nothing about the µop count changed. Simplifying store addressing is therefore a genuine micro-optimization. Store-to-load forwarding depends on address and size matching rather than on the addressing mode used to compute the address, which is where the forwarding answer breaks down.",
+      "sourceAnchor": "2712-execution-ports-and-port-contention",
+      "difficulty": "trap"
+    },
+    {
+      "id": "27-q30",
+      "prompt": "An FMA has latency 4 and reciprocal throughput 0.5. How long do eight *independent* FMAs take?",
+      "options": [
+        "About 4 cycles, since two can start each cycle and the last one's latency overlaps the rest.",
+        "About 32 cycles, since each FMA must complete its 4 cycles of latency before the next begins.",
+        "About 16 cycles, since latency and reciprocal throughput multiply to give the per-instruction cost.",
+        "About 8 cycles, since reciprocal throughput of 0.5 means one FMA can be issued every two cycles."
+      ],
+      "correctIndex": 0,
+      "explanation": "Independent work is governed by throughput, not latency: two FMAs start every cycle, so eight are all in flight after four cycles and the last retires shortly after. Multiplying eight by the 4-cycle latency is the single most common analysis error in this chapter, and it is only correct when the eight form a serial chain. Note also that a reciprocal throughput of 0.5 means two per cycle, not one every two cycles — inverting that is the other half of the same confusion.",
+      "sourceAnchor": "2713-instruction-latency-and-throughput",
+      "difficulty": "trap"
+    },
+    {
+      "id": "27-q31",
+      "prompt": "A spin-then-park loop calibrated on Haswell with a fixed `_mm_pause()` count backs off far too long on a Skylake-generation server. Why?",
+      "options": [
+        "`pause` went from about 5 cycles to about 140, so the same iteration count waits roughly 28× longer.",
+        "`pause` became a serializing instruction on Skylake, so each one also drains the store buffer.",
+        "Skylake raised the core clock, so the same cycle count now corresponds to more wall-clock time.",
+        "`pause` now yields the physical core to the sibling thread, so the loop is descheduled entirely."
+      ],
+      "correctIndex": 0,
+      "explanation": "Intel deliberately lengthened `pause` on Skylake to force harder spin backoff, and a loop whose trip count was tuned against the old cost now waits about 28 times longer — which is why any hand-calibrated spin threshold must be re-measured per microarchitecture. The frequency answer gets the direction backwards: a higher clock makes a fixed cycle count take *less* wall-clock time, not more. `pause` does release core resources to an SMT sibling, but it is a hint rather than a deschedule and that behaviour did not change.",
+      "sourceAnchor": "2713-instruction-latency-and-throughput",
+      "difficulty": "trap"
+    },
+    {
+      "id": "27-q32",
+      "prompt": "With `imul` at latency 3 and throughput 1/cycle, how does `x = (a*b)*(c*d)` compare with `x = ((a*b)*c)*d`?",
+      "options": [
+        "The tree form has a 6-cycle critical path against 9, because two multiplies overlap at the first level.",
+        "Both have a 9-cycle critical path; the parenthesization only changes which port each multiply uses.",
+        "The tree form is slower at 12 cycles, because the extra temporary needs an additional rename register.",
+        "Both take 3 cycles, because all three multiplies are independent once the operands are loaded."
+      ],
+      "correctIndex": 0,
+      "explanation": "Serializing three multiplies gives a 3 + 3 + 3 chain, whereas the balanced tree runs `a*b` and `c*d` concurrently and then combines, for two levels of 3 cycles each. The 'both are 9' answer misses that reassociation genuinely changes the dependence graph rather than merely the syntax — this is the same restructuring that multiple accumulators apply to a reduction. Three multiplies are never all independent here, since the final one consumes the results of the other two.",
+      "sourceAnchor": "2713-instruction-latency-and-throughput",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q33",
+      "prompt": "A `memcpy`-style loop slows down badly when source and destination happen to be offset by an exact multiple of 4 KB. What is the mechanism?",
+      "options": [
+        "4K aliasing: the load matches an older store in the low 12 address bits, so a false dependency is predicted.",
+        "The two buffers map to the same L1 set, so every access evicts the line the other just filled.",
+        "The copy crosses a page boundary each iteration, forcing a page-walk assist on every access.",
+        "Store-to-load forwarding succeeds too often, and each forwarded load costs the full ~12-cycle penalty."
+      ],
+      "correctIndex": 0,
+      "explanation": "Disambiguation compares only the page-offset bits early, so a load whose low 12 bits match an older store's is predicted to conflict even though the page numbers differ, costing roughly 5 cycles per occurrence and showing up in `LD_BLOCKS_PARTIAL.ADDRESS_ALIAS`. Cache-set conflict is the tempting alternative because it is also an address-bit-collision effect, but L1 sets are indexed by far fewer bits and the resulting misses would appear as L1 misses rather than as blocked loads. Successful forwarding is a win, not a penalty; only forwarding *failure* costs cycles.",
+      "sourceAnchor": "2714-data-control-and-structural-hazards",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q34",
+      "prompt": "What sets the hard ceiling on how many L1 data-cache misses a core can have outstanding at once?",
+      "options": [
+        "The fill buffers (MSHRs), of which there are roughly 10–16 per core.",
+        "The reorder buffer, since each outstanding miss holds one entry until its data returns.",
+        "The two load ports, since only two misses may be issued to the memory system per cycle.",
+        "The load buffer, which is drained in order and so permits only one miss at a time."
+      ],
+      "correctIndex": 0,
+      "explanation": "Outstanding misses each occupy a fill buffer, and with only about 10–16 of them the structure — not the window — caps memory-level parallelism. The reorder buffer answer is the strongest decoy because a full ROB genuinely does stall a miss-heavy loop, but it is a much larger structure and binds for a different reason: it limits total in-flight µops rather than concurrent misses. Load ports govern issue rate per cycle, and the load buffer permits many misses in flight rather than one.",
+      "sourceAnchor": "2714-data-control-and-structural-hazards",
+      "difficulty": "recall"
+    },
+    {
+      "id": "27-q35",
+      "prompt": "A hot decode-side loop contains `mov ax, 1234`. What does `ild_stall.lcp` measure here, and what is the cost?",
+      "options": [
+        "A length-changing prefix stall in decode, costing about 3 cycles each time the instruction is decoded.",
+        "An instruction-cache line-crossing stall, costing an extra fetch cycle for the second half.",
+        "A microcode-sequencer entry, costing the ~4-µop threshold above which decode is bypassed.",
+        "A partial-register merge for the 16-bit write, costing an extra µop at the allocation stage."
+      ],
+      "correctIndex": 0,
+      "explanation": "A 16-bit immediate changes the instruction's length relative to the default operand size, so the predecoder's length determination is disrupted and the front end pays about 3 cycles per decode — which is why compilers avoid such encodings and why the fix is to use a 32-bit immediate. The partial-register answer is genuinely related in spirit and a real cost of 16-bit destinations, but it lives in rename rather than decode and is not what this counter reports. The distinction matters because the two are fixed in different ways.",
+      "sourceAnchor": "2715-front-end-bandwidth-and-instruction-cache-pressure",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q36",
+      "prompt": "Why do huge pages for `.text` help a binary with a 10 MB hot code footprint?",
+      "options": [
+        "That footprint needs ~2560 4 K entries against a ~128–256-entry iTLB, but only 5 entries at 2 MB.",
+        "Huge pages let the instruction cache hold more code, since a line can span the whole huge page.",
+        "Huge pages let the µop cache index by 2 MB regions rather than 32 B, raising its effective capacity.",
+        "Huge pages eliminate instruction-cache misses, because the whole page is prefetched on first touch."
+      ],
+      "correctIndex": 0,
+      "explanation": "The instruction TLB has only a couple of hundred entries, so a multi-megabyte hot text region cannot be covered at 4 K granularity and thrashes; 2 MB mappings shrink the requirement to a handful of entries. Each of the other explanations attributes a real benefit to the wrong structure — page size does not change instruction-cache capacity or line size, does not affect how the µop cache indexes its 32-byte regions, and does not cause the page's code to be prefetched. Reducing code size with BOLT or hot/cold splitting attacks the same problem from the other direction.",
+      "sourceAnchor": "2715-front-end-bandwidth-and-instruction-cache-pressure",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q37",
+      "prompt": "A pricing service develops p99.9 latency spikes with no code change and no change in code path taken. What is the first microarchitectural cause to check?",
+      "options": [
+        "Denormal floating-point inputs triggering microcode assists of roughly 150–300 cycles each.",
+        "Branch mispredictions on the pricing branch, which cost roughly 150–300 cycles each when cold.",
+        "Instruction-cache misses on the hot path, which cost roughly 250 cycles per spike occurrence.",
+        "Self-modifying-code clears from the logging path writing into a page that also holds code."
+      ],
+      "correctIndex": 0,
+      "explanation": "A decayed EWMA or a price drifting toward zero produces subnormals, and each one triggers a microcode assist costing hundreds of cycles on Intel — invisible in code review, invisible in the code path, and exactly the shape of a sudden tail-latency cliff; `fp_assist.any` confirms it and FTZ/DAZ in MXCSR fixes it, per thread. The mispredict answer borrows the right cost range but the wrong structure: a mispredict is roughly 15–20 cycles, an order of magnitude smaller. Self-modifying-code clears are real and expensive, but they require code generation or writes into code pages, which a data-only change does not produce.",
+      "sourceAnchor": "2716-machine-clears",
+      "difficulty": "application"
+    },
+    {
+      "id": "27-q38",
+      "prompt": "How does a machine clear differ from a branch-misprediction flush?",
+      "options": [
+        "It flushes the whole pipeline rather than only µops younger than a branch, and costs ~20 to 200+ cycles.",
+        "It flushes only the front end, leaving the back end draining, and so costs less than a mispredict.",
+        "It is raised at allocation rather than at execution, so no speculative work is ever discarded.",
+        "It differs only in accounting: both flush identically and the counters merely name the trigger."
+      ],
+      "correctIndex": 0,
+      "explanation": "A mispredict squashes everything younger than a single known instruction, whereas a machine clear restarts the pipeline from a known-good architectural state entirely — which is why the cost range runs from ~20–30 cycles for memory ordering up to 100–200+ for self-modifying code and 150–300 for a denormal assist. The 'only an accounting difference' answer is the tempting one because both appear under Bad Speculation in top-down analysis, but grouping them for attribution does not make their recovery costs equal.",
+      "sourceAnchor": "2716-machine-clears",
+      "difficulty": "recall"
+    },
+    {
+      "id": "27-q39",
+      "prompt": "You offline the SMT siblings of your isolated cores at runtime instead of disabling SMT in the BIOS. What should you be careful about?",
+      "options": [
+        "On several microarchitectures the statically partitioned ROB and load/store buffers are not recombined.",
+        "Offlining a sibling also offlines the physical core, so the isolated thread loses its execution ports.",
+        "The offlined sibling keeps its share of L1 and L2 capacity reserved, halving the effective cache.",
+        "Offlining forces the remaining thread onto the shared scheduler partition, halving its issue width."
+      ],
+      "correctIndex": 0,
+      "explanation": "SMT statically partitions the reorder buffer and the load and store buffers, and on several designs those structures only recombine on a BIOS disable or when the sibling reaches a deep C-state — so the surviving thread may still be running with half its out-of-order window. That makes runtime offlining strictly weaker than BIOS-disabling, and it is worth verifying with a memory-latency-bound microbenchmark before and after. The cache answer inverts the sharing model: caches are competitively shared rather than partitioned, so an idle sibling gives its capacity back immediately.",
+      "sourceAnchor": "2717-hardware-multithreading-and-smt-contention",
+      "difficulty": "trap"
+    },
+    {
+      "id": "27-q40",
+      "prompt": "Beyond the direct cost at each indirect call, what second-order penalty does retpoline impose?",
+      "options": [
+        "The trampoline's `call`/`ret` construction corrupts the return stack, so return-heavy code mispredicts more.",
+        "It disables the µop cache for any function containing an indirect call, forcing legacy decode there.",
+        "It inserts a serializing fence at each call, which drains the store buffer and blocks all speculation.",
+        "It flushes the branch-target buffer at every indirect call, so subsequent direct branches re-steer."
+      ],
+      "correctIndex": 0,
+      "explanation": "Retpoline replaces an indirect branch with a `call`/`ret` trampoline whose returns do not correspond to real call sites, so the return address stack degrades and ordinary returns elsewhere start mispredicting — a cost on top of the 5–30% already paid on indirect-heavy code. The fence answer describes the Spectre v1 mitigation instead: `lfence` after a bounds check is the ~20–40-cycle serializing fix, and conflating the two variants' mitigations is the usual slip. Enhanced IBRS on Ice Lake and later is the hardware alternative that avoids the return-stack damage.",
+      "sourceAnchor": "2718-spectre-class-mitigations",
+      "difficulty": "application"
+    }
+  ]
+}

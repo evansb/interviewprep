@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-41-assembly-binaries-and-abi",
+  "questions": [
+    {
+      "id": "41-q01",
+      "prompt": "You are handed a listing containing `mov %rsp, %rbp` and `$42`. Which syntax is it, and what is the operand order?",
+      "options": [
+        "AT&T syntax, and the order is `mov src, dst` — so `rsp` is copied into `rbp`.",
+        "AT&T syntax, and the order is `mov dst, src` — so `rbp` is copied into `rsp`.",
+        "Intel syntax, and the order is `mov dst, src` — so `rsp` is copied into `rbp`.",
+        "Intel syntax, and the order is `mov src, dst` — so `rbp` is copied into `rsp`."
+      ],
+      "correctIndex": 0,
+      "explanation": "The `%` register prefix and the `$` immediate prefix are the AT&T markers, and AT&T writes the destination last, so the source `rsp` lands in `rbp`. The tempting near-miss is the reading that keeps AT&T but applies Intel's destination-first order, which reverses the data flow and would make this a stack-pointer assignment rather than a standard frame-pointer prologue. Intel syntax would have written bare `rbp`, `rsp`, and `42`.",
+      "sourceAnchor": "411-reading-x86-64-assembly",
+      "difficulty": "recall"
+    },
+    {
+      "id": "41-q02",
+      "prompt": "Inside a hot loop you see `mov rax, [rsp+0x18]` and `mov [rsp+0x20], rdx`, plus `addsd xmm0, xmm1`. What is the diagnosis?",
+      "options": [
+        "The loop is spilling to the stack and the float math is scalar, so the compiler neither kept values in registers nor vectorized.",
+        "The loop is spilling to the stack but the float math is packed, so vectorization succeeded and only register pressure is a problem.",
+        "The stack traffic is argument passing rather than spilling, and the scalar suffix confirms the loop was fully vectorized.",
+        "The stack traffic is red-zone scratch and the `sd` suffix marks a four-wide packed add, so the loop is already optimal."
+      ],
+      "correctIndex": 0,
+      "explanation": "Loads and stores against `[rsp+N]` inside a loop body are the signature of register spills, and the `s` in `addsd` means scalar-double — a single element — whereas packed math would appear as `addpd` or a `v`-prefixed form. The reading that calls `addsd` packed is the tempting one because the `d` looks like it counts lanes; it denotes double precision, not width. Arguments arrive in registers under SysV, so this stack traffic is not argument passing.",
+      "sourceAnchor": "411-reading-x86-64-assembly",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q03",
+      "prompt": "A function computes `x` in `eax`, then later code reads `rax` expecting the full 64-bit value. Which write pattern guarantees the upper 32 bits are zero?",
+      "options": [
+        "Writing the 32-bit `eax`, because 32-bit writes zero the upper half of the 64-bit register.",
+        "Writing the 8-bit `al`, because sub-register writes are always widened to the full register.",
+        "Writing the 16-bit `ax`, because x86-64 zero-extends every write narrower than 64 bits.",
+        "Any of the narrow writes, because the register renamer clears the high half on every partial write."
+      ],
+      "correctIndex": 0,
+      "explanation": "Only 32-bit destination writes zero bits 32-63; writes to `ax` or `al` merge with the old contents and create a false dependency on the previous value, which is why `movzx eax, byte ptr [..]` is preferred over `mov al, ..`. The claim that the renamer clears the high half on every partial write is the seductive one because it correctly identifies that renaming is involved, but merging is exactly what the renamer must do for 8- and 16-bit writes.",
+      "sourceAnchor": "412-x86-64-registers-flags-and-addressing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "41-q04",
+      "prompt": "Source code compares two variables you believe are `int`, but the disassembly ends the compare with `jb .L2`. What does that tell you?",
+      "options": [
+        "The comparison was performed as unsigned, so an implicit conversion changed the operand types.",
+        "The comparison was performed as signed, and `jb` is simply the compiler's shorter encoding for `jl`.",
+        "The comparison used the overflow flag, which only signed comparisons on `int` operands can set.",
+        "The comparison was against a constant, and `jb` is emitted whenever one side is an immediate."
+      ],
+      "correctIndex": 0,
+      "explanation": "`jb`/`ja`/`jae`/`jbe` (below/above) consume the carry flag and mean unsigned; `jl`/`jg`/`jle`/`jge` (less/greater) consume the overflow and sign flags and mean signed — so a `jb` where you expected signed comparison is direct evidence of an implicit conversion. The claim that `jb` is a shorter encoding of `jl` is the tempting one; the two conditions test different flags and are not interchangeable.",
+      "sourceAnchor": "412-x86-64-registers-flags-and-addressing",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q05",
+      "prompt": "You see `lea rax, [rdi + rdi*2]` with no subsequent memory access through `rax`. What is the compiler doing?",
+      "options": [
+        "Computing `rdi * 3` arithmetically, using `lea` as an add-and-shift that touches no memory and sets no flags.",
+        "Loading the third element of an array based at `rdi`, with the dereference folded into the addressing mode.",
+        "Computing `rdi * 3` and setting the carry and overflow flags so a following conditional jump can test it.",
+        "Prefetching the address `rdi + rdi*2` into cache without keeping the loaded value in a register."
+      ],
+      "correctIndex": 0,
+      "explanation": "`lea` evaluates the addressing expression and stores the result, performing no load and leaving RFLAGS untouched, which is precisely why compilers abuse it as a three-operand add/shift for strength-reduced multiplies. The reading that has it compute the product but also set flags is the closest miss — the arithmetic is right, but not clobbering flags is a large part of why the compiler chose `lea` over `imul` here.",
+      "sourceAnchor": "412-x86-64-registers-flags-and-addressing",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q06",
+      "prompt": "`perf stat --topdown` on a large service reports frontend-bound near zero with negligible iTLB and L1i misses. What should you conclude about code layout work?",
+      "options": [
+        "Layout work will do nothing measurable here; the bottleneck is elsewhere and the effort should go there.",
+        "Layout work is still the highest-leverage step, since low frontend-bound means the DSB is already saturated.",
+        "The counters are unreliable under `--topdown`, so hot/cold splitting should be applied and re-measured regardless.",
+        "Low iTLB misses specifically indicate that huge-page text is already in effect, so only BOLT can help further."
+      ],
+      "correctIndex": 0,
+      "explanation": "The chapter's explicit gate is to confirm you are front-end bound before spending effort: if frontend-bound is low and the icache/iTLB counters are quiet, PGO, BOLT, and huge-page text have nothing to recover. The reading that low frontend-bound means the micro-op cache is saturated inverts the metric — a saturated DSB is a healthy front end, which is exactly the case where layout is not your problem. At 20-40% frontend-bound the ordered fix list is PGO, then BOLT, then huge-page text.",
+      "sourceAnchor": "4117-code-layout-and-cold-splitting",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q07",
+      "prompt": "A disassembly shows `mov rax, 0x51EB851EB851EB85` followed by `mul rsi` and `shr rdx, 5`. What is this sequence?",
+      "options": [
+        "A division by a compile-time constant, replaced with a multiply-high by a magic reciprocal plus a shift.",
+        "A hash or checksum step, since large odd hex constants multiplied into a value are the classic mixing primitive.",
+        "A modulo by a power of two, expanded because the compiler could not prove the operand was unsigned.",
+        "A 128-bit multiply of two runtime values, with the shift extracting the high half of the product."
+      ],
+      "correctIndex": 0,
+      "explanation": "Compilers replace `x / d` for constant `d` with a multiply-high by roughly 2^k/d plus shifts because `div` costs 20-40+ cycles and is not pipelined while `mul` is about 3 — so a big hex constant feeding `mul` and then `shr` is a division, not cryptography. Reading it as a hash mixing step is the tempting misidentification since the constant looks arbitrary. A power-of-two modulo would compile to a single `and` with a mask.",
+      "sourceAnchor": "413-common-compiler-assembly-idioms",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q08",
+      "prompt": "Auditing a hot path for accidental `shared_ptr` copies, which disassembly pattern is the reliable tell?",
+      "options": [
+        "`lock`-prefixed read-modify-write instructions such as `lock xadd`, each a serialization point and cache-line ownership request.",
+        "`mov rax, fs:0x28` sequences, since reference counts live in thread-local storage alongside the stack canary.",
+        "`mov rax,[rdi]; call [rax+16]` pairs, since refcount updates are dispatched through the control block's vtable.",
+        "`rep movsb` bulk copies, since copying a smart pointer copies both the pointer and its control block inline."
+      ],
+      "correctIndex": 0,
+      "explanation": "Reference-count traffic is an atomic read-modify-write, so it appears as a `lock`-prefixed instruction; counting `lock` instructions in a disassembled hot path is the chapter's recommended fast audit for hidden atomics. The vtable-dispatch pattern is the most tempting distractor because control blocks genuinely are polymorphic, but the dispatch happens on destruction of the last owner, not on the copy, and the copy's cost is the atomic increment. `fs:0x28` is the stack-protector canary.",
+      "sourceAnchor": "413-common-compiler-assembly-idioms",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q09",
+      "prompt": "Which pair correctly matches an AArch64 architectural feature to its consequence for C++ code?",
+      "options": [
+        "Weak memory ordering means code relying on x86's TSO for implicit acquire/release can break when ported.",
+        "Fixed 4-byte instruction encoding means arithmetic instructions can fold one memory operand for free.",
+        "Thirty-one general-purpose registers mean the stack pointer doubles as a general register in leaf functions.",
+        "The zero register `xzr` means comparisons need no flags, so conditional branches read `xzr` directly."
+      ],
+      "correctIndex": 0,
+      "explanation": "AArch64 is weakly ordered while x86-64 is TSO, so a missing `std::atomic` or an under-strength memory order that happens to work on x86 surfaces as a real bug on Graviton or Apple Silicon — the classic porting failure. The claim that fixed-width encoding buys folded memory operands inverts the actual property: AArch64 is a load/store architecture where arithmetic is register-to-register only. Flags still exist, but only `S`-suffixed forms set them.",
+      "sourceAnchor": "414-aarch64-assembly-fundamentals",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q10",
+      "prompt": "Which statement about the AAPCS64 calling convention is correct?",
+      "options": [
+        "First eight integer args in `x0-x7`, callee-saved `x19-x28`, 16-byte stack alignment at all times, and no red zone.",
+        "First six integer args in `x0-x5`, callee-saved `x19-x28`, 16-byte alignment only at calls, and a 128-byte red zone.",
+        "First eight integer args in `x0-x7`, callee-saved `x0-x7`, 8-byte stack alignment at all times, and no red zone.",
+        "First eight integer args in `x0-x7`, callee-saved `x19-x28`, 16-byte alignment only at calls, and a 128-byte red zone."
+      ],
+      "correctIndex": 0,
+      "explanation": "AAPCS64 passes eight integer arguments in `x0-x7` and eight FP/SIMD arguments in `v0-v7`, preserves `x19-x28` plus the low 64 bits of `v8-v15`, requires 16-byte stack alignment continuously rather than only at call sites, and has no red zone. The variant that keeps the right registers but grants a 128-byte red zone and call-site-only alignment is the tempting one: both of those are SysV AMD64 rules imported wholesale, and both are stricter on ARM.",
+      "sourceAnchor": "414-aarch64-assembly-fundamentals",
+      "difficulty": "trap"
+    },
+    {
+      "id": "41-q11",
+      "prompt": "For `void f(int a, double b, int c, double d);` under SysV AMD64, where does each argument travel?",
+      "options": [
+        "`a`→`rdi`, `c`→`rsi`, `b`→`xmm0`, `d`→`xmm1` — the integer and SSE sequences advance independently.",
+        "`a`→`rdi`, `b`→`xmm1`, `c`→`rdx`, `d`→`xmm3` — each argument consumes a slot in both sequences positionally.",
+        "`a`→`rdi`, `b`→`xmm0`, `c`→`rdx`, `d`→`xmm2` — the FP arguments block the intervening integer registers.",
+        "`a`→`rcx`, `b`→`xmm0`, `c`→`r8`, `d`→`xmm1` — integers take the four-register sequence and FP the eight."
+      ],
+      "correctIndex": 0,
+      "explanation": "SysV classifies each argument and then assigns it from its own class's register sequence, so the two counters never interfere: the integers take `rdi` and `rsi` in order and the doubles take `xmm0` and `xmm1` in order. The positional readings — where a `double` in position two blocks `rsi` — describe Windows x64, which really is positional; that is the most common confusion on this topic. The `rcx`-first assignment is also the Windows sequence.",
+      "sourceAnchor": "415-system-v-amd64-calling-convention",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q12",
+      "prompt": "A non-static member function returns a 64-byte struct by value. What does `rdi` hold on entry, and what does `rsi` hold?",
+      "options": [
+        "`rdi` holds the hidden return pointer and `rsi` holds `this`, since the sret pointer precedes all other arguments.",
+        "`rdi` holds `this` and `rsi` holds the hidden return pointer, since `this` always occupies the first integer slot.",
+        "`rdi` holds `this` and `rsi` holds the first declared argument, since the return buffer is passed on the stack.",
+        "`rdi` holds the hidden return pointer and `rsi` holds the first declared argument, since `this` travels in `rax`."
+      ],
+      "correctIndex": 0,
+      "explanation": "A large or non-trivial return type forces the sret convention, where the caller allocates the storage and passes its address as an implicit *first* integer argument, shifting everything right — so `this` moves to `rsi` and the callee also returns the same pointer in `rax`. The ordering that puts `this` first is the tempting one, because `this` does precede all *declared* arguments; the hidden pointer precedes even `this`. Nothing here places `this` in `rax`.",
+      "sourceAnchor": "415-system-v-amd64-calling-convention",
+      "difficulty": "trap"
+    },
+    {
+      "id": "41-q13",
+      "prompt": "Calling a variadic function through a wrong or missing prototype can crash. Which SysV rule explains why?",
+      "options": [
+        "`al` must hold the number of SSE registers used, and the callee saves `xmm0-7` to its register save area only if `al` says to.",
+        "`al` must hold the total argument count, and the callee indexes its stack save area directly by that count.",
+        "`rax` must hold a pointer to a type descriptor array, which the callee walks to decide which registers to read.",
+        "`rcx` must hold the number of stack arguments, and the callee uses it to compute where its save area ends."
+      ],
+      "correctIndex": 0,
+      "explanation": "SysV requires `al` to carry the count of SSE registers used, between 0 and 8, so a variadic callee knows whether to spill `xmm0-7` into its register save area before `va_arg` walks it; call it with a stale or absent `al` and the floating-point arguments are never saved. The version where `al` holds the total argument count is the natural guess and is wrong about both the quantity and its purpose — the count is specifically about vector registers.",
+      "sourceAnchor": "415-system-v-amd64-calling-convention",
+      "difficulty": "recall"
+    },
+    {
+      "id": "41-q14",
+      "prompt": "Which row correctly states a difference between the SysV AMD64 and Windows x64 conventions?",
+      "options": [
+        "Windows requires the caller to reserve 32 bytes of shadow space for the callee to spill its four register arguments.",
+        "Windows passes six integer arguments in registers while SysV passes four, so SysV spills to the stack sooner.",
+        "Windows provides a 128-byte red zone below `rsp` while SysV requires an explicit `sub rsp` for any scratch.",
+        "Windows treats `rdi` and `rsi` as caller-saved scratch, while SysV preserves them across calls for the caller."
+      ],
+      "correctIndex": 0,
+      "explanation": "The 32-byte shadow space is a real Windows x64 requirement paid on every call and has no SysV counterpart. The other rows are all inversions of the truth: SysV passes six integer arguments to Windows' four, SysV is the convention with the 128-byte red zone while Windows has none, and it is Windows that adds `rdi` and `rsi` to the callee-saved set while SysV treats them as scratch. The register-count inversion is the most commonly repeated of these.",
+      "sourceAnchor": "415-system-v-amd64-calling-convention",
+      "difficulty": "trap"
+    },
+    {
+      "id": "41-q15",
+      "prompt": "Stated precisely, what is `rsp` modulo 16 at the `call` instruction and on entry to the callee?",
+      "options": [
+        "0 at the `call`, and 8 on entry, because `call` pushes an 8-byte return address.",
+        "8 at the `call`, and 0 on entry, because the pushed return address restores alignment.",
+        "0 at the `call`, and 0 on entry, because the return address is stored in a shadow region rather than the stack.",
+        "8 at the `call`, and 8 on entry, because the ABI fixes the offset before and after the transfer."
+      ],
+      "correctIndex": 0,
+      "explanation": "The rule is stated at the `call`: `rsp` must be 16-byte aligned there, and the pushed return address then leaves the callee entering with `rsp % 16 == 8`, which the standard `push rbp` prologue brings back to 0. Getting this off by 8 in either direction is the single most common error here — the reversed version reads plausibly because the prologue really does end at 0, but that is after the push, not at entry.",
+      "sourceAnchor": "416-stack-alignment-and-the-red-zone",
+      "difficulty": "recall"
+    },
+    {
+      "id": "41-q16",
+      "prompt": "A JIT calls into C code and the process crashes inside `memcpy` at a `movaps` instruction with a fault address that is 8 mod 16. What is the bug?",
+      "options": [
+        "The stack was misaligned at the call, so libc's 16-byte-aligned SIMD spill faulted rather than any buffer being overrun.",
+        "The destination buffer overlapped the source, so `memcpy`'s SIMD path read past the end of the mapping.",
+        "The JIT wrote below `rsp` into the red zone, which libc had already reserved for its own inbound arguments.",
+        "The JIT emitted code into a page mapped without execute permission, so the fault is a W^X violation."
+      ],
+      "correctIndex": 0,
+      "explanation": "`movaps` requires a 16-byte-aligned address and raises SIGSEGV otherwise, so a fault address congruent to 8 mod 16 inside a libc SIMD routine is the textbook signature of a caller that did not have `rsp` 16-byte aligned at the `call` — nearly every crash inside `memcpy` that is not a buffer overrun is this. The overlap explanation is the tempting one because `memcpy` genuinely forbids overlap, but that produces wrong data, not an alignment-shaped fault address.",
+      "sourceAnchor": "416-stack-alignment-and-the-red-zone",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q17",
+      "prompt": "Why is the Linux kernel built with `-mno-red-zone`?",
+      "options": [
+        "Interrupts push onto the current stack, so the 128 bytes below `rsp` would be clobbered while a leaf function was using them.",
+        "Kernel stacks are too small to afford 128 bytes of scratch, so the compiler must adjust `rsp` for every local.",
+        "The red zone requires a frame pointer to be present, and the kernel omits frame pointers for code density.",
+        "The red zone is a user-space-only ABI extension that the kernel's `-ffreestanding` mode already disables."
+      ],
+      "correctIndex": 0,
+      "explanation": "The red zone's guarantee is that nothing writes below `rsp` behind your back, and in kernel context an interrupt does exactly that by pushing its frame onto the current stack — so leaf functions relying on unadjusted scratch space would be silently corrupted. The stack-size explanation is tempting because kernel stacks really are small, but the flag exists for the clobbering hazard, not for space; user-space signal delivery is safe precisely because the kernel skips 128 bytes when building the signal frame.",
+      "sourceAnchor": "416-stack-alignment-and-the-red-zone",
+      "difficulty": "recall"
+    },
+    {
+      "id": "41-q18",
+      "prompt": "In the chapter's cold-splitting pattern, the slow-path handler is marked `[[gnu::noinline, gnu::cold]]`. What does `cold` add that `noinline` alone does not?",
+      "options": [
+        "It moves the body into `.text.unlikely` and propagates an unlikely prediction to the call sites.",
+        "It guarantees the call is compiled as a tail jump, so the hot function keeps no frame for the slow path.",
+        "It forces the handler's code onto huge pages separate from `.text`, collapsing its iTLB footprint to one entry.",
+        "It marks the handler as callable only from the hot function, letting the linker drop it under `--gc-sections`."
+      ],
+      "correctIndex": 0,
+      "explanation": "`cold` does two things: it emits the body into a distant `.text.unlikely` section so it stops occupying cache lines and TLB entries next to hot code, and it propagates the unlikely hint to callers so the branch is predicted not-taken and the hot path stays the fall-through. `noinline` alone only stops the body from being folded in — it does not relocate it or bias the branch. The tail-jump reading is the tempting one, since a cold call often is the last thing a path does, but that transformation is unrelated to the attribute.",
+      "sourceAnchor": "4117-code-layout-and-cold-splitting",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q19",
+      "prompt": "Which set is exactly the SysV AMD64 callee-saved general-purpose registers?",
+      "options": [
+        "`rbx`, `rbp`, `r12`, `r13`, `r14`, `r15`.",
+        "`rax`, `rbx`, `rbp`, `r8`, `r9`, `r10`.",
+        "`rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`.",
+        "`rbx`, `rbp`, `rdi`, `rsi`, `r12`, `r15`."
+      ],
+      "correctIndex": 0,
+      "explanation": "SysV preserves `rbx`, `rbp`, and `r12` through `r15` across calls, with `rsp` restored by convention; everything else including `rax`, `rcx`, `rdx`, `rsi`, `rdi`, and `r8` through `r11` is scratch. The set that adds `rdi` and `rsi` to the preserved list is the tempting one because those two genuinely are callee-saved on Windows x64. The argument-register sequence is caller-saved by definition — the callee is free to consume its arguments in place.",
+      "sourceAnchor": "417-caller-saved-and-callee-saved-registers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "41-q20",
+      "prompt": "A vectorized loop stops being fast once a non-inlined call is added to its body. Beyond the call overhead itself, what is the dominant new cost on SysV?",
+      "options": [
+        "All vector registers are caller-saved, so the compiler spills up to sixteen `ymm` registers — 512 bytes — around the call.",
+        "The call forces the vector unit into a lower power state, so subsequent SIMD instructions run at a reduced frequency.",
+        "Vector registers are callee-saved, so the callee must spill and reload them even if it never uses SIMD at all.",
+        "The call invalidates the loop's scaled-index addressing, forcing an explicit `imul` for every element access."
+      ],
+      "correctIndex": 0,
+      "explanation": "On SysV every `xmm`/`ymm`/`zmm` register is caller-saved, so a call in the middle of a vectorized loop forces a mass evacuation of the vector register file to the stack and back on each iteration — the register-file cost dwarfs the `call`/`ret` pair. The inverted version claiming vector registers are callee-saved is tempting because Windows x64 really does preserve `xmm6`-`xmm15`, which shifts the cost onto the callee but does not remove it.",
+      "sourceAnchor": "417-caller-saved-and-callee-saved-registers",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q21",
+      "prompt": "You write `asm volatile(\"cpuid\" : : \"a\"(0) : \"rcx\",\"rdx\");`. What is the consequence?",
+      "options": [
+        "`cpuid` also writes `rbx`, and omitting it from the clobber list miscompiles only in optimized builds that keep a value there.",
+        "The statement fails to assemble, because `volatile` requires at least one output operand to be present.",
+        "`cpuid` requires a memory clobber, and omitting it lets the compiler reorder unrelated loads but never corrupts registers.",
+        "The input constraint on `a` is illegal for `cpuid`, so the compiler will silently pass the leaf number in `rbx` instead."
+      ],
+      "correctIndex": 0,
+      "explanation": "`cpuid` writes `rax`, `rbx`, `rcx`, and `rdx`, so leaving `rbx` out of the clobber list tells the compiler a value it parked there survives — and it reads garbage. The failure appears only under optimization, because at `-O0` nothing is kept in registers across the statement, which is what makes this class of bug so nasty. The memory-clobber answer is the tempting near-miss: a memory clobber is a real and separate concern, but it would not protect `rbx`.",
+      "sourceAnchor": "417-caller-saved-and-callee-saved-registers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "41-q22",
+      "prompt": "A prologue reads `push rbx; push r12; sub rsp, 8`. Why the extra `sub rsp, 8`?",
+      "options": [
+        "To restore 16-byte alignment: entry leaves `rsp` at 8 mod 16, two pushes return it to 8, and 8 more bytes realign it.",
+        "To reserve a slot for the return address, which `call` does not push when the callee saves any registers.",
+        "To reserve the minimum 8-byte red zone that the ABI requires a non-leaf function to leave untouched.",
+        "To create a spill slot for `rbp`, which must be saved separately whenever the frame pointer is omitted."
+      ],
+      "correctIndex": 0,
+      "explanation": "The callee enters with `rsp % 16 == 8`; two 8-byte pushes bring it back to 8 mod 16, so an extra 8 bytes are needed before this function can itself issue a `call`. Reading a prologue's push count plus the `sub` and checking the total is a multiple of 16 is the standard sanity check when chasing alignment faults. The return-address explanation is tempting but backwards — `call` always pushes it, regardless of what the callee saves.",
+      "sourceAnchor": "417-caller-saved-and-callee-saved-registers",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q23",
+      "prompt": "Under SysV, how is `struct E { long x; ~E(); };` passed to a non-inlined function?",
+      "options": [
+        "In memory: the non-trivial destructor forces class MEMORY regardless of the struct's 8-byte size.",
+        "In `rdi`: at 8 bytes it fits one eightbyte, and destructors affect only the return path, never argument passing.",
+        "In `xmm0`: types with non-trivial special members are classified SSE so the destructor can run on the callee side.",
+        "In memory only if the destructor is virtual; a non-virtual user-provided destructor still permits register passing."
+      ],
+      "correctIndex": 0,
+      "explanation": "Classification rule two says a non-trivial copy constructor, move constructor, or destructor forces class MEMORY irrespective of size, so the caller allocates a slot, copies the value there, and passes the address. This is precisely why `std::unique_ptr` is not zero-overhead at a non-inlined ABI boundary while a raw `T*` rides in a register. The size-based reading is the tempting one because 8 bytes obviously fits an eightbyte — size is necessary but not sufficient.",
+      "sourceAnchor": "418-structure-parameter-and-return-abi",
+      "difficulty": "trap"
+    },
+    {
+      "id": "41-q24",
+      "prompt": "How does SysV pass `struct C { long x; double y; };` and `struct B { double x, y; };`?",
+      "options": [
+        "`C` in `rdi` and `xmm0`; `B` in `xmm0` and `xmm1`, since each eightbyte is classified separately.",
+        "`C` in `rdi` and `rsi`; `B` in `xmm0` and `xmm1`, since a mixed aggregate is classified INTEGER as a whole.",
+        "Both in memory, since any aggregate reaching a full 16 bytes exceeds the register-passing threshold.",
+        "`C` in `xmm0` and `xmm1`; `B` in `xmm0` and `xmm1`, since the presence of a `double` makes the whole struct SSE."
+      ],
+      "correctIndex": 0,
+      "explanation": "Aggregates of at most 16 bytes are split into two eightbytes and each is classified independently, so `C`'s integer half takes the next INTEGER register and its floating half takes the next SSE register, while `B`'s two floating halves take `xmm0` and `xmm1`. The whole-struct-INTEGER reading is the tempting one because that rule does apply *within* a single eightbyte — `struct { float a; int b; }` is one INTEGER eightbyte — but it does not propagate across eightbytes. Sixteen bytes is the inclusive limit, not the cutoff.",
+      "sourceAnchor": "418-structure-parameter-and-return-abi",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q25",
+      "prompt": "Why is guaranteed copy elision for a large returned object described as an ABI-level property rather than a compiler optimization?",
+      "options": [
+        "The sret convention hands the callee the caller's storage address, so the callee constructs directly into it with nothing to elide.",
+        "The compiler proves the temporary is unobservable and deletes the copy, which every conforming implementation is required to do.",
+        "The returned object is built in `rax:rdx` and blitted into place, so no constructor call ever crosses the boundary.",
+        "The linker rewrites the return sequence at link time once it can see both the caller's and the callee's frame layouts."
+      ],
+      "correctIndex": 0,
+      "explanation": "For a large or non-trivial return type the caller allocates the result storage and passes its address in `rdi`, so the callee's only option is to construct the object in place and return that pointer in `rax` — there is genuinely no copy or move to remove. The framing as a required optimization is the tempting one: it describes what elision looks like from the source level, but it attributes to the compiler a choice the calling convention has already made for it.",
+      "sourceAnchor": "418-structure-parameter-and-return-abi",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q26",
+      "prompt": "Which version of `int f(int x)` can the compiler turn into a tail call to `g`?",
+      "options": [
+        "`{ { std::string s = make(); use(s); } return g(x); }` — the scope closes so the destructor runs before the call.",
+        "`{ std::string s = make(); return g(x); }` — the destructor is trivial enough to be reordered ahead of the call.",
+        "`{ std::string s = make(); return g(&s); }` — passing the local by address lets the callee reuse the frame directly.",
+        "`{ try { return g(x); } catch (...) { return 0; } }` — the handler is on the cold path so it does not constrain the call."
+      ],
+      "correctIndex": 0,
+      "explanation": "Closing the block runs `~s` before the call, which puts `g(x)` genuinely in tail position with nothing left to do afterwards. Keeping `s` alive across the return is the classic blocker — its destructor must run *after* `g` returns, so `call; ret` cannot collapse to `jmp`. Passing the local's address into the callee is worse still, since the frame cannot be destroyed while the callee may read it, and an active `try` scope keeps unwinding state alive.",
+      "sourceAnchor": "419-tail-calls",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q27",
+      "prompt": "An interpreter dispatch loop relies on tail calls to avoid unbounded stack growth. What is the correct way to depend on this?",
+      "options": [
+        "Use `[[clang::musttail]]`, which guarantees the transformation and is a compile error when it cannot be applied.",
+        "Rely on `-foptimize-sibling-calls` being on at `-O2`, which makes the transformation mandatory for calls in tail position.",
+        "Rely on GCC's `musttail` attribute, which has provided the same guarantee since GCC 14 and is the portable spelling.",
+        "Mark the handlers `[[gnu::cold, gnu::noinline]]`, which forces the compiler to emit `jmp` instead of `call`."
+      ],
+      "correctIndex": 0,
+      "explanation": "`[[clang::musttail]]` is a guarantee rather than a hint — the compiler must emit the tail call or reject the program — which is exactly what a dispatch loop needs, because a debug build or a sanitizer silently disables `-foptimize-sibling-calls` and the stack then overflows. Trusting the `-O2` default is the tempting answer since it usually works; it is an optimization, not a contract. GCC still has no `musttail` equivalent as of GCC 14.",
+      "sourceAnchor": "419-tail-calls",
+      "difficulty": "trap"
+    },
+    {
+      "id": "41-q28",
+      "prompt": "A 1 GB zero-initialized static array is added to a program and the binary on disk barely grows. Why?",
+      "options": [
+        "It lands in `.bss`, which occupies no file space and is mapped from zeroed pages at load time.",
+        "It lands in `.data`, which the linker compresses because a run of zeros deduplicates to almost nothing.",
+        "It lands in `.rodata`, which is shared between processes and therefore stored only once per system.",
+        "It lands in `.tbss`, which is materialized per thread at runtime and so never appears in the file at all."
+      ],
+      "correctIndex": 0,
+      "explanation": "Zero-initialized globals go to `.bss`, which records only a size in the section header and is backed by zeroed pages at load, so the array costs address space and RAM but no file bytes. The compression explanation is the plausible trap — it correctly predicts the observed small file but attributes it to a linker transform rather than to `.bss` having no file image by definition. `.tbss` is the thread-local counterpart and applies only to `thread_local` objects.",
+      "sourceAnchor": "4110-elf-sections-and-segments",
+      "difficulty": "recall"
+    },
+    {
+      "id": "41-q29",
+      "prompt": "You strip a production binary and exceptions still propagate correctly, but `addr2line` can no longer name functions. Which sections explain this?",
+      "options": [
+        "`strip` removes `.symtab` and `.strtab` but leaves `.eh_frame`, which unwinding needs and which is therefore not strippable.",
+        "`strip` removes `.eh_frame` but leaves `.symtab`, so unwinding falls back to frame pointers while names survive.",
+        "`strip` removes the program headers but leaves the section headers, so the loader reconstructs symbols at runtime.",
+        "`strip` removes `.debug_*` and `.dynsym`, so exceptions use `.gcc_except_table` alone and names come only from the GOT."
+      ],
+      "correctIndex": 0,
+      "explanation": "`strip` deletes the full static symbol table `.symtab` and its string table, which is what address-to-name tooling reads, while `.eh_frame` and `.eh_frame_hdr` survive because C++ exception propagation depends on those CFI tables at runtime. The version claiming `.eh_frame` is removed and frame pointers take over is the tempting inversion — frame-pointer walking is a profiling mechanism, and the unwinder for exceptions has no such fallback. Section headers, not program headers, are the strippable part.",
+      "sourceAnchor": "4110-elf-sections-and-segments",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q30",
+      "prompt": "An inline function defined in a header is emitted into several object files. What keeps the link from failing with duplicate symbols?",
+      "options": [
+        "It is emitted with `WEAK` binding in a COMDAT group, so the linker keeps one copy and discards the duplicates.",
+        "It is emitted with `LOCAL` binding in each object, so each translation unit ends up with a private copy at runtime.",
+        "It is emitted with `HIDDEN` visibility, which prevents export and therefore prevents the collision from being seen.",
+        "It is emitted with `GLOBAL` binding but `NOTYPE`, so the linker treats every definition as an undefined reference."
+      ],
+      "correctIndex": 0,
+      "explanation": "Inline functions and template instantiations are emitted as weak symbols in COMDAT groups with `SHF_GROUP` sections, and the linker keeps exactly one and drops the rest — that is the link-level mechanism behind `inline`. The `LOCAL` answer is the tempting one because it would also avoid a duplicate-definition error, but it would give each TU its own copy and break the address-identity guarantee. Hidden visibility is orthogonal: it governs export, not duplicate merging.",
+      "sourceAnchor": "4111-elf-symbols-and-relocations",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q31",
+      "prompt": "A large PIE C++ binary takes hundreds of milliseconds to reach `main` before any of your code runs. Which metric should you check first, and what mitigates it?",
+      "options": [
+        "The `R_X86_64_RELATIVE` relocation count, which `DT_RELR` compresses into a bitmap to cut both size and startup time.",
+        "The `R_X86_64_JUMP_SLOT` relocation count, which `DT_RELR` compresses so PLT entries need no load-time patching.",
+        "The `R_X86_64_COPY` relocation count, which modern linkers eliminate entirely by switching data references to the GOT.",
+        "The `R_X86_64_PC32` relocation count, which the loader must apply for every intra-module call in a PIE binary."
+      ],
+      "correctIndex": 0,
+      "explanation": "`R_X86_64_RELATIVE` is the symbol-less load-base addition applied to every internal pointer — vtables and pointer-containing globals produce hundreds of thousands of them, and the dynamic linker must walk all of them before `main`, which `DT_RELR` addresses by encoding them as a bitmap. Pointing at `JUMP_SLOT` is the tempting miss: those are real load-time relocations under BIND_NOW, but they scale with imported function count, not with your data. `PC32` is resolved at static link time, never by the loader.",
+      "sourceAnchor": "4111-elf-symbols-and-relocations",
+      "difficulty": "trap"
+    },
+    {
+      "id": "41-q32",
+      "prompt": "Trace the first call to an imported function through lazy binding. What is the sequence?",
+      "options": [
+        "The PLT stub jumps via its GOT slot back into the stub, which pushes an index and reaches the resolver, which writes the address into the GOT.",
+        "The GOT stub jumps via its PLT slot back into the resolver, which rewrites the PLT stub in place with a direct jump to the target.",
+        "The call traps into the dynamic linker, which patches the original `call` instruction in `.text` to point straight at the target.",
+        "The PLT stub reads the address from `.dynsym` on every call, and the GOT caches only the containing library's load base."
+      ],
+      "correctIndex": 0,
+      "explanation": "Initially each GOT slot points back at its own PLT stub just past the jump, so the first call falls through to a push of the relocation index and a jump to `_dl_runtime_resolve`, which resolves the symbol and writes the real address into the GOT — subsequent calls are one indirect jump. The version that swaps the roles, having a GOT stub jump through a PLT slot, is the classic inversion: the PLT is code and the GOT is data. Nothing patches `.text`, which is why it can stay read-only and shared.",
+      "sourceAnchor": "4112-plt-got-and-position-independent-code",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q33",
+      "prompt": "A latency-critical process occasionally stalls for microseconds on a rarely-taken error path during a market event. Which fix targets the cause most directly?",
+      "options": [
+        "Link with `-Wl,-z,now` so every symbol is resolved at load and no first-call PLT resolution happens at runtime.",
+        "Link with `-Wl,-z,relro` alone, which makes the GOT read-only and therefore removes the need to resolve symbols lazily.",
+        "Compile with `-fPIC` instead of `-fPIE` so that global accesses go through the GOT and skip the PLT entirely.",
+        "Back the `.text` segment with 2 MB huge pages so the error path's code is never evicted from the iTLB."
+      ],
+      "correctIndex": 0,
+      "explanation": "The described stall is first-call symbol resolution — a hash lookup across every loaded object — and BIND_NOW moves all of it to load time, which is exactly why `-z now` heads the chapter's fix list. Plain `-z relro` is the tempting partial answer: it hardens the GOT but does not by itself resolve PLT entries eagerly, so the jitter remains. Choosing `-fPIC` over `-fPIE` moves in the wrong direction, adding GOT indirection that `-fPIE` can avoid.",
+      "sourceAnchor": "4112-plt-got-and-position-independent-code",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q34",
+      "prompt": "Why is position-independent code nearly free on x86-64 but expensive on 32-bit x86?",
+      "options": [
+        "x86-64 has RIP-relative addressing, so internal references are one instruction; 32-bit x86 needed a dedicated GOT register and a `call`/`pop` to learn the PC.",
+        "x86-64 resolves all relocations at load time, so PIC costs nothing at runtime; 32-bit x86 resolved them lazily on every access.",
+        "x86-64 has sixteen general registers, so the GOT base register costs nothing; 32-bit x86 had to reload the GOT base before each access.",
+        "x86-64 maps the GOT into the text segment, so accesses hit the instruction cache; 32-bit x86 kept it in a separate data page."
+      ],
+      "correctIndex": 0,
+      "explanation": "RIP-relative addressing lets a module-internal global be reached with a single `mov eax, [rip+disp]` needing no load-time relocation at all, whereas 32-bit x86 had no PC-relative data addressing and had to burn `ebx` on the GOT base plus a `call`/`pop` sequence to discover the program counter. The register-count answer is the tempting near-miss — the extra registers help generally, but the decisive change is that x86-64 usually needs no GOT base register for internal references in the first place.",
+      "sourceAnchor": "4112-plt-got-and-position-independent-code",
+      "difficulty": "recall"
+    },
+    {
+      "id": "41-q35",
+      "prompt": "You build on a host with glibc 2.35 and deploy to a host with glibc 2.31. What happens and why?",
+      "options": [
+        "It fails with a missing-version error, because symbol versioning records the newer versions the binary was linked against.",
+        "It runs, because glibc's symbol versioning is designed to let a newer-built binary fall back to older symbol versions.",
+        "It fails only if the binary is dynamically linked to C++ libraries, since glibc itself versions only its C entry points.",
+        "It runs but with degraded behavior, because unresolved versioned symbols bind weakly and resolve to zero at load."
+      ],
+      "correctIndex": 0,
+      "explanation": "Versioning makes each reference name a specific version such as `memcpy@GLIBC_2.14`, so a binary linked against newer definitions asks the old runtime for versions it does not have and dies with the familiar missing-version message; the reverse direction, old binary on newer glibc, generally works. The fallback answer inverts the guarantee — versioning exists so old *binaries* keep old behavior, not so new binaries degrade gracefully. Build on the oldest supported target or use a sysroot.",
+      "sourceAnchor": "4113-dynamic-linking",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q36",
+      "prompt": "Why does `LD_PRELOAD` succeed in replacing libc's `malloc` process-wide?",
+      "options": [
+        "Symbol lookup is breadth-first in load order and the first definition wins, and the preloaded object is placed first.",
+        "The preloaded object's symbols are marked `PROTECTED`, which gives them precedence over any later definition.",
+        "The dynamic linker rewrites libc's `.text` so its internal calls are redirected to the preloaded implementation.",
+        "Depth-first lookup reaches the deepest dependency first, and preloaded objects are appended after all libraries."
+      ],
+      "correctIndex": 0,
+      "explanation": "Resolution walks the loaded objects breadth-first and stops at the first definition of a name, and `LD_PRELOAD` inserts its object at the front of that order — so its `malloc` wins for every reference resolved afterwards. This same first-wins rule is why two libraries defining the same symbol silently pick one. The depth-first description reverses both the traversal and the preload position, and `PROTECTED` visibility makes a symbol non-interposable, which is the opposite of what preloading needs.",
+      "sourceAnchor": "4113-dynamic-linking",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q37",
+      "prompt": "A 400 MB binary needs its size attributed to the code that caused it. Which tool is the right first call?",
+      "options": [
+        "`bloaty -d compileunits,symbols`, which attributes binary size to compile units, symbols, and sections.",
+        "`readelf -rW`, which lists relocations and therefore attributes bytes to the symbols that required them.",
+        "`pahole -C`, which reports struct layout and holes and therefore accounts for the binary's data growth.",
+        "`llvm-mca`, which models throughput for a code block and reports the byte cost of each emitted instruction."
+      ],
+      "correctIndex": 0,
+      "explanation": "`bloaty` exists precisely to answer \"why is the binary this big\", breaking size down by compile unit, symbol, or section, and it is the chapter's canonical workflow for that question; `size -A` gives the coarser per-section view. `pahole` is the tempting alternative because it also reports sizes, but it describes struct layout and padding in memory, not the on-disk composition of the binary. `llvm-mca` models execution port pressure and says nothing about size.",
+      "sourceAnchor": "4114-binary-inspection-tools",
+      "difficulty": "recall"
+    },
+    {
+      "id": "41-q38",
+      "prompt": "Why does building production with `-O2 -g` cost nothing at runtime?",
+      "options": [
+        "DWARF lives in non-`SHF_ALLOC` sections, so it is never mapped into memory during execution — only disk and link time grow.",
+        "The `-g` flag is ignored at `-O2` because optimization invalidates line tables, so no debug data is emitted at all.",
+        "DWARF sections are mapped lazily, so their pages are faulted in only when a debugger actually attaches to the process.",
+        "The loader strips `.debug_*` sections while building the process image, so they exist only in the on-disk file."
+      ],
+      "correctIndex": 0,
+      "explanation": "`.debug_*` sections lack the `SHF_ALLOC` flag, so no `PT_LOAD` segment covers them and they are never part of the running image — the cost is entirely disk footprint and link time, which is why shipping stripped binaries with no archived debug info is a false economy. The lazy-mapping answer is the plausible trap: it reaches the right conclusion about runtime cost by a mechanism that does not exist, and it would wrongly imply the pages are in the address space at all.",
+      "sourceAnchor": "4115-debug-information-and-symbolization",
+      "difficulty": "recall"
+    },
+    {
+      "id": "41-q39",
+      "prompt": "A crash handler must record enough to symbolize a fault in an optimized, stripped production binary. What is the safest pattern?",
+      "options": [
+        "Record raw addresses plus the build ID and symbolize offline, since symbolization inside a signal handler is not async-signal-safe.",
+        "Call `backtrace_symbols()` in the handler, since it resolves names without allocating and covers static symbols too.",
+        "Ship unstripped binaries and call `addr2line` from the handler, since resolving in-process avoids any build-matching problem.",
+        "Record the return addresses only, since the build ID changes on every relink and cannot be matched to a debug file."
+      ],
+      "correctIndex": 0,
+      "explanation": "Symbolizing in a signal handler allocates and takes locks, neither of which is async-signal-safe, so the robust practice is to log raw addresses together with the `.note.gnu.build-id` value and resolve later against the archived debug file for that exact build. The `backtrace_symbols()` answer is the tempting one because it is the obvious API, but it does allocate and it sees only dynamic symbols. The build ID changing per build is the feature, not a problem — that is what makes the match exact.",
+      "sourceAnchor": "4115-debug-information-and-symbolization",
+      "difficulty": "application"
+    },
+    {
+      "id": "41-q40",
+      "prompt": "`perf report` on a production service shows stacks only one or two frames deep. What is the most likely cause and fix?",
+      "options": [
+        "Frame pointers are omitted while sampling used `--call-graph fp`; rebuild with `-fno-omit-frame-pointer` for roughly a 1-2% cost.",
+        "Frame pointers are present but `--call-graph dwarf` was used, so `.eh_frame` parsing truncated the walk at the first frame.",
+        "The `.eh_frame` section was removed by `strip`, so no unwind information survives; rebuild without stripping the binary.",
+        "The kernel's ORC unwinder was used on user-space frames, so only the entry frame resolves; switch to `--call-graph lbr`."
+      ],
+      "correctIndex": 0,
+      "explanation": "Frame-pointer sampling follows the `rbp` chain, so if the binary was built with `rbp` omitted the walk stops almost immediately — truncated stacks under `--call-graph fp` are the textbook signature, and the fix costs about 1-2% on x86-64's sixteen-register file. The `--call-graph dwarf` explanation is the tempting one; DWARF unwinding produces correct but slow and disk-heavy sampling, not truncation. `.eh_frame` survives `strip` because exceptions need it.",
+      "sourceAnchor": "4116-stack-unwinding-and-frame-pointers",
+      "difficulty": "application"
+    }
+  ]
+}

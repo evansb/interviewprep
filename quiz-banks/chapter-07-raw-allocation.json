@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-07-raw-allocation",
+  "questions": [
+    {
+      "id": "7-q01",
+      "prompt": "A new-expression `new T(args)` decomposes into which two steps, and which of them can you replace?",
+      "options": [
+        "A call to the allocation function `operator new(size_t)` for raw storage, then construction in that storage; only the allocation function is replaceable.",
+        "A call to `malloc` for raw storage, then construction in that storage; only the `malloc` call is replaceable, via `LD_PRELOAD`.",
+        "Construction of a temporary `T`, then a copy of it into freshly obtained storage; neither step is replaceable by user code.",
+        "A call to the constructor, which itself calls `operator new` for its own storage; both steps are replaceable per class."
+      ],
+      "correctIndex": 0,
+      "explanation": "The new-expression is language syntax you cannot redefine; the allocation function it calls is an ordinary function you can replace or overload. The `malloc` answer is tempting because the default `operator new` does go to `malloc` on glibc, but that is an implementation detail one layer down — the standard hook is `operator new`, not `malloc`. Construction happens in place, exactly as placement new does; no temporary is created and copied.",
+      "sourceAnchor": "71-new-and-delete",
+      "difficulty": "recall"
+    },
+    {
+      "id": "7-q02",
+      "prompt": "`int* a = new int; int* b = new int();` — what is the difference?",
+      "options": [
+        "`a` points to an indeterminate value (default-initialization) while `b` points to zero (value-initialization).",
+        "`b` points to an indeterminate value, since the empty parens suppress the implicit zeroing that `new int` performs.",
+        "There is no difference for a scalar type; both forms zero-initialize the object since C++11.",
+        "`a` is zero because raw pages from the kernel are zero, while `b` is zero because of value-initialization."
+      ],
+      "correctIndex": 0,
+      "explanation": "The parentheses select value-initialization, which zeroes a scalar; bare `new int` is default-initialization, which for a trivial type leaves the value indeterminate. The reversed-direction option is the classic half-remembered version. The 'kernel pages are zero' answer confuses `calloc`'s optimization with language semantics — recycled heap memory holds old bytes, and reading it is UB regardless.",
+      "sourceAnchor": "71-new-and-delete",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q03",
+      "prompt": "You give a class a member `operator new` but no matching member `operator delete`. A constructor of that class then throws. What is the consequence?",
+      "options": [
+        "The storage leaks, because the runtime has no matching deallocation function to call on the unwind path.",
+        "The object is destroyed and the storage released normally, since the compiler falls back to the global `operator delete`.",
+        "The program calls `std::terminate`, because a throwing constructor with a custom allocation function is ill-formed.",
+        "Nothing is leaked: the constructor's own stack unwinding returns the block to the class pool automatically."
+      ],
+      "correctIndex": 0,
+      "explanation": "When a constructor throws inside a new-expression the runtime automatically calls the *matching* deallocation function, so `new T` normally cannot leak storage — the matching function must exist and be accessible for that to work. The global-fallback answer is the tempting one: name lookup for the deallocation function is done in class scope, so it does not silently reach past the class, and compilers warn about exactly this pairing.",
+      "sourceAnchor": "71-new-and-delete",
+      "difficulty": "trap"
+    },
+    {
+      "id": "7-q04",
+      "prompt": "Which statement about the cost of `new`/`delete` on a latency-sensitive path is accurate?",
+      "options": [
+        "The mean is often fine (a tcache hit is ~15-30 ns); the problem is variance from arena locks, `brk`/`mmap` syscalls, and first-touch page faults.",
+        "The mean is the problem: a typical small allocation costs several microseconds even on the fast path because of chunk-header bookkeeping.",
+        "Both mean and variance are low; the real cost is entirely the constructor, since `operator new` is a lock-free pointer bump.",
+        "`delete` is essentially free because it only writes a pointer, whereas `new` must search bins and coalesce neighbours."
+      ],
+      "correctIndex": 0,
+      "explanation": "The fast path is genuinely cheap — a thread-local free-list pop — so what kills low-latency code is the tail: arena mutex contention, heap growth via syscall, and microsecond page faults on first touch. The 'delete is free' option inverts reality: `delete` must load the chunk header immediately before the pointer (usually a cache miss on a long-lived object), may coalesce, and may `munmap`, which costs a syscall plus a TLB shootdown.",
+      "sourceAnchor": "71-new-and-delete",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q05",
+      "prompt": "Under the Itanium ABI, when does `new T[n]` request strictly more than `n * sizeof(T)` bytes?",
+      "options": [
+        "When `T` has a non-trivial destructor, so an array cookie holding `n` must be stored ahead of the returned pointer.",
+        "When `T` has a non-trivial constructor, so the count must be recorded for the exception-unwinding path.",
+        "Always, since every array allocation carries a cookie recording both the element count and `sizeof(T)`.",
+        "When `n` is not known at compile time, since a constant-sized array can have its count baked into the code."
+      ],
+      "correctIndex": 0,
+      "explanation": "The cookie exists so `delete[]` knows how many destructors to run, so it is needed exactly when the destructor is non-trivial — `new int[n]` really is `n*4` bytes on that ABI. The 'non-trivial constructor' variant is the near-miss: partial-construction unwinding is handled without a persistent cookie. 'Always' is the MSVC-flavoured intuition; the standard leaves it to the ABI, and Itanium omits it for trivially destructible types.",
+      "sourceAnchor": "72-array-new-and-delete",
+      "difficulty": "recall"
+    },
+    {
+      "id": "7-q06",
+      "prompt": "`Foo* q = new Foo[10]; delete q;` where `Foo` has a non-trivial destructor. Why is this heap corruption rather than merely a leak of nine objects?",
+      "options": [
+        "The pointer you hold is offset past the cookie, so `operator delete` receives an address the allocator never handed out.",
+        "`operator delete` and `operator delete[]` are backed by different heaps, so the block is returned to the wrong arena's free list.",
+        "`delete` runs one destructor and then frees only the first element's bytes, leaving the remaining nine slots permanently reserved.",
+        "The single destructor call writes a vtable pointer over the cookie field, which the allocator later reads as a chunk size."
+      ],
+      "correctIndex": 0,
+      "explanation": "The cookie sits ahead of the pointer you were given, so the true allocation start is lower; handing the offset pointer to `operator delete` makes the allocator interpret user bytes as chunk metadata. The 'only frees the first element' option is the intuitive leak story and is wrong — nothing in `operator delete` knows about elements, and free is not partial. Different heaps is also wrong: both usually route to the same `malloc`.",
+      "sourceAnchor": "72-array-new-and-delete",
+      "difficulty": "trap"
+    },
+    {
+      "id": "7-q07",
+      "prompt": "You need a large owned I/O buffer and reach for `std::make_unique<char[]>(n)`. What hidden cost does that carry, and what is the C++20 fix?",
+      "options": [
+        "It value-initializes every element, touching every page; `std::make_unique_for_overwrite<char[]>(n)` skips the zeroing.",
+        "It allocates with an array cookie for `char`, wasting a size_t per buffer; `std::make_unique_for_overwrite<char[]>(n)` drops the cookie.",
+        "It calls `operator new` rather than `operator new[]`, so `delete[]` mismatches; `std::make_unique_for_overwrite<char[]>(n)` fixes the pairing.",
+        "It default-initializes the buffer, so reading it is UB; `std::make_unique_for_overwrite<char[]>(n)` value-initializes it safely."
+      ],
+      "correctIndex": 0,
+      "explanation": "`make_unique` for arrays value-initializes, which means writing zeros over the whole buffer and faulting in every page — a multi-millisecond surprise on a large allocation. `make_unique_for_overwrite` default-initializes instead, leaving the bytes indeterminate, which is fine for a buffer you are about to fill from a socket. The 'the buffer is default-initialized, so reading it is UB' answer reverses which function does which initialization; the cookie option is irrelevant since `char` is trivially destructible and gets no cookie.",
+      "sourceAnchor": "72-array-new-and-delete",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q08",
+      "prompt": "You define `void* operator new(std::size_t)` and `void operator delete(void*) noexcept` at global scope in one .cpp of your program. What happens?",
+      "options": [
+        "They replace the library's versions program-wide; no header or opt-in is needed, since these are replaceable functions with an ODR dispensation.",
+        "They overload the library's versions, and calls resolve to yours only in translation units that declare them first.",
+        "The program is ill-formed by ODR, since two definitions of the same non-inline function now exist in the program.",
+        "They are used only for explicit `::operator new(n)` calls; new-expressions keep calling the library's internal versions."
+      ],
+      "correctIndex": 0,
+      "explanation": "Global allocation functions are *replaceable*, not overloadable: the linker simply resolves to yours, which is exactly how tcmalloc and jemalloc integrate when statically linked. The 'ODR violation' answer sounds principled and is the common wrong instinct — the standard carves out a specific exception for this family. Nothing is per-TU either; there is one definition for the whole program.",
+      "sourceAnchor": "73-overloading-allocation-functions",
+      "difficulty": "recall"
+    },
+    {
+      "id": "7-q09",
+      "prompt": "A class-scope `operator delete` is defined on `Base`, and `Derived` is allocated with `new Derived` but freed through `Base* p; delete p;`. What must be true for the right deallocation to happen?",
+      "options": [
+        "`Base` must have a virtual destructor, otherwise lookup uses the static type and passes `sizeof(Base)` to `Base::operator delete`.",
+        "`Derived` must redeclare `operator delete`, since class-scope allocation functions are not inherited by derived classes.",
+        "`Base::operator delete` must be declared non-static, so that `this` carries the dynamic type at the point of deallocation.",
+        "The deallocation function must be the sized form, since only that overload receives the runtime size of the complete object."
+      ],
+      "correctIndex": 0,
+      "explanation": "Deallocation-function lookup for `delete p` uses the dynamic type only when the destructor is virtual; without it you get `Base::operator delete` and a wrong size, which is fatal for a size-classed pool. The 'non-static' option is impossible — class-scope allocation functions are implicitly static, since they run before construction and after destruction, so there is no `this`. Class-scope operators are inherited normally.",
+      "sourceAnchor": "73-overloading-allocation-functions",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q10",
+      "prompt": "Pre-C++17, `struct alignas(64) Line { std::atomic<uint64_t> v; }; Line* p = new Line;` — what was wrong, and what changed?",
+      "options": [
+        "`new` guaranteed only `alignof(std::max_align_t)`, so the alignment was silently ignored; C++17 routes over-aligned types to `operator new(size_t, align_val_t)`.",
+        "`new` refused to compile for over-aligned types; C++17 made it compile by silently rounding the request up to the next power of two.",
+        "`new` honoured the alignment but not the size, allocating only `sizeof(atomic<uint64_t>)`; C++17 fixed the size computation.",
+        "`new` was fine; what changed in C++17 is that `alignas(64)` on a class member became legal in the first place."
+      ],
+      "correctIndex": 0,
+      "explanation": "The pre-C++17 guarantee was fundamental alignment only (16 on x86-64 SysV), so an over-aligned object came back misaligned and misuse showed up later as a SIMD fault or a split lock. C++17 changed overload selection so the compiler emits the `align_val_t` call automatically when `alignof(T) > __STDCPP_DEFAULT_NEW_ALIGNMENT__`; your source does not change. The 'refused to compile' option is wrong precisely because the failure was silent, which is what made it dangerous.",
+      "sourceAnchor": "74-aligned-allocation",
+      "difficulty": "recall"
+    },
+    {
+      "id": "7-q11",
+      "prompt": "Which call is the portability trap that the chapter singles out as a standard interview probe?",
+      "options": [
+        "`aligned_alloc(64, 100)` — the size must be a multiple of the alignment under the C11 rule.",
+        "`posix_memalign(&p, 64, 100)` — the size must be a multiple of the alignment, and the block needs `_aligned_free`.",
+        "`operator new(100, std::align_val_t{64})` — over-aligned new-expressions may not be paired with a sized delete.",
+        "`std::align(64, 100, p, sz)` — it fails whenever the requested size is not a multiple of the alignment."
+      ],
+      "correctIndex": 0,
+      "explanation": "`aligned_alloc` requires `size` to be a multiple of `align` (relaxed only in C23, so assume the strict rule), making a 100-byte request at 64-byte alignment non-conforming. `posix_memalign` is the near-miss: it constrains the *alignment* (power of two and a multiple of `sizeof(void*)`) but not the size, and its blocks go to plain `free` — `_aligned_free` belongs to MSVC's `_aligned_malloc`. `std::align` merely advances a pointer inside a block you already own.",
+      "sourceAnchor": "74-aligned-allocation",
+      "difficulty": "trap"
+    },
+    {
+      "id": "7-q12",
+      "prompt": "Beyond raw correctness, why does the chapter call aligned allocation a system-stability requirement rather than an optimization?",
+      "options": [
+        "A misaligned atomic RMW on x86 asserts a bus lock — a split lock that stalls every core on the machine for microseconds.",
+        "A misaligned load costs roughly double when it straddles a cache line, which compounds across a hot loop into a measurable regression.",
+        "Misaligned allocations defeat `MADV_HUGEPAGE`, so an arena silently falls back to 4 KB pages and loses TLB reach.",
+        "Misaligned per-thread counters share a cache line, so every increment invalidates the line in the other cores' caches."
+      ],
+      "correctIndex": 0,
+      "explanation": "A split lock is a whole-machine event: the core asserts a bus lock and every other core stalls, which is a different category of problem from a local slowdown. The cache-line-straddle and false-sharing options are both real effects from the same section, but they are performance costs confined to the offending code — that is exactly the 'optimization' framing the question contrasts against. Huge-page alignment is a separate concern in §7.14.",
+      "sourceAnchor": "74-aligned-allocation",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q13",
+      "prompt": "A benchmark `calloc`s a 1 GB buffer and reports 20 ns. What has it actually measured?",
+      "options": [
+        "Almost nothing: the kernel's fresh anonymous pages are already zero, so the zeroing is skipped and the real cost is deferred to a page fault per 4 KB on first touch.",
+        "The real cost: for large requests `calloc` is genuinely O(1) because the allocator records a zero flag and clears bytes lazily as they are read.",
+        "A `memset` of 1 GB running at memory bandwidth, which is roughly the right order of magnitude for a modern server.",
+        "The `mmap` syscall plus the overflow-checked multiply, which together dominate and are correctly reported by the benchmark."
+      ],
+      "correctIndex": 0,
+      "explanation": "`calloc` is not `malloc` + `memset`: for large requests the allocator takes fresh pages from `mmap`, which the kernel guarantees are zero, so it can return without writing anything. The cost has not disappeared, it has moved to one fault per page on first touch — which is why `calloc` plus prefault (`MAP_POPULATE` or a touch loop) is the low-latency pattern. The 'lazy zero flag' answer invents allocator machinery that does not exist; the laziness lives in the kernel's page fault path.",
+      "sourceAnchor": "75-malloc-calloc-realloc-and-free",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q14",
+      "prompt": "Why can't `std::vector` grow its buffer with `realloc`?",
+      "options": [
+        "`realloc` may relocate by `memcpy`, which is only valid for trivially copyable types, whereas `vector` must run move constructors.",
+        "`realloc` may return null on failure, and `vector` must provide the strong exception guarantee, which a null return cannot express.",
+        "`realloc` pairs with `free`, and mixing it with the storage that `operator new` produced would be undefined behaviour by itself.",
+        "`realloc` cannot honour an over-aligned element type, so `vector<alignas(64) T>` would come back misaligned."
+      ],
+      "correctIndex": 0,
+      "explanation": "A byte-wise copy silently breaks any type with self-pointers or registration in an external structure, so `vector` is obliged to move-construct into the new buffer element by element. The trivial-relocatability work (P2786) is precisely the machinery that would let it use the cheaper path. The allocator-mismatch answer is a real rule but not the reason: a `vector` with a custom allocator could legitimately use `realloc` on `malloc`ed storage and the move-constructor problem would still stand.",
+      "sourceAnchor": "75-malloc-calloc-realloc-and-free",
+      "difficulty": "recall"
+    },
+    {
+      "id": "7-q15",
+      "prompt": "In glibc's allocator, where is the latency cliff on the small-allocation path?",
+      "options": [
+        "Past 7 chunks in a tcache size class, allocation falls back to the arena, which takes a mutex instead of a lock-free thread-local pop.",
+        "Past the 64th tcache size class, allocation falls back to `mmap`, which costs a syscall and later a TLB shootdown on free.",
+        "Past `M_TRIM_THRESHOLD` bytes of free heap, `malloc` must first return memory via `brk` before it can satisfy the request.",
+        "Past the first allocation on a thread, the thread is bound to an arena permanently, so every later small allocation contends."
+      ],
+      "correctIndex": 0,
+      "explanation": "tcache holds 7 chunks in each of 64 classes ≤1032 B and is a per-thread array pop at ~15 ns with no atomic; overflowing a class drops you to the shared arena and its mutex, which is the cliff. The arena-stickiness option is a real glibc behaviour but has the opposite effect: sticky assignment *bounds* contention (at the cost of memory blowup), rather than causing it on every allocation. The `mmap` path is chosen by size against `M_MMAP_THRESHOLD`, not by tcache class count.",
+      "sourceAnchor": "75-malloc-calloc-realloc-and-free",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q16",
+      "prompt": "A `new_handler` is installed that logs the failure and returns. What does the throwing `operator new` do next?",
+      "options": [
+        "It retries the allocation and calls the handler again, looping forever, since the handler freed nothing and installed no replacement.",
+        "It throws `std::bad_alloc`, because a handler that returns without freeing memory is treated as declining to handle the failure.",
+        "It returns null to the new-expression, which then skips construction and yields a null pointer to the caller.",
+        "It calls `std::terminate`, because the standard requires a handler to free memory, replace itself, or abort."
+      ],
+      "correctIndex": 0,
+      "explanation": "The allocation function loops: allocate, on failure call the handler, repeat — so a handler that returns without changing anything spins forever. The `bad_alloc` answer is the intuitive one but that only happens when *no* handler is installed. The standard states the handler must make memory available, install a different handler, abort/exit, or throw; violating that is a program bug producing the loop, not an automatic `terminate`.",
+      "sourceAnchor": "76-allocation-failure-handling",
+      "difficulty": "trap"
+    },
+    {
+      "id": "7-q17",
+      "prompt": "What does `new (std::nothrow) T` actually guarantee?",
+      "options": [
+        "Only that allocation failure yields null rather than `bad_alloc`; the new-handler loop still runs first, and a throwing constructor still propagates.",
+        "That the expression never throws and never blocks, since the nothrow overload bypasses the new-handler and returns null immediately.",
+        "That the expression never throws, because a constructor exception is converted into a null return by the nothrow deallocation function.",
+        "That allocation failure yields null and the object is still default-constructed in a zero-filled block for safety."
+      ],
+      "correctIndex": 0,
+      "explanation": "`nothrow` changes only how allocation failure is reported; it does not mean fail-fast, because the handler loop runs exactly as it does for the throwing form, and it says nothing about `T`'s constructor. The 'never throws at all' options are the standard misreading — the name promises more than the overload delivers. Note also that on a null return the new-expression skips construction entirely, so the null check is mandatory.",
+      "sourceAnchor": "76-allocation-failure-handling",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q18",
+      "prompt": "On a 64-bit Linux server with default overcommit, you catch `std::bad_alloc`. What should you conclude?",
+      "options": [
+        "Most likely a bogus size — an unvalidated length field or an overflowed size computation — since genuine exhaustion arrives as a SIGKILL from the OOM killer.",
+        "That physical memory is genuinely exhausted, and the correct response is to release caches and retry the allocation.",
+        "That the process hit its `RLIMIT_AS`, since that is the only mechanism by which Linux ever makes an allocation fail.",
+        "That the new-handler chain was exhausted after each handler declined, which is the normal path under memory pressure."
+      ],
+      "correctIndex": 0,
+      "explanation": "Overcommit means `mmap`/`brk` succeed against address space rather than physical memory, so real exhaustion surfaces later as an unsatisfiable page fault and a `SIGKILL` — your handler never runs and the catch block is dead code. Treat `bad_alloc` as a bug indicator. `RLIMIT_AS` and cgroup limits do make failure deterministic, which is why they are the recommended defense, but they are not the only way to get a null back — a wildly bogus size fails on its own.",
+      "sourceAnchor": "76-allocation-failure-handling",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q19",
+      "prompt": "What do you gain and give up with a bump/arena allocator relative to a general-purpose one?",
+      "options": [
+        "Gain 2-5 ns predictable allocation, contiguous allocation-order layout, no per-object header, and O(1) bulk release; give up individual deallocation and destructor execution.",
+        "Gain 2-5 ns predictable allocation and individual O(1) deallocation; give up the ability to serve more than one object size from a single region.",
+        "Gain immunity to both internal and external fragmentation; give up thread safety, since the cursor must be updated under a mutex on every call.",
+        "Gain contiguous layout and automatic destructor execution on reset; give up the ability to grow beyond the initial block."
+      ],
+      "correctIndex": 0,
+      "explanation": "Allocation is an add, a mask, a compare, and a store, and objects land contiguously in allocation order — ideal for a sequential prefetch stream. The price is that memory is reclaimed only in bulk, so lifetimes must be phase-structured. The 'automatic destructors on reset' option is the dangerous misconception: a bump allocator that resets its cursor never runs a destructor, which is why the right default is to `static_assert` that arena types are trivially destructible.",
+      "sourceAnchor": "77-arena-and-bump-allocators",
+      "difficulty": "recall"
+    },
+    {
+      "id": "7-q20",
+      "prompt": "Your per-tick arena is sized to a guess and configured to chain a new upstream block when it fills. Why does the chapter treat that as a hot-path hazard?",
+      "options": [
+        "The first allocation after exhaustion is a `malloc` and possibly a page fault — precisely the tail-latency event the arena existed to eliminate.",
+        "Chained blocks are not contiguous with the first, so a traversal in allocation order degenerates into a linked-list pointer chase across all blocks.",
+        "Chaining makes `reset()` O(number of blocks) rather than O(1), so the per-tick teardown cost grows without bound over a session.",
+        "Each chained block is geometrically larger, so RSS doubles on every exhaustion and the process is eventually OOM-killed."
+      ],
+      "correctIndex": 0,
+      "explanation": "Chaining trades determinism for convenience: the moment you exhaust the block you are back in the general allocator, taking exactly the syscall-and-fault spike you built the arena to avoid. The prescription is to size the initial block from measured worst case and assert on overflow in test builds. The locality answer is a genuine secondary effect but only bites on the boundary between blocks; within each block layout is still contiguous.",
+      "sourceAnchor": "77-arena-and-bump-allocators",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q21",
+      "prompt": "What does a stack allocator add over a plain bump allocator?",
+      "options": [
+        "A marker/scope discipline: you may deallocate, but only in reverse order, by restoring a saved cursor value.",
+        "Per-object deallocation in any order, implemented by threading a free list through the released regions.",
+        "Storage on the real call stack via a stack-pointer adjustment, so the region dies automatically at function exit.",
+        "Automatic destructor execution, because the RAII scope object records a thunk for every object allocated within it."
+      ],
+      "correctIndex": 0,
+      "explanation": "A stack allocator is an arena with LIFO release: `mark()` saves the cursor and `release(m)` pops everything after it, usually wrapped in an RAII `Scope`. The 'real call stack' option describes `alloca`, which is discussed in the same section and is a different mechanism with different hazards. The RAII scope in the chapter restores a cursor; it does not record or run destructors.",
+      "sourceAnchor": "78-stack-allocators",
+      "difficulty": "recall"
+    },
+    {
+      "id": "7-q22",
+      "prompt": "Why is a large `alloca(n)` with attacker-influenced `n` a security problem and not just a crash risk?",
+      "options": [
+        "There is no failure indication, and a large enough `n` can skip past the single guard page entirely and land in other valid memory.",
+        "There is no failure indication, so `alloca` returns null and the subsequent write dereferences it, which is a reliably exploitable null write.",
+        "`alloca` memory is not zeroed, so the callee reads stale frame contents from earlier calls, disclosing whatever was on the stack.",
+        "`alloca` inside a loop accumulates until function exit, so a bounded loop can still exhaust the stack over many iterations."
+      ],
+      "correctIndex": 0,
+      "explanation": "Guard pages are one page by default, so a sufficiently large stack-pointer adjustment jumps over the guard and the first write corrupts unrelated memory — the stack-clash class, which `-fstack-clash-protection` closes with probing code. The 'returns null' option is wrong in the way that matters: `alloca` has no error path at all, which is precisely why it is unsafe. Loop accumulation and non-zeroed memory are real properties but are reliability and hygiene issues, not the clash.",
+      "sourceAnchor": "78-stack-allocators",
+      "difficulty": "trap"
+    },
+    {
+      "id": "7-q23",
+      "prompt": "A free list is two loads and a store per allocation, yet it often underperforms its instruction count. Why?",
+      "options": [
+        "Reading `next` is a dependent load into a block nothing has touched, so a shuffled list produces a cache miss per allocation on the critical path.",
+        "The `next` pointer stored in each free block adds 8 bytes of per-object overhead, inflating the working set beyond what fits in cache.",
+        "Pushing to the head means the next allocation returns the coldest block, so every allocation starts with a compulsory miss.",
+        "Each pop must be a compare-and-swap on the head pointer, so the loop retries whenever another thread touches the list concurrently."
+      ],
+      "correctIndex": 0,
+      "explanation": "The `next` pointer lives inside the free block itself, so allocation must dereference cold memory, and the *next* allocation depends on that load — the miss cannot be hidden. The overhead option gets the mechanism backwards: threading the list through free blocks is exactly why a free list has zero space overhead while in use. LIFO push returns the most recently freed, i.e. the *hottest*, block; FIFO is the variant that is measurably worse.",
+      "sourceAnchor": "79-free-list-and-slab-allocators",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q24",
+      "prompt": "What problem does cache coloring in a slab allocator solve?",
+      "options": [
+        "Objects at the same index in different slabs would map to the same cache set, so a hot field at a fixed offset causes conflict misses.",
+        "Objects in different slabs would share a cache line across threads, so writes from two cores would ping-pong the line between caches.",
+        "Slabs allocated at page granularity would all start on a page boundary, so the allocator's own metadata would collide in the TLB.",
+        "Objects of different size classes would interleave within a slab, so a scan for a free slot would touch many lines to find one."
+      ],
+      "correctIndex": 0,
+      "explanation": "Successive slabs offset their first object by a different multiple of the cache-line size, so equally-indexed objects across slabs land in different sets — otherwise a field at a fixed offset in many hot objects hammers one set and evicts itself. The false-sharing option is the tempting neighbour: that is a cross-core coherence problem fixed by `alignas(64)` padding, not by coloring, which is about set-index distribution within one core's cache.",
+      "sourceAnchor": "79-free-list-and-slab-allocators",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q25",
+      "prompt": "In the chapter's `Pool<T, N>`, why is the free list built by iterating `for (i = N; i-- > 0; )` rather than forward?",
+      "options": [
+        "Pushing slots in descending index order leaves the head at the lowest address, so the first N allocations walk memory sequentially and prefetch well.",
+        "Pushing in descending order guarantees the list is in death order, which keeps recently used slots hot in cache across pool cycles.",
+        "Forward iteration would write the `next` pointer of slot i before slot i exists, so descending order is required for correctness.",
+        "Descending order makes exhaustion deterministic, since the allocator can compare the head pointer against the storage base."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each iteration pushes onto the head, so building from the highest index down leaves the list in ascending address order and the first N `create()` calls return sequential addresses — a clean prefetch stream. Death order is what the list degrades into *after* a workload, and it is effectively random; that option inverts the goal. Forward iteration would build a valid list too, just a badly ordered one, so this is a locality choice and not a correctness one.",
+      "sourceAnchor": "710-object-pools",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q26",
+      "prompt": "Your object pool is exhausted at peak. Which behaviour matches the chapter's low-latency guidance, and what is the hard case to raise unprompted?",
+      "options": [
+        "Return null or throw so exhaustion is deterministic; the hard case is allocate-on-thread-A / free-on-thread-B, best solved with per-thread pools and an MPSC return path.",
+        "Fall back to `new` so the request always succeeds; the hard case is the ABA problem, best solved by taking a mutex around the free-list head.",
+        "Grow the pool by chaining a second slab from the upstream allocator; the hard case is destructor ordering, best solved by resetting objects rather than destroying them.",
+        "Block the caller until a slot is released; the hard case is priority inversion, best solved by pinning all pool users to one core."
+      ],
+      "correctIndex": 0,
+      "explanation": "Deterministic exhaustion is the entire point: a pool that silently falls back to `new` reintroduces exactly the tail latency it was built to remove, so you size from the measured worst case and alarm on the high-water mark. Cross-thread free is the genuinely hard part, and per-thread pools with a return queue beat both a mutex (defeats the purpose) and a lock-free stack (which needs tagged pointers for ABA). The fallback option pairs the wrong policy with a real-but-misapplied concurrency fact.",
+      "sourceAnchor": "710-object-pools",
+      "difficulty": "trap"
+    },
+    {
+      "id": "7-q27",
+      "prompt": "For a fixed-size block allocator holding network buffers, what is the bitmap's decisive advantage over an in-block free list on a latency path?",
+      "options": [
+        "Freeing clears an out-of-band bit, so a cold freed buffer is never pulled into cache; it also detects double frees and can find contiguous runs.",
+        "Allocation is O(1) rather than O(n/64), because a single `TZCNT` finds a free block without any scan or hint structure.",
+        "Metadata lives inside the block, so the allocator's own working set is one bit per block and never competes with user data for cache.",
+        "It eliminates internal fragmentation, because a bitmap can describe blocks of any size rather than a fixed size class."
+      ],
+      "correctIndex": 0,
+      "explanation": "The free-list `free` writes a `next` pointer into the block, dragging a possibly cold buffer into cache; clearing a bit in an out-of-band word does not touch the block at all. Double-free detection (the bit is already clear) and multi-block runs come along for free. The O(1) option has the comparison backwards: the free list is the O(1) pop and the bitmap is the one that scans, made cheap by `countr_zero` and a two-level summary rather than made unnecessary.",
+      "sourceAnchor": "711-fixed-size-block-allocators",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q28",
+      "prompt": "Which allocator does the chapter single out for its per-page thread-free list as a direct answer to producer-allocates/consumer-frees pipelines?",
+      "options": [
+        "mimalloc, which pushes a cross-thread free atomically onto a separate thread-free list belonging to the block's page.",
+        "jemalloc, whose extent-based arenas and decay purging give it the best fragmentation behaviour of the four.",
+        "tcmalloc, whose per-CPU caches return cross-thread frees to a central free list without a per-page structure.",
+        "glibc ptmalloc2, whose tcache absorbs a cross-thread free into the freeing thread's own per-thread cache."
+      ],
+      "correctIndex": 0,
+      "explanation": "Cross-thread free is the discriminator between general allocators, and mimalloc's per-page thread-free list with an atomic push is the design built specifically for it — the exact shape of a feed handler. jemalloc's distinction is fragmentation and profiling, tcmalloc's is raw speed via per-CPU caches, and glibc absorbing the free into the *freeing* thread's tcache is precisely the behaviour that causes memory to migrate and arenas to blow up.",
+      "sourceAnchor": "712-general-purpose-allocator-implementations",
+      "difficulty": "recall"
+    },
+    {
+      "id": "7-q29",
+      "prompt": "A service holds a steady 2 GB of live heap but RSS sits at 8 GB after a traffic burst. What is the most likely diagnosis and the right first check?",
+      "options": [
+        "External fragmentation plus retained pages, not a leak — compare live bytes from a heap profiler against RSS, since a blowup ratio above ~1.5 warrants investigation.",
+        "A genuine leak, since a non-leaking allocator always returns freed pages to the OS once the burst subsides — check for missing `delete` calls.",
+        "Internal fragmentation from size-class rounding — reduce the number of size classes so free blocks become interchangeable and RSS falls.",
+        "The allocator has stopped coalescing free chunks — call `malloc_trim()` from the hot thread so the heap is compacted back to live size."
+      ],
+      "correctIndex": 0,
+      "explanation": "The peak scattered live blocks across a wide address range, and freeing them leaves holes the allocator retains; C++ cannot compact because addresses must stay stable, so RSS ≫ live bytes is normal. Comparing live bytes to RSS is the diagnostic that separates this from a real leak. The internal-fragmentation option also gets the fix backwards — fewer classes reduce *external* fragmentation, more classes reduce internal — and `malloc_trim` walks the heap, so it is a latency event to schedule off the hot path.",
+      "sourceAnchor": "713-internal-and-external-fragmentation",
+      "difficulty": "trap"
+    },
+    {
+      "id": "7-q30",
+      "prompt": "Internal and external fragmentation have opposite fixes. Which pair states them correctly?",
+      "options": [
+        "More size classes reduce internal fragmentation; fewer size classes reduce external fragmentation by making free blocks interchangeable.",
+        "Fewer size classes reduce internal fragmentation by shrinking metadata; more size classes reduce external fragmentation by isolating lifetimes.",
+        "More size classes reduce both, since finer rounding wastes less per block and leaves smaller unusable gaps between blocks.",
+        "Compaction reduces internal fragmentation; per-allocation headers reduce external fragmentation by recording neighbour sizes."
+      ],
+      "correctIndex": 0,
+      "explanation": "Internal waste is rounding, so finer classes waste less per request — tcmalloc's ~88 classes at 12.5% spacing versus powers of two is exactly that trade. External fragmentation is free-but-noncontiguous memory, and it shrinks when blocks are interchangeable, i.e. with *fewer* classes; taken to the limit, a single fixed size eliminates it by construction. The 'more classes reduce both' option is the appealing free-lunch answer, and the reason every allocator has to pick a point on the curve.",
+      "sourceAnchor": "713-internal-and-external-fragmentation",
+      "difficulty": "recall"
+    },
+    {
+      "id": "7-q31",
+      "prompt": "Roughly how much does moving a large working set from 4 KB to 2 MB pages change TLB reach, and where does the benefit come from?",
+      "options": [
+        "About 512x — the same ~1536 STLB entries cover 3 GB instead of 6 MB, removing most page walks on a random-access structure.",
+        "About 8x — the walk shortens from four dependent levels to one, so a miss costs ~12 cycles instead of ~100.",
+        "About 512x — the core gains 512 times as many TLB entries when huge pages are enabled, so more translations stay cached.",
+        "About 64x — the L1 DTLB grows from 64 entries to a full 4096-entry table when a region is backed by huge pages."
+      ],
+      "correctIndex": 0,
+      "explanation": "The entry count is fixed by the hardware; what changes is how much memory each entry covers, so ~1536 L2 entries reach 3 GB instead of 6 MB. The '512x more TLB entries' answer gets the right number for the wrong reason — no core gains TLB entries from huge pages — and that confusion is the common one. Shortening the walk is real but secondary; the walk is up to four dependent accesses at ~50-100 cycles whether or not the region is huge-backed.",
+      "sourceAnchor": "714-huge-page-backed-arenas",
+      "difficulty": "application"
+    },
+    {
+      "id": "7-q32",
+      "prompt": "You `mmap` an arena, call `madvise(p, bytes, MADV_HUGEPAGE)`, and see no latency improvement. Which omission does the chapter flag first?",
+      "options": [
+        "The region's start is not 2 MB aligned — `mmap` returns page-aligned memory, so THP silently declines and you get 4 KB pages; verify `AnonHugePages` in `/proc/self/smaps`.",
+        "`MADV_HUGEPAGE` only takes effect when the system policy is `always`; under the `madvise` default the advice is recorded but ignored until `khugepaged` runs.",
+        "The region was not `mlock`ed, and THP refuses to back swappable memory, so the pages fall back to 4 KB until `RLIMIT_MEMLOCK` is raised.",
+        "The arena is smaller than 1 GB, and `MADV_HUGEPAGE` requests gigabyte pages, which the kernel declines for any region below that size."
+      ],
+      "correctIndex": 0,
+      "explanation": "THP will not back a region whose start is not 2 MB aligned, and `mmap` only guarantees 4 KB alignment — so you over-allocate and align manually, or use `MAP_HUGETLB` which aligns for you. The failure is silent, which is why confirming with `smaps` matters: a large fraction of 'we enabled huge pages' claims are unaligned regions. The policy option inverts the setting — `madvise` mode is exactly the mode in which `MADV_HUGEPAGE` is honoured, and is the recommended configuration.",
+      "sourceAnchor": "714-huge-page-backed-arenas",
+      "difficulty": "trap"
+    }
+  ]
+}

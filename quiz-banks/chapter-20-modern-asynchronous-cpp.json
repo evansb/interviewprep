@@ -1,0 +1,355 @@
+{
+  "slug": "chapter-20-modern-asynchronous-cpp",
+  "questions": [
+    {
+      "id": "20-q01",
+      "prompt": "What does the heap-allocated shared state behind a `std::future`/`std::promise` pair actually contain?",
+      "options": [
+        "The value or an `exception_ptr`, a ready flag, a mutex and condition variable, and a reference count shared by both ends.",
+        "The value or an `exception_ptr` plus a single atomic ready flag, with no mutex or condition variable involved.",
+        "A pointer to the producing thread's stack slot, a ready flag, and a reference count for the two ends.",
+        "The value only, plus a reference count; exceptions are stored separately in the promise object itself."
+      ],
+      "correctIndex": 0,
+      "explanation": "The full set — value-or-exception, ready flag, mutex, condvar, refcount — is what makes each handoff cost one allocation plus a futex round trip. The 'single atomic flag, no mutex' answer describes the hand-rolled replacement the chapter recommends for hot paths (a preallocated slot plus `atomic<T>::wait`), not what the standard facility actually does. Exceptions live in the shared state, not in the promise, which is exactly why `get()` can rethrow after the promise is gone.",
+      "sourceAnchor": "201-futures-and-promises",
+      "difficulty": "recall"
+    },
+    {
+      "id": "20-q02",
+      "prompt": "A worker thread constructs a `std::promise<int>`, hands the future to a consumer, then throws and unwinds before ever calling `set_value`. What does the consumer's blocking `f.get()` do?",
+      "options": [
+        "Throws `std::future_error` with `broken_promise`, because the promise's destructor stores that exception into the shared state.",
+        "Blocks forever, since nothing ever marks the shared state ready and the refcount alone does not wake waiters.",
+        "Returns a value-initialized `int`, because the destructor marks the state ready with a default-constructed result.",
+        "Throws whatever exception unwound the worker, because the promise destructor captures the in-flight exception."
+      ],
+      "correctIndex": 0,
+      "explanation": "Destroying an unsatisfied promise deliberately stores `broken_promise` so waiters fail loudly instead of hanging — the chapter calls this the correct design and worth citing. The 'blocks forever' answer is the intuitive-but-wrong one: it assumes the destructor is passive. The destructor does not consult the in-flight exception either; it always stores `broken_promise`, so the original throw is not what surfaces at `get()`.",
+      "sourceAnchor": "201-futures-and-promises",
+      "difficulty": "application"
+    },
+    {
+      "id": "20-q03",
+      "prompt": "Three components each need to read the result of one asynchronous computation. What is the correct standard facility?",
+      "options": [
+        "A `std::shared_future`, which is copyable and hands every consumer a `const T&` from the same shared state.",
+        "One `std::future` copied to each consumer, since copying the future duplicates the shared state's refcount.",
+        "One `std::future` whose `get()` each consumer calls, since only a move-out invalidates it and `get()` does not move.",
+        "Three separate `std::promise` objects fed by the producer, since a shared state permits only one waiter at a time."
+      ],
+      "correctIndex": 0,
+      "explanation": "`shared_future` exists precisely for multi-consumer retrieval: copyable, and `get()` returns `const T&` rather than moving. `std::future` is move-only, so the 'copy the future' answer does not compile, and the 'everyone calls get()' answer is wrong twice over — `future::get()` does move the value out and a second call throws `future_already_retrieved`. A shared state also supports many waiters; the one-shot restriction is about retrieval, not about waiter count.",
+      "sourceAnchor": "201-futures-and-promises",
+      "difficulty": "application"
+    },
+    {
+      "id": "20-q04",
+      "prompt": "Why did `future::then`, `when_all`, and `when_any` never make it out of the Concurrency TS into the standard?",
+      "options": [
+        "Continuations need an executor/scheduler concept the standard lacked, and the TS design was ultimately superseded by senders/receivers.",
+        "They were dropped because chaining continuations onto a shared state cannot establish a happens-before edge between the stages.",
+        "They were rejected as unimplementable without compiler support, and only coroutines eventually made continuations possible.",
+        "They shipped as continuations but were removed in C++17 together with the allocator-taking `promise` constructors."
+      ],
+      "correctIndex": 0,
+      "explanation": "The blocker was the missing vocabulary for *where* a continuation runs — an executor — and P2300's senders/receivers is the design that replaced the TS approach. The happens-before claim is false: the future/promise pair already establishes that edge, and chaining would not break it. What C++17 actually removed was the allocator-taking `promise` constructors, so the 'shipped then removed' answer is version confusion.",
+      "sourceAnchor": "201-futures-and-promises",
+      "difficulty": "recall"
+    },
+    {
+      "id": "20-q05",
+      "prompt": "An awaiter's `await_ready()` returns `true` when the requested bytes are already sitting in a user-space buffer. What does that buy?",
+      "options": [
+        "The coroutine never suspends: `await_suspend` is skipped and `await_resume` supplies the value inline, avoiding the whole round trip.",
+        "The coroutine still suspends but is queued for immediate resumption, so the loop resumes it on its next iteration.",
+        "The compiler can apply HALO and elide the frame, since a coroutine that never suspends needs no heap storage.",
+        "The submission is still issued but marked non-blocking, so the kernel completes it without an interrupt."
+      ],
+      "correctIndex": 0,
+      "explanation": "A `true` from `await_ready` is the fast path that skips the suspend entirely — no SQE, no handle stash, no resume — which is exactly what you want when data is already buffered or the operation completed synchronously. The HALO answer is the tempting one because elision is a real coroutine optimization, but it is decided for the *whole* frame at the call site, not per-`co_await`, and here the handle still escapes into the ring on the slow paths. Nothing is submitted or queued when `await_ready` is `true`.",
+      "sourceAnchor": "206-coroutine-based-asynchronous-io",
+      "difficulty": "application"
+    },
+    {
+      "id": "20-q06",
+      "prompt": "Given `std::packaged_task<int(int,int)> t(add); auto f = t.get_future(); t(2,3);` — on which thread does `add` execute?",
+      "options": [
+        "On whichever thread evaluates `t(2,3)`; `packaged_task` never introduces a thread of its own.",
+        "On a fresh thread of execution spawned by the call operator, with `get_future()` returning the join handle.",
+        "On whichever thread later calls `f.get()`, since the invocation only records the arguments.",
+        "On an implementation-chosen pool thread, the same pool `std::async` draws from on that platform."
+      ],
+      "correctIndex": 0,
+      "explanation": "`packaged_task` is exactly promise-plus-callable with automatic exception capture; invoking it runs the body inline and stores the result. The 'runs when you call get()' answer describes `launch::deferred` under `std::async`, which is the neighbouring concept people confuse it with. Nothing about `packaged_task` spawns or borrows a thread — placing the work is entirely the caller's job.",
+      "sourceAnchor": "202-packaged-tasks",
+      "difficulty": "application"
+    },
+    {
+      "id": "20-q07",
+      "prompt": "A pre-C++23 thread pool wraps its `std::packaged_task` in a `std::make_shared` before pushing the job. What forces that wrapper?",
+      "options": [
+        "`packaged_task` is move-only, and `std::function` requires a copy-constructible target, so the queue cannot store it directly.",
+        "The shared state must outlive the future, and only a `shared_ptr` keeps the state alive after the task object is popped.",
+        "`std::function` cannot store a callable exceeding its small-object buffer, and a `packaged_task` always exceeds it.",
+        "The worker thread and the submitting thread both invoke the task, so its refcount must be atomic to avoid a race."
+      ],
+      "correctIndex": 0,
+      "explanation": "The whole reason is the copy-constructibility requirement of pre-C++23 `std::function` colliding with `packaged_task`'s move-only nature; `std::move_only_function` (C++23) removes the wrapper and saves one allocation plus a refcount pair. The lifetime answer is a real-sounding but false premise — the shared state is already refcounted internally and survives the task's destruction on its own. The task is invoked exactly once, by the worker.",
+      "sourceAnchor": "202-packaged-tasks",
+      "difficulty": "trap"
+    },
+    {
+      "id": "20-q08",
+      "prompt": "A coroutine handler reads into a buffer that a caller passed in by reference and captured in a lambda. Why is that unsafe across a `co_await`?",
+      "options": [
+        "Only locals held across the suspension live in the coroutine frame; a referenced or captured object is not, so it can die while the kernel op is in flight.",
+        "The frame is relocated on each resume, so any reference into it is invalidated after the first suspension point.",
+        "`io_uring` requires buffers registered with `IORING_REGISTER_BUFFERS`, so unregistered memory is rejected at submission.",
+        "Captures are copied into the frame by value, so the kernel writes into the copy and the caller never sees the data."
+      ],
+      "correctIndex": 0,
+      "explanation": "Locals that live across a `co_await` are stored in the frame and are therefore stable; anything reached by reference or captured by reference is not, so it can be destroyed while an SQE still points at it. The relocation answer is false — coroutine frames are stable in memory once allocated, which is the whole reason storing locals there works. Registered buffers are a performance optimization that removes per-op pinning cost, not a correctness precondition for submission.",
+      "sourceAnchor": "206-coroutine-based-asynchronous-io",
+      "difficulty": "trap"
+    },
+    {
+      "id": "20-q09",
+      "prompt": "Which statement about `std::async(std::launch::deferred, f)` is correct?",
+      "options": [
+        "`f` runs on the thread that first calls `get()` or `wait()`, and never runs at all if neither is called.",
+        "`f` runs eagerly on the calling thread at the point of the `async` call, with `get()` merely retrieving the stored value.",
+        "`f` runs on a new thread but the future's destructor does not join, since deferred futures are not owning.",
+        "`f` runs lazily on an implementation-chosen thread once the first `wait_for` observes `future_status::deferred`."
+      ],
+      "correctIndex": 0,
+      "explanation": "Deferred means lazy *and* in-place: nothing happens until `get()`/`wait()`, and then the body runs on the consuming thread. The 'runs eagerly on the calling thread' answer inverts the timing while keeping the right thread — a plausible half-memory. `wait_for` never triggers execution; it just reports `future_status::deferred`, forever, which is why polling a deferred future spins without progress.",
+      "sourceAnchor": "203-stdasync",
+      "difficulty": "recall"
+    },
+    {
+      "id": "20-q10",
+      "prompt": "What is the effect of the statement `std::async(std::launch::async, slow_work);` written on a line by itself?",
+      "options": [
+        "It is fully synchronous: the unnamed future is destroyed at the semicolon and its destructor blocks until `slow_work` finishes.",
+        "It starts `slow_work` and abandons it, since destroying a future without calling `get()` detaches the task.",
+        "It is a no-op, because with no one holding the future the implementation is permitted to skip launching the task.",
+        "It starts `slow_work` and blocks only if the task throws, since the destructor must surface the stored exception."
+      ],
+      "correctIndex": 0,
+      "explanation": "A future produced by `std::async` has the unique blocking destructor that joins the task, so a temporary destroyed at the semicolon turns the call into a synchronous one — Meyers' Item 38. The 'destroying a future detaches' answer is exactly right for futures from `promise::get_future` or `packaged_task::get_future` and exactly wrong here; that asymmetry is the whole trap. `launch::async` also guarantees the task really is launched, so skipping it is not permitted.",
+      "sourceAnchor": "203-stdasync",
+      "difficulty": "trap"
+    },
+    {
+      "id": "20-q11",
+      "prompt": "A service submits ten thousand small work items with `std::async(std::launch::async, item)` on Linux. What is the dominant cost?",
+      "options": [
+        "One fresh OS thread per call on libstdc++/libc++ — roughly 10–30 µs of `clone()`, stack mmap, and TLS setup each.",
+        "Contention on the implementation's shared thread pool, whose fixed worker count serializes the ten thousand items.",
+        "The shared-state allocation per call, since thread creation itself is amortized by the runtime's thread cache.",
+        "Repeated futex wakeups from `get()`, since thread creation is lazy and only materializes on first wait."
+      ],
+      "correctIndex": 0,
+      "explanation": "No thread pool is mandated, and libstdc++/libc++ create a genuinely fresh `std::thread` per call, so thread setup dwarfs the ~one allocation of the shared state. The 'shared pool contention' answer is a reasonable guess and is true only on MSVC, which uses the Windows thread pool — on Linux there is no pool to contend for. `launch::async` also requires eager start, so nothing is deferred to the first `get()`.",
+      "sourceAnchor": "203-stdasync",
+      "difficulty": "application"
+    },
+    {
+      "id": "20-q12",
+      "prompt": "Code calls `std::async(f, std::ref(local))` with the default launch policy, where `local` is a stack object in the enclosing function. What is the specific hazard?",
+      "options": [
+        "The default policy may defer, so the work can run at a `get()` issued after `local`'s scope ended, leaving the reference dangling.",
+        "`std::ref` is ignored by `std::async`, so `local` is decay-copied anyway and the callee mutates a copy instead of the original.",
+        "The default policy forces a new thread, so `local` is read concurrently with the enclosing function's writes to it without synchronization.",
+        "`std::ref` forces eager execution, so `f` starts before the enclosing function has finished initializing `local`."
+      ],
+      "correctIndex": 0,
+      "explanation": "Arguments are decay-copied, so `std::ref` is how you keep a reference — and combining a reference to a stack object with a policy that may defer is the dangling recipe the chapter names, because deferred work runs whenever `get()` finally happens. The 'ref is ignored' answer inverts the rule: decay-copying is precisely why `std::ref` exists and it is honoured. The default policy is `async|deferred`, so it forces nothing.",
+      "sourceAnchor": "203-stdasync",
+      "difficulty": "trap"
+    },
+    {
+      "id": "20-q13",
+      "prompt": "What is `std::async`'s one clear advantage over launching a raw `std::thread` for the same work?",
+      "options": [
+        "An exception escaping the callable is captured and rethrown from `get()`, whereas one escaping a `std::thread` body calls `std::terminate`.",
+        "It lets you name the execution context the work runs on, whereas `std::thread` always creates its own.",
+        "It supports cancellation through a `stop_token` injected into the callable, which `std::thread` does not provide.",
+        "It reuses threads across calls on every major implementation, whereas each `std::thread` costs a fresh `clone()`."
+      ],
+      "correctIndex": 0,
+      "explanation": "Exception propagation through `get()` is genuinely convenient and is the one place `std::async` beats a raw thread, where an escaping exception terminates the process. Automatic `stop_token` injection is real but belongs to `std::jthread`, not `std::async` — that is the neighbouring-concept trap. `std::async` explicitly gives you no executor and no cancellation, and reuses nothing on libstdc++/libc++.",
+      "sourceAnchor": "203-stdasync",
+      "difficulty": "application"
+    },
+    {
+      "id": "20-q14",
+      "prompt": "Why does standard C++ offer no preemptive thread cancellation?",
+      "options": [
+        "Killing a thread mid-stack leaves destructors unrun and locks held, so cancellation has to be a request the target observes.",
+        "The standard could not agree on a signal number to reserve for it, so the facility was deferred to a later release.",
+        "Preemption would break the happens-before edges the memory model relies on, making all cross-thread visibility undefined.",
+        "It exists but only through `std::jthread`, whose destructor forcibly terminates the thread after `request_stop()` times out."
+      ],
+      "correctIndex": 0,
+      "explanation": "The reason is RAII: an asynchronously killed thread abandons destructors and held locks, which is also why `pthread_cancel` is effectively unusable in C++. The `jthread` answer is the tempting one because `jthread`'s destructor really does call `request_stop()` — but it then *joins* and waits cooperatively; there is no timeout and no forced kill. Preemption would not invalidate the memory model; it would just leave program invariants broken.",
+      "sourceAnchor": "204-cooperative-cancellation",
+      "difficulty": "recall"
+    },
+    {
+      "id": "20-q15",
+      "prompt": "A worker is parked in a `condition_variable` wait rather than polling. How do you make it observe a stop request?",
+      "options": [
+        "Register a `std::stop_callback` on the token that performs the wakeup — `notify_all`, an `eventfd` write, or a socket shutdown.",
+        "Have the worker check `stop_requested()` before waiting, since the token's control block itself signals any registered condvar.",
+        "Call `request_stop()` from the controlling thread, which interrupts the blocking call and makes it return early.",
+        "Replace the wait with `wait_for` on a short timeout, since `stop_token` only ever integrates with timed waits."
+      ],
+      "correctIndex": 0,
+      "explanation": "A stop request is inert against a blocked thread; the `stop_callback` is the glue that turns it into an actual wakeup, and the callback runs on the thread that called `request_stop()`. The 'request_stop interrupts the blocking call' answer is the exact misconception the chapter flags — nothing in `stop_token` reaches into a blocked syscall. Checking `stop_requested()` before waiting also loses any request that arrives after the check but before the wait.",
+      "sourceAnchor": "204-cooperative-cancellation",
+      "difficulty": "application"
+    },
+    {
+      "id": "20-q16",
+      "prompt": "A `std::stop_callback` is constructed from a token on which `request_stop()` has *already* been called. What happens?",
+      "options": [
+        "The callback runs immediately, synchronously, on the thread constructing the `stop_callback`.",
+        "The callback is discarded without running, since the stop transition it would have observed is already past.",
+        "The callback is queued and runs on the thread that originally called `request_stop()`, once that thread returns.",
+        "Construction throws `std::future_error`, since registering against an already-stopped source is a logic error."
+      ],
+      "correctIndex": 0,
+      "explanation": "Late registration still fires — immediately and on the constructing thread — which is what makes the callback usable without racing against the stop request. The 'discarded' answer is the dangerous misconception: it would make every registration a lost-wakeup race. Only callbacks registered *before* the request run on the requesting thread, and nothing here throws.",
+      "sourceAnchor": "204-cooperative-cancellation",
+      "difficulty": "application"
+    },
+    {
+      "id": "20-q17",
+      "prompt": "A team wants stop-aware waiting and writes `cv.wait(lock, token, pred)` against a `std::condition_variable`. Why does it not compile?",
+      "options": [
+        "Only `std::condition_variable_any` has the stop-token overload; plain `condition_variable` was left without one.",
+        "The overload exists on both, but requires the predicate to accept the token as a parameter rather than closing over it.",
+        "The overload exists on both, but only accepts a `std::stop_source`; passing a `stop_token` is the error.",
+        "The overload was removed in C++23 in favour of `std::atomic<T>::wait`, so it compiles only under C++20."
+      ],
+      "correctIndex": 0,
+      "explanation": "The stop-aware `wait(lock, token, pred)` lives only on `condition_variable_any`, which works with any lockable; plain `condition_variable` is tied to `unique_lock<mutex>` and was left alone. The 'predicate must take the token' answer is the plausible-shaped wrong one — the predicate signature is unchanged, and the overload returns `false` when stop was requested. Nothing here is a C++23 removal; the facility is C++20 and still present.",
+      "sourceAnchor": "204-cooperative-cancellation",
+      "difficulty": "application"
+    },
+    {
+      "id": "20-q18",
+      "prompt": "What does C++26's `std::inplace_stop_source`/`inplace_stop_token` change relative to `std::stop_source`/`std::stop_token`?",
+      "options": [
+        "It keeps the same semantics but drops the allocation and the atomic refcount, for a source owned by a structured scope it cannot outlive.",
+        "It makes cancellation preemptive within a structured scope, unwinding the target rather than requiring it to poll.",
+        "It replaces the callback mechanism with direct condition-variable integration, so blocked waiters wake without a `stop_callback`.",
+        "It allows a single token to observe several sources at once, so a scope can cancel on the first of many requests."
+      ],
+      "correctIndex": 0,
+      "explanation": "The in-place variants are the same cooperative semantics with borrowed rather than shared ownership — no allocation, no refcount — which is the low-latency answer and why senders lean on them. Cancellation stays cooperative in every variant, so the 'preemptive within a scope' answer contradicts the entire model. The `stop_callback` mechanism is unchanged; what changes is only the ownership and allocation story.",
+      "sourceAnchor": "204-cooperative-cancellation",
+      "difficulty": "recall"
+    },
+    {
+      "id": "20-q19",
+      "prompt": "What are a receiver's completion channels in `std::execution`?",
+      "options": [
+        "`set_value`, `set_error`, and `set_stopped` — cancellation is a first-class outcome distinct from an error.",
+        "`set_value` and `set_error` only, with cancellation delivered as a `std::future_error` through the error channel.",
+        "`set_value`, `set_error`, and `set_done`, where `set_done` also signals ordinary end-of-stream completion.",
+        "`start`, `connect`, and `set_value`, the three operations every receiver must expose to be composable."
+      ],
+      "correctIndex": 0,
+      "explanation": "Exactly three channels, and the point of a separate `set_stopped` is that cancellation is neither success nor failure — the very distinction `std::future` lacks. The `set_done` answer is version confusion: that was the earlier libunifex-era spelling, renamed before P2300 landed. `connect` and `start` are operations on senders and operation states, not receiver completion channels.",
+      "sourceAnchor": "205-senders-and-receivers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "20-q20",
+      "prompt": "A pipeline `just(42) | then(f) | continues_on(sched) | then(g)` is built and stored in a variable, but nothing else is written. What has executed?",
+      "options": [
+        "Nothing — senders only describe work; execution needs `connect` plus `start`, or a bridge like `sync_wait`.",
+        "`just(42)` and `then(f)` have run on the constructing thread; only the part after `continues_on` awaits the scheduler.",
+        "The whole pipeline has run eagerly, and the variable now holds the completed result ready for retrieval.",
+        "`just(42)` alone has run, since a value sender is eager while adapters stay lazy until connected."
+      ],
+      "correctIndex": 0,
+      "explanation": "Laziness is the defining property: composing senders builds a graph and nothing runs until `start(op)` on the operation state that `connect` produces, with `sync_wait` as the sanctioned blocking bridge. Both partial-execution answers project the `std::future` model — eager at creation — onto senders, which is exactly the habit the design inverts. That laziness is also what lets the compiler size the whole pipeline's storage as one object.",
+      "sourceAnchor": "205-senders-and-receivers",
+      "difficulty": "application"
+    },
+    {
+      "id": "20-q21",
+      "prompt": "Why is the operation state returned by `connect(sender, receiver)` specified as immovable?",
+      "options": [
+        "Receivers and awaiters within the graph hold pointers into it, so relocating the object would invalidate them.",
+        "It is allocated inside the scheduler's arena, and moving it out would escape the arena's lifetime.",
+        "Movability would require a copy of the receiver, and receivers are specified as move-only for cancellation safety.",
+        "It stores an `exception_ptr` to the completing frame, and moving that pointer would break exception propagation."
+      ],
+      "correctIndex": 0,
+      "explanation": "The state is one composed object that internal receivers and awaiters point into, so a move would dangle those pointers — hence created in place by the caller and started where it sits. The 'scheduler arena' answer sounds architectural but reverses the design: the whole claim of the model is that the state can live wherever the caller puts it, including the stack or as a member, precisely because it never has to be an allocation.",
+      "sourceAnchor": "205-senders-and-receivers",
+      "difficulty": "application"
+    },
+    {
+      "id": "20-q22",
+      "prompt": "How does a stop token reach a deeply nested operation inside a sender graph without threading a parameter through every layer?",
+      "options": [
+        "Each receiver carries an environment, queried via `get_stop_token(get_env(receiver))` as the operation is connected.",
+        "Each sender stores the token at construction, so composition copies it forward down the pipeline.",
+        "`sync_wait` installs the token in thread-local storage, which every nested operation reads on start.",
+        "The scheduler owns the token and every operation queries the scheduler it was placed on via `starts_on`."
+      ],
+      "correctIndex": 0,
+      "explanation": "The environment on the receiver answers queries like `get_stop_token`, `get_scheduler`, and `get_allocator`, so context flows down the graph without signature changes — the same mechanism carries allocator propagation. The 'senders store the token' answer inverts the direction: senders are the description and are built before any receiver exists, so they have nothing to store. Thread-local storage would also defeat the model, since a graph spans contexts.",
+      "sourceAnchor": "205-senders-and-receivers",
+      "difficulty": "application"
+    },
+    {
+      "id": "20-q23",
+      "prompt": "What is the standard criticism of the sender/receiver model that dominated its standardization?",
+      "options": [
+        "Compile-time type composition yields large types, slow compiles, and hostile error messages, even though codegen is excellent.",
+        "The per-stage heap allocation makes it unusable on hot paths despite the composability it adds over futures.",
+        "It requires a runtime scheduler in the standard library, forcing a thread pool into freestanding implementations.",
+        "It cannot express cancellation, so every graph needs a hand-written escape path around the completion channels."
+      ],
+      "correctIndex": 0,
+      "explanation": "The cost of encoding the whole graph in the type system is type bloat, compile times, and diagnostics — the loudest objection during standardization — while a fully synchronous pipeline can still optimize to straight-line code. The 'per-stage heap allocation' answer describes `std::future`, the model senders were designed to replace; senders require zero allocations. Cancellation is likewise a strength here, not a gap, via `set_stopped` and `get_stop_token`.",
+      "sourceAnchor": "205-senders-and-receivers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "20-q24",
+      "prompt": "In an `io_uring` coroutine reactor, the loop drains a CQE and calls `op->handle.resume()`. A handler then does 5 ms of parsing after that resume. What is the consequence?",
+      "options": [
+        "Every other connection is stalled for those 5 ms, because the continuation runs inline on the loop thread.",
+        "Only that connection is delayed, since the coroutine resumes on the thread that originally submitted its SQE.",
+        "The loop keeps draining, because `resume()` returns immediately and schedules the continuation for later.",
+        "The kernel migrates the completion to another core once the CQ ring fills, bounding the stall to one ring depth."
+      ],
+      "correctIndex": 0,
+      "explanation": "`handle.resume()` runs the continuation inline and returns only when the coroutine next suspends, so long work in a handler is head-of-line blocking for every connection the loop serves. The 'resume returns immediately' answer confuses `resume()` with posting to a queue — there is no scheduler underneath it. The fix is to hand long work to a worker, not to hope the kernel intervenes.",
+      "sourceAnchor": "206-coroutine-based-asynchronous-io",
+      "difficulty": "application"
+    },
+    {
+      "id": "20-q25",
+      "prompt": "A connection handler is a coroutine with an `io_uring` recv in flight when the server decides to tear the connection down. What must happen before the coroutine frame is destroyed?",
+      "options": [
+        "Submit `IORING_OP_ASYNC_CANCEL` and wait for the cancellation *completion*, since the ring still references the frame's buffer and handle.",
+        "Set the stop token and destroy the frame, since a cancelled operation's completion is dropped by the kernel rather than delivered.",
+        "Close the file descriptor, which synchronously retires any pending SQEs referencing it before `close` returns.",
+        "Nothing — the frame is heap-allocated, so the completion resumes a valid handle even after the coroutine has returned."
+      ],
+      "correctIndex": 0,
+      "explanation": "The frame must outlive the in-flight kernel operation, so you cancel *and* await the cancellation completion before destroying — the chapter calls this the single hardest correctness issue in coroutine I/O, and it is why structured scopes exist. The 'close the fd' answer is the tempting near-miss: closing is a legitimate cancellation trigger, but it does not synchronously retire outstanding SQEs, so the completion still arrives afterwards and resumes a freed frame.",
+      "sourceAnchor": "206-coroutine-based-asynchronous-io",
+      "difficulty": "trap"
+    }
+  ]
+}

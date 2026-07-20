@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-12-associative-containers",
+  "questions": [
+    {
+      "id": "12-q01",
+      "prompt": "Why do mainstream standard libraries back `std::map` with a red-black tree rather than an AVL tree?",
+      "options": [
+        "A red-black insert or erase needs at most three rotations, while an AVL erase can rebalance up the whole path — cheaper writes for a slightly taller tree.",
+        "A red-black tree is strictly shorter than an AVL tree of the same size, so lookups incur fewer dependent cache misses on the way down.",
+        "A red-black tree gives O(1) lookup once the root is cached, whereas an AVL tree is O(log n) for every operation regardless of caching.",
+        "An AVL tree cannot supply bidirectional iterators, so ordered traversal of `begin()` to `end()` would not be expressible in the interface."
+      ],
+      "correctIndex": 0,
+      "explanation": "The trade is mutation cost versus balance quality: red-black caps rotations at three per insert/erase, AVL can do O(log n) rotations on erase. The 'shorter tree' option is the tempting inversion — AVL is the better-balanced, shorter structure; red-black accepts height up to 2·log2(n+1) precisely to buy the cheaper writes.",
+      "sourceAnchor": "121-ordered-maps-and-sets",
+      "difficulty": "recall"
+    },
+    {
+      "id": "12-q02",
+      "prompt": "A hot lookup path does `if (m[symbol] > threshold)` on a `std::map<std::string, int>` where `symbol` is often absent. What is the effect?",
+      "options": [
+        "Each miss throws `std::out_of_range`, which is why the idiom must be wrapped in a try block or replaced by `find`.",
+        "Each miss yields a value-initialized temporary that is discarded, leaving the map's size and contents completely unchanged.",
+        "Each miss default-constructs an `int` and inserts it, so the map silently grows and the branch compares against a fresh zero.",
+        "The line fails to compile, because `operator[]` is unavailable on a map whose `mapped_type` is a fundamental type."
+      ],
+      "correctIndex": 2,
+      "explanation": "`operator[]` inserts on read: an absent key is default-constructed and added, so a read-only-looking path mutates and grows the map. Throwing is `at`'s behaviour, not `operator[]`'s — that is the classic mix-up. Use `find`, `at`, `contains`, or `try_emplace` when you do not want insertion.",
+      "sourceAnchor": "121-ordered-maps-and-sets",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q03",
+      "prompt": "What does declaring `std::map<std::string, V, std::less<>>` instead of the default comparator change?",
+      "options": [
+        "The comparator becomes transparent, so lookups compare keys by `operator==` instead of by the two-call `!(a<b) && !(b<a)` equivalence test.",
+        "The comparator becomes transparent, enabling templated `find`/`lower_bound`/`equal_range` overloads so a `string_view` or literal needs no temporary `std::string`.",
+        "The map stores `std::string_view` keys internally, avoiding one heap allocation per stored element as well as per lookup.",
+        "The map gains the C++20 heterogeneous overloads that `std::unordered_map` also needs, provided the equality functor is transparent too."
+      ],
+      "correctIndex": 1,
+      "explanation": "`std::less<>` is the void specialization; its `is_transparent` member unlocks the templated lookup overloads added in C++14, so a comparable non-`string` argument is compared directly rather than converted. The C++20 option describes the unordered containers, which needed `is_transparent` on both hash and equality — the ordered ones got this six years earlier and involve no hash at all.",
+      "sourceAnchor": "121-ordered-maps-and-sets",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q04",
+      "prompt": "You must move an entry holding a move-only mapped type from one `std::map` to another and change its key on the way. What does `extract` give you?",
+      "options": [
+        "A node handle that detaches the node without allocating; inserting it into the destination is O(1) because the node already carries its ordering links.",
+        "A copy of the `pair<const K, V>`, leaving the original node in the source container until you separately call `erase` on the same key.",
+        "A reference into the source node whose key you may mutate in place, after which the source container re-sorts itself lazily on the next lookup.",
+        "A node handle that detaches the node without allocating; you assign through `key()` and `insert` it into the destination in O(log n), still with no allocation."
+      ],
+      "correctIndex": 3,
+      "explanation": "`extract` unlinks the node and hands you ownership; the handle's `key()` is non-const, which is the only sanctioned way to change a key, and reinserting relinks in O(log n) without touching the allocator. The O(1) option is the near-miss: no allocation happens, but the destination still has to find the insertion point, so the tree walk cost remains.",
+      "sourceAnchor": "121-ordered-maps-and-sets",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q05",
+      "prompt": "Two keys `a` and `b` satisfy `a == b` being false, yet `std::map` treats them as the same key. How is that possible?",
+      "options": [
+        "Key equivalence in a `map` is `operator==`, but the red-black tree caches comparison results and may reuse a stale one for keys inserted close together.",
+        "It is impossible for a conforming `map`; the container is required to call `operator==` before concluding that an insert is a duplicate.",
+        "Key equivalence in a `map` is `!(comp(a,b)) && !(comp(b,a))`, which is defined purely by the comparator and need not agree with `operator==`.",
+        "Equivalence is comparator-based only for `multimap` and `multiset`; the unique-key containers additionally require `operator==` on the key type."
+      ],
+      "correctIndex": 2,
+      "explanation": "Ordered associative containers never call `operator==` on keys — equivalence is the double-negative of the strict weak ordering, so a comparator that ignores part of the key (case, a trailing field) makes distinct-by-`==` keys collide. The 'impossible' and 'multimap only' options both invent an `operator==` requirement that the key type is not even obliged to have.",
+      "sourceAnchor": "121-ordered-maps-and-sets",
+      "difficulty": "trap"
+    },
+    {
+      "id": "12-q06",
+      "prompt": "Which standard requirement is the actual reason `std::unordered_map` cannot be implemented with open addressing?",
+      "options": [
+        "References and pointers to elements must survive insert and erase, and open addressing relocates entries, so elements cannot be pinned in place.",
+        "Average lookup must be O(1) and worst case O(n), a bound open addressing cannot meet because its probe sequences are unbounded near a full table.",
+        "`max_load_factor` defaults to 1.0 and must be settable above 1, which open addressing supports only when the bucket array is a power of two.",
+        "The bucket count must be a prime number, and open addressing requires a power-of-two capacity so that probing can use a mask instead of a modulo."
+      ],
+      "correctIndex": 0,
+      "explanation": "The no-invalidation guarantee on references is the binding constraint: separate chaining with stable nodes is the only way to honour it, and the bucket interface plus O(n) forward iteration then force the one-linked-list layout. The load-factor option states the rule backwards — open addressing must keep α below 1, so it could never honour a settable factor of 1.0 at all.",
+      "sourceAnchor": "122-unordered-maps-and-sets",
+      "difficulty": "recall"
+    },
+    {
+      "id": "12-q07",
+      "prompt": "Walking through a libstdc++ `unordered_map::find` on a cold table, what does the work actually consist of?",
+      "options": [
+        "Hash the key, mask with `bucket_count - 1` since the count is a power of two, then one cache miss into the slot array and an in-line key compare.",
+        "Hash the key, then a compiler-generated multiply-and-shift replacing the division because the bucket count is fixed at instantiation time.",
+        "Hash the key, index the bucket array directly, then a SIMD compare of sixteen packed hash bytes before touching any key data at all.",
+        "Hash the key, take a modulo by the runtime prime bucket count (~20-40 cycles), then at least two dependent cache misses — bucket pointer, then node."
+      ],
+      "correctIndex": 3,
+      "explanation": "libstdc++ uses prime bucket counts and a real `%` by a value only known at runtime, so the division cannot be strength-reduced; then the bucket pointer and the node it names are two dependent misses. The masking option describes what fast flat tables do — and libc++ partly — but it is not what makes `unordered_map` slow; the SIMD option is SwissTable.",
+      "sourceAnchor": "122-unordered-maps-and-sets",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q08",
+      "prompt": "You need an `unordered_map` keyed by `std::pair<int,int>` and write `return h(p.first) ^ h(p.second);`. What is wrong?",
+      "options": [
+        "`std::hash<std::pair>` has existed since C++17 and already combines properly, so the custom specialization is an ODR violation over the standard one.",
+        "There is no `std::hash` for `pair`, so a custom one is required, and XOR is symmetric: `(a,b)` and `(b,a)` collide and `(a,a)` hashes to zero.",
+        "XOR is a sound combiner because `std::hash` results are uniformly distributed; the real defect is that the functor must be marked `noexcept` to compile.",
+        "Nothing is wrong for `pair<int,int>` specifically, since libstdc++'s `std::hash<int>` avalanches its input before returning, breaking the symmetry."
+      ],
+      "correctIndex": 1,
+      "explanation": "The standard specializes `std::hash` for fundamentals, pointers, strings and a few library types, but not for `pair`, `tuple` or containers — and XOR destroys ordering information and self-cancels. The 'uniform distribution' option is the seductive one: even perfectly uniform inputs stay symmetric under XOR, and `std::hash<int>` in libstdc++ is the identity, so nothing avalanches it.",
+      "sourceAnchor": "122-unordered-maps-and-sets",
+      "difficulty": "trap"
+    },
+    {
+      "id": "12-q09",
+      "prompt": "You add `using is_transparent = void;` to a custom hash functor and call `m.find(std::string_view{\"AAPL\"})` on an `unordered_map<std::string, V, MyHash>`. It still builds a temporary string. Why?",
+      "options": [
+        "Heterogeneous lookup on unordered containers requires a transparent comparator named `std::less<>` in the fourth template parameter position.",
+        "`is_transparent` is only honoured on functors passed by value at construction time, so a default-constructed hash never enables the extra overloads.",
+        "Heterogeneous lookup on unordered containers requires `is_transparent` on the equality functor as well, and the default `std::equal_to<std::string>` is not transparent.",
+        "The hash must additionally be `noexcept`, because the templated `find` overloads are constrained to hashes that cannot throw during a lookup."
+      ],
+      "correctIndex": 2,
+      "explanation": "P0919 gated the templated overloads on both the hasher and the key-equality functor advertising `is_transparent`; leaving `std::equal_to<Key>` in place keeps the conversion. `std::less<>` is the ordered-container mechanism and has no role in a hash table, and neither `noexcept` nor how the functor was constructed enters into the constraint.",
+      "sourceAnchor": "122-unordered-maps-and-sets",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q10",
+      "prompt": "A table masks with a power-of-two capacity and keys are 16-byte-aligned pointers hashed by libstdc++'s `std::hash<void*>`. What happens and what fixes it?",
+      "options": [
+        "The low bits are always zero, so keys spread evenly across the table; the real risk is only the high bits, which masking discards without consequence.",
+        "Nothing goes wrong, because a masked table consumes the high bits of the hash first and the alignment zeros never reach the index computation.",
+        "Clustering occurs only with a prime modulus, which folds structured keys onto shared residues; switching to a power-of-two mask is itself the fix.",
+        "The low bits are always zero, so every key lands in a small subset of slots; a finalizer such as murmur3's fmix64 must avalanche the hash before masking."
+      ],
+      "correctIndex": 3,
+      "explanation": "Masking keeps exactly the low bits, and identity-hashed aligned pointers have zeros there, so a large fraction of the table is unreachable and probe runs explode. The claim that clustering is a prime-modulus problem is the rule stated backwards: a prime modulus mixes structured keys reasonably well, which is precisely why libstdc++ can get away with identity integer hashing while masked tables cannot.",
+      "sourceAnchor": "122-unordered-maps-and-sets",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q11",
+      "prompt": "For separate chaining at load factor α, what are the expected probe counts for a successful and an unsuccessful search?",
+      "options": [
+        "About 1 + α/2 for a successful search and about α for an unsuccessful one, so the cost grows linearly rather than explosively with α.",
+        "About α for a successful search and about 1 + α/2 for an unsuccessful one, since a miss must always examine the head node of the bucket.",
+        "About ½(1 + 1/(1−α)²) for an unsuccessful search, which is why chaining tables are capped at load factors around 0.875.",
+        "About 1 for both, because the bucket array is indexed directly and any chain beyond one node triggers an immediate rehash of the table."
+      ],
+      "correctIndex": 0,
+      "explanation": "A hit stops on average halfway down its chain (1 + α/2); a miss walks the whole chain, whose expected length is α. The ½(1 + 1/(1−α)²) formula is linear probing's unsuccessful-search cost — that is exactly the open-addressed behaviour that blows up near α = 1, and it is why chaining can tolerate α above 1 while open addressing cannot.",
+      "sourceAnchor": "123-hash-table-collision-resolution",
+      "difficulty": "recall"
+    },
+    {
+      "id": "12-q12",
+      "prompt": "An interviewer asks you to contrast separate chaining with open addressing. Which set of claims is correct?",
+      "options": [
+        "Chaining: no stability, α capped below 1, tombstones to delete, ~1 miss. Open addressing: stable references, α may exceed 1, unlink to delete, 2+ misses.",
+        "Chaining: stable references, α may exceed 1, unlink to delete, 2+ dependent misses. Open addressing: one array, ~1 miss, no stability, tombstones or backward shift.",
+        "Chaining: stable references, α capped below 1, ~1 miss per lookup. Open addressing: no stability, α may exceed 1, one allocation per element on insert.",
+        "Chaining: no allocation per element, α may exceed 1, 2+ dependent misses. Open addressing: stable references, no allocation per rehash, tombstone-free deletes."
+      ],
+      "correctIndex": 1,
+      "explanation": "Nodes never move, so chaining is stable and chains may average more than one entry; the price is a dependent pointer follow per lookup and a malloc per element. The option that gives chaining tombstones and open addressing stable references is the whole comparison inverted, which is the answer to reach for if you have memorised the properties without attaching them to a mechanism — stability comes from *not moving elements*, which only chaining offers.",
+      "sourceAnchor": "123-hash-table-collision-resolution",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q13",
+      "prompt": "A system needs a hard bound on lookup tail latency and can tolerate expensive inserts. Which collision scheme fits, and what is its cost?",
+      "options": [
+        "Cuckoo hashing: an insert writes exactly one slot, but a lookup may follow an unbounded displacement chain, so its worst case is O(log n) rather than O(1).",
+        "Coalesced hashing: chain nodes are stored inside the table, bounding a lookup to one cache line while inserts pay a cascading relocation of the chain.",
+        "Two-choice hashing: hashing to two buckets and inserting into the shorter makes lookup worst case O(1), at the cost of probing both buckets on every insert.",
+        "Cuckoo hashing: a lookup checks exactly d candidate slots for worst-case O(1), but an insert displaces occupants and can cycle, forcing a full rehash."
+      ],
+      "correctIndex": 3,
+      "explanation": "Cuckoo's whole selling point is that a key can only ever live in one of d fixed slots, so a lookup is worst-case constant; the eviction cascade on insert can loop and force a rehash, which is where the variance moves. Two-choice reduces the maximum chain length to O(log log n) but leaves lookup expected-case, not worst-case, constant.",
+      "sourceAnchor": "123-hash-table-collision-resolution",
+      "difficulty": "recall"
+    },
+    {
+      "id": "12-q14",
+      "prompt": "An `unordered_map` has `max_load_factor()` of 0.5 and you expect 1,000,000 elements. Which call guarantees no rehash during the fill?",
+      "options": [
+        "`rehash(1000000)`, because `rehash` takes a number of elements and the implementation divides by the max load factor on your behalf.",
+        "`reserve(2000000)`, because `reserve` takes a number of buckets and you must pre-divide by the max load factor before calling it.",
+        "`reserve(1000000)`, because `reserve` takes a number of elements and internally requests `rehash(ceil(1000000 / 0.5))` buckets.",
+        "Neither, because `max_load_factor` is only a hint and the container may rehash at any size regardless of the capacity you requested."
+      ],
+      "correctIndex": 2,
+      "explanation": "`reserve(n)` means n *elements* and already accounts for the load factor; `rehash(n)` means n *buckets* and does not, so `rehash(1000000)` here leaves room for only 500,000 elements. `max_load_factor` being a hint means implementations may exceed it, which never causes a premature rehash of a table you have already sized.",
+      "sourceAnchor": "124-load-factors-and-rehashing",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q15",
+      "prompt": "You mark your custom hash functor `noexcept` on a libstdc++ `unordered_map`, expecting faster rehashes. What actually happens?",
+      "options": [
+        "libstdc++ starts caching the hash in each node, costing 8 bytes per node but letting a rehash relink without recomputing — caching requires a non-throwing hash.",
+        "libstdc++ stops caching the hash in each node, saving 8 bytes per node but recomputing every hash during a rehash — it caches precisely when the hash may throw.",
+        "Nothing changes in the node layout; `noexcept` only lets the container use a non-allocating fast path when the rehash's element moves cannot throw.",
+        "The container switches from prime bucket counts to power-of-two counts, replacing the modulo with a mask, since a `noexcept` hash is assumed well-mixed."
+      ],
+      "correctIndex": 1,
+      "explanation": "The logic is inverted from intuition: libstdc++ caches the hash when recomputing it during a rehash could throw, so a `noexcept` hash is recomputed instead of stored. The option claiming `noexcept` switches caching on is that intuition written down — it sounds like a sensible optimisation policy and is exactly backwards, which is why this detail shows up in interviews.",
+      "sourceAnchor": "124-load-factors-and-rehashing",
+      "difficulty": "trap"
+    },
+    {
+      "id": "12-q16",
+      "prompt": "A loop over an `unordered_map` calls `it = m.erase(it)` on some elements and `m.emplace(...)` on others. Which statement about validity holds?",
+      "options": [
+        "The erase branch is fine, but the emplace is undefined behaviour if it triggers a rehash, since a rehash invalidates every iterator including `it`.",
+        "The emplace branch is fine, but the erase is undefined behaviour, because erasing invalidates all iterators into the container rather than only the erased one.",
+        "Both branches are fine, because a rehash relocates nodes but the standard requires iterators to be repaired to point at their elements' new buckets.",
+        "Both branches are undefined behaviour, because any mutation of an `unordered_map` during iteration invalidates references and pointers to all elements."
+      ],
+      "correctIndex": 0,
+      "explanation": "Erase invalidates only the erased element's iterators and returns a usable successor; an insert that pushes α past `max_load_factor` rehashes and kills every iterator. The option calling both branches undefined overreaches in a specific way worth remembering: references and pointers into an `unordered_map` are *never* invalidated by insert or erase — only iterators are, and only on rehash.",
+      "sourceAnchor": "124-load-factors-and-rehashing",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q17",
+      "prompt": "A service's `unordered_map` grows to 10 million entries and then erases all but ten. What is its memory profile afterwards?",
+      "options": [
+        "It shrinks the bucket array on the erase that drops the load factor below a quarter of `max_load_factor`, mirroring `std::vector`'s growth policy in reverse.",
+        "It shrinks as soon as you call `max_load_factor(1.0)` again, since lowering and restoring the threshold forces an immediate resize of the bucket array.",
+        "It keeps the ~10-million-entry bucket array; no implementation shrinks automatically, and `rehash(0)` is the way to request the minimum.",
+        "It keeps the bucket array but frees the node allocations lazily, so memory returns to the allocator only once the container is destroyed or cleared."
+      ],
+      "correctIndex": 2,
+      "explanation": "Erase unlinks and frees each node immediately, but the bucket array is never contracted by any implementation — you must ask, via `rehash(0)`. The `max_load_factor` option is the plausible near-miss: setting the factor does not resize anything on the spot, it only changes the threshold consulted at the next rehash.",
+      "sourceAnchor": "124-load-factors-and-rehashing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "12-q18",
+      "prompt": "Why do open-addressed tables cap the load factor near 0.875 while `std::unordered_map` happily defaults to 1.0?",
+      "options": [
+        "Chaining's unsuccessful-search cost is ½(1 + 1/(1−α)²) but is amortised across the bucket array, whereas open addressing pays the full cost per probe.",
+        "Open addressing must leave slack for tombstones specifically; without deletions it can run at load factor 1.0 with no measurable probe-length growth.",
+        "The standard fixes 1.0 as the maximum any hash table may use, and open-addressed libraries choose 0.875 only to leave headroom for SIMD group alignment.",
+        "Linear probing's unsuccessful-search cost is ½(1 + 1/(1−α)²), which explodes near 1, whereas a chain's expected length grows only linearly with α."
+      ],
+      "correctIndex": 3,
+      "explanation": "Clustering makes probe runs merge, so the expected probes go roughly 1.5 at α=0.5 to 10.5 at α=0.95 — a cliff — while chaining goes 1.25 to 1.5 over the same range. The tombstone option is wrong on the mechanism: even an insert-only open-addressed table degrades as α approaches 1, because the free slots that terminate a probe run become scarce.",
+      "sourceAnchor": "124-load-factors-and-rehashing",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q19",
+      "prompt": "In an open-addressed table with linear probing, why can a deletion not simply mark the slot empty?",
+      "options": [
+        "An empty slot is indistinguishable from a never-used one, so the table's `size()` bookkeeping would drift and the load factor would be computed wrongly.",
+        "An empty slot terminates a probe run, so blanking it would hide every key that had probed past that slot on its way to a later position.",
+        "Blanking is safe for lookups but breaks inserts, which scan for the *last* free slot in a run and would place duplicates ahead of existing keys.",
+        "The metadata byte encodes the entry's home bucket, so clearing it loses the information needed to rehash the table at the next growth step."
+      ],
+      "correctIndex": 1,
+      "explanation": "Lookup stops at the first empty slot; a hole punched mid-run makes anything after it unreachable even though it is still stored. Hence tombstones (occupied-for-lookup, reusable-for-insert) or backward-shift deletion, which pulls later entries back to close the gap and so never leaves a truncating hole.",
+      "sourceAnchor": "125-open-addressing",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q20",
+      "prompt": "A workload inserts and erases heavily at a steady size, so α stays around 0.4, yet lookups get slower over hours. What is the mechanism and the fix?",
+      "options": [
+        "Tombstones accumulate and lengthen probe runs independently of α; either rehash in place to clear them or use backward-shift deletion instead.",
+        "The load factor computation excludes tombstones, so α is really approaching 1; lowering `max_load_factor` forces earlier growth and restores probe lengths.",
+        "Repeated erases fragment the slot array into non-contiguous regions, so probes lose prefetchability; switching to double hashing restores sequential access.",
+        "Erase leaves each entry's cached hash stale, so lookups fall back to full key comparison; recomputing the hash on erase avoids the extra comparisons."
+      ],
+      "correctIndex": 0,
+      "explanation": "A tombstone is opaque to lookup — it never terminates a run — so a delete-heavy table degrades even at a low live-element density, which is why implementations count tombstones and trigger a rehash-in-place. The fragmentation-and-double-hashing option gets the mechanism backwards: the slot array stays one contiguous block, and double hashing has *worse* cache behaviour than linear probing, not better.",
+      "sourceAnchor": "125-open-addressing",
+      "difficulty": "trap"
+    },
+    {
+      "id": "12-q21",
+      "prompt": "Double hashing has the best theoretical probe count of the common schemes, yet production tables use linear probing. Why?",
+      "options": [
+        "Double hashing needs the second hash to be coprime with the table size, which is unachievable when the capacity is a power of two rather than a prime.",
+        "Linear probing has no clustering to fix, so its measured probe count actually matches uniform hashing while double hashing suffers secondary clustering.",
+        "Double hashing cannot support backward-shift deletion or tombstones, so any table using it must be rebuilt from scratch after every erase.",
+        "One cache miss followed by several in-line sequential comparisons beats a handful of random dependent misses, and linear probes are prefetcher-friendly."
+      ],
+      "correctIndex": 3,
+      "explanation": "The theory counts probes; the hardware counts cache misses, and sequential probes often stay within the line already fetched. The coprimality option states a real requirement as an impossibility — it is trivially satisfied by forcing `h2` odd against a power-of-two table. Linear probing is also the scheme with the *worst* clustering (primary clustering), which is what Robin Hood and SwissTable exist to bound.",
+      "sourceAnchor": "125-open-addressing",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q22",
+      "prompt": "Which requirement does moving from `std::unordered_map` to an open-addressed table impose on the stored element type and on calling code?",
+      "options": [
+        "Elements must be default-constructible so empty slots can hold a valid object, and callers must not erase while any iterator into the table is live.",
+        "Elements must be trivially destructible so tombstoned slots need no cleanup, though pointers into the table stay valid until the next explicit rehash.",
+        "Elements must be movable and callers must hold keys rather than pointers, since any insert may rehash and relocate every element in the table.",
+        "Elements must supply a `noexcept` hash and callers must set `max_load_factor` below 0.5, since higher factors make probe runs unbounded in principle."
+      ],
+      "correctIndex": 2,
+      "explanation": "Storing entries in the array itself means growth is a relocation of everything, so movability is mandatory and no pointer or reference survives an insert — the standard workaround is to key by value or store `unique_ptr`s. The default-constructible option describes a naive design; real implementations track EMPTY/OCCUPIED/DELETED in separate metadata precisely so unoccupied slots hold no object at all.",
+      "sourceAnchor": "125-open-addressing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "12-q23",
+      "prompt": "What does Robin Hood hashing actually improve relative to plain linear probing?",
+      "options": [
+        "It leaves the mean probe length unchanged but collapses the variance: maximum displacement drops from O(log n) to O(log log n) with high probability.",
+        "It reduces the mean probe length by roughly half at every load factor, since displaced entries are relocated closer to their own home buckets.",
+        "It removes primary clustering entirely, so the expected probe count matches idealised uniform hashing the way double hashing does.",
+        "It lets the table exceed load factor 1 by chaining the displaced entries, so growth is needed far less often than with plain linear probing."
+      ],
+      "correctIndex": 0,
+      "explanation": "Swapping on insert redistributes displacement without changing the total, so the average is identical and only the tail improves — which is the whole point when tail latency is the metric. The 'halves the mean' option is the most tempting because the reordering feels like it should help everyone; it strictly moves cost from the unluckiest keys to the luckiest ones.",
+      "sourceAnchor": "126-robin-hood-hashing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "12-q24",
+      "prompt": "A Robin Hood lookup for key K is at offset d = 4 from K's home bucket and finds an occupant whose PSL is 2. What may it conclude?",
+      "options": [
+        "K may still lie further along, so probing continues until an empty slot is reached, exactly as it would in a plain linear-probing table.",
+        "K is absent and the search stops now, because entries along a run are in non-decreasing PSL order so K would already have taken this slot on insert.",
+        "K is absent and the search stops, because a PSL smaller than d proves the occupant is a tombstone left behind by a backward-shift deletion.",
+        "The table's invariant is broken and it must be rehashed, since no occupant along a probe run may have a PSL below the current probe distance."
+      ],
+      "correctIndex": 1,
+      "explanation": "The insert rule guarantees non-decreasing PSL along a run, so an occupant poorer in displacement than the key being sought means the key was never placed here — a failed lookup terminates early rather than running to the next empty slot. The 'keep probing' option is what a plain linear-probing table must do, and giving up that early exit is exactly what tombstones would cost you.",
+      "sourceAnchor": "126-robin-hood-hashing",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q25",
+      "prompt": "Why must a Robin Hood table use backward-shift deletion rather than tombstones?",
+      "options": [
+        "A tombstone occupies a slot that an insert could otherwise reuse, so a Robin Hood table would exceed its 0.9 load-factor cap far sooner than intended.",
+        "Backward shift is required because Robin Hood uses quadratic probing, and only a shift can preserve a probe sequence that is not contiguous in memory.",
+        "Tombstones would force the table to store a full hash per slot rather than a PSL byte, doubling the metadata cost of every slot in the array.",
+        "A tombstone carries no meaningful PSL, so it breaks the non-decreasing displacement invariant that the early-exit lookup rule depends on."
+      ],
+      "correctIndex": 3,
+      "explanation": "Robin Hood buys its tail bound and its early exit from the sorted-by-PSL invariant; a tombstone is a slot with no displacement value, so a probe run containing one can no longer be reasoned about and lookups must degrade to running to the next empty slot. Robin Hood is linear probing plus reordering, never quadratic — which is precisely why backward shift is available to it.",
+      "sourceAnchor": "126-robin-hood-hashing",
+      "difficulty": "trap"
+    },
+    {
+      "id": "12-q26",
+      "prompt": "In SwissTable, what does the control byte hold and what does a single probe do with it?",
+      "options": [
+        "State plus the high 7 bits of the hash; a probe SIMD-compares 16 control bytes and any match is a confirmed hit, so key data is never loaded at all.",
+        "The slot's probe sequence length; a probe compares 16 such bytes at once and stops as soon as one is smaller than the current probe distance.",
+        "State plus the low 7 bits of the hash; a probe SIMD-compares 16 control bytes against the broadcast H2 and yields a mask of candidate slots to check.",
+        "A pointer tag identifying the slot's home group; a probe reads it to jump directly to the group where the key must live, in a single memory access."
+      ],
+      "correctIndex": 2,
+      "explanation": "H1 (the high bits) picks the group, H2 (the low 7) goes in the control byte, and `_mm_cmpeq_epi8` plus `_mm_movemask_epi8` turns 16 slots into a 16-bit candidate mask. The high-7-bits option is the near-miss on both counts: the split is high-selects-group, low-goes-in-the-byte, and 7 bits only reject about 127/128 of non-matches — every candidate still needs a real key comparison.",
+      "sourceAnchor": "127-flat-hash-maps",
+      "difficulty": "recall"
+    },
+    {
+      "id": "12-q27",
+      "prompt": "Code stores `V*` pointers obtained from an `absl::flat_hash_map<K, V>` and keeps inserting. What is the correct characterisation?",
+      "options": [
+        "Pointers stay valid and only iterators are invalidated by a rehash, matching `std::unordered_map`'s contract, since both are hash tables over the same interface.",
+        "Any insert may rehash and relocate every element, so the pointers dangle; `absl::node_hash_map` or a mapped `std::unique_ptr<V>` restores stability.",
+        "Pointers stay valid as long as `reserve` was called before the first insert, because a table that never rehashes never relocates any of its elements.",
+        "Pointers stay valid because Abseil stores mapped values out of line by default; only the keys live in the slot array and only they may move."
+      ],
+      "correctIndex": 1,
+      "explanation": "Flat means the elements live in the slot array, so growth is a bulk relocation and the flat maps advertise no pointer or reference stability whatsoever. The `reserve` option is the dangerous half-truth to reject: avoiding a rehash avoids relocation in that one run, but the type gives you no guarantee, and any later insert past the reserved capacity moves everything.",
+      "sourceAnchor": "127-flat-hash-maps",
+      "difficulty": "trap"
+    },
+    {
+      "id": "12-q28",
+      "prompt": "A per-venue table holds about 8 entries and is read on every message. What is the strongest recommendation?",
+      "options": [
+        "An `absl::flat_hash_map` with `reserve(8)`: the SIMD group probe examines all 16 control bytes at once, so the whole table resolves in a single comparison.",
+        "A `std::unordered_map` with `max_load_factor(0.25)`: at that density chains are one node long, so a lookup is a single dependent load after the modulo.",
+        "A `std::map`: at eight elements the tree is three levels deep and entirely resident in L1, so the pointer chase costs no more than an array scan.",
+        "A flat array scanned linearly: one or two cache lines, perfectly predicted branches, and no hash to compute at all — it beats every hash table at that size."
+      ],
+      "correctIndex": 3,
+      "explanation": "Below roughly 16 entries the hash computation and metadata machinery cost more than simply comparing every key in a contiguous block, and volunteering this signals practical judgement. The SwissTable option is the most credible distractor — it is genuinely fast — but you still pay to hash the key and touch a separate control array, for a table that fits in a cache line.",
+      "sourceAnchor": "127-flat-hash-maps",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q29",
+      "prompt": "How is `std::flat_map` laid out internally, and why does that layout matter for lookup?",
+      "options": [
+        "Two parallel sorted containers, keys and values kept in the same order, so a binary search touches only the key array and the value is loaded once at the end.",
+        "One sorted `std::vector<std::pair<const Key, T>>`, so a binary search walks contiguous memory and finds the key and its value in the same cache line.",
+        "A sorted key vector plus a hash index over it, so lookup is O(1) average through the index with the sorted keys serving only ordered iteration.",
+        "Two parallel unsorted vectors kept in insertion order, with a separate sorted permutation array consulted for `lower_bound` and ordered traversal."
+      ],
+      "correctIndex": 0,
+      "explanation": "The C++23 adaptor is structure-of-arrays: `KeyContainer keys_` and `MappedContainer values_`, so the probe levels of the binary search pull in only keys and the cache lines spent on the search do not carry mapped data. The single-vector-of-pairs option is `boost::container::flat_map`'s AoS design — a real container, but not what the standard adopted.",
+      "sourceAnchor": "128-flat-maps-and-sets",
+      "difficulty": "recall"
+    },
+    {
+      "id": "12-q30",
+      "prompt": "You must add 100,000 entries to an existing `std::flat_map` of 1,000,000. What is the right approach?",
+      "options": [
+        "Call `insert` in a loop after `reserve`, because reserving removes the reallocation and reduces each individual insert to amortised O(log n).",
+        "Call `insert` in a loop but pass a hint iterator, because a correct hint reduces a `flat_map` insert to amortised O(1) exactly as it does for `std::map`.",
+        "Append the new entries, sort that suffix, then `inplace_merge` — O(n + m log m) — because individual inserts are O(n) each and would cost O(n·m).",
+        "Sort the new entries and insert them in descending key order, so each insert lands at the front and shifts a suffix that is already in cache."
+      ],
+      "correctIndex": 2,
+      "explanation": "A `flat_map` insert shifts the tail of both vectors, so it is O(n) no matter what — a hundred thousand of them is 10^11 element moves. `reserve` only removes reallocation, not the shift, and a hint cannot help either, since the cost is memory movement rather than locating the position; `sorted_unique_t` construction is the other batching route.",
+      "sourceAnchor": "128-flat-maps-and-sets",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q31",
+      "prompt": "Why does `auto& p = *it;` fail to behave as expected on a `std::flat_map` iterator?",
+      "options": [
+        "`value_type` is `pair<const Key, T>` stored contiguously, but the iterator returns it by value to keep the key immutable, so binding it to `auto&` copies.",
+        "`value_type` is `pair<const Key, T>` but no such object exists in storage, so the iterator synthesises a `pair<const Key&, T&>` proxy rather than a real element.",
+        "The iterator is a `contiguous_iterator` into the key vector alone, so dereferencing yields a `Key&` and the mapped value must be reached through `it.mapped()`.",
+        "`flat_map` iterators are input iterators, so dereferencing twice may yield different objects and binding a reference to the first is always undefined behaviour."
+      ],
+      "correctIndex": 1,
+      "explanation": "With keys and values in separate vectors there is nothing in memory shaped like a `pair<const Key, T>`, so `operator*` builds a proxy of references and `operator->` needs a proxy too. That also means `flat_map` iterators are *not* contiguous iterators — they do satisfy C++20 `random_access_iterator` under the proxy-friendly ranges rules, so calling them input iterators understates them badly.",
+      "sourceAnchor": "128-flat-maps-and-sets",
+      "difficulty": "application"
+    },
+    {
+      "id": "12-q32",
+      "prompt": "You need an ordered map that is both read-heavy and write-heavy, with millions of entries. Which choice do you defend and why?",
+      "options": [
+        "`std::flat_map`: contiguous binary search and about five times less memory, with inserts staying O(log n) because the two vectors are searched independently.",
+        "`std::map`: the only structure with O(log n) writes, since both B-trees and sorted vectors must shift or split O(n) elements on every insertion.",
+        "`std::unordered_map` with an auxiliary sorted index rebuilt lazily, giving O(1) writes while still answering `lower_bound` queries in O(log n).",
+        "`absl::btree_map`: O(log n) insert *and* erase, contiguous scanning within cache-line-sized nodes, and roughly a third of `std::map`'s memory."
+      ],
+      "correctIndex": 3,
+      "explanation": "A B-tree is the middle ground: it keeps logarithmic mutation like a red-black tree while packing many keys per node for contiguous scanning and far less pointer overhead, at the cost of invalidating iterators on mutation. `flat_map` is the trap here — its lookups are excellent, but insert and erase shift the tail and are O(n), which is disqualifying for a write-heavy load.",
+      "sourceAnchor": "128-flat-maps-and-sets",
+      "difficulty": "application"
+    }
+  ]
+}

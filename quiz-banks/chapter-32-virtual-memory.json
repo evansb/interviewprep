@@ -1,0 +1,649 @@
+{
+  "slug": "chapter-32-virtual-memory",
+  "questions": [
+    {
+      "id": "32-q01",
+      "prompt": "On x86-64 with 4-level paging, what happens when a program dereferences an address in the non-canonical hole between the user and kernel halves?",
+      "options": [
+        "It raises a general-protection fault (`#GP`), not a page fault, because the address is malformed before translation is attempted.",
+        "It raises an ordinary page fault (`#PF`) that the kernel converts into `SIGSEGV` after finding no VMA.",
+        "It is silently truncated to 48 bits and translated as if bit 47 had been sign-extended correctly.",
+        "It raises a page fault only if the address falls above `mmap_min_addr`; below that it is a `#GP`."
+      ],
+      "correctIndex": 0,
+      "explanation": "Hardware requires bits 63:47 to be all-equal, so a non-canonical address fails the format check before any page-table lookup and delivers `#GP`. The tempting near-miss is the ordinary-page-fault answer: it describes exactly what happens for a canonical address with no VMA behind it, but a non-canonical address never reaches VMA lookup at all. Nothing is truncated, and `mmap_min_addr` governs the low end of the user half, not canonicality.",
+      "sourceAnchor": "321-virtual-and-physical-addresses",
+      "difficulty": "recall"
+    },
+    {
+      "id": "32-q02",
+      "prompt": "You allocate a buffer that is 4 KiB-aligned in virtual address space. What can you conclude about its physical address?",
+      "options": [
+        "It is also 4 KiB-aligned, because the low 12 bits are the page offset and pass through translation unchanged.",
+        "Nothing — the MMU is free to place the page at any physical byte address it chooses.",
+        "It is 4 KiB-aligned only if the mapping uses huge pages, which force stronger physical alignment.",
+        "It is aligned to the same boundary only while the page stays resident; reclaim can shift it."
+      ],
+      "correctIndex": 0,
+      "explanation": "Translation replaces only the upper bits with a page frame number; the low 12 bits are copied verbatim, so any virtual alignment up to page granularity is preserved physically. The 'MMU can place it anywhere' answer confuses frame selection with byte-level placement — the kernel picks any *frame*, but frames are themselves 4 KiB-aligned. Huge pages raise the guaranteed alignment further, but 4 KiB alignment already holds without them.",
+      "sourceAnchor": "321-virtual-and-physical-addresses",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q03",
+      "prompt": "A service sets `ulimit -s unlimited` in its launch script and then finds its address-space layout and ASLR entropy have changed. Why?",
+      "options": [
+        "An unlimited `RLIMIT_STACK` switches the kernel to the legacy bottom-up `mmap` layout instead of the top-down one, changing where mappings land and how much they are randomized.",
+        "An unlimited stack disables `stack_guard_gap`, so the stack VMA is placed adjacent to the mmap region and both are randomized together.",
+        "An unlimited stack forces the kernel to reserve the full 128 TiB user half for stack growth, leaving randomization only within the heap.",
+        "An unlimited stack makes the main thread's stack a normal `mmap` region, so it is randomized with the mmap base rather than separately."
+      ],
+      "correctIndex": 0,
+      "explanation": "The kernel chooses between `legacy` (mmap grows up from low addresses) and `topdown` (mmap base near the stack, growing down) based on `RLIMIT_STACK`, and an unlimited stack selects legacy — a genuinely surprising coupling between a resource limit and address-space geometry. The guard-gap answer is the tempting one because `stack_guard_gap` is real (1 MiB), but it is a fixed gap that an unlimited stack does not disable. The main thread's stack remains a `VM_GROWSDOWN` VMA, not an ordinary mmap.",
+      "sourceAnchor": "322-process-address-space-layout",
+      "difficulty": "trap"
+    },
+    {
+      "id": "32-q04",
+      "prompt": "Why does Linux use a four-level radix page table rather than a single flat array indexed by virtual page number?",
+      "options": [
+        "A flat table for a 48-bit space at 4 KiB pages would need 2^36 entries × 8 B = 512 GiB per process; a radix tree materializes only the levels actually used.",
+        "A flat table would exceed the 512-entry limit the hardware imposes on any single translation structure, so levels are mandatory.",
+        "A radix tree is faster to walk than a flat array because the top levels are indexed rather than searched linearly.",
+        "A flat table cannot encode per-page permission bits, so protection would have to live in a separate parallel structure."
+      ],
+      "correctIndex": 0,
+      "explanation": "The whole justification is space: 512 GiB per process for a flat table versus about 4 pages of tables for a process using 1 MiB. The 'faster to walk' answer inverts reality — a flat table would be a single indexed load, whereas the radix tree costs up to four *dependent* loads; levels are a space optimization paid for with walk latency. A flat table would encode permissions perfectly well, and 512 is the entries-per-4-KiB-page count, not a hardware cap on table size.",
+      "sourceAnchor": "323-multi-level-page-tables",
+      "difficulty": "recall"
+    },
+    {
+      "id": "32-q05",
+      "prompt": "A process maps and touches 100 GiB using 4 KiB pages. Roughly how much memory do its page tables consume, and where do you read it?",
+      "options": [
+        "About 200 MiB, at roughly 2 MiB of page tables per GiB mapped; `VmPTE` in `/proc/<pid>/status` reports it.",
+        "About 200 MiB, but it is charged to the kernel rather than the process, so no procfs field attributes it.",
+        "About 800 MiB, since each of the four levels contributes its own copy of the mapping; `VmPTE` reports it.",
+        "About 25 MiB, because only the leaf level scales with mapped size; `VmData` in `/proc/<pid>/status` reports it."
+      ],
+      "correctIndex": 0,
+      "explanation": "One 8-byte PTE per 4 KiB page is about 0.2% overhead, i.e. 2 MiB per GiB, so 100 GiB costs roughly 200 MiB — real memory and real cache pressure during walks — and `VmPTE` exposes it per process. The four-levels-multiply answer is the most tempting: the upper levels exist, but each PML4E covers 512 GiB and each PDE covers 2 MiB, so their contribution is negligible rather than a 4× multiplier. Page-table memory is also counted against the process, including in the OOM badness score.",
+      "sourceAnchor": "323-multi-level-page-tables",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q06",
+      "prompt": "A thread writes to a page whose PTE is present but marked read-only, while the covering VMA has `VM_WRITE` set. What does the fault handler do?",
+      "options": [
+        "Treats it as a copy-on-write fault: it copies the frame, or reuses it in place if the refcount has fallen to one.",
+        "Delivers `SIGSEGV`, because the PTE's permission bits are authoritative and they forbid the write.",
+        "Upgrades the PTE to writable unconditionally, since the VMA already grants write permission to the range.",
+        "Treats it as a major fault and re-reads the page from its backing store before making it writable."
+      ],
+      "correctIndex": 0,
+      "explanation": "The mismatch between a writable VMA and a non-writable PTE is precisely the signature the kernel uses to recognize COW; permission violations are the case where the *VMA* forbids the write. Unconditional upgrade is the tempting distractor — it is what the reuse path does, but only after confirming `page_count(page) == 1`, otherwise it would let one sharer's write leak into another mapping. No I/O is involved, so this is a minor fault at 1.5–3 µs with the copy, or 0.5–1 µs on the reuse path.",
+      "sourceAnchor": "324-page-faults",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q07",
+      "prompt": "How do the chapter's minor and major fault costs compare on a modern NVMe-backed host?",
+      "options": [
+        "Minor faults cost 0.5–2 µs, major faults 30–150 µs on NVMe and 3–10 ms on a spinning disk — roughly a 100× gap.",
+        "Minor faults cost 0.5–2 µs, major faults 5–10 µs on NVMe, since the device latency is now close to a memory access.",
+        "Minor faults cost 50–100 ns because no allocation occurs; major faults cost 30–150 µs on NVMe.",
+        "Minor and major faults both cost 0.5–2 µs; only the accounting counter differs between the two classes."
+      ],
+      "correctIndex": 0,
+      "explanation": "The defining difference is I/O: a minor fault allocates and zeroes in software, a major fault waits on a device, and the 100× gap is the number to carry into an interview. The 50–100 ns figure for minor faults is the tempting one because it sounds like a cache-miss cost, but the fault path alone is ~200 ns of exception entry plus ~100 ns VMA lookup plus ~300 ns to clear 4 KiB. The counters `minflt` and `majflt` do differ, but the cost differs too.",
+      "sourceAnchor": "324-page-faults",
+      "difficulty": "recall"
+    },
+    {
+      "id": "32-q08",
+      "prompt": "You `mmap` 1 GiB of anonymous memory and then run a loop that reads one byte from every page. RSS does not move. What happened?",
+      "options": [
+        "Reads of untouched anonymous pages map a single shared read-only zero page, so no frames were allocated and the buffer is still unfaulted for writes.",
+        "The reads were elided by the optimizer, so no faults occurred at all and the mapping remains entirely untouched.",
+        "The pages were faulted in normally but are accounted under `Cached` rather than RSS until the first write dirties them.",
+        "RSS lags behind by a reclaim cycle; the pages are resident and the counter catches up when `kswapd` next runs."
+      ],
+      "correctIndex": 0,
+      "explanation": "The zero-page optimization means a read costs a minor fault that installs one shared frame for the whole mapping; only a write triggers a COW off that zero page and a real allocation. This is exactly why a read-only pre-fault loop is the single most common pre-faulting bug — the loop appears to work and buys nothing. The `Cached` answer is the plausible near-miss: anonymous pages are counted in `AnonPages` and RSS, never in `Cached`, which tracks page-cache file pages.",
+      "sourceAnchor": "325-demand-paging",
+      "difficulty": "trap"
+    },
+    {
+      "id": "32-q09",
+      "prompt": "What does `mmap`ing 1 GiB anonymous and then `memset`ting all of it actually cost, in the chapter's numbers?",
+      "options": [
+        "The `mmap` is ~5 µs and zero RAM; the `memset` takes 262,144 faults at ~1.5 µs each, roughly 400 ms on top of the bandwidth cost.",
+        "The `mmap` is ~400 ms because the kernel must reserve and zero the frames up front; the `memset` then runs at full bandwidth.",
+        "The `mmap` is ~5 µs and zero RAM; the `memset` takes 262,144 faults at ~1.5 µs each, but they are overlapped with the copy and cost nothing extra.",
+        "The `mmap` is ~5 µs and zero RAM; the `memset` takes 2,048 faults because the kernel batches fault-around in 512-page groups."
+      ],
+      "correctIndex": 0,
+      "explanation": "Virtual space is allocated eagerly and physical memory lazily, so the mapping is essentially free and the entire cost lands on first touch: 1 GiB ÷ 4 KiB is 262,144 faults, and a few hundred milliseconds of pure fault overhead separate from memory bandwidth. The overlap answer is the appealing one — faults are synchronous exceptions on the faulting thread, so they serialize with the stores rather than hiding behind them. The 2,048 figure is the fault count for 2 MiB pages, not for fault-around on 4 KiB anonymous memory.",
+      "sourceAnchor": "325-demand-paging",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q10",
+      "prompt": "A parent `fork`s and the child immediately `exec`s. Why do the parent's subsequent COW faults cost far less than a naive analysis predicts?",
+      "options": [
+        "The `exec` drops the child's references, so the frames' refcounts fall to one and the parent's faults take the reuse path — a PTE update with no copy.",
+        "The `exec` restores the parent's PTEs to writable eagerly, so the parent takes no COW faults on its working set at all.",
+        "The kernel defers marking the parent's PTEs read-only until the child actually writes, so a fast `exec` avoids the marking entirely.",
+        "The parent's pages are shared rather than copied, so its writes go to the same frames the child inherited until the child exits."
+      ],
+      "correctIndex": 0,
+      "explanation": "The reuse path is the mechanism: when `page_count(page) == 1` and the page is not KSM, the handler just calls `pte_mkwrite` for ~0.5–1 µs instead of allocating and copying 4 KiB for 1.5–3 µs. The 'PTEs restored eagerly' answer is tempting because the outcome looks similar, but `exec` in the child cannot touch the parent's page tables — the parent still faults, it just faults cheaply. `fork` marks the parent's PTEs read-only immediately, which is why a large-heap parent can take tens of thousands of COW faults after forking.",
+      "sourceAnchor": "326-copy-on-write-faults",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q11",
+      "prompt": "Redis warns you to disable THP before running `BGSAVE`. What specifically goes wrong if you ignore it?",
+      "options": [
+        "Each COW fault after the fork copies 2 MiB instead of 4 KiB, so a write to a single key can duplicate a huge page and memory usage balloons.",
+        "`khugepaged` cannot collapse pages belonging to two processes, so the fork silently falls back to 4 KiB pages and loses TLB reach.",
+        "The child's huge pages cannot be written to swap, so the snapshot blocks until the parent's dirty pages are flushed to disk.",
+        "The fork itself becomes O(huge pages) rather than O(mapped pages), making the `BGSAVE` fork call itself the dominant stall."
+      ],
+      "correctIndex": 0,
+      "explanation": "COW granularity follows page size, so one touched byte in a THP copies 2 MiB (~50–150 µs) or forces a page split — memory usage can nearly double for a lightly-modified dataset. The swap answer trades on a true fact stated about the wrong thing: HugeTLB pages are indeed unswappable, but that is explicit huge pages, and it is not what makes `BGSAVE` bloat. Fork cost scales with page-table size, which THP actually *reduces*; the damage is entirely on the COW side.",
+      "sourceAnchor": "326-copy-on-write-faults",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q12",
+      "prompt": "With a 1536-entry STLB, what is the TLB reach at 4 KiB versus 2 MiB pages, and why does the 4 KiB number matter so much?",
+      "options": [
+        "6 MiB versus 3 GiB — and 6 MiB is smaller than L3, so a large working set misses the TLB essentially always even while hitting in cache.",
+        "6 MiB versus 3 GiB — and 6 MiB comfortably exceeds L3, so TLB misses only appear once the working set spills to DRAM.",
+        "1536 MiB versus 3 GiB, since the STLB entries are shared between 4 KiB and 2 MiB translations at a fixed ratio.",
+        "6 MiB versus 768 MiB, because 2 MiB translations occupy the dedicated 32-entry L1 dTLB rather than the STLB."
+      ],
+      "correctIndex": 0,
+      "explanation": "Reach is entries × page size: 1536 × 4 KiB = 6 MiB, 1536 × 2 MiB = 3 GiB. The reason it is the whole huge-page argument is precisely that 6 MiB sits *below* typical L3 capacity, so a 1 GiB random-access workload can hit in L3 while still paying a page walk on nearly every access. The 'exceeds L3' variant states the relationship backwards and would imply TLB pressure is a DRAM-only concern. The 2 MiB L1 dTLB has 32 entries, but 2 MiB translations also occupy the shared STLB.",
+      "sourceAnchor": "327-translation-lookaside-buffers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "32-q13",
+      "prompt": "Which single `perf` measurement most directly tells you what fraction of your runtime is address translation?",
+      "options": [
+        "`dtlb_load_misses.walk_active` divided by `cycles` — walk-active cycles over total cycles; above about 5% argues for huge pages.",
+        "`dTLB-load-misses` divided by `instructions` — the miss rate per instruction, which converts directly to a time fraction.",
+        "`page_walker_loads.dtlb_memory` divided by `cycles` — walk loads that reached memory over total cycles.",
+        "`dtlb_load_misses.walk_completed` divided by `cache-references` — completed walks as a share of memory operations."
+      ],
+      "correctIndex": 0,
+      "explanation": "`walk_active` counts cycles during which a page walk is in progress, so dividing by total cycles yields a time fraction with no assumed cost-per-miss. The miss-rate-per-instruction answer is the most tempting because miss counts are the familiar metric, but a miss count says nothing about time until you multiply by a walk cost that varies from ~7 cycles to 200 ns depending on where the levels are cached. `page_walker_loads.dtlb_memory` is a useful signal that the page tables themselves fell out of cache, but it is a count of loads, not of cycles.",
+      "sourceAnchor": "327-translation-lookaside-buffers",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q14",
+      "prompt": "Your workload runs inside a VM with EPT/NPT enabled and shows far worse TLB-miss cost than on bare metal. What is the structural reason?",
+      "options": [
+        "Each guest-physical address in the walk must itself be translated, so a full nested walk reaches up to 4 × 4 + 4 = 24 memory accesses.",
+        "The hypervisor traps every guest TLB miss and services the walk in software, adding a VM exit to each miss.",
+        "Nested paging disables the paging-structure caches, so every level must be re-read from the data cache on each walk.",
+        "The guest and host share one TLB without ASID tagging, so every VM exit flushes the guest's translations entirely."
+      ],
+      "correctIndex": 0,
+      "explanation": "Nested paging multiplies the walk: every one of the guest's four level-pointers is a guest-physical address needing its own four-level host walk, plus the final translation, so misses can cost 500 ns or more and huge pages matter far more in virtualized environments. The VM-exit answer is the plausible one because software-shadow paging genuinely did trap, but EPT/NPT exist precisely to let hardware walk both levels without exits. Paging-structure caches remain active under nested paging, and modern hardware tags guest translations so exits do not flush everything.",
+      "sourceAnchor": "328-page-walks",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q15",
+      "prompt": "Beyond reducing miss rate, how do huge pages change the page walk itself?",
+      "options": [
+        "The walk terminates early — a 2 MiB page ends at the PDE (three levels) and a 1 GiB page at the PDPTE (two levels) — so there are fewer dependent loads.",
+        "The walk still traverses all four levels, but each level's entry is cached longer because fewer distinct entries compete for cache lines.",
+        "The walk is issued to both page-miss handlers in parallel, halving latency because the leaf level can be predicted from the PDE.",
+        "The walk skips the PML4 entirely, since a huge page's mapping is installed directly into the paging-structure caches at fault time."
+      ],
+      "correctIndex": 0,
+      "explanation": "The PS bit at the PD or PDPT level makes that entry map the page directly, so the walk stops there — fewer levels, fewer loads, and 512× fewer distinct entries competing for TLB slots. The 'all four levels but better cached' answer is the tempting one because the caching benefit is real, but it understates the change: the leaf load genuinely disappears rather than merely hitting more often. The two page-miss handlers let two independent walks proceed concurrently; they do not split one walk, and nothing skips the PML4.",
+      "sourceAnchor": "328-page-walks",
+      "difficulty": "recall"
+    },
+    {
+      "id": "32-q16",
+      "prompt": "A 64-thread process calls `munmap` on one core. Why does that stall the initiating thread for 10–50 µs?",
+      "options": [
+        "It must IPI every CPU in `mm_cpumask` to invalidate their TLBs and then busy-wait for all acknowledgements, so cost scales with participating cores.",
+        "It must take `mmap_lock` for write and wait for all 64 threads to leave the kernel, so cost scales with the number of runnable threads.",
+        "It must write back and free the underlying frames synchronously, so cost scales with the size of the region being unmapped.",
+        "It must broadcast an invalidation on the coherence fabric and wait for the memory controller to drain, so cost scales with socket count."
+      ],
+      "correctIndex": 0,
+      "explanation": "TLBs are per-core caches with no hardware coherence on x86, so a PTE change requires explicit inter-processor interrupts to every CPU that has run this `mm`, and the initiator blocks until each target acknowledges: ~0.2 µs single-threaded, 2–5 µs at two cores, 10–50 µs at sixty-four. The `mmap_lock` answer is tempting because that lock is a genuine tail-latency source in multithreaded servers, but it does not require threads to leave the kernel and it is not what makes the cost scale with core count. On ARM64 the same operation is far cheaper because `TLBI` with the inner-shareable modifier broadcasts in hardware.",
+      "sourceAnchor": "329-tlb-shootdowns",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q17",
+      "prompt": "A thread on a fully isolated, `nohz_full` core takes a 12 µs stall with no context switch, no syscall, and no page fault of its own. What is the most likely cause?",
+      "options": [
+        "A TLB-shootdown IPI, sent because another thread in the same process called `munmap` or `mprotect`.",
+        "A minor page fault on the isolated thread's own stack, which is not counted while the core is tickless.",
+        "A `kswapd` wakeup on that core, which preempts the thread briefly to scan the LRU lists.",
+        "A `khugepaged` scan of the thread's arena, which runs on the core that owns the memory being collapsed."
+      ],
+      "correctIndex": 0,
+      "explanation": "Shootdown IPIs are one of the very few ways a properly isolated core can still be interrupted, and the signature — a multi-microsecond stall with no context switch, no syscall, no fault — is exactly this; `/proc/interrupts`' `TLB` row climbing on that core confirms it. The stack-fault answer is the plausible one, but minor faults are counted in `minflt` regardless of tickless mode, so the stated absence of faults rules it out. `kswapd` and `khugepaged` are kernel threads that isolation keeps off the core, though `khugepaged`'s collapse work can reach you indirectly — as a shootdown.",
+      "sourceAnchor": "329-tlb-shootdowns",
+      "difficulty": "trap"
+    },
+    {
+      "id": "32-q18",
+      "prompt": "Why does jemalloc's use of `MADV_FREE` rather than `MADV_DONTNEED` reduce shootdown pressure?",
+      "options": [
+        "`MADV_FREE` marks pages reclaimable without unmapping them, so no PTE is invalidated at call time and the shootdown is deferred or avoided.",
+        "`MADV_FREE` batches the invalidations and issues one IPI per arena instead of one per region, cutting the IPI count by the arena size.",
+        "`MADV_FREE` unmaps the pages but skips the acknowledgement wait, so the initiator returns before the targets have flushed.",
+        "`MADV_FREE` restricts the invalidation to the calling CPU, leaving other cores to discover the stale entry on their next miss."
+      ],
+      "correctIndex": 0,
+      "explanation": "Laziness is the whole mechanism: the pages stay mapped with their contents intact until memory pressure arrives, so there is nothing to invalidate now — about 1 µs versus 2–20 µs plus a shootdown for `MADV_DONTNEED`. The 'skips the acknowledgement wait' answer is the tempting one because it correctly identifies the busy-wait as the expensive part, but skipping it would leave other cores using stale translations, which is a correctness violation no flag can license. The visible cost of `MADV_FREE` is that RSS stays high until pressure, which monitoring often misreads as a leak.",
+      "sourceAnchor": "329-tlb-shootdowns",
+      "difficulty": "recall"
+    },
+    {
+      "id": "32-q19",
+      "prompt": "Your host reserves a 32 GiB pool of 1 GiB HugeTLB pages at boot, but the application only uses 20 GiB of it. What is true of the other 12 GiB?",
+      "options": [
+        "It is unavailable to everything else on the box — the pool is a carve-out, not a cache, and HugeTLB pages are never reclaimed or swapped.",
+        "It is returned to the buddy allocator as ordinary 4 KiB pages until a huge-page allocation needs it back.",
+        "It is reclaimable under memory pressure like page cache, but only after `kswapd` has exhausted the file LRU lists.",
+        "It is swappable but never reclaimed as clean, so it appears under `VmSwap` once the system comes under pressure."
+      ],
+      "correctIndex": 0,
+      "explanation": "Reserving HugeTLB removes memory from general circulation permanently: the pool is never swapped, never reclaimed, never split, and never subject to compaction — which is exactly the determinism you are buying, and exactly the cost you accept. The 'reclaimable like page cache' answer is the seductive one because page cache really does behave that way, and it is why `free -h`'s available column is usually large; huge-page reservations are the opposite, showing up as `Hugetlb` in `/proc/meminfo` and unavailable to anyone else. Reserving at boot is preferred because runtime reservation fails once physical memory is fragmented.",
+      "sourceAnchor": "3210-explicit-huge-pages",
+      "difficulty": "recall"
+    },
+    {
+      "id": "32-q20",
+      "prompt": "A service with THP `enabled=always` and `defrag=always` shows isolated latency spikes of 10–500 ms with high `sys` time. What is happening?",
+      "options": [
+        "A THP fault found no free huge page and triggered synchronous compaction, migrating pages to build a contiguous 2 MiB block while the thread waits.",
+        "`khugepaged` collapsed a region during the request, holding `mmap_lock` for write for the full duration of the spike.",
+        "The THP fault had to zero 2 MiB before installing the PTE, and zeroing at 12 GB/s accounts for the observed millisecond range.",
+        "A COW fault on a THP copied 2 MiB, and the copy plus the resulting page split accounts for the observed millisecond range."
+      ],
+      "correctIndex": 0,
+      "explanation": "`defrag=always` means the allocating thread performs direct compaction rather than falling back to 4 KiB pages, and on fragmented memory that is the unbounded multi-millisecond stall; confirm with `compact_stall`/`compact_fail` in `/proc/vmstat` and a stack through `__alloc_pages_direct_compact`. The `khugepaged` answer is the strongest distractor because collapse really does take `mmap_lock` for write and really does stall things — but its signature is *periodic* stalls correlated with `khugepaged` CPU time, not isolated 500 ms outliers. Zeroing 2 MiB costs 20–100 µs and a THP COW copy 50–150 µs; neither reaches milliseconds.",
+      "sourceAnchor": "3211-transparent-huge-pages",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q21",
+      "prompt": "You echo `never` into `/sys/kernel/mm/transparent_hugepage/enabled` on a running process that has been up for hours. What have you actually achieved?",
+      "options": [
+        "New faults stop producing huge pages, but THPs already established stay huge — you must apply the setting at boot to be sure of the state.",
+        "All existing THPs are split back into 4 KiB PTEs immediately, with a shootdown per split, so the process is fully converted.",
+        "Nothing at all, because the `enabled` file only gates `madvise` requests and the process never called `madvise(MADV_HUGEPAGE)`.",
+        "New faults stop producing huge pages and `khugepaged` finishes collapsing its current scan window, after which the state is clean."
+      ],
+      "correctIndex": 0,
+      "explanation": "Flipping the knob at runtime changes future behaviour only; pages already collapsed or faulted as huge remain huge, which is why the recommendation is `transparent_hugepage=never` on the kernel command line. The immediate-split answer is tempting because splitting is a real operation with a real shootdown cost, but the kernel does not walk every mapping to undo existing THPs when you write the file. The `madvise` reading is backwards: `enabled=madvise` is the setting that restricts THP to regions that asked, whereas `never` disables it outright.",
+      "sourceAnchor": "3211-transparent-huge-pages",
+      "difficulty": "trap"
+    },
+    {
+      "id": "32-q22",
+      "prompt": "Under memory pressure caused by an unrelated batch job, your trading process shows major faults in code that touches no new data. What is the mechanism?",
+      "options": [
+        "Clean file-backed pages are dropped without writeback, so the binary's `.text` pages were evicted and the next call into that code re-reads them from disk.",
+        "Anonymous heap pages were swapped out, and returning from a function faulted them back in as the stack was unwound.",
+        "The page cache grew and pushed the process's page tables out of DRAM, so each call paid a page walk that reached the device.",
+        "`kswapd` migrated the text pages to the remote NUMA node, and the resulting hint faults are accounted as major."
+      ],
+      "correctIndex": 0,
+      "explanation": "The reclaim asymmetry is the key: anonymous pages must be written to swap first, but clean file-backed pages — including your executable's text — cost nothing to drop, so they are the cheapest thing for the kernel to take, and re-reading them is a major fault. This is the standard argument for `mlockall`, which pins text as well as data. The swapped-heap answer is plausible but does not fit the stated symptom of code that touches no new data; and page tables falling out of DRAM produces slow page walks, not `majflt` counts.",
+      "sourceAnchor": "3212-anonymous-and-file-backed-mmap",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q23",
+      "prompt": "For streaming a large file sequentially in a latency-sensitive service, why is `read`/`io_uring` preferred over `mmap`?",
+      "options": [
+        "`mmap` produces a fault storm and turns an I/O error into an asynchronous `SIGBUS` at an arbitrary instruction, whereas `read` reports `errno` where you called it.",
+        "`mmap` copies the data from the page cache into your buffer just as `read` does, so it costs the same while adding fault overhead on top.",
+        "`mmap` cannot use readahead at all, so every 4 KiB is fetched as an isolated device request rather than a sequential stream.",
+        "`mmap` holds `mmap_lock` for write for the duration of the streaming loop, blocking any concurrent allocation in the process."
+      ],
+      "correctIndex": 0,
+      "explanation": "Two things decide it: sequential streaming through a mapping means a fault per page (~1 µs cached, 30–150 µs uncached and unpredictable), and the only error channel is `SIGBUS` delivered asynchronously at whatever instruction touched the page — which you cannot handle cleanly. The zero-copy claim is inverted in the tempting distractor: `mmap` genuinely avoids the page-cache-to-user copy that `read` pays, so its advantage is real but does not outweigh the fault storm and error model. `MADV_SEQUENTIAL` does drive readahead for mappings, and the faults take `mmap_lock` for read, not write.",
+      "sourceAnchor": "3212-anonymous-and-file-backed-mmap",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q24",
+      "prompt": "Two processes `MAP_PRIVATE` the same file. Process A modifies the file through a `MAP_SHARED` mapping. What may process B observe through its private mapping?",
+      "options": [
+        "Pages B has not yet written to may or may not reflect A's changes; once B writes a page it has a private COW copy and is isolated thereafter.",
+        "B sees a consistent snapshot taken at `mmap` time, because `MAP_PRIVATE` copies the file's pages into the mapping eagerly.",
+        "B sees all of A's changes until B calls `msync`, which is what commits the private copy and detaches it from the file.",
+        "B never sees A's changes, because `MAP_PRIVATE` installs read-only PTEs over private frames allocated at mapping time."
+      ],
+      "correctIndex": 0,
+      "explanation": "POSIX explicitly leaves it unspecified whether a private file mapping sees other writers' updates before the reader's own first write; only after the COW copy is taken does the page become genuinely private. The snapshot answer is the intuitive and wrong one — `MAP_PRIVATE` shares page-cache frames read-only and copies lazily, so nothing is snapshotted at `mmap` time. `msync` is meaningless for private mappings since the writes never reach the file at all.",
+      "sourceAnchor": "3213-shared-and-private-mappings",
+      "difficulty": "trap"
+    },
+    {
+      "id": "32-q25",
+      "prompt": "A developer calls `madvise(buf, len, MADV_DONTNEED)` on a live anonymous arena to hint that it is cold. What actually happens on Linux?",
+      "options": [
+        "The pages are discarded immediately and subsequent reads return zeroes — it is a data-destroying operation, plus a TLB shootdown.",
+        "The pages are marked reclaimable and their contents survive until memory pressure arrives, at which point they may read back as zeroes.",
+        "The pages are moved to the inactive LRU list so reclaim prefers them, but their contents are preserved until they are actually swapped.",
+        "The advice is ignored for anonymous mappings, since only file-backed pages have a backing store to be re-read from."
+      ],
+      "correctIndex": 0,
+      "explanation": "`MADV_DONTNEED` is not a hint on Linux; it means delete this data now, and reading the region afterwards yields zeroes, plus you pay a shootdown at call time. The 'reclaimable, contents survive until pressure' answer is exactly `MADV_FREE`, which is the single most valuable distinction in this table and the one interviews probe — swapping the two is the classic error. `MADV_COLD` is the operation that merely deactivates without destroying, and portability is a further hazard since on BSD `MADV_DONTNEED` really is advisory.",
+      "sourceAnchor": "3214-madvise",
+      "difficulty": "trap"
+    },
+    {
+      "id": "32-q26",
+      "prompt": "Your service switches from glibc `malloc` to jemalloc and monitoring reports that RSS no longer falls after large frees. What should you check?",
+      "options": [
+        "`LazyFree` in `/proc/<pid>/smaps` — jemalloc uses `MADV_FREE`, which keeps pages resident until pressure, so RSS stays high without a leak.",
+        "`VmSwap` in `/proc/<pid>/status` — jemalloc leaves freed pages mapped but swappable, so they migrate to swap rather than being released.",
+        "`Locked` in `/proc/<pid>/smaps` — jemalloc pins its arenas, so freed pages cannot be reclaimed and RSS is genuinely retained.",
+        "`Committed_AS` in `/proc/meminfo` — jemalloc raises the commit charge for freed regions so they are reserved rather than returned."
+      ],
+      "correctIndex": 0,
+      "explanation": "`MADV_FREE` marks pages reclaimable-if-needed and drops RSS only under pressure, so a healthy jemalloc process routinely looks like it is leaking; `smaps`' `LazyFree` field quantifies exactly that amount. `VmSwap` is the tempting alternative because it also explains high memory that is not in use, but lazy-freed pages are not swapped — they are still resident and instantly reusable, and a write cancels the marking. jemalloc does not `mlock` its arenas, so `Locked` would be zero.",
+      "sourceAnchor": "3214-madvise",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q27",
+      "prompt": "Your process calls `mlockall(MCL_CURRENT | MCL_FUTURE)` successfully at startup. Which of these problems does that *not* solve?",
+      "options": [
+        "TLB shootdowns and `khugepaged` collapse — locking neither prevents IPIs nor stops THP work, so you also need `MADV_NOHUGEPAGE`.",
+        "Text pages of the binary being evicted under page-cache pressure and re-faulted on the next call into that code.",
+        "Pages of a shared library being dropped by `kswapd` during a memory spike caused by an unrelated process.",
+        "Anonymous heap pages being written to swap and later returning as major faults on the critical path."
+      ],
+      "correctIndex": 0,
+      "explanation": "Locking guarantees presence and prevents reclaim, which is exactly what kills major faults on text, libraries, and heap — but it says nothing about page-table modifications, so shootdown IPIs still arrive and `khugepaged` can still collapse your locked region and shoot down while doing it. Text-page eviction is the most tempting pick because it is the surprising case people remember, but it is precisely a case locking *does* fix. Note also that locking does not pin the physical address: NUMA balancing and compaction can still migrate the page.",
+      "sourceAnchor": "3215-memory-locking",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q28",
+      "prompt": "Your `mlockall(MCL_CURRENT | MCL_FUTURE)` call returns −1 with `ENOMEM` on a box with 256 GiB of free RAM. What is the most likely cause?",
+      "options": [
+        "`RLIMIT_MEMLOCK` is at its common 64 KiB default; raise it via `limits.conf`, systemd's `LimitMEMLOCK=infinity`, or `CAP_IPC_LOCK`.",
+        "`vm.overcommit_memory` is set to strict mode, so the commit charge for locking the whole address space exceeds `CommitLimit`.",
+        "`MCL_FUTURE` is unsupported without `MCL_ONFAULT` on kernels since 4.4, so the combination must be requested through `mlock2` instead.",
+        "The process is in a cgroup whose `memory.max` is below its `VmSize`, and locking is charged against virtual rather than resident size."
+      ],
+      "correctIndex": 0,
+      "explanation": "`RLIMIT_MEMLOCK` caps locked memory independently of free RAM, and its default of 64 KiB on many distributions makes `mlockall` fail immediately — which is why forgetting to check the return value is a listed trap. Strict overcommit is the plausible alternative since it also produces allocation-time failures, but it is not the default mode and would not be provoked by locking already-mapped memory. `MCL_FUTURE` needs no companion flag; `MCL_ONFAULT` merely avoids pre-faulting sparse mappings.",
+      "sourceAnchor": "3215-memory-locking",
+      "difficulty": "recall"
+    },
+    {
+      "id": "32-q29",
+      "prompt": "You must pre-fault a 4 GiB arena at startup with the lowest startup cost and zero steady-state faults. Which approach wins, and why?",
+      "options": [
+        "2 MiB HugeTLB plus populate, at about 0.2 s — fault *count* dominates, and 4 GiB is 2,048 huge-page faults versus 1,048,576 at 4 KiB.",
+        "A manual `volatile` touch loop at 4 KiB, at about 0.8 s — staying in userspace avoids the syscall overhead the kernel paths pay.",
+        "`madvise(MADV_WILLNEED)` over the whole arena, at about 0.2 s — it starts the work asynchronously so startup is not blocked.",
+        "`mmap` with `MAP_POPULATE` at 4 KiB, at about 0.15 s — populating inside `mmap` avoids a second pass over the mapping."
+      ],
+      "correctIndex": 0,
+      "explanation": "The huge-page rows make the point that per-fault cost is secondary to fault count: 2,048 faults at 2 MiB beat a million at 4 KiB even though each huge-page fault zeroes 512× more memory. The touch loop is the tempting choice because it is portable and obviously correct, but at ~1.5 s it is the slowest listed option, and `MADV_POPULATE_WRITE` at ~0.8 s beats it precisely by staying in the kernel. `MADV_WILLNEED` is advisory and guarantees nothing about presence, so it cannot deliver zero steady-state faults.",
+      "sourceAnchor": "3216-page-prefaulting",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q30",
+      "prompt": "A startup sequence pre-faults all arenas, then pins each worker thread to its core, then calls `mlockall`. What goes wrong?",
+      "options": [
+        "First touch happens during pre-faulting, so every page is bound to whichever node ran the startup code — pinning must come before pre-faulting.",
+        "`mlockall(MCL_CURRENT)` after pre-faulting re-faults everything a second time, doubling startup cost for no benefit.",
+        "Pinning after allocation invalidates the pre-fault, because affinity changes force the kernel to drop and re-establish the PTEs.",
+        "Pre-faulting before pinning maps the shared zero page, so the arenas are not actually resident when `mlockall` runs."
+      ],
+      "correctIndex": 0,
+      "explanation": "First touch binds a page to the NUMA node of the CPU that first writes it, so pre-faulting before pinning is exactly the classic bug — every page lands on one node and the workers then read remotely at 1.4–2× the latency. The correct order is pin, set NUMA policy, allocate, pre-fault, `mlockall`, warm, and raise priority last. The double-fault answer is the plausible near-miss: `mlockall(MCL_CURRENT)` after pre-faulting finds the pages already present and simply pins them, so it is cheap rather than wasteful. Pre-faulting with a write never touches the zero page.",
+      "sourceAnchor": "3216-page-prefaulting",
+      "difficulty": "trap"
+    },
+    {
+      "id": "32-q31",
+      "prompt": "Why is *direct* reclaim a worse latency event than `kswapd` reclaim?",
+      "options": [
+        "It runs synchronously in the allocating thread when free memory hits the min watermark, so your fault or `malloc` blocks while the kernel scans and writes out.",
+        "It runs at a higher priority than `kswapd` and preempts application threads across all cores until the high watermark is reached.",
+        "It writes pages out with `O_DIRECT` rather than through the page cache, so it cannot batch and each page costs a full device round-trip.",
+        "It is triggered at the low watermark rather than the min watermark, so it fires far more often than background reclaim does."
+      ],
+      "correctIndex": 0,
+      "explanation": "The distinction is whose thread does the work: `kswapd` wakes at the low watermark and reclaims asynchronously in the background, while hitting the min watermark forces the allocating thread to do the scanning, writeback, and possibly compaction itself. Raising `vm.min_free_kbytes` or `vm.watermark_scale_factor` is the standard tuning precisely because it makes `kswapd` start earlier and keeps you out of the direct path. The watermark answer inverts the two thresholds; `pgscan_direct`/`pgsteal_direct` in `/proc/vmstat` are how you confirm it is happening.",
+      "sourceAnchor": "3217-swapping",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q32",
+      "prompt": "An operator sets `vm.swappiness=0` on a trading host and reports that swap is now disabled. Is that correct?",
+      "options": [
+        "No — `swappiness=0` only means the kernel swaps as a last resort to avoid OOM; only `swapoff` genuinely disables it.",
+        "Yes — `swappiness=0` removes anonymous pages from reclaim consideration entirely, which is functionally identical to `swapoff`.",
+        "No — `swappiness=0` disables reclaim of *file* pages instead, which is why anonymous memory is swapped more aggressively.",
+        "Yes for anonymous pages, but `tmpfs` and shared-memory pages still reach swap because they bypass the swappiness weighting."
+      ],
+      "correctIndex": 0,
+      "explanation": "`vm.swappiness` (0–200, default 60) only sets the relative preference between reclaiming anonymous and file pages; at 0 the kernel still swaps rather than invoking the OOM killer. The 'functionally identical' answer is the tempting one because the behaviour looks the same right up until memory pressure, which is exactly when it matters. The standard trading-host configuration is `swapoff -a` with no swap entry in `fstab`, accepting the OOM killer in exchange for never taking a 3–10 ms swap-in on a `SCHED_FIFO` thread.",
+      "sourceAnchor": "3217-swapping",
+      "difficulty": "trap"
+    },
+    {
+      "id": "32-q33",
+      "prompt": "Under which overcommit setting does `malloc` returning non-NULL actually guarantee the memory exists?",
+      "options": [
+        "Only mode 2 (strict), where total commit must fit within swap plus `overcommit_ratio`% of RAM and allocations fail honestly at request time.",
+        "Modes 0 and 2, since the heuristic mode also refuses any allocation that cannot be backed and only mode 1 defers the failure.",
+        "Only mode 1, since always-overcommit forces the kernel to reserve frames eagerly rather than deferring to first touch.",
+        "All three modes, provided `RLIMIT_AS` is set, because the limit is checked against real availability at allocation time."
+      ],
+      "correctIndex": 0,
+      "explanation": "In modes 0 and 1 an allocation succeeds and the failure surfaces later at an arbitrary page fault as an OOM kill, so checking `malloc`'s return is necessary but not sufficient on Linux; mode 2 is the only one where the commit accounting is enforced up front. The heuristic answer is the seductive one — mode 0 does refuse *obviously* absurd single allocations, but that is a sanity filter, not a guarantee, and it happily permits the aggregate overcommit that kills you. `RLIMIT_AS` caps virtual size and says nothing about physical availability.",
+      "sourceAnchor": "3218-memory-overcommit-and-the-oom-killer",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q34",
+      "prompt": "You set `oom_score_adj=-1000` on your trading process. What is the important corollary?",
+      "options": [
+        "The OOM killer now takes something else instead — possibly `sshd` or your monitoring agent — so protect your ability to log in and observe too.",
+        "The process can no longer be killed by `SIGKILL` from any source, so a hung instance must be recovered by rebooting the host.",
+        "The process's RSS and page-table memory stop contributing to the system-wide badness calculation, lowering everyone else's scores.",
+        "Reclaim now skips the process's anonymous pages entirely, giving the same guarantee as `mlockall` without raising `RLIMIT_MEMLOCK`."
+      ],
+      "correctIndex": 0,
+      "explanation": "Immunity is relative: the badness ranking still picks a victim, and excluding the most important process just moves the kill to whatever is next, which is frequently the infrastructure you need to diagnose the incident. The `SIGKILL` answer confuses OOM-killer selection with signal delivery — `oom_score_adj` only biases the kernel's victim choice and has no effect on signals sent by anything else. The score is a per-process adjustment, not a redistribution, and it does not exempt pages from reclaim.",
+      "sourceAnchor": "3218-memory-overcommit-and-the-oom-killer",
+      "difficulty": "recall"
+    },
+    {
+      "id": "32-q35",
+      "prompt": "`strace` on your steady-state service shows a repeating cycle of `brk` shrink followed immediately by `brk` grow. What is the fix?",
+      "options": [
+        "The allocation pattern is crossing `M_TRIM_THRESHOLD`; call `mallopt(M_TRIM_THRESHOLD, -1)` and raise `M_MMAP_THRESHOLD` so the heap only ever grows.",
+        "The main arena is exhausted and glibc is cycling arenas; set `MALLOC_ARENA_MAX=2` so the heap stops being resized per thread.",
+        "Transparent huge pages are being split and recollapsed at the heap top; set `transparent_hugepage=never` to stop the cycle.",
+        "The kernel is trimming the heap under memory pressure; raise `vm.min_free_kbytes` so `kswapd` reclaims elsewhere first."
+      ],
+      "correctIndex": 0,
+      "explanation": "Free space above `M_TRIM_THRESHOLD` at the top of the heap is returned via `brk`, and an allocation pattern that oscillates across that boundary pays syscalls, page faults, and TLB shootdowns on every cycle — invisible in the source. Pinning both thresholds stops it. The arena answer is the strongest distractor because `MALLOC_ARENA_MAX=2` is a real and common tuning, but it addresses VSZ growth and per-arena fragmentation from `8 × ncores` 64 MiB regions, not `brk` oscillation — non-main arenas use `mmap`, never `brk`. Trimming is an allocator decision, not a kernel one.",
+      "sourceAnchor": "3219-heap-growth-with-brk-and-mmap",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q36",
+      "prompt": "A 64-core container running a glibc-based service shows tens of gigabytes of VSZ at startup. What is the default cause?",
+      "options": [
+        "glibc creates up to `8 × ncores` malloc arenas, each reserving a 64 MiB `mmap` region — 512 arenas on a 64-core box.",
+        "glibc reserves one 64 MiB arena per thread with no cap, so VSZ tracks the peak thread count rather than the core count.",
+        "glibc maps `M_MMAP_THRESHOLD` bytes of scratch space per core, and the threshold grows dynamically as blocks are freed.",
+        "glibc reserves 8 MiB of guard space per arena in addition to the arena itself, which dominates the total on high-core hosts."
+      ],
+      "correctIndex": 0,
+      "explanation": "The arena count is capped at `8 × ncores`, and each non-main arena is a 64 MiB `mmap` region, so a 64-core host can reach 512 arenas and tens of gigabytes of address space — with real RSS growth from per-arena fragmentation on top. `MALLOC_ARENA_MAX=2` is the standard container tuning. The per-thread-uncapped answer is tempting because arenas really are assigned to threads, but the cap is what produces the specific core-count-driven number. `M_MMAP_THRESHOLD` governs which allocations bypass the arenas; it reserves nothing itself.",
+      "sourceAnchor": "3219-heap-growth-with-brk-and-mmap",
+      "difficulty": "recall"
+    },
+    {
+      "id": "32-q37",
+      "prompt": "A microbenchmark reports an 8% regression that disappears when the commit is reverted and reappears on an unrelated commit. What should you suspect first?",
+      "options": [
+        "ASLR: different stack and heap alignment changes cache-set conflicts and 4 KiB aliasing, and runs can differ 5–10% for no other reason.",
+        "THP: `khugepaged` collapses the benchmark's arena at a different point in each run, changing TLB reach mid-measurement.",
+        "NUMA balancing: hint faults migrate the working set differently each run, so the benchmark alternates between local and remote memory.",
+        "Overcommit: the benchmark's arena is faulted in at different points, so page-fault cost lands inside different measured regions."
+      ],
+      "correctIndex": 0,
+      "explanation": "Per-`exec` randomization of the stack, heap, and mmap bases shifts every subsequent alignment, and the resulting cache-set conflicts and 4 KiB aliasing routinely move results 5–10% — the classic mysterious-regression-on-an-unrelated-commit story. Stabilize with `setarch $(uname -m) -R ./bench` and control environment-variable size, since the environment block sits on the stack. The THP answer is a genuine noise source too, but its signature is large occasional stalls from compaction, not a stable few-percent shift that tracks which commit is built.",
+      "sourceAnchor": "3220-address-space-layout-randomization",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q38",
+      "prompt": "Why must a crash handler for stack overflow use `sigaltstack` with `SA_ONSTACK`?",
+      "options": [
+        "The default handler runs on the overflowed stack, so it faults immediately and the process dies with no diagnostic at all.",
+        "`SIGSEGV` from stack overflow is delivered with the stack pointer already reset to the guard page, so any handler needs a fresh mapping.",
+        "The kernel refuses to deliver `SIGSEGV` to a handler whose code pages are file-backed, and the alternate stack forces them resident.",
+        "Without it the handler runs but cannot unwind, so `si_addr` is unavailable and the faulting address cannot be reported."
+      ],
+      "correctIndex": 0,
+      "explanation": "Signal handlers run on the interrupted thread's stack by default, and there is by definition no room left after an overflow, so the handler's own frame faults and you get a silent death. `SA_ONSTACK` plus a registered alternate stack gives the handler somewhere to live. The unwind answer is the tempting partial truth — `si_addr` is populated by the kernel in `siginfo` regardless, so the problem is not information availability but that the handler never executes a single instruction successfully.",
+      "sourceAnchor": "3221-stack-growth-and-guard-pages",
+      "difficulty": "trap"
+    },
+    {
+      "id": "32-q39",
+      "prompt": "A logging thread writes steadily to a file on a 512 GiB host and periodically blocks inside `write()` for hundreds of milliseconds. What is the cause and fix?",
+      "options": [
+        "Dirty pages hit `vm.dirty_ratio` (20%, i.e. ~100 GiB here) and the writer is throttled; set `vm.dirty_bytes` to 64–256 MiB to convert one huge stall into many tiny ones.",
+        "Dirty pages hit `vm.dirty_background_ratio` (10%) and the writer is throttled; raise it so background writeback starts later and batches better.",
+        "The page cache filled and `write()` blocked in direct reclaim; drop the caches periodically with `echo 3 > /proc/sys/vm/drop_caches`.",
+        "Readahead is competing with writeback for the device; lower `read_ahead_kb` so the flusher threads get the full queue depth."
+      ],
+      "correctIndex": 0,
+      "explanation": "`dirty_background_ratio` starts *background* writeback, but `dirty_ratio` is the point at which writers are throttled synchronously inside `write()`, and on a large-RAM box 20% is an absurd amount of dirty data whose eventual flush is catastrophic — which is why the absolute `dirty_bytes` form is preferred there. The background-ratio answer is the strongest distractor because the knob is real and adjacent, but crossing it does not block anyone, and raising it would make the eventual stall worse. `drop_caches` is a benchmarking tool that also evicts your binary's text pages.",
+      "sourceAnchor": "3222-page-cache",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q40",
+      "prompt": "What is the canonical Linux technique for measuring a process's real working set?",
+      "options": [
+        "Echo 1 to `/proc/<pid>/clear_refs` to clear the Accessed bits, wait an interval, then read `Referenced:` from `smaps`.",
+        "Read `VmRSS` from `/proc/<pid>/status` at two points and take the difference, which isolates the pages touched in between.",
+        "Read `/proc/<pid>/pagemap` twice and diff the physical frame numbers, since re-faulted pages get new frames.",
+        "Sample `dTLB-load-misses` with `perf stat` and divide by the page size to recover the number of distinct pages touched."
+      ],
+      "correctIndex": 0,
+      "explanation": "`clear_refs` resets the PTE Accessed bits that hardware sets on access, so `Referenced:` after an interval is exactly the set of pages touched in that window — the definition of W(t, τ). The RSS-difference answer is the tempting one because RSS is the familiar residency number, but it counts pages that are *resident*, including everything touched once at startup and never again, which is precisely what the working set is meant to exclude. TLB misses measure the symptom of exceeding reach, not the identity of the pages.",
+      "sourceAnchor": "3223-working-sets",
+      "difficulty": "recall"
+    },
+    {
+      "id": "32-q41",
+      "prompt": "Two processes each map libc (2 MiB) and each have 10 MiB private. What do RSS and PSS report, and which is safe to sum?",
+      "options": [
+        "RSS is 12 MiB each and sums to 24 MiB against 22 MiB actually in use; PSS is 11 MiB each and sums correctly to 22 MiB.",
+        "RSS is 10 MiB each because shared library pages are excluded from RSS; PSS is 11 MiB each and sums correctly to 22 MiB.",
+        "RSS is 12 MiB each and sums to 24 MiB; PSS is 12 MiB each too, differing only in that it excludes clean file pages.",
+        "RSS is 11 MiB each because the shared 2 MiB is already divided by the sharer count; PSS additionally excludes page-cache pages."
+      ],
+      "correctIndex": 0,
+      "explanation": "RSS counts every shared page in full for every sharer, so summing it double-counts libc; PSS charges each shared page divided by the number of sharers and is the only one of the four metrics that adds up across processes. The 'RSS excludes shared pages' answer is the plausible inversion — that would describe USS, which is private pages only and tells you what you would actually reclaim by killing the process. VSZ, by contrast, is nearly meaningless on 64-bit and should never be alerted on.",
+      "sourceAnchor": "3224-rss-vsz-and-pss",
+      "difficulty": "recall"
+    },
+    {
+      "id": "32-q42",
+      "prompt": "Your monitoring agent polls `/proc/<pid>/smaps` every second for a process with tens of thousands of mappings, and `mmap`-heavy threads start showing multi-millisecond stalls. Why?",
+      "options": [
+        "Reading full `smaps` takes `mmap_lock` for read across every VMA, blocking concurrent `mmap`/`munmap` for tens of milliseconds; use `smaps_rollup`.",
+        "Reading `smaps` walks and clears the Accessed bits of every page, forcing a re-fault of the working set after each poll.",
+        "Reading `smaps` forces a TLB shootdown per VMA so the reported residency is coherent, so the IPI cost scales with mapping count.",
+        "Reading `smaps` pins each VMA's pages while it reports them, so reclaim backs off and the process is pushed into direct reclaim."
+      ],
+      "correctIndex": 0,
+      "explanation": "The cost is lock hold time, not the read itself: the kernel walks every VMA under `mmap_lock`, and on a large map count that serializes against any thread trying to map or unmap memory — a documented cause of real production latency incidents. `smaps_rollup` gives the aggregate cheaply. The Accessed-bit answer is the tempting one because that mechanism genuinely exists, but it belongs to `clear_refs`, which is a separate file you must explicitly write to; reading `smaps` only reports the bits.",
+      "sourceAnchor": "3225-procfs-memory-maps",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q43",
+      "prompt": "The main thread `memset`s a 1 GiB buffer at startup; eight workers are then pinned across two sockets and each processes its own slice. What is the placement outcome and the fix?",
+      "options": [
+        "Every page is on the node that ran the `memset`, so half the workers read remotely at 1.4–2×; have each worker pre-fault its own slice after being pinned.",
+        "Pages are interleaved across both nodes because `malloc` spreads large allocations, so half the workers read remotely; use `numactl --membind` instead.",
+        "Pages are placed on the node of the CPU that called `malloc`, so the fix is to allocate from a worker thread rather than the main thread.",
+        "Pages are unplaced until each worker's first read, so placement is already correct and the remote traffic must come from false sharing."
+      ],
+      "correctIndex": 0,
+      "explanation": "First touch places a page on the node of the CPU that first *writes* it, so the startup `memset` binds all 1 GiB to one node before any worker exists — the single most common NUMA bug, and `numa_maps` or `numastat -p` will show it immediately. The allocate-from-a-worker answer is the near-miss worth naming: `malloc` assigns no node at all because no physical page exists yet, so moving the allocation changes nothing; only moving the first write does. `MPOL_DEFAULT` is first-touch, not interleave, and a read would map the shared zero page rather than placing anything.",
+      "sourceAnchor": "3226-numa-memory-policies",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q44",
+      "prompt": "Why should `kernel.numa_balancing` be disabled on a pinned, membound, pre-faulted process?",
+      "options": [
+        "It samples access patterns by deliberately unmapping pages, so on already-optimal placement every hint fault and migration is pure overhead.",
+        "It conflicts with `MPOL_BIND` and can migrate pages off the bound node, silently violating the policy you configured.",
+        "It runs its scanning work on the same core as the task being sampled, so an isolated core loses cycles to the scanner thread.",
+        "It disables the paging-structure caches while sampling, so every access on the sampled region pays a full four-level walk."
+      ],
+      "correctIndex": 0,
+      "explanation": "The mechanism is deliberate breakage: periodically mark pages `PROT_NONE`, take the resulting hint faults at 0.5–2 µs each, and migrate pages that look remote — all of which is wasted when the placement was already correct, with `numa_hint_faults_local` counting the pure waste. Its diagnostic signature is sporadic microsecond stalls with no context switch, syscall, or application fault. The `MPOL_BIND` conflict is the tempting answer since it sounds like a correctness bug, but balancing respects the policy; the problem is cost, not violation.",
+      "sourceAnchor": "3227-automatic-numa-balancing",
+      "difficulty": "application"
+    },
+    {
+      "id": "32-q45",
+      "prompt": "A shared-memory writer restarts, recreates its segment and `ftruncate`s it, and every reader still holding the old mapping dies. What signal, and what is the right prevention?",
+      "options": [
+        "`SIGBUS` — the mapping is still valid but the pages are gone; prevent it with `memfd_create` plus `F_SEAL_SHRINK`, which makes truncation impossible.",
+        "`SIGSEGV` — truncation invalidates the readers' mappings, so their addresses no longer resolve; prevent it by re-`mmap`ing on every restart.",
+        "`SIGBUS` — truncation implies `munmap` in every mapper; prevent it by having readers install a handler that re-maps and resumes.",
+        "`SIGSEGV` — the readers' PTEs are cleared and the VMA removed; prevent it with `fallocate` instead of `ftruncate` when sizing."
+      ],
+      "correctIndex": 0,
+      "explanation": "`SIGSEGV` means the address is wrong; `SIGBUS` means the address is right but the backing store cannot supply the page, which is exactly the truncation race — the VMA survives, `munmap` is not implied, and any access beyond the new end of file faults. Sealing eliminates the failure class rather than handling it, which is why it is the preferred defence. The handle-and-resume answer is the tempting one, but continuing correctly after `SIGBUS` is extremely hard; treat it as a crash-with-diagnostics path. `fallocate` is a real defence against a *full filesystem*, not against deliberate truncation.",
+      "sourceAnchor": "3228-shared-memory-truncation-and-sigbus",
+      "difficulty": "recall"
+    },
+    {
+      "id": "32-q46",
+      "prompt": "A journal writes records by storing into a `MAP_SHARED` mapping and calling `msync(MS_ASYNC)` after each one. What is guaranteed after `msync` returns?",
+      "options": [
+        "Only that writeback was scheduled — the data is visible to other mappers but survives neither a kernel panic nor power loss.",
+        "That the mapped pages have reached the device, though file metadata such as size may still be unwritten.",
+        "That the data survives a kernel panic, because scheduling writeback moves the pages out of the volatile page cache.",
+        "That the data survives a process crash but not a power loss, which is the guarantee `MS_ASYNC` is defined to provide."
+      ],
+      "correctIndex": 0,
+      "explanation": "`msync(MS_ASYNC)` returns before anything is written and is nearly useless as a durability primitive; only `MS_SYNC` blocks until the mapped pages are written back, and even then it does not necessarily flush file metadata. The process-crash answer is the tempting one because that guarantee is real — but it comes for free from the page cache outliving the process the moment the store lands, with or without any `msync` at all. Durability requires `fdatasync`/`fsync` (20–200 µs on NVMe), plus an `fsync` of the parent directory for a newly created file.",
+      "sourceAnchor": "3229-durable-versus-visible-mapped-writes",
+      "difficulty": "recall"
+    }
+  ]
+}

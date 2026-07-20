@@ -1,0 +1,649 @@
+{
+  "slug": "chapter-34-system-calls-and-io",
+  "questions": [
+    {
+      "id": "34-q01",
+      "prompt": "Before KPTI, why did entering the kernel via a syscall not flush the TLB?",
+      "options": [
+        "Kernel mappings are present in every process's page tables as supervisor-only entries, so no `CR3` write is needed.",
+        "The `syscall` instruction is microcoded to preserve TLB entries across the privilege change on x86-64.",
+        "Ring 0 code runs with paging disabled, so no translation entries are consulted or invalidated at all.",
+        "The kernel keeps its own TLB partition that is tagged separately, so user entries are never touched."
+      ],
+      "correctIndex": 0,
+      "explanation": "The kernel occupies the high canonical half of every process's address space, marked supervisor-only, so a mode switch changes privilege without changing the address space — no `CR3` write, therefore no flush. The claim that the kernel runs with paging disabled is the tempting near-miss: long mode requires paging, and the kernel very much uses virtual addresses. That single fact is why a syscall is ~60 ns and a context switch is microseconds.",
+      "sourceAnchor": "341-user-mode-and-kernel-mode",
+      "difficulty": "recall"
+    },
+    {
+      "id": "34-q02",
+      "prompt": "Two identical hosts run the same syscall-heavy service and one is 25% slower; `/sys/devices/system/cpu/vulnerabilities/meltdown` differs. What is the mechanism?",
+      "options": [
+        "KPTI adds a `CR3` write on kernel entry and another on return, roughly doubling syscall cost from ~50 ns to ~100–180 ns.",
+        "KPTI forces every syscall onto the legacy `int 0x80` interrupt-gate path, which costs 250–400 cycles per entry.",
+        "KPTI unmaps user pages while in the kernel, so `copy_to_user` must fault each page back in on every transfer.",
+        "KPTI disables PCID tagging entirely, so each syscall must invalidate the branch predictor and the whole L1 cache."
+      ],
+      "correctIndex": 0,
+      "explanation": "Kernel Page-Table Isolation gives each process separate user and kernel page-table sets, so entry and exit each write `CR3` — about 100–200 cycles apiece, and a full TLB flush on hardware without PCID. Syscall-heavy workloads regress 5–30%. The `int 0x80` answer confuses two independent things: KPTI changes what the entry path does, not which instruction reaches it; `syscall`/`sysret` is still used.",
+      "sourceAnchor": "341-user-mode-and-kernel-mode",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q03",
+      "prompt": "Why does the Linux x86-64 syscall ABI pass the fourth argument in `r10` rather than `rcx`, unlike the function ABI?",
+      "options": [
+        "The `syscall` instruction itself writes the saved user RIP into `rcx`, destroying anything placed there.",
+        "`rcx` is callee-saved in the kernel, so the kernel would be obliged to restore it before dispatch.",
+        "`r10` is the only argument register whose value survives the `swapgs` and kernel stack switch sequence.",
+        "The `IA32_FMASK` MSR clears `rcx` on entry along with the RFLAGS bits it is configured to mask."
+      ],
+      "correctIndex": 0,
+      "explanation": "Hardware semantics force the substitution: `syscall` sets `rcx` to the return address and `r11` to the saved RFLAGS, so both are clobbered before the kernel ever runs. The `IA32_FMASK` answer is tempting because FMASK really does exist and really does clear bits on entry — but it masks RFLAGS bits (IF, DF, AC), not general-purpose registers.",
+      "sourceAnchor": "342-system-call-entry",
+      "difficulty": "recall"
+    },
+    {
+      "id": "34-q04",
+      "prompt": "Under what circumstance does the kernel return from a syscall via the slower `iret` path instead of `sysretq`?",
+      "options": [
+        "When registers were modified — after `ptrace`, after a signal, or in the child of `fork` — or when the return RIP is non-canonical.",
+        "Whenever the syscall returned a negative value in `rax`, since errno translation requires the full interrupt return frame.",
+        "Whenever KPTI is enabled, because restoring the user `CR3` cannot be done on the `sysret` fast path.",
+        "Whenever the syscall number exceeded `__NR_syscall_max` and the bounds check in the entry stub failed."
+      ],
+      "correctIndex": 0,
+      "explanation": "`sysret` restores RIP from `rcx` without validating canonicality, which would fault in ring 0 with the user stack loaded — the classic sysret escalation bug class — so Linux checks and falls back to `iret`, as it also does whenever `pt_regs` was altered. Blaming KPTI is the plausible trap: KPTI adds a `CR3` restore before the return, but the return instruction itself is still `sysretq`.",
+      "sourceAnchor": "342-system-call-entry",
+      "difficulty": "trap"
+    },
+    {
+      "id": "34-q05",
+      "prompt": "Which cost is unique to a context switch and absent from a plain mode switch?",
+      "options": [
+        "A page-table switch and the subsequent TLB refill, unless the switch is between threads of one process.",
+        "The transition of the current privilege level in the low two bits of `%cs` from ring 3 to ring 0.",
+        "The push and pop of the general-purpose registers into a `struct pt_regs` on the kernel stack.",
+        "The `swapgs` instruction that installs the per-CPU kernel data pointer for the incoming code."
+      ],
+      "correctIndex": 0,
+      "explanation": "The address-space change is the defining difference: a context switch writes `CR3` (except between threads sharing an address space) and pays a TLB refill afterwards, which is where the ~10–50 µs indirect cost comes from. Register save/restore is the tempting pick because it sounds expensive, but a mode switch already pushes `pt_regs` — it is common to both, not unique.",
+      "sourceAnchor": "343-mode-switches-versus-context-switches",
+      "difficulty": "recall"
+    },
+    {
+      "id": "34-q06",
+      "prompt": "A blocking `read()` on an empty socket ends up costing 5–60 µs. Roughly what share of that is the syscall boundary itself?",
+      "options": [
+        "About 1% — the sleep, the wakeup latency, and the cache and TLB refill dominate completely.",
+        "About half — the two mode switches bracket the sleep and each costs a few microseconds.",
+        "Nearly all of it — a blocking syscall takes the slow `iret` entry path, which costs tens of microseconds.",
+        "About a quarter — `copy_to_user` at memcpy speed accounts for most of the remaining time."
+      ],
+      "correctIndex": 0,
+      "explanation": "The decomposition is ~60 ns in, a context switch away at 1–3 µs, a 2–10 µs wakeup latency, a context switch back, and 10–50 µs of cache and TLB refill — the syscall is about 1% of the total. The 'half' answer inflates the mode switch to microseconds; mode switches are tens of nanoseconds. This is precisely the argument for busy-polling: the enemy is the sleep, not the syscall.",
+      "sourceAnchor": "343-mode-switches-versus-context-switches",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q07",
+      "prompt": "How does the vDSO's `clock_gettime(CLOCK_MONOTONIC)` produce a timestamp without a ring transition?",
+      "options": [
+        "It reads a seqlock-protected `vvar` page for the mult/shift and base, executes `rdtsc`, scales, and re-checks the sequence.",
+        "It issues the syscall on a dedicated low-latency entry gate that the kernel pre-registers in `IA32_LSTAR` at boot.",
+        "It reads a memory-mapped HPET comparator register directly from user space and converts using a fixed divisor.",
+        "It maintains a per-thread cached timestamp that a kernel timer interrupt refreshes every scheduling tick."
+      ],
+      "correctIndex": 0,
+      "explanation": "The kernel publishes clocksource state — `cycle_last`, `mult`, `shift`, the base nanoseconds, and a sequence counter — in the `vvar` page, and the vDSO code reads `rdtsc` and does the arithmetic entirely in user space. The 'dedicated entry gate' answer still involves a ring transition, which is exactly what the vDSO eliminates; `LSTAR` is the ordinary syscall entry point.",
+      "sourceAnchor": "344-vdso",
+      "difficulty": "recall"
+    },
+    {
+      "id": "34-q08",
+      "prompt": "Timestamping cost in an unchanged binary jumps from ~25 ns to ~250 ns per call after a host reboot. What is the first thing to check?",
+      "options": [
+        "`/sys/devices/system/clocksource/clocksource0/current_clocksource` — a demotion off `tsc` disables the vDSO fast path.",
+        "`/proc/self/maps` for a missing `[vdso]` mapping, since the loader may have skipped mapping the object.",
+        "Whether `nopti` was dropped from the kernel command line, since KPTI makes the vDSO take a `CR3` write.",
+        "Whether the process lost `CAP_SYS_TIME`, which the vDSO requires in order to read the shared timekeeping page."
+      ],
+      "correctIndex": 0,
+      "explanation": "The vDSO can only compute time in user space when the clocksource is `tsc`; a demotion to `hpet` or `acpi_pm` forces every call into a real syscall reading a shared, uncached MMIO register — roughly a 10× regression, worse under contention. The KPTI answer is the plausible trap: KPTI taxes syscalls, but the vDSO path makes no syscall at all, so it is untouched by KPTI.",
+      "sourceAnchor": "344-vdso",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q09",
+      "prompt": "A program burns wall time somewhere, yet `strace -c` reports almost no syscalls and it looks idle. Which explanation fits?",
+      "options": [
+        "It is calling `clock_gettime` heavily through the vDSO, which makes no syscall and is therefore invisible to `strace`.",
+        "`strace` samples syscalls rather than intercepting them all, so a high-rate caller is statistically under-counted.",
+        "`strace -c` reports only syscalls that returned an error, so all the successful calls are omitted from the histogram.",
+        "The syscalls come from threads `strace` does not attach to unless the traced process is single-threaded."
+      ],
+      "correctIndex": 0,
+      "explanation": "vDSO calls execute entirely in user space, so there is no syscall for ptrace to stop on and `strace` shows nothing — the same reason seccomp filters cannot see them. The 'sampling' answer misstates the mechanism: `strace` uses `ptrace(PTRACE_SYSCALL)` and stops on every single call, which is why it costs 100–500×, not why it would miss anything.",
+      "sourceAnchor": "344-vdso",
+      "difficulty": "trap"
+    },
+    {
+      "id": "34-q10",
+      "prompt": "Which item contributes the largest single share of a ~60 ns null syscall on an unmitigated x86-64 host?",
+      "options": [
+        "The microcoded `syscall`/`sysret` instruction pair, at roughly 40–60 cycles or 15–20 ns.",
+        "The `swapgs` and kernel stack switch, which together account for roughly 20 ns of the total.",
+        "The indirect dispatch through `sys_call_table`, which costs roughly 20 ns even without a retpoline.",
+        "The push and pop of the fifteen general-purpose registers into `pt_regs`, at roughly 20 ns."
+      ],
+      "correctIndex": 0,
+      "explanation": "The instruction pair itself dominates the unmitigated breakdown at ~15–20 ns, against ~3 ns for `swapgs` plus stack switch, ~5 ns for `pt_regs`, and ~2 ns for the table dispatch. The dispatch answer is tempting because retpoline really does make it expensive — but that is the mitigated case, adding 10–20 ns on top, not the baseline.",
+      "sourceAnchor": "345-system-call-overhead",
+      "difficulty": "recall"
+    },
+    {
+      "id": "34-q11",
+      "prompt": "A candidate proposes replacing per-message `sendto` with `io_uring` batching to cut a UDP send from ~2 µs. What is the realistic outcome?",
+      "options": [
+        "A small win, because the ~60 ns boundary is a tiny fraction of the cost — the network stack traversal is what dominates.",
+        "Roughly a 2× win, because batching removes both the mode switch and the socket-buffer copy for every message.",
+        "No change at all, because `io_uring` submissions for sockets always fall back to the `io-wq` worker thread pool.",
+        "A large win, because the kernel coalesces batched datagrams into a single stack traversal per submission."
+      ],
+      "correctIndex": 0,
+      "explanation": "A small UDP send costs 1–3 µs and the syscall boundary is tens of nanoseconds of it; the stack traversal is the expense, so batching amortizes the cheap part. The 'coalesces into one traversal' answer is the seductive one — batching amortizes syscall *entry*, but each datagram still walks the stack independently. Only kernel bypass changes the floor.",
+      "sourceAnchor": "345-system-call-overhead",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q12",
+      "prompt": "Why does `strace` slow a syscall-heavy program by 100–500×?",
+      "options": [
+        "`ptrace` stops the tracee twice per syscall, and each stop is a context switch to the tracer and back.",
+        "It rewrites each syscall instruction with a breakpoint trap that must be single-stepped and reinstalled.",
+        "It copies the full register set and every buffer argument into a kernel ring that user space drains per call.",
+        "It disables the vDSO for the traced process, forcing every timestamp through the full syscall entry path."
+      ],
+      "correctIndex": 0,
+      "explanation": "The mechanism is `ptrace(PTRACE_SYSCALL)`: a stop on entry and another on exit, each requiring a switch to the tracer, a register peek, and a switch back — roughly 50–150 µs per traced syscall. The breakpoint-rewriting answer describes how uprobes and `ltrace`-style PLT patching work, not how `strace` intercepts syscalls.",
+      "sourceAnchor": "346-strace-and-ltrace",
+      "difficulty": "recall"
+    },
+    {
+      "id": "34-q13",
+      "prompt": "You must count syscalls on a running production process for one minute without perturbing its latency. Which is appropriate?",
+      "options": [
+        "`perf stat -e raw_syscalls:sys_enter -p PID`, which counts via tracepoints without any ptrace stops.",
+        "`strace -c -f -p PID`, whose summary mode aggregates counts in the kernel and so avoids the probe effect.",
+        "`ltrace -c -p PID`, which counts at the PLT and therefore adds only a single jump per traced call site.",
+        "`strace -T -tt -p PID`, since per-call durations let you subtract the tracer's own overhead afterwards."
+      ],
+      "correctIndex": 0,
+      "explanation": "`perf stat` on the `raw_syscalls` tracepoint counts in-kernel with no ptrace involvement, as do `perf trace` (~5–20%) and `bpftrace` (~1–5%). The `strace -c` answer is the trap: the summary is aggregated in the *tracer*, and every call still costs two ptrace stops and 50–150 µs, so the full slowdown applies. `ltrace` sees library calls, not syscalls.",
+      "sourceAnchor": "346-strace-and-ltrace",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q14",
+      "prompt": "A developer opens a log file with `O_RDONLY | O_NONBLOCK` and registers it with epoll so the hot thread never stalls on disk. What actually happens?",
+      "options": [
+        "`O_NONBLOCK` does nothing on regular files and epoll always reports them ready, so the `read` still stalls on I/O.",
+        "`epoll_ctl` rejects the registration with `EPERM`, forcing the developer to fall back to a thread pool.",
+        "It works as intended: the `read` returns `EAGAIN` while the page is being faulted in from the device.",
+        "epoll reports the file readable only once the readahead window has been fully populated by the kernel."
+      ],
+      "correctIndex": 0,
+      "explanation": "`O_NONBLOCK` is silently a no-op on regular files and block devices — the read still blocks on the page fault or the device — and files are permanently 'ready' from epoll's point of view, so it conveys no information. Believing the `EAGAIN` story is the exact gap interviewers probe; it is why thread pools sit behind file access in event-driven servers and one of the original motivations for `io_uring`.",
+      "sourceAnchor": "347-blocking-and-non-blocking-io",
+      "difficulty": "trap"
+    },
+    {
+      "id": "34-q15",
+      "prompt": "A server sets `O_NONBLOCK` on its listening socket, then finds that sockets returned by `accept()` block. Why?",
+      "options": [
+        "`accept()` does not propagate the listener's `O_NONBLOCK` to the new socket; `accept4` with `SOCK_NONBLOCK` does.",
+        "The flag was set with `fcntl` after `listen()`, and status flags can only be changed before the socket is listening.",
+        "`O_NONBLOCK` lives in the fd table entry rather than the open file description, so it cannot be inherited at all.",
+        "Accepted sockets inherit only flags set atomically at `socket()` creation time, which excludes `O_NONBLOCK`."
+      ],
+      "correctIndex": 0,
+      "explanation": "Non-inheritance across `accept` is a documented, persistent bug source, and `accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC)` is the fix. The 'lives in the fd table entry' answer is backwards: `O_NONBLOCK` is a property of the open file description, which is precisely why `dup`ed descriptors and forked children *do* share it.",
+      "sourceAnchor": "347-blocking-and-non-blocking-io",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q16",
+      "prompt": "Which statement correctly places `epoll` on the synchronous/asynchronous axis?",
+      "options": [
+        "It is a readiness mechanism: the data transfer is still a synchronous `read` you perform yourself afterwards.",
+        "It is asynchronous I/O, since the kernel fills your buffer and the event announces that the copy finished.",
+        "It is asynchronous for sockets and synchronous for pipes, depending on which wait queue the callback attaches to.",
+        "It is neither, since readiness notification is orthogonal to whether any transfer takes place at all."
+      ],
+      "correctIndex": 0,
+      "explanation": "epoll tells you a subsequent synchronous `read` will not block; you own the buffer and you perform the copy, which is two syscalls per event. The 'kernel fills your buffer' answer describes the completion model — Windows IOCP and `io_uring` — where the kernel owns the buffer until the completion arrives. Stating that distinction correctly is a reliable interview differentiator.",
+      "sourceAnchor": "348-synchronous-and-asynchronous-io",
+      "difficulty": "recall"
+    },
+    {
+      "id": "34-q17",
+      "prompt": "Why is glibc's POSIX AIO (`aio_read`/`aio_write`) considered a failure rather than a real asynchronous interface?",
+      "options": [
+        "It is implemented with user-space threads, so it delivers no kernel asynchrony and is strictly worse than a thread pool.",
+        "It requires `O_DIRECT` on regular files and silently blocks on buffered I/O, which defeats its own purpose.",
+        "It supports only regular files and returns `ENOTSUP` for sockets, so an event loop cannot use it uniformly.",
+        "It delivers completions via real-time signals, which the kernel coalesces and drops under queue pressure."
+      ],
+      "correctIndex": 0,
+      "explanation": "glibc emulates POSIX AIO on a user-space thread pool, so the promised kernel asynchrony never materializes and you pay thread-pool costs with a worse API. The `O_DIRECT` and socket limitations are the tempting swap — those are true of Linux's *native* `libaio` (`io_submit`/`io_getevents`), which is genuinely kernel-side but crippled in exactly those ways. Both were superseded by `io_uring` in 2019.",
+      "sourceAnchor": "348-synchronous-and-asynchronous-io",
+      "difficulty": "trap"
+    },
+    {
+      "id": "34-q18",
+      "prompt": "What happens when code calls `FD_SET` with a descriptor numbered 2000 on Linux?",
+      "options": [
+        "It writes past the end of the 1024-bit `fd_set`, corrupting the stack rather than returning any error.",
+        "`select` later returns `EINVAL`, because the descriptor exceeds the `FD_SETSIZE` bound that it validates.",
+        "The bit is silently masked modulo `FD_SETSIZE`, so descriptor 976 is monitored in its place.",
+        "glibc transparently heap-allocates a larger set, so the call succeeds at the cost of a small allocation."
+      ],
+      "correctIndex": 0,
+      "explanation": "`fd_set` is a fixed 1024-bit bitmap and `FD_SET` is a macro with no bounds check, so a high descriptor is an out-of-bounds write — `_FORTIFY_SOURCE` catches only some cases. Expecting `EINVAL` is the natural but wrong assumption: nothing validates the descriptor, which is why `select` is disqualified for any server that can exceed 1024 open files.",
+      "sourceAnchor": "349-select-and-poll",
+      "difficulty": "trap"
+    },
+    {
+      "id": "34-q19",
+      "prompt": "With 10,000 idle connections and exactly one ready, why does `poll` cost ~300–800 µs where `epoll_wait` costs ~2–5 µs?",
+      "options": [
+        "`poll` copies the whole interest set in and runs every descriptor's poll method, so it is O(interest set), not O(ready).",
+        "`poll` wakes once per registered descriptor, so 10,000 wakeups occur before the ready one is finally reported.",
+        "`poll` must rebuild its descriptor array in the kernel on each call because the array is modified in place.",
+        "`poll` holds a global descriptor-table lock for the duration of the scan, serializing against every other thread."
+      ],
+      "correctIndex": 0,
+      "explanation": "The interest set is passed wholesale on every call and every descriptor's poll method is invoked, then user space scans 10,000 `revents` for the one that is set — that is the C10K problem. The 'modified in place' answer describes `select`, not `poll`: `poll` deliberately separates `events` from `revents` so the array is reusable, and it still scales badly.",
+      "sourceAnchor": "349-select-and-poll",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q20",
+      "prompt": "Which kernel structure makes `epoll_wait` O(ready) rather than O(interest set)?",
+      "options": [
+        "A ready list appended by a per-file wait-queue callback, so readiness is pushed by the source rather than scanned.",
+        "A hash table of epitems keyed by descriptor number, which is probed once per waiter to find the ready entries.",
+        "A red-black tree of epitems that `epoll_wait` walks in order, stopping at the first non-ready descriptor it meets.",
+        "A per-descriptor bitmap the kernel scans with vector instructions, reducing the scan cost by a constant factor."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each epitem registers `ep_poll_callback` on the target file's wait queue; when the source becomes ready it appends the epitem to `rdllist` and wakes any waiter, so consuming ready events is O(1) each. The red-black tree answer names a structure that really exists in `struct eventpoll` — but `rbr` gives O(log N) add/mod/del keyed by (fd, file*), and is not what `epoll_wait` traverses.",
+      "sourceAnchor": "3410-epoll",
+      "difficulty": "recall"
+    },
+    {
+      "id": "34-q21",
+      "prompt": "A service `dup()`s a socket, closes the original descriptor, and finds epoll still reporting events for that number. Why?",
+      "options": [
+        "Registration is keyed on the open file description, which stays alive while any duplicate holds a reference.",
+        "epoll caches the descriptor's readiness state and only re-evaluates it after an explicit `EPOLL_CTL_MOD` call.",
+        "`close` on a registered descriptor is deferred until the next `epoll_wait` returns, leaving a reporting window.",
+        "`dup` copies the epoll registration onto the new descriptor, so both numbers now generate independent events."
+      ],
+      "correctIndex": 0,
+      "explanation": "epoll tracks (fd, struct file), so closing one of several descriptors sharing a description removes nothing — only closing the *last* one auto-deregisters. Believing `dup` copies the registration inverts the model: registration lives with the description, and the fix is an explicit `EPOLL_CTL_DEL` before dropping the descriptor.",
+      "sourceAnchor": "3410-epoll",
+      "difficulty": "trap"
+    },
+    {
+      "id": "34-q22",
+      "prompt": "Multiple threads share one epoll set on a listening socket and all wake on every incoming connection. Which pair of fixes addresses this?",
+      "options": [
+        "`EPOLLEXCLUSIVE` to wake a single waiter, or `SO_REUSEPORT` with a separate listener and epoll set per thread.",
+        "`EPOLLONESHOT` on the listener, or raising `RLIMIT_NOFILE` so `accept` never has to contend for descriptors.",
+        "`EPOLLET` on the listener, or nesting each thread's epoll fd inside a shared parent set to serialize the wakeups.",
+        "`EPOLLRDHUP` on the listener, or having every thread call `accept4` with `SOCK_NONBLOCK` so losers fail fast."
+      ],
+      "correctIndex": 0,
+      "explanation": "`EPOLLEXCLUSIVE` (4.5+) exists specifically for the accept thundering herd, and `SO_REUSEPORT` with per-thread listeners is generally the better design because the kernel hashes connections and there is no shared state at all. `EPOLLONESHOT` is the tempting pick — it does guarantee one thread per connection, but it disarms the fd after one event and needs a `MOD` to rearm, which makes it a handoff tool, not a herd fix.",
+      "sourceAnchor": "3410-epoll",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q23",
+      "prompt": "1000 bytes arrive on an `EPOLLET` socket and the handler reads only 100, then returns to `epoll_wait`. What happens?",
+      "options": [
+        "No further notification arrives until new data does, so the 900 residual bytes sit unread indefinitely.",
+        "The next `epoll_wait` reports the fd readable again, because 900 bytes still satisfy the readable condition.",
+        "The kernel posts exactly one more edge event to cover the residue, after which the descriptor goes quiet.",
+        "`epoll_wait` returns immediately with `EPOLLERR` set, flagging the incomplete drain as a protocol error."
+      ],
+      "correctIndex": 0,
+      "explanation": "Edge-triggered notification fires on the readiness *transition*, so failing to drain to `EAGAIN` produces a silent, permanent stall — the connection simply hangs. Expecting another report because the condition still holds is exactly level-triggered semantics; that is the behaviour you get without `EPOLLET`, and confusing the two is the most common ET bug after forgetting `O_NONBLOCK`.",
+      "sourceAnchor": "3411-edge-triggered-and-level-triggered-readiness",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q24",
+      "prompt": "Why does an edge-triggered descriptor left in blocking mode hang the entire event loop?",
+      "options": [
+        "The drain loop's final `read` blocks in the kernel instead of returning `EAGAIN`, so the loop never reaches `epoll_wait`.",
+        "`epoll_ctl` refuses to arm `EPOLLET` on a blocking descriptor, so the fd is never registered and never reported.",
+        "The kernel converts the edge event into a level event for blocking descriptors, producing an unbounded wakeup storm.",
+        "Blocking descriptors do not generate readiness transitions, so the wait-queue callback is never invoked at all."
+      ],
+      "correctIndex": 0,
+      "explanation": "The ET drain loop terminates on `EAGAIN`, which a blocking descriptor never returns — the last `read` simply sleeps, and one stalled connection freezes every other connection that thread serves. The 'wakeup storm' answer swaps the failure mode: storms are the LT hazard (notably with `EPOLLOUT` left armed), while ET's hazard is a silent stall.",
+      "sourceAnchor": "3411-edge-triggered-and-level-triggered-readiness",
+      "difficulty": "recall"
+    },
+    {
+      "id": "34-q25",
+      "prompt": "Which capability does `kqueue` have that epoll does not?",
+      "options": [
+        "A single `kevent` call registers a batch of changes and retrieves events, and each event carries a data payload.",
+        "Its wait-queue callbacks are lock-free, so registration scales to far more descriptors than epoll's red-black tree.",
+        "It delivers completions rather than readiness, so the kernel performs the transfer before the event is ever posted.",
+        "It permits unlimited nesting of event sets, whereas epoll caps composition of sets at a depth of five."
+      ],
+      "correctIndex": 0,
+      "explanation": "One syscall for registration plus retrieval halves the syscall count in a loop that changes interest often, and `kevent.data` reports bytes available for reads, buffer space for writes, and exit status for processes. The 'delivers completions' answer misplaces it: `kqueue` is a readiness mechanism just like epoll — the move to a completion model is `io_uring`'s contribution, going further than `kqueue` ever did.",
+      "sourceAnchor": "3412-kqueue",
+      "difficulty": "recall"
+    },
+    {
+      "id": "34-q26",
+      "prompt": "Which Linux facilities does a single `kqueue` set subsume through its filters?",
+      "options": [
+        "`signalfd`, `timerfd`, `eventfd`, and `inotify`, via `EVFILT_SIGNAL`, `EVFILT_TIMER`, `EVFILT_USER`, and `EVFILT_VNODE`.",
+        "`epoll_ctl`, `epoll_pwait2`, and `ppoll`, which BSD collapses into the single `kevent` registration entry point.",
+        "`io_uring` submission and completion, since `EVFILT_AIO` performs the transfer as well as reporting its result.",
+        "`sendfile` and `splice`, since `EVFILT_VNODE` can move page references between two watched descriptors."
+      ],
+      "correctIndex": 0,
+      "explanation": "`kqueue` is a unified event system rather than an fd multiplexer, and Linux needed four separate descriptor types to reach the coverage BSD had in 2000; it also watches processes via `EVFILT_PROC` and, unlike epoll, regular files. The `EVFILT_AIO` answer overreaches: that filter reports AIO completions, it does not itself perform I/O the way an `io_uring` SQE does.",
+      "sourceAnchor": "3412-kqueue",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q27",
+      "prompt": "How does `io_uring` reach zero syscalls per operation in steady state?",
+      "options": [
+        "Two mmap'd SPSC rings with atomic head/tail indices; submission is a ring write plus a release store on the tail.",
+        "It maps the NIC's descriptor rings into user space, so the kernel is not present in the data path at all.",
+        "It amortizes one `io_uring_enter` over a batch, so the per-operation count approaches but never actually reaches zero.",
+        "It replaces `syscall` with a vDSO trampoline that writes the submission queue without any ring transition."
+      ],
+      "correctIndex": 0,
+      "explanation": "The submission and completion queues are shared memory with acquire/release ordering on the indices — structurally an interprocess ring — and with `SQPOLL` a kernel thread consumes submissions, so no `io_uring_enter` is needed at all. The NIC-descriptor-ring answer describes kernel bypass (DPDK, ef_vi, AF_XDP); `io_uring` still traverses the full kernel stack.",
+      "sourceAnchor": "3413-io_uring",
+      "difficulty": "recall"
+    },
+    {
+      "id": "34-q28",
+      "prompt": "A trading team proposes replacing an epoll order-entry path with `io_uring` to cut wire-to-wire latency. What is the honest assessment?",
+      "options": [
+        "It will not lower single-message latency, since both traverse the same kernel stack; expect a ~5–15% throughput gain.",
+        "It will roughly halve latency, since the completion model removes the second syscall that epoll needs per event.",
+        "It will lower latency only if operations are chained with `IOSQE_IO_LINK`, which merges the stack traversals.",
+        "It will lower latency by eliminating the `copy_to_user` step, since the kernel writes directly into the shared ring."
+      ],
+      "correctIndex": 0,
+      "explanation": "`io_uring` is a throughput and syscall-count win — roughly 5–15% on an echo server at moderate load, more at high connection counts — but the packet still walks the same stack, so the latency floor is unchanged; only kernel bypass moves it. The 'removes the second syscall' reasoning is true as far as it goes and still does not follow: that syscall is tens of nanoseconds against microseconds of stack traversal.",
+      "sourceAnchor": "3413-io_uring",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q29",
+      "prompt": "A protocol message is a 16-byte header, a pooled payload, and a 4-byte CRC. Why is `writev` the right emission idiom?",
+      "options": [
+        "One syscall and one TCP segment with no concatenation copy — the kernel walks the `iovec` array into the socket buffer.",
+        "It guarantees the whole message is written or none of it, removing the need for a partial-write loop on the socket.",
+        "It sets `TCP_CORK` implicitly for the duration of the call, which is what merges the three parts into one segment.",
+        "It pins the pooled payload pages for the duration of the transfer, so the payload is never copied at any point."
+      ],
+      "correctIndex": 0,
+      "explanation": "The alternatives are N syscalls (N entry costs, and N segments without `TCP_CORK`) or a memcpy into a staging buffer; `writev` avoids both while leaving the payload in its pooled buffer. The atomicity claim is the trap: vectored writes on a socket can still be short, and you must advance through the `iovec` array yourself — consuming whole entries, then partially consuming the next.",
+      "sourceAnchor": "3414-scatter-gather-io",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q30",
+      "prompt": "Which statement about vectored I/O limits and semantics is correct?",
+      "options": [
+        "`IOV_MAX` is 1024 on Linux and exceeding it returns `EINVAL`; `readv` fills each buffer fully before the next.",
+        "`IOV_MAX` is 1024 on Linux and exceeding it silently truncates; `readv` spreads a short read across all buffers.",
+        "`IOV_MAX` is unbounded on Linux since 2.6; `readv` fills each buffer completely before moving to the next one.",
+        "`IOV_MAX` is 64 on Linux and exceeding it returns `E2BIG`; `readv` fills the buffers in reverse declaration order."
+      ],
+      "correctIndex": 0,
+      "explanation": "The limit is 1024 (queryable via `sysconf(_SC_IOV_MAX)`) and violating it is a hard `EINVAL`, while `readv` fills sequentially — so a short read leaves later buffers untouched and you cannot use it to demultiplex into fixed slots. The 'spreads across all buffers' variant is the tempting misreading and would be genuinely useful if true, which is exactly why people assume it.",
+      "sourceAnchor": "3414-scatter-gather-io",
+      "difficulty": "recall"
+    },
+    {
+      "id": "34-q31",
+      "prompt": "Why is zero-copy largely irrelevant to a trading system's message path?",
+      "options": [
+        "For 50–500 byte messages the copy costs ~20 ns while stack traversal costs microseconds — and `sendfile` adds a syscall.",
+        "`sendfile` requires the input descriptor to be a socket, which rules out the file-backed sources trading systems use.",
+        "Zero-copy paths bypass the page cache, so every message would incur a device round trip instead of a cache hit.",
+        "The NIC cannot checksum referenced pages, so scatter-gather DMA silently falls back to a full CPU copy anyway."
+      ],
+      "correctIndex": 0,
+      "explanation": "Zero-copy is a bandwidth optimization for large, file-backed, bulk transfers; at HFT message sizes the copy is already negligible and the extra syscall is a net loss. The `sendfile` direction claim is inverted — `out_fd` is the socket and `in_fd` must be mmap-able — and checksum offload is precisely what *enables* the scatter-gather zero-copy path rather than defeating it.",
+      "sourceAnchor": "3415-sendfile-splice-and-zero-copy-file-io",
+      "difficulty": "trap"
+    },
+    {
+      "id": "34-q32",
+      "prompt": "How does `splice` move data between two sockets without copying it?",
+      "options": [
+        "It moves page references through a pipe, which is why one end of each call must be a pipe descriptor.",
+        "It maps both socket buffers into a shared kernel region, so the second call simply re-points the sk_buff at it.",
+        "It uses NIC scatter-gather DMA to transfer directly between the two devices, bypassing kernel memory entirely.",
+        "It reflinks the socket buffers the way `copy_file_range` does on btrfs, making the transfer metadata-only."
+      ],
+      "correctIndex": 0,
+      "explanation": "`splice` moves page references rather than bytes, and the pipe requirement is the awkward constraint that forces the two-call idiom — in to the pipe, out of the pipe — which is how a zero-copy proxy is built. The reflink answer borrows a real mechanism from the wrong place: `copy_file_range` can be metadata-only on btrfs or XFS, but that applies to files on a reflink-capable filesystem, not to sockets.",
+      "sourceAnchor": "3415-sendfile-splice-and-zero-copy-file-io",
+      "difficulty": "recall"
+    },
+    {
+      "id": "34-q33",
+      "prompt": "An `O_DIRECT` `pread` of 4096 bytes from a 4096-aligned offset into a `malloc`'d buffer fails with `EINVAL`. What is wrong?",
+      "options": [
+        "The buffer address must also be block-aligned; `malloc` gives no such guarantee, so use `posix_memalign`.",
+        "`pread` cannot be used with `O_DIRECT` at all, because positioned reads bypass the alignment checks entirely.",
+        "The transfer length must be a multiple of the page size rather than the block size, so 4096 bytes is too small.",
+        "`O_DIRECT` requires the file to have been opened `O_RDWR`, and read-only direct descriptors are rejected."
+      ],
+      "correctIndex": 0,
+      "explanation": "All three of buffer address, file offset, and transfer length must be multiples of the device's logical block size — 512 on older devices, 4096 on modern ones — and only two of the three hold here. The 'length must be a page multiple' answer is close enough to be tempting, but the constraint is the block size, and 4096 satisfies it on any current device; `posix_memalign(&buf, 4096, len)` is the fix.",
+      "sourceAnchor": "3416-direct-io",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q34",
+      "prompt": "An order journal is opened `O_DIRECT` and the author concludes `fdatasync` is now unnecessary. Why is that wrong?",
+      "options": [
+        "`O_DIRECT` bypasses the page cache but says nothing about the device's volatile write cache, which still needs flushing.",
+        "`O_DIRECT` writes are durable only when the transfer exceeds the device's logical block size in a single call.",
+        "`O_DIRECT` is durable on return, but `fdatasync` is still needed to push the inode's metadata to stable storage.",
+        "`O_DIRECT` defers the DMA until the page cache is next reclaimed, so a flush is what actually starts the write."
+      ],
+      "correctIndex": 0,
+      "explanation": "Bypassing the page cache and reaching stable storage are independent properties: durability still requires `fdatasync`, `O_DSYNC`, or `RWF_DSYNC`, which issue a FLUSH or FUA to the device. The 'durable but metadata still needs syncing' answer is the most seductive because that data/metadata split is real for `O_DSYNC` versus `O_SYNC` — but `O_DIRECT` alone guarantees durability for neither.",
+      "sourceAnchor": "3416-direct-io",
+      "difficulty": "trap"
+    },
+    {
+      "id": "34-q35",
+      "prompt": "Two threads in one process share fd 7; one closes it while another is mid-`read`. Why is this dangerous beyond the obvious race?",
+      "options": [
+        "Descriptor allocation returns the lowest free number, so a concurrent `open` reuses 7 and the `read` hits the wrong file.",
+        "`close` blocks until all in-flight operations on the descriptor complete, so the closing thread stalls unboundedly.",
+        "The open file description is freed immediately on `close`, so the in-flight `read` dereferences a dangling `struct file`.",
+        "The kernel marks the descriptor number permanently poisoned, so subsequent `open` calls skip it and leak numbering."
+      ],
+      "correctIndex": 0,
+      "explanation": "Lowest-free-number allocation is deterministic, so another thread's `open` or `accept` immediately claims 7 and the in-flight read silently reads a completely different file — a data-corruption bug, not just a lost read. The dangling-`struct file` answer is wrong about lifetime: the description is refcounted and survives while anything holds a reference; the hazard is number reuse, and the only fix is a synchronized ownership protocol.",
+      "sourceAnchor": "3417-file-descriptors-and-descriptor-tables",
+      "difficulty": "trap"
+    },
+    {
+      "id": "34-q36",
+      "prompt": "A level-triggered epoll server hits `RLIMIT_NOFILE` and pegs a core at 100% while accepting nothing. What is the standard defence?",
+      "options": [
+        "Keep a spare fd open, close it to accept and immediately close the connection, shedding it cleanly rather than spinning.",
+        "Switch the listening socket to edge-triggered, so the pending-connection event fires only once and the spin stops.",
+        "Raise the hard limit in `/proc/sys/fs/file-max` at runtime, since the soft limit cannot be changed after startup.",
+        "Deregister the listener on `EMFILE` and rely on the kernel's backlog to retain connections until memory frees up."
+      ],
+      "correctIndex": 0,
+      "explanation": "`accept` returns `EMFILE` without consuming the pending connection, so level-triggered epoll re-reports it forever — the reserved-fd trick breaks the livelock by making one `accept` possible. Switching to edge-triggered is the tempting fix and is genuinely worse: the connection stays pending with no further edge, so the server silently stops accepting instead of spinning.",
+      "sourceAnchor": "3417-file-descriptors-and-descriptor-tables",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q37",
+      "prompt": "`int a = open(\"f\", O_RDONLY); int b = dup(a);` then `read(a, buf, 10)` followed by `read(b, buf, 10)`. What does the second read return?",
+      "options": [
+        "Bytes 10 through 19, because both descriptors share one open file description and therefore one file offset.",
+        "Bytes 0 through 9, because `dup` snapshots the offset at duplication time and each descriptor advances its own.",
+        "Zero bytes, because the first read consumed the description's readable region and left it positioned at EOF.",
+        "Bytes 10 through 19, but only if `a` was opened `O_APPEND`; otherwise the offsets are tracked independently."
+      ],
+      "correctIndex": 0,
+      "explanation": "Duplicates point at the same `struct file`, so the offset is shared and reading through `b` continues where `a` left off; a second `open` of the same path would instead create an independent description starting at 0. The `O_APPEND` conditional is the tempting hedge — that flag also lives in the description, but offset sharing follows from duplication itself and does not depend on it.",
+      "sourceAnchor": "3418-descriptor-duplication",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q38",
+      "prompt": "Why is `dup2(pipefd[1], STDOUT_FILENO)` preferred over `close(1); dup(pipefd[1]);` when wiring up a child process?",
+      "options": [
+        "`dup2` closes the target and installs the copy atomically, leaving no window for another thread's `open` to claim fd 1.",
+        "`dup2` preserves `FD_CLOEXEC` on the new descriptor, so the redirection survives the following `execvp` correctly.",
+        "`dup` cannot return a descriptor number below 3, so the close-then-dup sequence would never land on fd 1 at all.",
+        "`dup2` duplicates the inode reference rather than the description, giving the child an independent file offset."
+      ],
+      "correctIndex": 0,
+      "explanation": "Atomicity is the whole point: the close-then-dup sequence has a gap in which a concurrent `open` grabs the lowest free number, which is 1. The `FD_CLOEXEC` answer inverts the requirement — the redirection works *because* `FD_CLOEXEC` is clear on the duplicate, so fd 1 survives the exec; preserving a set flag would close it.",
+      "sourceAnchor": "3418-descriptor-duplication",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q39",
+      "prompt": "A 100-byte application message arrives on a TCP socket as 40 bytes then 60. What must the receiver have?",
+      "options": [
+        "Explicit framing — a length prefix, delimiter, or fixed record — plus a reassembly buffer that persists across reads.",
+        "A large enough receive buffer, since a single `read` of sufficient size is guaranteed to return a whole message.",
+        "`MSG_WAITALL` on the `recv`, which makes the kernel deliver exactly one application message per call.",
+        "A level-triggered epoll registration, since edge-triggered mode is what splits messages across notifications."
+      ],
+      "correctIndex": 0,
+      "explanation": "TCP is a byte stream with no message boundaries, so fragments and coalesced messages are both normal and only application-level framing can recover them. The `MSG_WAITALL` answer is the sharpest distractor: that flag waits for a requested *byte count*, which the receiver cannot know before parsing the header, and it does not survive signals or a peer close.",
+      "sourceAnchor": "3419-short-reads-and-writes",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q40",
+      "prompt": "A non-blocking `write` transfers 300 of 1000 bytes and the next call returns `EAGAIN`. What is the correct response?",
+      "options": [
+        "Buffer the remaining 700 bytes and register for writability — this is backpressure, not an error condition.",
+        "Retry the write immediately in a loop, since the send buffer will drain within microseconds on a healthy link.",
+        "Close the connection, because a partial write on a non-blocking socket means the peer has stopped reading.",
+        "Fall back to a blocking write for the remainder, which is the only way to guarantee the message is not truncated."
+      ],
+      "correctIndex": 0,
+      "explanation": "`EAGAIN` after a partial write means the send buffer filled; the fix is to queue the remainder and arm `EPOLLOUT`, which is exactly what a write-all loop should return to its caller. Retrying immediately is the classic accidental spin — correct output at 100% CPU, with `strace` showing a torrent of `-1 EAGAIN` — and it is the single most common misreading of this errno.",
+      "sourceAnchor": "3419-short-reads-and-writes",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q41",
+      "prompt": "Code that ran for years starts returning `EINTR` from `recv` after someone adds `SO_RCVTIMEO`, even though `SA_RESTART` is set. Why?",
+      "options": [
+        "Timeout-bearing calls are never restarted, because a partially elapsed timeout cannot be resumed correctly.",
+        "`SO_RCVTIMEO` clears `SA_RESTART` on the process's installed handlers as a side effect of the socket option.",
+        "`SA_RESTART` applies only to descriptors opened before the handler was installed, and the option reopens the socket.",
+        "The timeout converts `recv` into a slow-device read, and slow-device reads are the category `SA_RESTART` excludes."
+      ],
+      "correctIndex": 0,
+      "explanation": "The kernel restarts only a subset of syscalls, and anything carrying a timeout is excluded — `poll`, `select`, `epoll_wait`, `nanosleep`, `futex` with timeout, and `recv`/`send` once `SO_RCVTIMEO`/`SO_SNDTIMEO` is set — because resuming would silently extend the deadline. The 'slow-device' answer inverts the table: slow-device reads and writes are precisely what `SA_RESTART` *does* cover.",
+      "sourceAnchor": "3420-eintr-and-eagain-handling",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q42",
+      "prompt": "`close(fd)` returns `EINTR` on Linux. What is the correct handling?",
+      "options": [
+        "Ignore it — the descriptor is already closed, and retrying may close a number another thread has since reused.",
+        "Retry the close until it succeeds, since an interrupted close leaves the descriptor allocated and leaks it.",
+        "Call `fsync` first and then retry the close, since `EINTR` here signals unflushed data on the description.",
+        "Treat it as fatal for the process, since a descriptor in an indeterminate state cannot be safely reasoned about."
+      ],
+      "correctIndex": 0,
+      "explanation": "On Linux the descriptor is released regardless of the `EINTR` return, so a retry can close an unrelated file that another thread has just opened into the freed number. Retrying is the reflex learned from every other syscall and is exactly wrong here; HP-UX behaves oppositely, which is why the portable answer is to check your platform and know this is a landmine.",
+      "sourceAnchor": "3420-eintr-and-eagain-handling",
+      "difficulty": "trap"
+    },
+    {
+      "id": "34-q43",
+      "prompt": "What does `IORING_REGISTER_BUFFERS` actually eliminate from each subsequent `*_fixed` operation?",
+      "options": [
+        "The `get_user_pages` pinning and unpinning plus `iov_iter` setup, worth roughly 5–15% on high-IOPS storage.",
+        "The `copy_to_user` step, since registered pages are mapped into the kernel and written in place with no copy.",
+        "The `fget`/`fput` refcount pair on `struct file`, which is what causes cache-line bouncing under multi-thread load.",
+        "The completion interrupt from the device, since registered buffers are DMA'd and reaped by the SQPOLL thread."
+      ],
+      "correctIndex": 0,
+      "explanation": "Registration pins the pages once, so each operation skips pinning, unpinning, and the associated mmap-semaphore contention — the gain is largest on small transfers where fixed costs dominate. The `fget`/`fput` answer describes registered *files* (`IORING_REGISTER_FILES`, worth 2–5% on network workloads), a different registration solving a different per-operation cost.",
+      "sourceAnchor": "3421-io_uring-registered-resources",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q44",
+      "prompt": "A multishot-recv server must serve 100,000 mostly idle connections without allocating a receive buffer for each. Which mechanism solves this?",
+      "options": [
+        "Provided buffers — the kernel picks one from a pool when data arrives and reports the chosen ID in the CQE.",
+        "Registered buffers — one pinned pool is shared, and every `read_fixed` references it by index rather than by address.",
+        "Registered files — descriptors are held by index, so the per-connection buffer is allocated lazily on first use.",
+        "`IORING_SETUP_ATTACH_WQ` — several rings share one worker pool, so buffers are pooled across the rings too."
+      ],
+      "correctIndex": 0,
+      "explanation": "Provided buffers (`IORING_REGISTER_PBUF_RING`) decouple memory from connection count: the kernel selects a buffer only when data actually arrives, so you size the pool for *active* connections. Registered buffers are the tempting answer but solve pinning cost, not allocation count — with a plain in-flight `recv` you still dedicate one buffer per pending operation.",
+      "sourceAnchor": "3421-io_uring-registered-resources",
+      "difficulty": "application"
+    },
+    {
+      "id": "34-q45",
+      "prompt": "Hand-written `SQPOLL` code fills SQEs and bumps the tail, and submissions silently stop being processed after an idle period. What was missed?",
+      "options": [
+        "The `IORING_SQ_NEED_WAKEUP` flag — once the kernel thread sleeps, `io_uring_enter` must be called to wake it.",
+        "A memory barrier before the tail store — without it the kernel thread never observes the newly written SQEs.",
+        "Re-registering the buffers, since registrations expire when the SQPOLL thread exceeds `sq_thread_idle`.",
+        "Reaping the completion queue, since a full CQ back-pressures the SQPOLL thread into refusing new submissions."
+      ],
+      "correctIndex": 0,
+      "explanation": "After `sq_thread_idle` milliseconds of inactivity the kernel thread sleeps and sets `IORING_SQ_NEED_WAKEUP` in the ring flags; `liburing`'s `io_uring_submit` checks it, and hand-rolled code that does not simply hangs. The missing-barrier answer describes a real and separate `io_uring` hazard, but it would corrupt or lose completions continuously rather than failing only after an idle gap.",
+      "sourceAnchor": "3422-io_uring-polling-modes",
+      "difficulty": "trap"
+    },
+    {
+      "id": "34-q46",
+      "prompt": "A team enables `IORING_SETUP_IOPOLL` on a ring used for buffered file writes and TCP sockets. What is the problem?",
+      "options": [
+        "`IOPOLL` works only on `O_DIRECT` block devices — not sockets, and not buffered file I/O.",
+        "`IOPOLL` requires `SQPOLL` to be set as well, since nothing else advances the completion queue for polled operations.",
+        "`IOPOLL` needs `CAP_SYS_NICE`, so the ring setup fails unless the process runs with elevated capabilities.",
+        "`IOPOLL` disables registered buffers, so the pinning cost returns on every operation submitted to that ring."
+      ],
+      "correctIndex": 0,
+      "explanation": "Device-side completion polling means the kernel polls an NVMe completion queue instead of taking an interrupt, so it is restricted to `O_DIRECT` block-device I/O; sockets and buffered file I/O are simply out of scope. The `SQPOLL` dependency is the plausible confusion: `IOPOLL` does require `io_uring_enter(..., IORING_ENTER_GETEVENTS)` to reap, but the two polling modes are independent, and `CAP_SYS_NICE` was an `SQPOLL` requirement.",
+      "sourceAnchor": "3422-io_uring-polling-modes",
+      "difficulty": "application"
+    }
+  ]
+}

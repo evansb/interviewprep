@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-51-exchange-protocols",
+  "questions": [
+    {
+      "id": "51-q01",
+      "prompt": "Which fields must occupy the first three positions of a FIX message, in that exact order?",
+      "options": [
+        "BeginString(8), then BodyLength(9), then MsgType(35), with CheckSum(10) required last.",
+        "BeginString(8), then MsgType(35), then MsgSeqNum(34), with BodyLength(9) required last.",
+        "SenderCompID(49), then TargetCompID(56), then MsgType(35), with SendingTime(52) last.",
+        "BodyLength(9), then BeginString(8), then CheckSum(10), with MsgType(35) required last."
+      ],
+      "correctIndex": 0,
+      "explanation": "The fixed prologue 8, 9, 35 plus a trailing 10 is what makes FIX self-framing over a TCP byte stream: you read to the length, consume exactly that many bytes, then the fixed trailer. The version that puts MsgSeqNum third and BodyLength last is the tempting miss, but a length field at the end cannot frame anything — you would already have had to find the message boundary to reach it. Session identity tags carry no ordering requirement at all.",
+      "sourceAnchor": "511-fix-session-layer",
+      "difficulty": "recall"
+    },
+    {
+      "id": "51-q02",
+      "prompt": "Your FIX engine expects MsgSeqNum 104 and receives a message stamped 108. What is the correct handling?",
+      "options": [
+        "Queue the message, then send a ResendRequest for 104 through 107 and process in order once filled.",
+        "Discard 108 as unusable, send a ResendRequest for 104 through 108, and reprocess the whole range.",
+        "Process 108 immediately, set the expectation to 109, and rely on the peer to notice the omission.",
+        "Send a Logout and escalate, since any sequence mismatch means the peer has lost session state."
+      ],
+      "correctIndex": 0,
+      "explanation": "A higher-than-expected number is a gap: request the missing range but retain the message you already hold, because it is valid data you would otherwise force the peer to send twice. Discarding 108 and re-requesting it is the near-miss — it works, but the rule is explicitly not to discard, and re-requesting a message in hand wastes a round trip on the recovery path. Immediate Logout is the response to a *lower*-than-expected number without PossDupFlag, not to a gap.",
+      "sourceAnchor": "511-fix-session-layer",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q03",
+      "prompt": "Expecting MsgSeqNum 104, your engine receives 97 with no PossDupFlag(43). What does the session layer require?",
+      "options": [
+        "Logout and escalate for human intervention: the peer has lost state and continuing risks stale order action.",
+        "Discard the message silently as a duplicate and continue processing from the current expectation of 104.",
+        "Send a ResendRequest covering 97 through 103 so the peer can replay whatever it believes it still owes.",
+        "Send a SequenceReset with NewSeqNo=104 to pull the peer's outbound counter forward to your expectation."
+      ],
+      "correctIndex": 0,
+      "explanation": "A backwards jump without PossDupFlag means the peer's persisted counter is wrong, so nothing it sends can be trusted — the protocol demands teardown and human involvement rather than automatic repair. Silent discard is the seductive answer because a lower number *is* a duplicate when PossDupFlag=Y, but that flag is exactly what distinguishes an administrative replay from a peer that has lost its state. Issuing a ResendRequest is also wrong-directioned: it asks for data you already have.",
+      "sourceAnchor": "511-fix-session-layer",
+      "difficulty": "trap"
+    },
+    {
+      "id": "51-q04",
+      "prompt": "A counterparty's FIX process is hung but its TCP connection is still established. Why does HeartBtInt with TestRequest catch this when TCP keepalive does not?",
+      "options": [
+        "Keepalive probes on minute-to-hour timescales and tests only the socket, so a hung application still answers.",
+        "Keepalive is disabled by default on all exchange sockets, so no liveness probing happens at the TCP layer.",
+        "Keepalive probes only the sending direction, so a peer that has stopped sending is never detected at all.",
+        "Keepalive frames are dropped by exchange firewalls, so the probe never reaches the counterparty process."
+      ],
+      "correctIndex": 0,
+      "explanation": "TCP keepalive is answered by the kernel and fires on a timescale of minutes to hours, so an application stuck in a loop keeps its socket looking perfectly healthy; TestRequest requires the *application* to echo a TestReqID within seconds. The claim that keepalive is off by default is a true-sounding premise that does not reach the conclusion — even fully enabled and tuned, keepalive cannot see past the kernel into a wedged process. Keepalive is bidirectional and is not systematically firewalled either.",
+      "sourceAnchor": "511-fix-session-layer",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q05",
+      "prompt": "An ExecutionReport arrives reporting a partial fill on a working order. What do ExecType(150) and OrdStatus(39) carry?",
+      "options": [
+        "ExecType=F for Trade and OrdStatus=1 for PartiallyFilled: the event, and the aggregate state.",
+        "ExecType=1 for PartiallyFilled and OrdStatus=F for Trade: the state, then the triggering event.",
+        "ExecType=0 for New and OrdStatus=2 for Filled, since any execution completes the reported slice.",
+        "ExecType and OrdStatus both carry F, since the two tags mirror each other on execution messages."
+      ],
+      "correctIndex": 0,
+      "explanation": "ExecType describes what *this message* reports while OrdStatus describes the order's current aggregate state, so a partial fill is the Trade event against a PartiallyFilled order. The swapped-values answer is the standard confusion and encodes the exact conflation the chapter warns about; a handler keyed on aggregate state alone cannot distinguish a new fill from a re-sent snapshot and double-counts position. The two tags draw from different value spaces and are never expected to agree.",
+      "sourceAnchor": "512-fix-application-messages",
+      "difficulty": "recall"
+    },
+    {
+      "id": "51-q06",
+      "prompt": "You must make an ExecutionReport handler idempotent against re-delivered reports. What is the design rule?",
+      "options": [
+        "Derive the fill increment as CumQty(14) minus the previously stored CumQty, so a duplicate yields a delta of zero.",
+        "Trust LastQty(32) as the increment but suppress any report whose ExecID(17) has already been seen this session.",
+        "Trust LastQty(32) as the increment and reject any report where PossDupFlag(43) is absent from the message.",
+        "Derive the increment as OrderQty(38) minus LeavesQty(151), which is stable across every duplicate delivery."
+      ],
+      "correctIndex": 0,
+      "explanation": "CumQty is monotonic, so subtracting the stored value makes a re-delivered report contribute nothing without any dedup bookkeeping — idempotence falls out of the arithmetic. The ExecID-dedup answer is the strongest distractor because per-report uniqueness is real, but it makes correctness depend on retaining an unbounded set of identifiers and still trusts a field the chapter says not to trust. Requiring PossDupFlag inverts the rule: a resend can overlap already-processed messages regardless of flagging.",
+      "sourceAnchor": "512-fix-application-messages",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q07",
+      "prompt": "A client sends OrderCancelReplaceRequest(G) for a working order, then a fill arrives naming the pre-replace identifier. What is the correct model?",
+      "options": [
+        "A replace mints a new ClOrdID(11) and names the old one in OrigClOrdID(41), so in-flight fills may cite either.",
+        "A replace reuses the original ClOrdID(11) throughout, so a fill naming a different identifier is a protocol violation.",
+        "A replace mints a new OrderID(37) at the client, so correlation should be keyed on that exchange-visible value.",
+        "A replace invalidates the old ClOrdID(11) at once, so a fill citing it must be dropped as a stale duplicate."
+      ],
+      "correctIndex": 0,
+      "explanation": "ClOrdID is unique per message rather than per order, so each amendment creates a fresh one chained through OrigClOrdID, and a fill that was in flight when the replace was sent legitimately references the earlier link in the chain. The drop-as-stale answer is the dangerous one: those fills are real executions, and discarding them loses position. OrderID is exchange-assigned and stable for the order's life, so it is not minted by the client on a replace.",
+      "sourceAnchor": "512-fix-application-messages",
+      "difficulty": "trap"
+    },
+    {
+      "id": "51-q08",
+      "prompt": "Why can a FIX repeating group such as NoPartyIDs(453) not be parsed by a generic tag-value reader with no schema?",
+      "options": [
+        "Nothing on the wire marks a group's end; only the dictionary says which tag delimits each repetition.",
+        "Group entries are length-prefixed in bytes, and only the dictionary supplies the width of that prefix field.",
+        "Group entries are delimited by a reserved SOH pair that a generic reader mistakes for a message boundary.",
+        "Group tags are renumbered per message, so only the dictionary maps the wire numbers back to field names."
+      ],
+      "correctIndex": 0,
+      "explanation": "FIX writes a count followed by that many repetitions, with the first tag of the repetition acting as the delimiter — a fact that lives only in the data dictionary, which is why the count field is also a prime input-validation target. The byte-length-prefix answer describes binary framing, not FIX: repeating groups carry no byte counts anywhere. Tag numbers are globally fixed rather than renumbered per message, so no remapping is involved.",
+      "sourceAnchor": "512-fix-application-messages",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q09",
+      "prompt": "How does FAST's stop-bit integer encoding mark the end of a variable-length value?",
+      "options": [
+        "Seven data bits per byte with the high bit set on the final byte — the opposite of the protobuf varint rule.",
+        "Seven data bits per byte with the high bit set on every byte but the last, matching the protobuf varint rule.",
+        "Eight data bits per byte with a separate trailing length byte, which the presence map may also elide.",
+        "Seven data bits per byte with a zero byte terminator, so a value containing zero must be escaped first."
+      ],
+      "correctIndex": 0,
+      "explanation": "FAST sets the stop bit on the terminating byte, so 127 fits in one byte whose high bit is set, and this inversion relative to protobuf's continuation-bit convention is exactly what interviewers probe. The protobuf-style answer is the reliable trap because both schemes are base-128 and differ only in which byte carries the marked bit. There is no separate length byte and no zero terminator, which is why decode is a serial, branch-heavy loop.",
+      "sourceAnchor": "513-fast-encoding",
+      "difficulty": "recall"
+    },
+    {
+      "id": "51-q10",
+      "prompt": "After a brief packet loss on a FAST feed, prices for one instrument freeze at a stale value while sequence numbers advance normally. What is happening?",
+      "options": [
+        "The per-template dictionary is stale, so copy and delta fields reconstruct from wrong prior state until a reset.",
+        "The presence map bits are misaligned by the loss, so every field reads shifted by one and prices decode as zero.",
+        "The stop-bit decoder resynchronized mid-value, so the message lengths are wrong and the parser is desynchronized.",
+        "The sequence layer suppressed the affected messages, so the last good price is simply being repeated by the feed."
+      ],
+      "correctIndex": 0,
+      "explanation": "FAST decoding is stateful: operators reconstruct values from the previous message's field values, so a dropped message corrupts every subsequent copy and delta field until a reset message or dictionary boundary. The tell is precisely the one described — plausible-but-wrong prices that drift by a constant offset or freeze, with sequencing intact. The desynchronized-framing answer would produce garbage and unknown templates rather than plausible prices, and the sequence layer does not suppress or repeat anything.",
+      "sourceAnchor": "513-fast-encoding",
+      "difficulty": "trap"
+    },
+    {
+      "id": "51-q11",
+      "prompt": "An ITCH feed handler receives a `P` (Trade, non-cross) message. What must it do to the order book?",
+      "options": [
+        "Nothing to the book: `P` prints execution against non-displayed liquidity and touches no displayed size.",
+        "Reduce the resting order named by the reference number, exactly as it would for an `E` or `C` message.",
+        "Reduce the price level's aggregate size without touching any individual order reference in the map.",
+        "Delete the referenced order outright, since a non-cross print always exhausts the liquidity it consumed."
+      ],
+      "correctIndex": 0,
+      "explanation": "`P` reports off-book or hidden-liquidity execution and must leave displayed depth untouched; only `E` and `C` reduce a resting order. The answer that decrements aggregate level size without touching references is the most tempting because it sounds like a conservative half-measure, but it corrupts the book exactly as thoroughly — displayed size that was never consumed disappears. Deleting the order compounds the same error.",
+      "sourceAnchor": "514-itch-market-data",
+      "difficulty": "recall"
+    },
+    {
+      "id": "51-q12",
+      "prompt": "A book builder shows unbounded memory growth across a trading day with no matching increase in book depth. Which ITCH handling bug fits?",
+      "options": [
+        "Order Replace (`U`) is handled by keeping the old reference number, so dead entries are never removed from the map.",
+        "Order Delete (`D`) is handled by zeroing the order's shares, so the entry is retained but no longer counted as depth.",
+        "Add Order with MPID (`F`) is inserted into a second map that duplicates every entry already tracked from `A`.",
+        "Broken Trade (`B`) is handled by re-adding the voided order, so each break resurrects an already-removed entry."
+      ],
+      "correctIndex": 0,
+      "explanation": "`U` retires the old reference number and issues a new one, so a handler that reuses the old reference leaks a map entry per replace — replaces are frequent, which is why the leak scales with the session rather than with depth. The zeroed-shares-on-delete answer is close and would also leak, but it is a self-inflicted variant not matching the protocol's actual sharp edge, and a correct `D` handler is a straightforward erase. Broken Trade voids a print and does not resurrect book entries.",
+      "sourceAnchor": "514-itch-market-data",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q13",
+      "prompt": "Where do sequence numbers, gap detection, and recovery live for a Nasdaq ITCH multicast feed?",
+      "options": [
+        "Entirely in MoldUDP64, which adds session id, a 64-bit sequence, and a count; ITCH itself carries no sequence number.",
+        "In the ITCH message header, whose TrackingNumber field carries the per-channel sequence used for gap detection.",
+        "In the UDP header, whose port and checksum fields the receiver combines to order datagrams within a session.",
+        "Split across both, with MoldUDP64 numbering packets and each ITCH message carrying its own message sequence."
+      ],
+      "correctIndex": 0,
+      "explanation": "The clean separation is the design lesson: MoldUDP64 is a protocol-agnostic framing and sequencing layer, and ITCH is pure business semantics with no sequence field of its own. The split-responsibility answer is the most plausible miss, but MoldUDP64 numbers *messages*, not packets — the header carries the sequence of the first message plus a count, and the receiver derives each message's number by adding its index. UDP supplies no ordering information whatsoever.",
+      "sourceAnchor": "514-itch-market-data",
+      "difficulty": "recall"
+    },
+    {
+      "id": "51-q14",
+      "prompt": "The ITCH Add Order message occupies 36 bytes on the wire, but the equivalent naive C struct is 40. Why, and what follows?",
+      "options": [
+        "Compiler padding inserted for member alignment, so overlaying the wire needs packing plus unaligned-safe access.",
+        "A 4-byte MoldUDP64 length prefix counted into the struct, so overlay works once the prefix is subtracted first.",
+        "The compiler widens the 48-bit timestamp to 64 bits, so overlay works if that one field is read separately.",
+        "Big-endian storage costs an extra padding byte per multi-byte field, so overlay works on big-endian hosts."
+      ],
+      "correctIndex": 0,
+      "explanation": "The wire format is packed to byte boundaries with no padding, while a C struct is padded so each member is naturally aligned — the four-byte discrepancy is pure padding, and it means struct overlay demands `#pragma pack` plus alignment-agnostic access, or field-by-field extraction. The 48-bit-timestamp answer is tempting since that field genuinely has no native type, but padding is inserted across several members, not localized to it. Endianness affects byte order, never field size.",
+      "sourceAnchor": "514-itch-market-data",
+      "difficulty": "trap"
+    },
+    {
+      "id": "51-q15",
+      "prompt": "A strategy must be able to cancel an order before the exchange acknowledgement arrives. What does OUCH's client-assigned OrderToken buy?",
+      "options": [
+        "The cancel can name the token immediately, removing a full round trip from the worst-case cancel latency.",
+        "The cancel is guaranteed to be processed ahead of the original enter, since tokens impose a client priority order.",
+        "The exchange assigns no order reference at all, so both enter and cancel are stateless on the exchange side.",
+        "The exchange echoes the token only on rejects, so the client learns the outcome without waiting for the ack."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because the identifier is the client's, there is no need to learn an exchange ID before cancelling, so a cancel is not serialized behind the ack — the contrast is with protocols that require the exchange OrderID and therefore add an RTT to worst-case cancel latency. The priority-ordering answer is the appealing overreach: earlier submission does not reorder exchange processing, and the token confers no queue advantage. The token appears on every response, not only rejects, and the exchange still assigns its own order reference on Accepted.",
+      "sourceAnchor": "515-ouch-order-entry",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q16",
+      "prompt": "How does SoupBinTCP sequence traffic between an OUCH client and the exchange?",
+      "options": [
+        "Outbound is sequenced data ('S') forming a replayable log; inbound is unsequenced data ('U') carried by TCP ordering.",
+        "Inbound is sequenced data ('S') so the exchange can detect client gaps; outbound is unsequenced data ('U').",
+        "Both directions are sequenced independently, with each side persisting its own counter across reconnection.",
+        "Neither direction is sequenced, since TCP already guarantees ordering and the type byte identifies each message."
+      ],
+      "correctIndex": 0,
+      "explanation": "The asymmetry is the point: the exchange is the authority on what happened, so the outbound stream is a durable log the client resumes from after reconnect, while inbound needs no sequence because TCP already orders it and the client learns every outcome from the outbound side. The both-directions-sequenced answer describes FIX, which does number each direction independently — that is exactly the per-direction persistence burden OUCH's design sheds. The type byte alone would give no recovery point.",
+      "sourceAnchor": "515-ouch-order-entry",
+      "difficulty": "recall"
+    },
+    {
+      "id": "51-q17",
+      "prompt": "A strategy reconnects mid-session having already reconciled its positions elsewhere. What should its SoupBinTCP Login Request request as the resume sequence number?",
+      "options": [
+        "0, meaning start from the next new message, since replaying the day's history is unwanted work on reconnect.",
+        "0, meaning replay the session from the very first message, so the client can verify its reconciliation is right.",
+        "1, meaning start from the next new message, since sequence numbering is one-based and 0 is not a legal value.",
+        "The last sequence seen, which the exchange interprets as a request to resume from the following message."
+      ],
+      "correctIndex": 0,
+      "explanation": "Requesting 0 means 'start from the next new message', which is the right choice precisely when the client has reconciled elsewhere and does not need history — and the wrong choice when it does. The 'replay everything' reading of 0 is the direct inversion and the common misreading; a client wanting history names the sequence it wants to resume from instead. Naming the last sequence seen would redeliver that message rather than skipping past it.",
+      "sourceAnchor": "515-ouch-order-entry",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q18",
+      "prompt": "What does the fixed 8-byte SBE MessageHeader contain?",
+      "options": [
+        "blockLength, templateId, schemaId and version, each a uint16 in the schema's declared byte order.",
+        "blockLength, templateId, numInGroup and version, each a uint16, with schemaId carried per session.",
+        "A uint32 total message length followed by templateId and schemaId as uint16 values.",
+        "sequenceNumber and templateId as uint32 values, with schemaId negotiated once at session logon."
+      ],
+      "correctIndex": 0,
+      "explanation": "Four uint16 fields — blockLength, templateId, schemaId, version — give the decoder the root block size, the message identity, and the schema generation in a constant eight bytes. The numInGroup variant is the closest miss: that field exists, but inside GroupSizeEncoding preceding each repeating group, not in the message header. SBE's header carries no total length and no sequence number; framing and sequencing are separate layers.",
+      "sourceAnchor": "516-simple-binary-encoding",
+      "difficulty": "recall"
+    },
+    {
+      "id": "51-q19",
+      "prompt": "A version-5 encoder sends a root block of 40 bytes to a decoder generated from version 3, which expects 32. What makes the decode correct?",
+      "options": [
+        "The decoder reads its known fields at unchanged offsets, then skips to offset + blockLength taken from the header.",
+        "The decoder reads its known fields, then skips to offset plus its own compiled-in blockLength constant of 32.",
+        "The decoder rejects the message on the version mismatch and requests a downgrade to version 3 encoding.",
+        "The decoder reads the trailing 8 unknown bytes as a variable-length field and discards them before the groups."
+      ],
+      "correctIndex": 0,
+      "explanation": "The whole compatibility contract rests on trusting the header's blockLength rather than the compiled constant: existing offsets never move, and the decoder steps over whatever the newer encoder appended to land exactly on the groups. Using the compiled-in 32 is the precise bug this design guards against — the decoder would start parsing group headers eight bytes early and misinterpret everything after. Version mismatch is not an error condition here, which is the point of appending only.",
+      "sourceAnchor": "516-simple-binary-encoding",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q20",
+      "prompt": "A colleague argues SBE must be slower to move than FAST because SBE messages are larger on the wire. Where does the argument fail?",
+      "options": [
+        "The premise holds but the conclusion does not: at 10 GbE, bandwidth is free and SBE decodes in tens of nanoseconds against FAST's microseconds.",
+        "The premise is false: SBE is smaller than FAST because fixed offsets remove the presence map and all field tags from the wire.",
+        "The premise is false: SBE and FAST produce near-identical byte counts, so the comparison never bears on latency at all.",
+        "The premise holds and so does the conclusion, but SBE wins on schema evolution, which outweighs the latency it gives up."
+      ],
+      "correctIndex": 0,
+      "explanation": "SBE genuinely is larger than FAST — roughly 60 to 80 bytes against 15 to 30 for a NewOrderSingle — and it is still unambiguously the right trade because link capacity stopped being the constraint while decode cost did not. The 'SBE is smaller' answer is wrong on fact: FAST's compression is precisely what makes it small, at the cost of serial stateful decode. Conceding the latency conclusion and falling back on evolution also misstates the ordering: SBE decodes an order of magnitude faster, not slower.",
+      "sourceAnchor": "516-simple-binary-encoding",
+      "difficulty": "trap"
+    },
+    {
+      "id": "51-q21",
+      "prompt": "A SoupBinTCP frame arrives with the length field reading 20. How many payload bytes follow the type byte?",
+      "options": [
+        "19, because the length counts the type byte but not the two bytes of the length field itself.",
+        "20, because the length counts only the payload and excludes both the type byte and the length field.",
+        "18, because the length counts the type byte and one trailing framing byte after the payload.",
+        "22, because the length counts only the payload and the two length bytes must be added back in."
+      ],
+      "correctIndex": 0,
+      "explanation": "SoupBinTCP's length includes the type byte, so payload length is len minus one — this off-by-one is the classic bug in the protocol and also the reason len == 0 must be rejected before the subtraction underflows. The '20 is the payload' answer is the exact mistake most implementations make, since length prefixes in many other protocols do exclude the type discriminator. There is no trailing framing byte and the length never counts itself.",
+      "sourceAnchor": "517-binary-message-framing",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q22",
+      "prompt": "A length-prefixed TCP session starts emitting unknown message types and nonsense fields from one instant onward, never recovering. What is the correct response?",
+      "options": [
+        "Tear down the session: the reader is now reading lengths out of payload bytes and cannot be resynchronized.",
+        "Scan forward for the next plausible type byte and length pair, then resume decoding from that offset.",
+        "Discard the current buffer contents and continue reading from the next recv boundary as a fresh frame.",
+        "Fall back to fixed-size-by-type framing using the message table until the length fields agree again."
+      ],
+      "correctIndex": 0,
+      "explanation": "Once framing desynchronizes, every subsequent length is read from the middle of some payload, and a length-prefixed stream carries no marker that could re-establish a boundary — teardown is the only correct answer. Scanning forward for a plausible header is the attractive repair and the dangerous one: it will eventually find bytes that look like a valid header and turn a framing bug into an incorrect trade. Recv boundaries are meaningless in a byte stream, and the type table cannot help when the type byte itself is misidentified.",
+      "sourceAnchor": "517-binary-message-framing",
+      "difficulty": "trap"
+    },
+    {
+      "id": "51-q23",
+      "prompt": "A frame reader dispatches at most one message per recv wakeup. What are the consequences under an edge-triggered epoll registration?",
+      "options": [
+        "Latency grows unboundedly under load and the reader stalls permanently, since no new edge arrives for buffered bytes.",
+        "Latency grows unboundedly under load but the reader recovers, since epoll re-arms on every byte already buffered.",
+        "Latency is unaffected but throughput halves, since each wakeup pays a syscall for a single message dispatch.",
+        "The reader stalls only when a message straddles a recv boundary, since a partial header suppresses the next edge."
+      ],
+      "correctIndex": 0,
+      "explanation": "Edge-triggered readiness fires on the transition, so bytes already sitting in the socket buffer generate no further notification — leaving messages undrained means waiting forever for an edge that will not come. The 'grows but recovers' variant assumes level-triggered semantics, which is exactly the distinction being tested. Partial headers are a separate hazard handled by checking that two bytes are present before reading a length; they are not what causes the stall.",
+      "sourceAnchor": "517-binary-message-framing",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q24",
+      "prompt": "A hot-path ITCH parser returns a view type holding a pointer into the receive buffer. What is the lifetime contract?",
+      "options": [
+        "The view is valid only until the receive buffer is recycled; anything outliving the callback copies into preallocated storage.",
+        "The view is valid until the next message of the same type arrives, since the parser reuses per-type staging buffers.",
+        "The view owns its bytes after construction, so it may be stored indefinitely provided the parser is not reentered.",
+        "The view is valid for the life of the session, since receive buffers are allocated per session and never reused."
+      ],
+      "correctIndex": 0,
+      "explanation": "Views cost zero bytes of ownership precisely because they alias the receive buffer, so the contract must be documented explicitly: retention past buffer recycling is a use-after-free with a load-dependent failure signature. The per-type staging-buffer answer invents a copy step that a genuinely zero-copy parser does not perform. Receive ring entries are returned to the NIC and reused constantly, so nothing about a view survives to session scope.",
+      "sourceAnchor": "518-allocation-free-parsing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "51-q25",
+      "prompt": "You must prove a parser performs no allocation during steady-state trading. What is the strongest mechanism?",
+      "options": [
+        "Interpose malloc so it traps when a hot-path flag is set, and watch page-fault and mmap counters stay flat after warmup.",
+        "Review every parser function for container types and confirm by inspection that no owning type appears on the path.",
+        "Run the parser under a debug allocator that logs each allocation, then check the log size stays within a budget.",
+        "Measure mean parse latency across a replay and confirm it stays under the allocator's typical 20 to 100 ns cost."
+      ],
+      "correctIndex": 0,
+      "explanation": "The strong-candidate answer is mechanical enforcement rather than assertion: a trapping interposer turns any allocation into an immediate, unmissable failure, and flat minor-fault and mmap counts corroborate it from outside the process. Logging allocations against a budget is the tempting weaker cousin — it detects allocation but tolerates it, and the whole point is that any allocation on the path makes the tail bimodal. Mean latency is exactly the statistic that hides an allocator's tail behaviour.",
+      "sourceAnchor": "518-allocation-free-parsing",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q26",
+      "prompt": "Why is `reinterpret_cast<const AddOrder*>(buf)` undefined behavior, and what is the default replacement?",
+      "options": [
+        "No object of that type exists there, the buffer may be misaligned, and it violates strict aliasing; use per-field memcpy accessors.",
+        "The cast discards const qualification and may violate alignment; use const_cast plus a packed struct overlay instead.",
+        "The cast is well defined for standard-layout types but non-portable across endianness; use ntohl on each member.",
+        "The cast is undefined only when the struct contains padding, so it is safe once the type is declared with pragma pack."
+      ],
+      "correctIndex": 0,
+      "explanation": "Three independent defects apply at once, and per-field memcpy fixes all of them while compiling to a single load after optimization. The 'safe once packed' answer is the most seductive because packing does remove the padding mismatch — but object lifetime and strict aliasing are untouched by it, and taking the address of a packed member is itself UB. Endianness is a real concern but an orthogonal one; it never makes an aliasing violation well defined.",
+      "sourceAnchor": "519-zero-copy-deserialization",
+      "difficulty": "trap"
+    },
+    {
+      "id": "51-q27",
+      "prompt": "In a 64-byte-aligned receive ring, UDP payload begins 42 bytes into the frame, so every 4-byte protocol field sits at a 2-mod-4 address. Which consequence is real?",
+      "options": [
+        "A field straddling a 4 KB page boundary costs hundreds of cycles and shows up as a tail-latency outlier on x86-64.",
+        "Every misaligned 4-byte scalar load costs hundreds of cycles on x86-64, making the whole parse uniformly slower.",
+        "Misaligned scalar loads fault on x86-64, so the driver must offset the DMA write before user code can read at all.",
+        "Misaligned loads are fine on ARM for every access type, so only x86-64 needs the NET_IP_ALIGN driver offset."
+      ],
+      "correctIndex": 0,
+      "explanation": "On x86-64 misaligned scalar loads are nearly free in the ordinary case; the exception is a load straddling a cache line or a page, and the page-crossing case is what surfaces as a rare tail outlier rather than a uniform slowdown. The 'uniformly slower' answer overgeneralizes a real hazard into a false one. On ARM misaligned access is fine for normal memory but fatal for atomics and SIMD, so ARM is not the safe platform here.",
+      "sourceAnchor": "519-zero-copy-deserialization",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q28",
+      "prompt": "Which statement about protocol endianness matches the chapter's table?",
+      "options": [
+        "ITCH, OUCH and MoldUDP64 are big-endian by era convention, while SBE declares byte order in the schema and normally chooses little.",
+        "ITCH, OUCH and MoldUDP64 are little-endian for host efficiency, while SBE is big-endian to preserve network byte order.",
+        "All binary exchange protocols are big-endian because network byte order is mandated by the sockets API contract.",
+        "SBE and MoldUDP64 are both little-endian, while ITCH and OUCH inherit whichever order the host encoder used."
+      ],
+      "correctIndex": 0,
+      "explanation": "Protocols designed before roughly 2005 inherited network byte order, so the Nasdaq family is big-endian; SBE made byte order a schema declaration and chose little-endian explicitly so hosts never swap. The blanket 'all binary protocols are big-endian' answer is built on a genuine convention that the sockets API never actually mandates for payloads — only header fields. Nothing in ITCH or OUCH defers to the encoder's host order; the wire order is fixed.",
+      "sourceAnchor": "5110-protocol-endianness-and-alignment",
+      "difficulty": "recall"
+    },
+    {
+      "id": "51-q29",
+      "prompt": "You must read ITCH's 48-bit big-endian nanosecond timestamp at offset 5 of a 36-byte message. What is the clean approach?",
+      "options": [
+        "Load a big-endian uint16 and a big-endian uint32 separately, then combine them as (hi << 32) | lo.",
+        "Load 8 bytes starting at offset 3, byteswap the result, and mask off the two leading bytes afterwards.",
+        "Load 8 bytes starting at offset 5, byteswap the result, and shift right by 16 to drop the trailing bytes.",
+        "Cast the six bytes to a packed uint64 bitfield of width 48 and let the compiler emit the correct load."
+      ],
+      "correctIndex": 0,
+      "explanation": "There is no uint48_t, so assembling from two correctly sized big-endian loads is the clean form — it reads exactly the six bytes that belong to the field. Loading eight bytes from offset 3 is the dangerous shortcut: it reads two bytes before the field, which may lie before the buffer entirely, and that is precisely why the chapter rejects it. Loading eight bytes from offset 5 in a 36-byte message reads past the field into unrelated data and can over-read the message.",
+      "sourceAnchor": "5110-protocol-endianness-and-alignment",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q30",
+      "prompt": "An exchange must add two fields to an existing SBE message while thousands of clients run older decoders. What is the required discipline?",
+      "options": [
+        "Append the new fields at the end of the block so blockLength grows; never change an existing field's offset, size or meaning.",
+        "Insert the new fields beside related ones and bump schemaId, since old decoders key on schemaId and skip unknown layouts.",
+        "Replace two deprecated fields' bytes with the new fields, since retired fields are dead space nobody reads any more.",
+        "Move the new fields into the variable-length section, since only that section may grow without a version bump."
+      ],
+      "correctIndex": 0,
+      "explanation": "Appending is the only mutation the blockLength mechanism can absorb: existing offsets stay put, old decoders read what they know and skip to offset plus blockLength. Reusing retired fields' bytes is the worst case in the whole chapter — no decoder errors anywhere, and every downstream number is silently wrong. Insertion beside related fields shifts every subsequent offset, and a schemaId bump does not teach an old decoder a new layout.",
+      "sourceAnchor": "5111-schema-and-version-evolution",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q31",
+      "prompt": "Your team gates every exchange schema version bump behind differential testing, yet a book builder breaks overnight with no protocol change. What is the likely cause?",
+      "options": [
+        "A reference-data change such as a new tick-size regime or a reused symbol, which arrives with no version bump at all.",
+        "A silent endianness change on the feed, which the schema does not describe and therefore never triggers a bump.",
+        "An accumulated sequence-number drift on the incremental feed, which only manifests after a full day of traffic.",
+        "A new SBE enum value, which the generated switch statement's default case forwards as a valid known state."
+      ],
+      "correctIndex": 0,
+      "explanation": "Reference-data changes are more dangerous than schema changes precisely because they bypass every version-gated control: a new tick grid, a symbol reuse, or a new instrument type reaches production with nothing to diff against, which is why startup reference-data validation is the guard. The new-enum-value answer names a real compatibility event, but it does not fit — it arrives with a schema change, and a correct generated switch has an explicit default that ignores or fails loudly rather than aliasing to a valid state.",
+      "sourceAnchor": "5111-schema-and-version-evolution",
+      "difficulty": "trap"
+    },
+    {
+      "id": "51-q32",
+      "prompt": "A repeating-group bounds check reads `if (2 + n * kEntrySize > remaining) return Err::Truncated;` with n a uint16 from the wire. What is wrong and what is the fix?",
+      "options": [
+        "The product can overflow, so the check passes on a hostile count; compare instead with n > (remaining - 2) / kEntrySize.",
+        "The constant 2 should be the entry size, so short groups are rejected; compare with kEntrySize + n * kEntrySize > remaining.",
+        "The comparison is signed, so a large n becomes negative; cast n to size_t first and keep the multiplication as written.",
+        "remaining is measured in entries rather than bytes, so divide it by kEntrySize before the comparison is performed."
+      ],
+      "correctIndex": 0,
+      "explanation": "Multiplying an attacker-controlled count by an element size overflows, and once it wraps the check passes for exactly the inputs it was meant to reject — dividing the remaining space instead never overflows. The signed-comparison answer is a real category of bug but misdiagnoses this one: widening n to size_t does not prevent the product from exceeding the range on a 32-bit result, and the defect is the multiplication itself, not the signedness.",
+      "sourceAnchor": "5112-untrusted-length-and-count-validation",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q33",
+      "prompt": "Why is `if (p + n <= end)` an incorrect bounds check even though it appears to compare pointers safely?",
+      "options": [
+        "Forming p + n past the end is undefined before the comparison ever executes; write end - p >= n, which is well defined.",
+        "Pointer comparison between p and end is unspecified for distinct objects, so both must be cast to uintptr_t first.",
+        "The addition can wrap on 32-bit targets only, so the check is correct on 64-bit hosts and needs no change.",
+        "The comparison should be strict rather than inclusive, since p + n == end means the last byte lies outside the buffer."
+      ],
+      "correctIndex": 0,
+      "explanation": "The UB is in the pointer arithmetic itself: computing an address more than one past the end is undefined regardless of what the comparison then decides, so the check has already lost before it runs. Subtracting two pointers into the same buffer and comparing the difference is well defined. The off-by-one answer is wrong on its own terms — p + n == end means the range ends exactly at the buffer end, which is valid — and the 32-bit-only claim understates UB as a platform quirk.",
+      "sourceAnchor": "5112-untrusted-length-and-count-validation",
+      "difficulty": "trap"
+    },
+    {
+      "id": "51-q34",
+      "prompt": "A SoupBinTCP frame arrives with its length field equal to 0 and the reader computes `payload_len = len - 1` into a size_t. What happens?",
+      "options": [
+        "It underflows to SIZE_MAX and the resulting span covers the address space; reject len == 0 before the subtraction.",
+        "It underflows to SIZE_MAX but the subsequent buffered-bytes check catches it, so only a spurious error is logged.",
+        "It evaluates to 0 because unsigned subtraction saturates at zero, so the reader dispatches an empty message harmlessly.",
+        "It traps at runtime because unsigned underflow is undefined behavior, terminating the session before any read."
+      ],
+      "correctIndex": 0,
+      "explanation": "Unsigned arithmetic wraps rather than saturating or trapping, so len - 1 with len == 0 yields the maximum value and any span built from it is catastrophic — the guard must precede the subtraction. The 'later check catches it' answer is the most plausible miss, and it is exactly the assumption that fails when the narrowed span has already been handed deeper into the system. Unsigned wraparound is well defined, so nothing traps on its own.",
+      "sourceAnchor": "5112-untrusted-length-and-count-validation",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q35",
+      "prompt": "What integrity property does the FIX CheckSum(10) field actually provide?",
+      "options": [
+        "A modulo-256 additive sum that cannot detect byte transposition at all, useful mainly as a framing sanity check.",
+        "A modulo-256 additive sum that detects all transpositions and any single-byte corruption within the message.",
+        "A CRC-8 over the message body that detects all burst errors up to eight bits at negligible computational cost.",
+        "A 16-bit one's-complement sum matching the TCP algorithm, computed over the body and rendered as three digits."
+      ],
+      "correctIndex": 0,
+      "explanation": "Addition is commutative, so reordering bytes leaves the sum unchanged — the field detects roughly 255 of 256 random corruptions and its real value is telling you that you are mis-framed rather than corrupted. The 'detects all transpositions' answer inverts the single most important weakness of an additive construct. It is not a CRC and not the one's-complement algorithm used by IP and TCP; it is a plain byte sum rendered as exactly three ASCII digits.",
+      "sourceAnchor": "5113-checksums-and-crcs",
+      "difficulty": "recall"
+    },
+    {
+      "id": "51-q36",
+      "prompt": "You are designing a new binary exchange protocol in 2026 and must pick a message integrity check. What is the defensible default and why?",
+      "options": [
+        "CRC-32C, because it has better Hamming distance than CRC-32 and runs about 8 bytes per cycle via the SSE4.2 instruction.",
+        "CRC-32 with the Ethernet polynomial, because reusing the link-layer polynomial lets the NIC compute it for free in hardware.",
+        "A modulo-256 additive sum, because it costs one add per byte and messages are already covered by the Ethernet FCS.",
+        "CRC-64, because message-sized payloads justify the wider residue and the cost difference against CRC-32C is negligible."
+      ],
+      "correctIndex": 0,
+      "explanation": "CRC-32C is both stronger and cheaper than the alternatives here: the hardware instruction makes a 64-byte message cost roughly ten cycles, less than a byte-wise additive sum over the same bytes. The Ethernet-polynomial answer trades on a real fact — the NIC does compute an FCS — but that covers each link only and is recomputed by store-and-forward switches, so it protects nothing end to end. CRC-64 is overkill for message-sized data.",
+      "sourceAnchor": "5113-checksums-and-crcs",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q37",
+      "prompt": "On a redundant A/B market-data feed, your handler logs a warning for every message whose sequence number is below the expectation. What is wrong with this?",
+      "options": [
+        "Duplicates are the normal case on A/B feeds, so the log becomes a self-inflicted denial of service; discard silently.",
+        "Duplicates on A/B feeds indicate one path is misconfigured, so the warning is correct but should escalate to an alarm.",
+        "Below-expectation messages on A/B feeds are gaps rather than duplicates, so the handler should trigger recovery instead.",
+        "Duplicates should be buffered rather than discarded, since the second copy may carry corrections the first one lacked."
+      ],
+      "correctIndex": 0,
+      "explanation": "With two independent paths every message arrives twice by design, so the dedup path is the hot path and must be allocation-free, branch-predictor-friendly, and silent — logging it turns normal operation into an overload. The 'one path is misconfigured' answer misreads correct redundancy as a fault. A below-expectation sequence is by definition a duplicate, not a gap; gaps are the above-expectation case, and the two copies are identical, so buffering the second gains nothing.",
+      "sourceAnchor": "5114-protocol-sequence-numbers",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q38",
+      "prompt": "At a daily reset the feed's sequence number returns to 1 and your handler begins issuing retransmission requests in a tight loop. What is the defect?",
+      "options": [
+        "The reset is being treated as a gap, so the handler requests messages that no longer exist; resets are explicit in-band events.",
+        "The reset is being treated as a duplicate, so the handler discards live traffic; resets should be handled as ordinary gaps.",
+        "The 32-bit counter wrapped rather than reset, so the comparison should use (int32_t)(a - b) > 0 to make it correct.",
+        "The retransmission service is rate-limiting the handler, so the requests are being retried until the limiter clears."
+      ],
+      "correctIndex": 0,
+      "explanation": "A daily reset or a FIX SequenceReset is an announced, in-band transition, and code that classifies 'sequence went backwards' as a gap will forever request messages the exchange has no record of — the fix is explicit handling logged where someone will read it. The wraparound answer is the most tempting because it also involves a backwards-looking comparison, but wraparound is a distinct condition, it is not reachable at 64 bits, and a signed-difference comparison would not stop a genuine reset from looking like a jump backwards.",
+      "sourceAnchor": "5114-protocol-sequence-numbers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "51-q39",
+      "prompt": "During FIX recovery you receive SequenceReset(4) with NewSeqNo(36)=104. How does GapFillFlag(123) change the meaning?",
+      "options": [
+        "Y means messages up to 104 were administrative and may be skipped; absent means set expectation to 104 unconditionally.",
+        "Y means set expectation to 104 unconditionally; absent means the skipped messages were administrative heartbeats.",
+        "Y means the peer will resend 101 through 103 shortly; absent means those messages are permanently unavailable.",
+        "Y means the reset applies to the inbound direction only; absent means both directions reset to 104 simultaneously."
+      ],
+      "correctIndex": 0,
+      "explanation": "GapFill is the benign form — it says the skipped range was session-level traffic like heartbeats that need not be replayed — while a bare Reset unconditionally advances your expectation and can silently discard application messages, including an ExecutionReport for a real fill, which is why firms alarm on it and reconcile against drop-copy. The swapped-meanings answer is the direct inversion and the one that matters: mistaking a Reset for a GapFill is how a fill goes missing. SequenceReset never promises a later resend and never affects both directions at once.",
+      "sourceAnchor": "5115-gap-fill-and-replay-protocols",
+      "difficulty": "application"
+    },
+    {
+      "id": "51-q40",
+      "prompt": "A multicast feed handler detects a gap of several thousand messages on one channel, and the B feed shows the same gap. What should it do?",
+      "options": [
+        "Resync from the snapshot feed and mark the affected book untrustworthy until recovery completes, rather than quoting from it.",
+        "Request retransmission of the full range immediately, since a per-client retransmit recovers in about a millisecond.",
+        "Continue applying live increments and let the book self-correct as subsequent updates overwrite the affected levels.",
+        "Request retransmission in small batched windows while quoting from the book, since only a few levels can be stale."
+      ],
+      "correctIndex": 0,
+      "explanation": "The recovery ladder is B-feed for small gaps, rate-limited retransmission for bounded ones, and snapshot resync once the gap is large — a large retransmit response is itself large and slow, whereas a snapshot bounds recovery time. The batched-retransmit-while-quoting answer is the dangerous one: retransmission services are shared and strictly rate-limited, and quoting from a book with a known gap is exactly how a correctness bug becomes a financial one. Live increments cannot repair a book whose baseline is wrong.",
+      "sourceAnchor": "5115-gap-fill-and-replay-protocols",
+      "difficulty": "application"
+    }
+  ]
+}

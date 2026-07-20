@@ -42,6 +42,56 @@ test('quiz banks satisfy the public data contract', async () => {
   assert.ok(total >= 1200, `expected at least 1,200 questions, found ${total}`);
 });
 
+test('hand-authored quiz banks meet the authoring standards', async () => {
+  const bankDir = path.join(root, 'quiz-banks');
+  let files;
+  try {
+    files = (await readdir(bankDir)).filter((file) => file.endsWith('.json')).sort();
+  } catch {
+    return; // no authored banks yet
+  }
+
+  for (const file of files) {
+    const bank = JSON.parse(await readFile(path.join(bankDir, file), 'utf8'));
+    const chapter = await readFile(path.join(chapterDir, file.replace('.json', '.md')), 'utf8').catch(() => null);
+    assert.ok(chapter, `${file} has no matching chapter page`);
+    assert.equal(bank.slug, file.replace('.json', ''), `${file} slug mismatch`);
+
+    const difficulties = { recall: 0, application: 0, trap: 0 };
+    for (const question of bank.questions) {
+      // Authored explanations must actually explain, not restate the correct option.
+      assert.ok(question.explanation.length >= 80, `${file} ${question.id} explanation too short`);
+      assert.ok(
+        !question.options.includes(question.explanation),
+        `${file} ${question.id} explanation merely repeats an option`,
+      );
+      // Options should be comparable in length so the correct one is not visually obvious.
+      const lengths = question.options.map((option) => option.length);
+      assert.ok(
+        Math.max(...lengths) / Math.min(...lengths) <= 3,
+        `${file} ${question.id} option lengths are lopsided (${lengths.join('/')})`,
+      );
+      assert.ok(
+        chapter.includes(`{#${question.sourceAnchor}}`) || question.sourceAnchor.length > 0,
+        `${file} ${question.id} has an empty sourceAnchor`,
+      );
+      // normalizeBank() reorders options, so a positional reference would point at the wrong one.
+      assert.ok(
+        !/\b(?:option|answer|choice)s? (?:[ABCD]\b|one\b|two\b|three\b|four\b)|\bthe (?:first|second|third|fourth|last|final|remaining|other) (?:option|answer|choice)\b/i.test(
+          question.explanation,
+        ),
+        `${file} ${question.id} explanation refers to an option by position`,
+      );
+      difficulties[question.difficulty] += 1;
+    }
+
+    const count = bank.questions.length;
+    assert.ok(difficulties.recall / count <= 0.5, `${file} is too recall-heavy`);
+    assert.ok(difficulties.application / count >= 0.3, `${file} needs more application questions`);
+    assert.ok(difficulties.trap > 0, `${file} has no trap questions`);
+  }
+});
+
 test('generated navigation covers chapters 1 through 60 once', async () => {
   const moduleUrl = new URL('../src/generated/navigation.mjs', import.meta.url);
   const { sidebar } = await import(`${moduleUrl.href}?t=${Date.now()}`);

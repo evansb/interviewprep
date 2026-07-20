@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-21-core-data-structures",
+  "questions": [
+    {
+      "id": "21-q01",
+      "prompt": "Why can a vector growth factor of 2 never reuse the blocks it has already freed, while a factor of 1.5 eventually can?",
+      "options": [
+        "The sum of all previous capacities is always one element short of the next request, so freed blocks can never be coalesced to satisfy it; any factor below φ ≈ 1.618 eventually can.",
+        "A request of double the size is always rounded into a fresh allocator size class, whereas a 1.5× request lands back in the same size class as the block just freed.",
+        "Doubling releases the old buffer only after the new one exists, whereas 1.5 growth releases first, which is what makes the freed space available to the pending request.",
+        "Doubling produces page-aligned sizes that force the allocator down the mmap path, while 1.5 keeps requests in the sbrk heap where coalescing is possible."
+      ],
+      "correctIndex": 0,
+      "explanation": "The argument is purely arithmetic: 1+2+…+2^(n−1) = 2^n − 1, always just under the 2^n being asked for, so the coalesced tail of freed blocks never fits the new request. Factors below the golden ratio break that. The size-class answer is the tempting one because allocator size classes are real, but the reuse property is a property of the growth series itself, not of any particular allocator's bucketing.",
+      "sourceAnchor": "211-arrays-and-dynamic-arrays",
+      "difficulty": "recall"
+    },
+    {
+      "id": "21-q02",
+      "prompt": "You will fill a 10 MB `std::vector<char>` by reading bytes into it from a socket, and you size it with `v.resize(10*1024*1024)`. What does that call cost that you did not ask for?",
+      "options": [
+        "A full memset of the buffer, because `resize` value-initializes the new elements before you overwrite every one of them.",
+        "Nothing beyond the single allocation, because for trivially copyable element types `resize` leaves the new bytes uninitialized.",
+        "About log₂(N) reallocations, because `resize` reaches the requested size by applying the container's geometric growth policy repeatedly.",
+        "A second allocation and a copy, because `resize` always obtains a fresh buffer even when the existing capacity is already sufficient."
+      ],
+      "correctIndex": 0,
+      "explanation": "`resize` value-initializes, which for `char` means zeroing all 10 MB immediately before the socket overwrites it — a measurable waste. The 'uninitialized for trivial types' answer is the common misbelief; that is what `reserve` plus `insert`, or a default-init allocator, gets you, and it is exactly why those workarounds exist. `resize` also grows to the requested size in one allocation, not a sequence of them.",
+      "sourceAnchor": "211-arrays-and-dynamic-arrays",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q03",
+      "prompt": "Walking a million scattered `std::list<int>` nodes costs roughly two orders of magnitude more per element than scanning a `std::vector<int>`. What is the dominant mechanism?",
+      "options": [
+        "Node i+1's address is unknown until node i's load retires, so memory-level parallelism is 1 and the prefetcher has no stride to predict.",
+        "List nodes are several times larger than the payload, so the traversal saturates memory bandwidth while the contiguous vector scan does not.",
+        "Each `next` dereference goes through the allocator's node header as an indirect call, adding a branch misprediction for every element visited.",
+        "Neither loop can be vectorized, so the whole gap comes from the extra end-of-list comparison the list performs on every iteration."
+      ],
+      "correctIndex": 0,
+      "explanation": "The chain of dependent loads is the whole story: misses cannot overlap, so you pay ~80–100 ns serially per node instead of streaming. The bandwidth answer is tempting because list nodes genuinely are fatter (often 32 bytes for an `int`), but a dependent chain is latency-bound, not bandwidth-bound — the machine is idle waiting, not saturated. There is no indirect call through a node header.",
+      "sourceAnchor": "212-linked-lists",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q04",
+      "prompt": "Why is `std::list::splice(pos, other, first, last)` O(distance) rather than the O(1) that a splice of pointer relinking suggests?",
+      "options": [
+        "C++11 mandates O(1) `size()`, so the elements in the range must be counted to keep both lists' cached sizes correct.",
+        "The range overload must relink each node individually; only a whole-list splice can be done with a constant number of pointer writes.",
+        "It must verify that `first` and `last` really denote a range inside `other`, and that check requires walking from one to the other.",
+        "Nodes are reallocated using the destination list's allocator, so every element in the spliced range is moved into new storage."
+      ],
+      "correctIndex": 0,
+      "explanation": "The linear cost is a consequence of an unrelated guarantee: making `size()` O(1) forced the range splice to count what it moves. The 'must relink each node' answer sounds mechanical and right but is false — the splice still needs only a handful of pointer writes regardless of range length. Allocators are irrelevant here; splice never reallocates, which is exactly why iterators into the spliced range stay valid.",
+      "sourceAnchor": "212-linked-lists",
+      "difficulty": "trap"
+    },
+    {
+      "id": "21-q05",
+      "prompt": "What is `std::deque`'s actual layout, and what does `operator[]` cost as a result?",
+      "options": [
+        "An array of pointers to fixed-size chunks; indexing is two dependent loads plus a shift or divide by the chunk size.",
+        "One contiguous buffer with spare capacity reserved at both ends, reallocated whenever either end runs out of room.",
+        "A doubly linked list of elements plus a cached midpoint pointer, from which indexing walks at most half the container.",
+        "Two vectors placed back to back, one of them filled in reverse, with the index selecting which half to address into."
+      ],
+      "correctIndex": 0,
+      "explanation": "The map-of-chunks layout is what buys O(1) push at both ends while keeping O(1) indexing, at the price of an extra indirection per access. The 'contiguous buffer with slack at both ends' design is the plausible near-miss — it would give faster indexing but could not offer deque's guarantee that end insertion never invalidates references, since it would still reallocate.",
+      "sourceAnchor": "213-stacks-queues-and-deques",
+      "difficulty": "recall"
+    },
+    {
+      "id": "21-q06",
+      "prompt": "`std::stack` defaults to `std::deque` as its backing container. Why is `std::vector` usually a better choice, and why is deque the default?",
+      "options": [
+        "Vector gives contiguity and ideal locality for LIFO access; deque is the default because growth at an end does not invalidate references to existing elements.",
+        "Vector is better because it never reallocates once constructed; deque is the default because a stack's interface requires `pop_front`, which vector cannot provide.",
+        "Vector is better because deque cannot offer O(1) `push_back`; deque remains the default purely for backward ABI compatibility with older libraries.",
+        "Vector is better because the adaptor exposes iterators that require contiguous storage; deque is the default because it returns memory to the allocator on `pop`."
+      ],
+      "correctIndex": 0,
+      "explanation": "A stack only ever touches one end, so vector's single contiguous buffer is the best possible layout; the standard chose deque for its reference stability on end insertion, which vector lacks. The `pop_front` answer is the trap: a stack requires `back`, `push_back` and `pop_back` only — no front operations at all. Deque also never returns memory on `pop`.",
+      "sourceAnchor": "213-stacks-queues-and-deques",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q07",
+      "prompt": "An SPSC ring of power-of-two capacity N keeps `head` and `tail` as monotonically increasing counters and indexes with `& (N-1)`. How is 'full' tested, and why is counter wraparound harmless?",
+      "options": [
+        "`tail - head == N`; the subtraction is modular on unsigned counters, so the difference stays correct even after either counter wraps.",
+        "`(tail + 1) & (N-1) == head & (N-1)`; wraparound cannot happen because both counters are reset to zero whenever the ring drains.",
+        "A separate atomic element count is compared against N; wraparound is impossible because that count is clamped to the range 0 to N.",
+        "`head == tail` after masking both; wraparound is harmless simply because a 64-bit counter is wide enough that it never reaches its limit."
+      ],
+      "correctIndex": 0,
+      "explanation": "Monotonic counters make size a plain subtraction, and unsigned modular arithmetic keeps that subtraction right across a wrap — which is why even a 32-bit counter still works after 4 G operations. The masked `head == tail` answer is the classic bug: that condition is the ambiguous one, indistinguishable between full and empty, which is precisely the problem monotonic counters exist to solve.",
+      "sourceAnchor": "214-circular-buffers",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q08",
+      "prompt": "A ring buffer declares `head` and `tail` as adjacent `size_t` members of one struct. The producer runs on one core and the consumer on another. What is the effect?",
+      "options": [
+        "They land on the same cache line, so each producer write invalidates the consumer's copy; the coherence ping-pong turns ~2 ns operations into ~100 ns ones.",
+        "There is no measurable effect, because each core writes a distinct variable and the coherence protocol tracks ownership at the granularity of the variable.",
+        "The compiler will fuse the two adjacent stores into one wide store, so the consumer can observe a torn combination of the old and new indices.",
+        "Reads of the opposite side's index will keep returning stale values indefinitely unless both members are additionally declared `volatile`."
+      ],
+      "correctIndex": 0,
+      "explanation": "Coherence works on cache lines, not variables, so two logically independent indices on one line generate MESI traffic on every push and pop — a ~50× slowdown that `alignas(64)` on each index removes. The 'distinct variables, no problem' answer is exactly the misconception false sharing names; the hardware has no idea the variables are unrelated. Cache coherence also guarantees eventual visibility, so `volatile` is not what fixes staleness.",
+      "sourceAnchor": "214-circular-buffers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "21-q09",
+      "prompt": "A cancel message arrives carrying an order ID, and the order must be unlinked from its price level's list. Why does an intrusive list beat `std::list<Order>` for this?",
+      "options": [
+        "One hash lookup yields an `Order*`, and the hook lives inside that object, so unlinking is two pointer writes with no second search and no node to visit.",
+        "Intrusive lists maintain an internal hash index over their elements, so erase by key is O(1) without any separately maintained external map at all.",
+        "`std::list::erase` is O(n) here because the list must be walked from `begin()` to locate the node that happens to hold the matching order value.",
+        "Intrusive lists store their elements contiguously in one slab, so erase is a single index write and the remaining elements stay perfectly prefetchable."
+      ],
+      "correctIndex": 0,
+      "explanation": "The decisive property is erase given a pointer to the element: the links are part of the object you already hold, so there is nothing left to find. The `std::list::erase` answer is wrong about the container — erase takes an iterator and is O(1); the real cost with `std::list` is that you must store that iterator alongside the order, which re-introduces the per-element node allocation. Intrusive lists also do not own or relocate their elements, so they are not contiguous.",
+      "sourceAnchor": "215-intrusive-lists",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q10",
+      "prompt": "An `Order` contains an intrusive list hook and is currently linked into a price level. Code elsewhere does `Order copy = order;`. What is the consequence?",
+      "options": [
+        "The copy duplicates the hook's pointers, so it looks linked into a list whose neighbours do not point back at it — corruption the moment either object is unlinked.",
+        "The copy's hook is value-initialized by the implicit copy constructor, so the new object is simply an unlinked element and nothing about the list breaks.",
+        "The copy is automatically spliced into the same list beside the original, leaving two genuinely valid list members that happen to share a payload.",
+        "The copy constructor is implicitly deleted, since an intrusive hook is by definition a non-copyable type and poisons its enclosing class."
+      ],
+      "correctIndex": 0,
+      "explanation": "A hook is just two raw pointers, so the default copy faithfully copies list membership that the list itself never recorded — the fix is to delete the copy operations or clear hooks on copy. The 'hook is value-initialized' answer is the appealing wrong one: an implicit copy constructor copies every member, it does not value-initialize any of them. Nothing makes a plain pointer pair non-copyable either.",
+      "sourceAnchor": "215-intrusive-lists",
+      "difficulty": "trap"
+    },
+    {
+      "id": "21-q11",
+      "prompt": "Why do slab-based structures in low-latency code link their nodes with 32-bit indices instead of pointers?",
+      "options": [
+        "They halve link size so more nodes fit per cache line, they survive relocation of the slab, and they remain valid in another process's mapping of shared memory.",
+        "They dereference faster because resolving an index needs no memory access at all, whereas following a pointer always costs at least one load from memory.",
+        "They let the compiler prove that distinct nodes cannot alias one another, which is what allows the traversal loop to be vectorized by the optimizer.",
+        "They remove the need for a separate free list, because an index value can simultaneously encode both the slot number and whether that slot is occupied."
+      ],
+      "correctIndex": 0,
+      "explanation": "The three wins are size, relocation safety and shared-memory validity; the last is why every interprocess ring and order book is index-based. The 'no memory access' answer confuses addressing with loading — `base + i*sizeof(Node)` is folded into an LEA, but you still load the node itself, exactly as with a pointer. The saving is that the *link* is 4 bytes rather than 8.",
+      "sourceAnchor": "216-indexed-and-free-lists",
+      "difficulty": "recall"
+    },
+    {
+      "id": "21-q12",
+      "prompt": "Handles into a preallocated slab are raw 32-bit indices. A slot is freed and immediately reallocated to a new object while stale handles to the old one are still circulating. What is the standard fix?",
+      "options": [
+        "Pack a generation counter into the handle and bump the slot's generation on free, so dereferencing a stale handle is detected and rejected rather than silently wrong.",
+        "Zero the slot's payload when it is freed, so any stale dereference reads a recognizably empty object instead of another owner's live data.",
+        "Allocate from a bitmap with `countr_zero` so the lowest free slot is always chosen, which guarantees a freed slot is not handed out again immediately.",
+        "Store a back-pointer from each slot to the handle that owns it and compare the two addresses before every dereference of the slot's payload."
+      ],
+      "correctIndex": 0,
+      "explanation": "Generations turn use-after-free from silent corruption into a detectable error, which is why game engines and exchange gateways both converge on `{index, generation}` handles. Zeroing on free is the tempting near-miss — it helps only until the slot is reused, and the entire scenario here is that it has been reused, so the stale handle reads live data belonging to someone else. Lowest-free bitmap allocation actually makes immediate reuse *more* likely.",
+      "sourceAnchor": "216-indexed-and-free-lists",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q13",
+      "prompt": "How does a Swiss table (`absl::flat_hash_map`, `boost::unordered_flat_map`) typically resolve a lookup in one cache line and one key comparison?",
+      "options": [
+        "A one-byte control word per slot holds 7 bits of the hash; 16 of them are compared at once with an SSE2 equality plus a movemask, yielding candidate slots.",
+        "Each bucket stores a sorted 16-entry key array that is binary-searched entirely inside the loaded cache line before the value array is touched at all.",
+        "Keys are held inline in the bucket array while values sit in a parallel array, so a hit needs no metadata lookup of any kind before comparing.",
+        "A 16-bit Bloom filter attached to each bucket is tested first, which eliminates every candidate but one before any key comparison is performed."
+      ],
+      "correctIndex": 0,
+      "explanation": "The control byte is the whole trick: one 16-byte load covers a whole group, and the movemask narrows 16 slots to the one or two whose hash fragments match, so usually a single full key comparison follows. The per-bucket Bloom filter answer is plausible-sounding but wrong in kind — a filter gives probabilistic exclusion, whereas the control word gives an exact positional bitmask from a single SIMD compare.",
+      "sourceAnchor": "217-hash-tables",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q14",
+      "prompt": "You key a power-of-two open-addressed table with `uint64_t` order IDs that are always multiples of 8, using libstdc++'s `std::hash`. Lookups collapse into long probe scans. Why?",
+      "options": [
+        "`std::hash` for integers is the identity there, so masking to the table size keeps only low bits that are always zero, funnelling every key into a few slots.",
+        "Open addressing requires a prime modulus; with a power-of-two table the probe sequence provably cannot reach every slot, so insertions cluster at the end.",
+        "Aligned keys push the table past its 0.875 load-factor ceiling sooner, and the resulting rehash lays the elements out in a degenerate probe order.",
+        "`std::hash` applies a Fibonacci mixing step for integers, and that multiplication maps all values sharing an alignment onto the same bucket index."
+      ],
+      "correctIndex": 0,
+      "explanation": "Identity hashing means the table sees the key's low bits directly, and IDs that are multiples of 8 have three constant low bits — so an eighth of the table is used. The fix is to mix (Fibonacci or a wyhash finalizer) before masking. The Fibonacci answer inverts the truth: libstdc++ does *not* mix, and mixing is exactly the remedy rather than the cause. Prime moduli tolerate bad hashes but power-of-two probing still covers the table.",
+      "sourceAnchor": "217-hash-tables",
+      "difficulty": "trap"
+    },
+    {
+      "id": "21-q15",
+      "prompt": "You must delete a BST node that has two children. What is the standard procedure?",
+      "options": [
+        "Replace its key with the in-order predecessor or successor, then delete that node instead, since it has at most one child by construction.",
+        "Promote whichever child subtree is taller into the node's slot, then re-insert the nodes of the shorter subtree one at a time from the root.",
+        "Splice the right child up into the node's slot and attach the entire left subtree as that promoted child's new left child.",
+        "Mark the node with a tombstone and leave it in place, deferring the physical removal until the whole tree is next rebuilt from scratch."
+      ],
+      "correctIndex": 0,
+      "explanation": "The predecessor is the rightmost node of the left subtree and the successor the leftmost of the right, and either has at most one child, which reduces the hard case to an easy one. The 'splice the right child up' answer is the near-miss candidates reach for: it only works when the right child has no left child, otherwise you are attaching a subtree to an already-occupied slot.",
+      "sourceAnchor": "218-binary-search-trees",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q16",
+      "prompt": "A balanced BST holding 10⁶ elements has height about 20. With a cold cache, what dominates the cost of one lookup?",
+      "options": [
+        "Roughly 20 dependent cache misses, because each child address only becomes available once the parent node's own load has completed.",
+        "Roughly 20 key comparisons, which dominate because each is a full three-way comparison on a user-defined key type rather than an integer.",
+        "The address arithmetic for each child pointer, which the compiler cannot fold into an addressing mode and so emits as separate instructions.",
+        "The rebalancing rotations performed along the search path, which the tree applies on every descent to keep its height at log n."
+      ],
+      "correctIndex": 0,
+      "explanation": "Twenty serialized misses at ~80 ns is roughly 1.6 µs, versus one or two misses for a hash lookup and about four levels for a B-tree of the same size — this is the whole reason `std::map` loses to `absl::btree_map`. The comparison-count answer is tempting because comparisons do scale with height, but they execute in a handful of cycles each and are utterly hidden behind the miss latency. Searches never rotate.",
+      "sourceAnchor": "218-binary-search-trees",
+      "difficulty": "recall"
+    },
+    {
+      "id": "21-q17",
+      "prompt": "In an AVL tree an insertion needs at most one rotation, but a deletion may need O(log n). What explains the asymmetry?",
+      "options": [
+        "An insertion's rotation restores the subtree's original height so rebalancing stops there; a deletion's rotation can shorten the subtree, propagating imbalance to the parent.",
+        "A deletion can push every node on the path to a balance factor of ±2 at once, whereas an insertion can only ever disturb the balance factor of a single node.",
+        "Deletion reduces to the two-child replacement case, and each replacement is itself an insertion that carries its own independent rotation cost upward.",
+        "Insertion always attaches the new node at a leaf whose balance factor is zero, so by construction an AVL insertion never requires a rotation at all."
+      ],
+      "correctIndex": 0,
+      "explanation": "Height restoration is the termination condition: once the rotated subtree is as tall as it was before, ancestors see no change and the walk stops — a deletion's rotation removes a level, so the ancestor's factor changes and the fix continues upward. The 'insertion never rotates' answer is simply too strong: an insertion can require a single or double rotation, just never more than one.",
+      "sourceAnchor": "219-avl-trees",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q18",
+      "prompt": "Stated in one line, what is the AVL versus red-black trade-off?",
+      "options": [
+        "AVL bounds height at 1.44 log₂ n so lookups are faster, but a delete may cascade O(log n) rotations; red-black bounds height at 2 log₂ n and structural change at ≤3 rotations.",
+        "AVL bounds height at 2 log₂ n with cheaper deletions; red-black bounds height at 1.44 log₂ n with correspondingly more rotations per update operation.",
+        "Both bound height identically at 2 log₂ n; AVL wins only by needing a two-bit balance factor rather than a full colour word of metadata per node.",
+        "AVL bounds rotations per delete at 3 while red-black permits O(log n) of them, which is why red-black is the read-heavy choice and AVL the write-heavy one."
+      ],
+      "correctIndex": 0,
+      "explanation": "AVL is more rigidly balanced, so it wins on lookups and loses on updates; red-black caps structural change (≤2 rotations on insert, ≤3 on delete), which is why the standard chose it for `std::map` given that mixed workloads dominate. The reversed-bounds option is the one to watch for — it attaches the right numbers to the wrong trees, and both the 1.44 and the rotation cap belong to AVL and red-black respectively, not the other way round.",
+      "sourceAnchor": "219-avl-trees",
+      "difficulty": "recall"
+    },
+    {
+      "id": "21-q19",
+      "prompt": "Which pair of red-black properties directly produces the bound h ≤ 2 log₂(n+1)?",
+      "options": [
+        "No red node has a red child, and every path from a node to its descendant nulls contains the same number of black nodes, so no path exceeds twice the shortest.",
+        "The root is black and the null leaves are black, which forces every root-to-leaf path to begin and end on a black node and so caps the overall height.",
+        "Every node is either red or black, and red nodes are excluded from the depth count, so the black-height is by definition exactly half the total height.",
+        "Each insertion recolours O(log n) nodes and rotates at most twice, which is what keeps the height pinned at no more than twice the black-height."
+      ],
+      "correctIndex": 0,
+      "explanation": "Equal black-height fixes a floor (an all-black path of length bh) and the no-consecutive-reds rule fixes a ceiling (an alternating path of length 2·bh), and together they bound the ratio between any two paths at 2. The root-and-leaves-are-black option states two genuine red-black rules, but they are conventions that simplify the cases — neither constrains path *lengths*, so no height bound follows from them.",
+      "sourceAnchor": "2110-red-black-trees",
+      "difficulty": "recall"
+    },
+    {
+      "id": "21-q20",
+      "prompt": "In what precise sense is a red-black tree a 2-3-4 B-tree?",
+      "options": [
+        "A black node together with its red children forms one B-tree node holding 2 to 4 children, and the uniform black-height is the B-tree's uniform leaf depth.",
+        "Every red node corresponds to a B-tree leaf and every black node to an internal node, so the colour bit is really an encoding of the leaf level.",
+        "A red-black tree of order 4 stores up to three keys directly in each node, and the colour bits are the index selecting among those three keys.",
+        "The correspondence holds only for red-black trees built by bulk loading, because ordinary insertion order otherwise destroys the structural equivalence."
+      ],
+      "correctIndex": 0,
+      "explanation": "Merging each black node with its red children yields nodes of 2 to 4 children all at the same depth — a 2-3-4 tree — which is why equal black-height is exactly the B-tree's all-leaves-at-one-level invariant. The 'red nodes are leaves' mapping is the appealing wrong one: red nodes appear at every level, and it is the *grouping* of red with black that forms a B-tree node, not a partition by colour.",
+      "sourceAnchor": "2110-red-black-trees",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q21",
+      "prompt": "What does it cost to build a binary heap from n unsorted elements, and why?",
+      "options": [
+        "O(n): Floyd's bottom-up heapify sifts down from index n/2−1, and the sum over subtree heights is a convergent geometric series.",
+        "O(n log n): each of the n elements has to be sifted into position, and a single sift costs O(log n) in the worst case.",
+        "O(n log n) worst case but O(n) on average, because in random input most elements already sit close to their final heap position.",
+        "O(n) only when the input arrives already sorted; for arbitrary input Floyd's method degrades back to n log n comparisons."
+      ],
+      "correctIndex": 0,
+      "explanation": "Most nodes are near the bottom and can sink only a level or two, so Σ(n/2^h)·h converges to O(n) — the geometric series is the actual proof, not a hand-wave. The O(n log n) answer is the standard trap: it is the cost of n successive `push` operations, which is a different algorithm from bottom-up heapify, and it is right about `push` while being wrong about `make_heap`.",
+      "sourceAnchor": "2111-binary-heaps-and-priority-queues",
+      "difficulty": "trap"
+    },
+    {
+      "id": "21-q22",
+      "prompt": "Your Dijkstra implementation needs decrease-key but you are using `std::priority_queue`. What does the chapter recommend as the simplest practical fix?",
+      "options": [
+        "Lazy deletion: push the improved entry as a new element and discard stale pops by checking each against the best known distance for that vertex.",
+        "Call `make_heap` over the adaptor's container after each relaxation, which restores the heap property in O(n) and amortizes away over the edges.",
+        "Call `std::push_heap` on the adaptor's iterators after mutating the key in place, since the underlying container is directly accessible.",
+        "Switch the comparator to `std::greater<>`, which turns the adaptor into a min-heap and thereby enables positional updates on stored entries."
+      ],
+      "correctIndex": 0,
+      "explanation": "Lazy deletion is usually fastest despite the duplicate entries; the alternative when you truly need O(log n) decrease-key is an indexed heap maintaining a key→position map. The `push_heap` on iterators answer fails on a factual point about the adaptor: `priority_queue` deliberately exposes no iterators at all, which is the very limitation the question is about. `std::greater<>` only flips the ordering and grants no update capability.",
+      "sourceAnchor": "2111-binary-heaps-and-priority-queues",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q23",
+      "prompt": "What is the defining complexity property of a trie lookup?",
+      "options": [
+        "O(k) in the key length, with no hashing and no key comparisons, and entirely independent of how many keys the structure holds.",
+        "O(k log n), because at each of the k levels the node's children are held sorted and must be binary-searched to pick the next edge.",
+        "O(1) expected with an O(k) worst case, which matches a hash map exactly once the node fan-out exceeds sixteen children.",
+        "O(log n) in the number of stored keys, with the key length entering only as a constant factor on each comparison performed."
+      ],
+      "correctIndex": 0,
+      "explanation": "The path spells the key, so the work is bounded by the key length alone — that deterministic bound with no adversarial degradation is the trie's real selling point, alongside native prefix queries. The O(k log n) answer is the balanced-BST-of-strings bound offered for a trie; a trie indexes each node by character rather than searching it, so n never enters the cost.",
+      "sourceAnchor": "2112-tries",
+      "difficulty": "recall"
+    },
+    {
+      "id": "21-q24",
+      "prompt": "A feed handler maps 4-to-8-character symbols to internal instrument indices on the critical path, and the symbol set is fully known at startup. What does the chapter say usually wins?",
+      "options": [
+        "Pack the symbol into a `uint64_t` and use an offline perfect hash: one memory access, zero collisions, and no per-character pointer chase at all.",
+        "Use a 256-way trie, since its O(k) bound with no hashing beats any hash table once the stored symbol set exceeds a few hundred entries.",
+        "Use `std::unordered_map<std::string,int>`, since symbols this short fit in the small-string buffer and the node allocation amortizes away.",
+        "Use `std::map<std::string,int>`, since ordered symbol iteration comes free and the log n string comparisons are shorter than a hash computation."
+      ],
+      "correctIndex": 0,
+      "explanation": "With a fixed key set the whole lookup collapses to integer comparison against a precomputed perfect hash — the trie's O(k) bound loses because it is k dependent cache misses where this is one access. The trie answer is the tempting one and it is wrong about the mechanism: a naive trie chases a pointer per character, so more stored symbols do not help it; the trie's genuine edge is prefix matching or a key set that changes at runtime.",
+      "sourceAnchor": "2112-tries",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q25",
+      "prompt": "What complexity guarantee does a skip list actually give, and what can degrade it?",
+      "options": [
+        "O(log n) expected and with high probability; only a broken or adversarial RNG can degrade it, since the shape depends on coin flips rather than on key values.",
+        "O(log n) worst case, matching a red-black tree, because the hard level cap of 32 bounds the length of any search path directly and deterministically.",
+        "O(log n) expected, but adversarially chosen input keys can force it into a linear chain in exactly the way they can against a hash table.",
+        "O(1) expected search when p is 1/2, degrading to O(log n) only when p is lowered to 1/4 to reduce the structure's memory footprint."
+      ],
+      "correctIndex": 0,
+      "explanation": "Randomization is over promotion coin flips, not over the keys, so no input can be crafted to force the bad case — that independence from input is a genuine advantage over hash tables, even though the bound is only probabilistic. The 'adversarial keys' answer borrows the hash-table failure mode and applies it where it does not exist; the 'worst case via level cap' answer misreads a memory bound as a path-length guarantee.",
+      "sourceAnchor": "2113-skip-lists",
+      "difficulty": "trap"
+    },
+    {
+      "id": "21-q26",
+      "prompt": "Why do RocksDB memtables, Redis sorted sets and `ConcurrentSkipListMap` all use skip lists rather than balanced trees?",
+      "options": [
+        "Insertion is a few localized CAS-linked pointer writes with no rotations, so lock-free and finely-locked implementations are tractable.",
+        "Skip lists have strictly better cache behaviour than a red-black tree, so they also win outright on single-threaded lookup throughput.",
+        "Skip lists give worst-case O(log n) without any rebalancing, a guarantee trees can only match by taking a coarse global lock.",
+        "Skip lists let readers proceed with no synchronization whatsoever, because the bottom level becomes immutable once the structure is built."
+      ],
+      "correctIndex": 0,
+      "explanation": "The decisive column is concurrency: a rotation restructures a whole path and needs coarse locking or an intricate protocol, whereas a skip-list insert touches only a few forward pointers. The 'better cache behaviour' answer is the trap — skip lists chase pointers at every level and are roughly as cache-hostile as a tree, so for single-threaded ordered access a B-tree or flat sorted vector beats them. They are chosen for concurrency and simplicity, not for speed.",
+      "sourceAnchor": "2113-skip-lists",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q27",
+      "prompt": "For 10⁶ in-memory elements, raising fan-out from 2 to about 32 cuts lookup cost dramatically. What is the actual argument?",
+      "options": [
+        "Height falls from ~20 to ~4, and the extra in-node comparisons scan cache lines that the descent has already loaded, so they are nearly free.",
+        "Height falls from ~20 to ~4 and the comparison count falls with it, because a 32-way node needs only a single comparison to select the next child.",
+        "A 32-key node is searched by hashing the key to a slot within the node, so each level costs one comparison rather than log₂ 32 of them.",
+        "Wider nodes let the prefetcher predict the child address before the parent's load retires, which removes the dependency between levels entirely."
+      ],
+      "correctIndex": 0,
+      "explanation": "You trade cache misses for comparisons, and that trade is enormously favourable because a miss is ~80 ns while an in-cache comparison is a few cycles — the same argument holds whether the block is a 64-byte line or a 4 KB page. The 'comparison count falls too' answer is the near-miss: comparisons per level actually *rise* to about five, which is precisely why the argument has to be about misses rather than comparison count.",
+      "sourceAnchor": "2114-b-trees-and-b-trees",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q28",
+      "prompt": "What distinguishes a B+ tree from a plain B-tree, and why is every major database index a B+ tree?",
+      "options": [
+        "Values live only in the leaves, so internal nodes are pure key arrays with higher fan-out, and the linked leaves make a range scan a sequential walk.",
+        "Values live only in the internal nodes, so a point lookup can terminate early at any level and need never descend all the way to a leaf.",
+        "B+ trees permit variable-length nodes, so a range scan spanning many keys touches strictly fewer blocks than a fixed-order B-tree can manage.",
+        "B+ trees relax the all-leaves-at-equal-depth invariant, which lets frequently accessed keys migrate closer to the root over time."
+      ],
+      "correctIndex": 0,
+      "explanation": "Both effects serve the workloads that matter for an index: higher fan-out means a shorter tree, and leaf linkage turns a range scan into a sequential traversal instead of an in-order walk up and down. The 'values in internal nodes' answer describes the plain B-tree's early-termination property and attaches it to the wrong structure — a B+ tree always descends to a leaf, and that is the price it pays for the fan-out.",
+      "sourceAnchor": "2114-b-trees-and-b-trees",
+      "difficulty": "recall"
+    },
+    {
+      "id": "21-q29",
+      "prompt": "What gives disjoint-set union its O(α(n)) cost, and what kind of bound is that?",
+      "options": [
+        "Union by rank or size combined with path compression; the bound is amortized, so an individual `find` can still cost O(log n).",
+        "Path compression alone; the bound is worst case per operation, since after the first compression every tree has been flattened to depth one.",
+        "Union by rank alone; the bound is amortized, and path compression contributes only a constant-factor improvement on top of it.",
+        "Either optimization on its own; combining them is a constant-factor refinement that Tarjan showed is not asymptotically tight."
+      ],
+      "correctIndex": 0,
+      "explanation": "Either optimization alone gives O(log n); only both together reach inverse-Ackermann, and Tarjan proved that bound tight for this class of algorithms. The 'path compression alone, worst case' answer gets two things wrong at once: compression flattens only the path just traversed, not the whole tree, and the guarantee is amortized over a sequence rather than per-operation.",
+      "sourceAnchor": "2115-disjoint-set-union",
+      "difficulty": "recall"
+    },
+    {
+      "id": "21-q30",
+      "prompt": "A connectivity service must support both adding and removing edges. Why is a plain DSU the wrong structure, and what does the chapter offer instead?",
+      "options": [
+        "A union cannot be undone, so deletion is unsupported; rollback DSU (drop path compression, keep an undo stack) or link-cut trees handle it.",
+        "DSU handles deletion correctly but at O(log n) per operation, so removing edges costs only the inverse-Ackermann bound and nothing more.",
+        "DSU supports deletion only when union by size is used, because the recorded set sizes are exactly what makes a merge reversible again.",
+        "Deletion is supported through path compression, which is what allows a node to be repointed away from its root in constant time."
+      ],
+      "correctIndex": 0,
+      "explanation": "DSU is an incremental structure: merging destroys the information needed to split again, which is why it fits Kruskal and incremental connectivity but not dynamic connectivity. Rollback DSU trades path compression for an undo log and O(log n) per operation. The 'union by size makes merges reversible' answer sounds mechanical but is false — sizes tell you how big the sets were, not which elements came from which.",
+      "sourceAnchor": "2115-disjoint-set-union",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q31",
+      "prompt": "A static instrument dependency graph is currently stored as `std::vector<std::vector<uint32_t>>`. What does converting it to CSR actually buy?",
+      "options": [
+        "Two allocations instead of V+1, no per-vertex heap header, and neighbour iteration becomes a contiguous scan the prefetcher handles perfectly.",
+        "O(1) `has_edge(u,v)` matching an adjacency matrix, a query that nested adjacency vectors cannot answer at any reasonable space budget.",
+        "O(1) edge insertion, which nested vectors cannot offer because the inner vector may reallocate and invalidate neighbour references.",
+        "Each undirected edge is stored once instead of twice, which halves the memory the neighbour arrays consume relative to nested vectors."
+      ],
+      "correctIndex": 0,
+      "explanation": "CSR is the nested representation flattened into `offsets[V+1]` and `targets[E]`, built with a degree-count pass, a prefix sum and a fill pass — the win is allocation count and contiguity, not asymptotics. The `has_edge` answer overclaims: CSR gives O(log deg u) with sorted rows, not O(1), and edge insertion actually gets *worse* since CSR is a static layout.",
+      "sourceAnchor": "2116-graph-representations",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q32",
+      "prompt": "Comparing the two classic graph representations, what do adjacency matrix and adjacency list actually cost?",
+      "options": [
+        "The matrix is O(V²) space with O(1) `has_edge` and O(V) neighbour iteration; the list is O(V+E) space with O(deg u) for both operations.",
+        "The matrix is O(V+E) space once packed into bits, with O(1) `has_edge` and O(deg u) neighbour iteration over just the set bits of a row.",
+        "The matrix is O(V²) space with O(V) `has_edge`; the list is O(V+E) with O(1) `has_edge` by indexing directly into the inner vector.",
+        "Both are O(V+E) in space; the matrix differs only by offering O(1) edge insertion at the cost of O(E) neighbour iteration per vertex."
+      ],
+      "correctIndex": 0,
+      "explanation": "The matrix trades quadratic space for constant-time edge tests and pays O(V) to enumerate a row regardless of degree; the list is the sparse default. The bit-packed variant is the tempting distractor because `vector<bitset<V>>` is a real technique — but packing changes the constant (V²/8 bytes), not the O(V²) asymptotic, and scanning a bit row is still O(V) rather than O(deg u).",
+      "sourceAnchor": "2116-graph-representations",
+      "difficulty": "recall"
+    },
+    {
+      "id": "21-q33",
+      "prompt": "Workload: a fixed-size integer array with point updates and range-sum queries, both on a hot path. What does the chapter recommend?",
+      "options": [
+        "A Fenwick tree: n words, no recursion, and roughly twice the constant-factor speed of a segment tree for exactly this operation mix.",
+        "A segment tree with lazy propagation, since lazy propagation is what keeps point updates at O(log n) rather than degrading them to O(n).",
+        "A sparse table, since summation is idempotent and a sparse table answers every range query in O(1) after an O(n log n) build.",
+        "A prefix-sum array rebuilt after each update, since the rebuild is O(1) amortized once spread across a long batch of subsequent queries."
+      ],
+      "correctIndex": 0,
+      "explanation": "Fenwick and segment tree share the asymptotics, but for invertible operations with point updates Fenwick wins on memory (n versus 2n–4n), code size and constants — a segment tree here is over-engineering. The sparse table answer fails twice: summation is not idempotent, so overlapping-interval O(1) queries are invalid, and sparse tables support no updates at all.",
+      "sourceAnchor": "2117-segment-trees",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q34",
+      "prompt": "What is the structural insight behind a segment tree's O(log n) range query?",
+      "options": [
+        "Any half-open range decomposes into at most 2 log n canonical nodes, and the query just combines the aggregates already stored in them.",
+        "The query walks a single root-to-leaf path and accumulates the aggregate stored at each node it passes through on the way down.",
+        "Every node caches the answer for each subrange it covers, so a query is one lookup performed after an O(log n) descent to the right node.",
+        "The tree is rebalanced around the queried bounds so that the requested range becomes a single subtree, whose root holds the answer."
+      ],
+      "correctIndex": 0,
+      "explanation": "The decomposition is the source of the bound: at each of the log n levels the range contributes at most one node on the left frontier and one on the right, giving ≤ 2 log n aggregates to merge. The single-path answer is the intuitive wrong one — a path visits only nodes containing one index, whereas a range generally spans siblings that must each be picked up separately.",
+      "sourceAnchor": "2117-segment-trees",
+      "difficulty": "recall"
+    },
+    {
+      "id": "21-q35",
+      "prompt": "You need range-minimum queries with point updates and reach for a Fenwick tree because it is smaller and simpler. What goes wrong?",
+      "options": [
+        "`range(l,r)` is computed as `sum(r) − sum(l−1)`, which requires an invertible operation, and min has no inverse, so arbitrary ranges cannot be answered.",
+        "Nothing structural is broken, but each update becomes O(log² n) because the comparison pass has to be repeated on every covering node.",
+        "Min works correctly only if the tree is rebuilt after each update, since the `i & -i` stepping assumes the stored values are monotone.",
+        "Fenwick trees support no point updates at all, offering only bulk construction, and that is the real obstacle to using one here."
+      ],
+      "correctIndex": 0,
+      "explanation": "Invertibility is the hidden requirement: the whole range trick is a subtraction of two prefixes, and you cannot subtract a minimum out. A Fenwick can be adapted to prefix-min with no arbitrary ranges and no decreasing updates; for genuine range-min with updates you need a segment tree. The 'O(log² n) update' answer invents a cost where the real failure is a correctness one — the query simply cannot be formed.",
+      "sourceAnchor": "2118-fenwick-trees",
+      "difficulty": "trap"
+    },
+    {
+      "id": "21-q36",
+      "prompt": "You keep a Fenwick tree over per-value counts and want 'the k-th smallest live value' as an order statistic. What is the efficient method?",
+      "options": [
+        "Binary-lift down from the highest power of two, taking each step whose running prefix sum stays below k — O(log n) with no outer search.",
+        "Binary-search the index space and call `sum(mid)` at each step; this is the only method the structure supports, and it costs O(log² n).",
+        "Maintain a second Fenwick tree built over the difference array and read the k-th smallest value off it as a single point query.",
+        "Re-sort the underlying value array after every update and index into it directly, which is O(n log n) but has the best constant factors."
+      ],
+      "correctIndex": 0,
+      "explanation": "Descending the tree's implicit binary structure from the top power of two answers the query in a single O(log n) pass, which is what turns a Fenwick over counts into an order-statistics structure. The binary-search-with-`sum` option is the one to scrutinise: that approach genuinely works and genuinely costs O(log² n), but its claim to be the only option is what makes it false — binary lifting removes the outer search entirely.",
+      "sourceAnchor": "2118-fenwick-trees",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q37",
+      "prompt": "What is a Bloom filter's error contract, and what is its rough space cost?",
+      "options": [
+        "False negatives never occur and false positives may; about 10 bits per element gives a 1% rate, independent of how large the elements are.",
+        "False positives never occur and false negatives may; about 10 bits per element gives a 1% rate for keys of up to roughly 64 bytes each.",
+        "Both kinds of error occur and are bounded by the same rate; the space needed scales with the total byte size of the inserted key set.",
+        "False negatives never occur; the 10-bits-per-element figure holds only for keys under 32 bytes and grows linearly with key size beyond that."
+      ],
+      "correctIndex": 0,
+      "explanation": "The one-sided error is the entire design contract — a negative is definitive, a positive needs verification — and the size independence is what makes filters valuable: a filter over million-character strings still costs about 10 bits each. The reversed-error option is the one to catch: false negatives would make the filter useless as a pre-filter, since you could no longer skip anything safely.",
+      "sourceAnchor": "2119-bloom-filters",
+      "difficulty": "recall"
+    },
+    {
+      "id": "21-q38",
+      "prompt": "Profiling shows your Bloom filter over a multi-megabyte bit array with k = 7 costs about seven cache misses per query. What is the fix to propose?",
+      "options": [
+        "A blocked Bloom filter: confine all k bits of an element to a single cache line, converting k scattered misses into one for a small false-positive penalty.",
+        "Reduce k to 1 and enlarge m proportionally, which preserves the same false-positive rate while requiring only one memory touch per query.",
+        "Use double hashing to derive all k indices from two base hashes, which also has the effect of colocating those indices in one cache line.",
+        "Switch to a counting Bloom filter, whose 4-bit counters let all k probes for an element be packed into a single machine word."
+      ],
+      "correctIndex": 0,
+      "explanation": "Scattering k bits across a multi-megabyte array is k independent misses, which defeats the point of a cheap pre-filter; blocking trades a small rate increase for a single miss. The double-hashing answer is the tempting one because Kirsch–Mitzenmacher really is standard practice — but it reduces how many hashes you compute, not where the resulting bits land, so the k misses remain.",
+      "sourceAnchor": "2119-bloom-filters",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q39",
+      "prompt": "A shared LRU cache is read-heavy and read latency degrades badly as threads are added. What is the defect, and what are the standard fixes?",
+      "options": [
+        "A `get` mutates the recency list, so every reader needs exclusive access and convoys; shard by key hash, batch recency updates, or switch to CLOCK.",
+        "A `get` invalidates the hash map's iterators, so readers must repeat the lookup under a lock; fix it by moving to a flat hash map with stable references.",
+        "Eviction is O(n) because the least recently used entry has to be searched for; fix it by keeping a min-heap of last-access timestamps alongside.",
+        "The map and the recency list can disagree after a concurrent eviction; fix it by storing the recency counter inside the map's mapped value instead."
+      ],
+      "correctIndex": 0,
+      "explanation": "LRU writes on read — that splice to the front is a mutation of shared state — so readers serialize where they should scale, which is why CLOCK (a read only sets a reference bit) or Caffeine-style batched updates exist. The flat-hash-map answer inverts a fact from the chapter: flat maps have *no* reference stability, which is precisely why the textbook LRU needs a node-based map in the first place.",
+      "sourceAnchor": "2120-lru-caches",
+      "difficulty": "application"
+    },
+    {
+      "id": "21-q40",
+      "prompt": "Why can the textbook O(1) LRU not simply keep its recency order in a `std::vector<std::pair<K,V>>` instead of a `std::list`?",
+      "options": [
+        "The map stores handles into the recency container, and `list::splice` moves a node in O(1) without invalidating them, whereas a vector would shift elements and break every stored handle.",
+        "A vector cannot hold pairs whose key is const-qualified, so the element type the map must reference would fail to compile against a vector at all.",
+        "`std::unordered_map` is not permitted to store iterators as mapped values, so only a list's raw node pointers can legally be indexed by the map.",
+        "A vector stores elements contiguously, so evicting from the back would release the whole buffer and invalidate every entry the map refers to."
+      ],
+      "correctIndex": 0,
+      "explanation": "Two properties make the classic design work: splice is O(1) and preserves iterators, and `unordered_map` guarantees stable references — so the stored handles survive every promotion. A vector fails on both counts, since moving an element to the front is an O(n) shift that relocates others. The 'const key' answer sounds like a real container constraint but is a red herring; the obstacle is handle stability, not the element type.",
+      "sourceAnchor": "2120-lru-caches",
+      "difficulty": "trap"
+    }
+  ]
+}

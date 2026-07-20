@@ -1,0 +1,649 @@
+{
+  "slug": "chapter-38-tcp",
+  "questions": [
+    {
+      "id": "38-q01",
+      "prompt": "An application calls `send(\"ABCDE\")` then `send(\"FGHIJ\")` on a TCP socket. Which receive behaviour on the peer is NOT conforming?",
+      "options": [
+        "A `recv()` that blocks until a whole 5-byte write is available, so message boundaries are preserved",
+        "One `recv()` returning all ten bytes as `\"ABCDEFGHIJ\"` because the writes were coalesced",
+        "Three `recv()` calls returning `\"ABC\"`, `\"DEFGHIJ\"`, and the remaining bytes in arbitrary splits",
+        "Two `recv()` calls returning exactly `\"ABCDE\"` and `\"FGHIJ\"` purely by coincidence of segmentation"
+      ],
+      "correctIndex": 0,
+      "explanation": "TCP is a byte stream with no message boundaries, so nothing in the protocol preserves write granularity — the kernel never waits for a 'whole message' because it has no idea what one is. Coalescing, arbitrary splits, and an accidental one-to-one match are all legal outcomes. The one-to-one case is the trap: it happens constantly on loopback with small messages, which is exactly why code that assumes it passes testing and fails in production.",
+      "sourceAnchor": "381-tcp-byte-stream-semantics",
+      "difficulty": "recall"
+    },
+    {
+      "id": "38-q02",
+      "prompt": "An order-entry gateway calls `send(fd, order, 60)` and it returns 60. The process then crashes. What can be asserted about the order?",
+      "options": [
+        "Nothing — the return value only proves the kernel copied 60 bytes into the socket buffer",
+        "The 60 bytes reached the exchange's kernel, since `send` blocks until the segment is ACKed",
+        "The exchange received and queued the order, but may not have matched or acknowledged it",
+        "The bytes are guaranteed delivered because TCP retransmits from the buffer after a crash"
+      ],
+      "correctIndex": 0,
+      "explanation": "A successful `send()` means the kernel accepted the bytes for transmission and nothing more — the segment may never have left the NIC, and a crash destroys the buffer along with the process. The 'reached the peer's kernel' answer confuses `send` with an acknowledged write; `send` returns as soon as buffer space is consumed and never waits for a TCP ACK. This is why any transactional flow needs application-level acknowledgement and post-reconnect reconciliation.",
+      "sourceAnchor": "381-tcp-byte-stream-semantics",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q03",
+      "prompt": "Why does the three-way handshake need three packets rather than two?",
+      "options": [
+        "Sequence numbers must be synchronized in both directions, and the third packet is what confirms the server's ISN was received",
+        "The first two packets negotiate options and the third is what actually carries the MSS and window-scale values",
+        "Two packets would leave the client unable to prove it can receive, since only the client randomizes its ISN",
+        "TCP requires an odd number of setup packets so the checksum covering the handshake can be computed"
+      ],
+      "correctIndex": 0,
+      "explanation": "Each direction has its own independent sequence space, so both ISNs must be exchanged and both must be acknowledged; the final ACK is what moves the server out of `SYN_RECEIVED`. The option-negotiation answer is the tempting near-miss — options genuinely are exchanged during setup, but they ride on the SYN and SYN+ACK only, not on the third packet. Both sides randomize their ISN per RFC 6528, and nothing about checksums depends on packet count.",
+      "sourceAnchor": "382-tcp-three-way-handshake",
+      "difficulty": "recall"
+    },
+    {
+      "id": "38-q04",
+      "prompt": "`ss -lnt` on a busy listening socket shows `Recv-Q 128  Send-Q 128`. What does this indicate?",
+      "options": [
+        "The accept queue is full at its `listen()` backlog limit — the application is not calling `accept()` fast enough",
+        "128 bytes of unread data are queued and 128 bytes await transmission on the listening socket",
+        "The SYN queue holds 128 half-open connections, so `tcp_max_syn_backlog` needs raising",
+        "128 connections are in `TIME_WAIT` against this port and are blocking further binds"
+      ],
+      "correctIndex": 0,
+      "explanation": "On a listening socket those columns are repurposed: `Recv-Q` is the current accept-queue depth and `Send-Q` is its limit, so equal values mean the queue is saturated and newly completed connections are being dropped silently while the client believes it is connected. The byte-count reading is the trap — that interpretation is correct for established sockets but wrong here. The SYN queue is a separate structure governed by `tcp_max_syn_backlog` and is not what these columns report.",
+      "sourceAnchor": "382-tcp-three-way-handshake",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q05",
+      "prompt": "A client's `connect()` to a remote host fails with `ETIMEDOUT` after roughly two minutes. What does that signature point to?",
+      "options": [
+        "The SYN was silently dropped — a firewall DROP rule, blackhole route, or wrong address — exhausting `tcp_syn_retries`",
+        "Nothing is listening on that port, so the server returned an RST that the client retried six times",
+        "The server's accept queue overflowed, so the connection completed and was then torn down",
+        "Window scaling was stripped by a middlebox, so the handshake could not agree on a window"
+      ],
+      "correctIndex": 0,
+      "explanation": "Six SYN retries at 1+2+4+8+16+32 seconds is where the ~2 minute figure comes from, and it only happens when the SYN gets no response at all — a silent drop. A port with nothing listening returns an RST, which surfaces immediately as `ECONNREFUSED` rather than after a timeout. Accept-queue overflow produces a connection the client thinks succeeded, and a stripped window-scale option yields a working but throughput-capped connection, not a failed connect.",
+      "sourceAnchor": "382-tcp-three-way-handshake",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q06",
+      "prompt": "A server accumulates thousands of sockets in `CLOSE_WAIT`. What is the cause?",
+      "options": [
+        "The application received EOF and never called `close()`, leaking a descriptor per connection toward `EMFILE`",
+        "Peers are closing abortively with RST, which strands the local socket until the kernel reaps it",
+        "The kernel is holding the 4-tuple to absorb delayed duplicates before the port can be reused",
+        "The peers' final ACKs are being lost on the return path, so teardown cannot complete"
+      ],
+      "correctIndex": 0,
+      "explanation": "`CLOSE_WAIT` means the peer's FIN arrived and was acknowledged by the kernel, and the socket now waits for the local application to call `close()` — it is always an application bug, never a network condition. The delayed-duplicate answer describes `TIME_WAIT`, which is held by the active closer and is a different state entirely. An RST tears the socket down rather than parking it, and lost ACKs would leave the peer in `LAST_ACK`, not this side in `CLOSE_WAIT`.",
+      "sourceAnchor": "383-tcp-connection-teardown",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q07",
+      "prompt": "A gateway sets `SO_LINGER` with `l_onoff=1, l_linger=0` on its exchange session socket to avoid `TIME_WAIT`. What is the consequence?",
+      "options": [
+        "`close()` sends an RST and discards buffered send data, so a queued cancel message can be silently lost",
+        "`close()` blocks until every queued byte is acknowledged, adding an unbounded stall to shutdown",
+        "The FIN is sent immediately but queued data still drains, so only the 60-second wait is avoided",
+        "The socket skips `FIN_WAIT_2` and enters `TIME_WAIT` for one MSL rather than two"
+      ],
+      "correctIndex": 0,
+      "explanation": "A zero linger timeout converts `close()` into an abortive close: an RST goes out, both socket buffers are discarded, and `TIME_WAIT` is skipped because there is no graceful exchange to protect. Losing the tail of the stream is exactly wrong on an order path where the last message might be a cancel. The 'blocks until drained' behaviour is what a nonzero linger timeout does, and the 'data still drains' answer describes a normal FIN close, which is what this setting replaces.",
+      "sourceAnchor": "383-tcp-connection-teardown",
+      "difficulty": "trap"
+    },
+    {
+      "id": "38-q08",
+      "prompt": "A cumulative ACK of `ack=2461` arrives while segments covering bytes 2461–3920 were lost and later segments arrived. Without SACK, what does the sender know?",
+      "options": [
+        "Only that bytes below 2461 arrived — everything past the hole is invisible no matter what else got through",
+        "That bytes below 2461 arrived and that exactly one segment beyond the hole is missing",
+        "That the receiver discarded everything past the hole, so a full Go-Back-N resend is mandatory",
+        "That the receiver's window has closed, since a repeated ACK also signals zero available buffer"
+      ],
+      "correctIndex": 0,
+      "explanation": "A cumulative ACK reports only the contiguous prefix, so any data received beyond the hole is unreportable — that information loss is precisely why SACK was specified. Assuming the receiver discarded the later segments is the tempting error: it holds them in its out-of-order queue and will use them once the hole is filled, which is why Go-Back-N is a sender behaviour choice rather than a protocol requirement. Window state is carried in a separate header field and is unrelated to the duplicate ACK.",
+      "sourceAnchor": "384-tcp-sequence-and-acknowledgement-numbers",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q09",
+      "prompt": "At 10 Gbit/s the 32-bit sequence space wraps in about 3.4 seconds. Which mechanism prevents an old segment from being mistaken for a new one?",
+      "options": [
+        "PAWS, which uses the timestamp option to reject segments whose timestamp predates the current window",
+        "Window scaling, which widens the sequence space beyond 32 bits on fast links",
+        "SACK blocks, whose explicit range edges disambiguate a wrapped sequence number",
+        "The initial-sequence-number randomization of RFC 6528, recomputed on each wrap"
+      ],
+      "correctIndex": 0,
+      "explanation": "PAWS (Protection Against Wrapped Sequences) compares the timestamp option's `TSval` against what has already been seen and discards anything stale, which is why timestamps are effectively mandatory on high-rate links. Window scaling is the tempting distractor because it is also a fast-link fix, but it scales the advertised *window* field, leaving the 32-bit sequence space untouched. SACK reports received ranges within the same wrapping space, and ISN randomization only protects the start of a connection.",
+      "sourceAnchor": "384-tcp-sequence-and-acknowledgement-numbers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "38-q10",
+      "prompt": "Which statement correctly separates flow control from congestion control?",
+      "options": [
+        "Flow control protects the receiver's buffer via the explicitly advertised `rwnd`; congestion control protects the network via an inferred `cwnd`",
+        "Flow control protects the network via an explicit `cwnd`; congestion control protects the receiver's buffer via an inferred `rwnd`",
+        "Both protect the receiver, but flow control acts per segment while congestion control acts per round trip",
+        "Flow control is negotiated on the SYN; congestion control is renegotiated whenever loss changes the window"
+      ],
+      "correctIndex": 0,
+      "explanation": "The receiver tells the sender its free buffer space in every ACK, so `rwnd` is explicit and receiver-scoped; the network never speaks, so `cwnd` must be inferred from loss, delay, or ECN. The swapped version is exactly the confusion interviewers probe for, and the giveaway is which variable is *told* to the sender. The sender is bounded by both simultaneously: `in_flight <= min(rwnd, cwnd)`.",
+      "sourceAnchor": "385-tcp-flow-control",
+      "difficulty": "recall"
+    },
+    {
+      "id": "38-q11",
+      "prompt": "A transfer over an 80 ms transatlantic path on a 10 Gbit/s link is pinned at exactly 6.5 Mbit/s. What is the diagnosis?",
+      "options": [
+        "Window scaling is not in effect, capping the window at 65535 bytes — 65535/80 ms is precisely 6.5 Mbit/s",
+        "The congestion window is stuck in slow start because the connection restarts after every idle period",
+        "The bottleneck router is dropping enough packets that Reno's linear recovery cannot rebuild the window",
+        "The receiver's delayed-ACK timer is firing at 40 ms, halving the effective ACK clock on the path"
+      ],
+      "correctIndex": 0,
+      "explanation": "Throughput exactly equal to `65535/RTT` is the fingerprint of a missing or middlebox-stripped window-scale option, since scaling must be offered by both sides on the SYN or it is disabled in both directions. The loss-based answer is plausible in the abstract but would produce variable, sawtooth throughput rather than a value that matches the 16-bit window ceiling to the digit. Slow start and delayed ACK slow the ramp; neither imposes a fixed steady-state ceiling.",
+      "sourceAnchor": "385-tcp-flow-control",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q12",
+      "prompt": "A receiver advertises a zero window, then frees buffer space and sends a window update that is lost. What prevents permanent deadlock?",
+      "options": [
+        "The sender's persist timer, which transmits a 1-byte window probe forcing the receiver to re-report its window",
+        "The receiver retransmits the window update, since window-carrying ACKs are tracked for reliable delivery",
+        "The retransmission timeout fires and the sender resends the last data segment, eliciting a fresh ACK",
+        "Silly window syndrome avoidance forces the receiver to send an unsolicited MSS-sized window opening"
+      ],
+      "correctIndex": 0,
+      "explanation": "Pure ACKs are not retransmitted, so a lost window update would strand both sides forever; the persist timer breaks it by sending a 1-byte probe with exponential backoff up to about 60 seconds. Expecting the receiver to retransmit is the natural but wrong intuition — TCP only retransmits data that consumes sequence space. Silly window syndrome avoidance governs how small a window a receiver may advertise, not whether an update gets re-sent.",
+      "sourceAnchor": "385-tcp-flow-control",
+      "difficulty": "trap"
+    },
+    {
+      "id": "38-q13",
+      "prompt": "An order-entry session drops mid-burst and reconnects successfully within two seconds. What must the gateway assume about orders sent just before the drop?",
+      "options": [
+        "Any unacknowledged order may or may not have executed, so no new orders go out until reconciliation completes",
+        "Orders whose `send()` returned successfully were delivered, so only the ones that failed need resending",
+        "TCP retransmission guarantees the bytes arrived before the drop, so the venue holds the full order set",
+        "The session-level sequence numbers replay automatically on logon, so reconciliation is unnecessary"
+      ],
+      "correctIndex": 0,
+      "explanation": "A successful `send()` proves only that the kernel took the bytes, so during a disconnect an order may have been filled, cancelled, or never seen — the position is unknown until a drop copy or order-status request resolves it, and sending new orders before then is a common source of duplicates and orphans. The sequence-replay answer is the tempting one: `ResendRequest`/`SequenceReset` genuinely restore *message* continuity, but message delivery is not the same as knowing the resulting order state. Cancel-on-disconnect is what converts the unknown into a known-flat position.",
+      "sourceAnchor": "3821-tcp-half-close-and-reconnect-behaviour",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q14",
+      "prompt": "What does it mean that TCP is 'ACK-clocked', and why does modern Linux add pacing?",
+      "options": [
+        "Each arriving ACK shows a packet left the network so another may enter; ACK compression makes that bursty, which `fq` pacing smooths",
+        "Each ACK carries a timestamp used to compute the send rate directly, and pacing supplies that rate when timestamps are off",
+        "Each ACK advances the congestion window by one MSS regardless of phase, and pacing prevents that growth from overshooting",
+        "Each ACK resets the retransmission timer, and pacing keeps the timer from expiring during large bursts"
+      ],
+      "correctIndex": 0,
+      "explanation": "Self-clocking means the sender's rate automatically matches the bottleneck drain rate with no explicit rate computation, because ACK arrivals mirror packet departures. When the network compresses or aggregates ACKs, several arrive together and the sender emits a burst, which is why the `fq` qdisc spreads transmissions in time. The 'advances cwnd by one MSS' answer describes slow start specifically, not the clocking property, and growth in congestion avoidance is far slower than that.",
+      "sourceAnchor": "386-tcp-congestion-control",
+      "difficulty": "recall"
+    },
+    {
+      "id": "38-q15",
+      "prompt": "Why is a loss detected by RTO so much more damaging than one detected by duplicate ACKs?",
+      "options": [
+        "The RTO collapses `cwnd` to 1 MSS and restarts slow start after a stall of at least 200 ms on Linux",
+        "The RTO forces a Go-Back-N resend of the whole window, whereas fast retransmit resends one segment",
+        "The RTO disables SACK for the remainder of the connection, so later losses also cost a full timeout",
+        "The RTO halves `cwnd` twice in succession, whereas fast recovery halves it only once"
+      ],
+      "correctIndex": 0,
+      "explanation": "Duplicate ACKs prove data is still flowing, so fast recovery costs half the window and about one RTT; a timeout proves nothing is flowing, so the sender restarts from scratch after waiting out `rto_min`, which is 200 ms on Linux and four thousand round trips on a 50 µs colo link. The Go-Back-N answer is the plausible near-miss — that is historic sender behaviour without SACK, not what the RTO itself mandates, and SACK remains active across a timeout.",
+      "sourceAnchor": "386-tcp-congestion-control",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q16",
+      "prompt": "A fresh connection must deliver a 20 KB response. With Linux's default initial window, how long does that take?",
+      "options": [
+        "Two RTTs — the initial window of 10 MSS carries about 14.6 KB, so the remainder waits for the first ACKs",
+        "One RTT — the initial window of 10 MSS is about 29 KB, comfortably covering the whole response",
+        "Two RTTs — the initial window is 2 MSS, so slow start needs a doubling before the bulk can flow",
+        "One RTT — slow start sends the full receiver window immediately and only shrinks on loss"
+      ],
+      "correctIndex": 0,
+      "explanation": "RFC 6928 sets IW to 10 MSS, roughly 14.6 KB at a 1460-byte MSS, so a 20 KB response spills past the first window and the tail waits a full round trip for `cwnd` to double. The 29 KB figure is the tempting arithmetic slip of using a 2900-byte segment. The old 2-segment initial window is historical, and slow start never sends the whole receiver window up front — that is precisely what starting small avoids.",
+      "sourceAnchor": "387-slow-start-and-congestion-avoidance",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q17",
+      "prompt": "An order-entry session is quiet between bursts, and the first burst after each lull is measurably slower. Which default explains it?",
+      "options": [
+        "`tcp_slow_start_after_idle=1` resets `cwnd` to the initial window after an idle period longer than one RTO",
+        "`tcp_slow_start_after_idle=1` halves `ssthresh` on each idle period, forcing congestion avoidance from a low window",
+        "Delayed ACK reverts to its 200 ms maximum on an idle socket, so the first burst's ACKs arrive late",
+        "Nagle re-arms after idleness, buffering the first sub-MSS message until an ACK returns"
+      ],
+      "correctIndex": 0,
+      "explanation": "Linux defaults to restarting slow start after an idle period exceeding one RTO, so a bursty session repeatedly rebuilds `cwnd` from 10 MSS and the first burst is throttled; setting `tcp_slow_start_after_idle=0` is standard on trading hosts. The `ssthresh`-halving variant is the plausible misremembering — the sysctl resets the congestion window, it does not touch the threshold. Nagle's behaviour depends on unacknowledged data, not on how long the socket was idle.",
+      "sourceAnchor": "387-slow-start-and-congestion-avoidance",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q18",
+      "prompt": "Why does fast retransmit wait for three duplicate ACKs rather than acting on the first?",
+      "options": [
+        "One or two duplicates are readily explained by mild reordering; three makes loss the likelier explanation",
+        "Three duplicates are needed to fill the SACK option's minimum block count before the sender can act",
+        "The receiver only emits a duplicate ACK on every second out-of-order segment, so three cover six arrivals",
+        "Three duplicates confirm the retransmission timer has been reset, which is required before resending"
+      ],
+      "correctIndex": 0,
+      "explanation": "Duplicate ACKs are fundamentally ambiguous between loss and reordering, and three is the heuristic chosen to tolerate modest reordering without waiting for a timeout — which is why heavily reordering paths such as some ECMP configurations cause spurious retransmissions. The SACK-block answer sounds mechanical but is invented: fast retransmit predates SACK and works without it. Receivers send a duplicate ACK immediately on every out-of-order segment, not on every second one.",
+      "sourceAnchor": "388-fast-retransmit-and-recovery",
+      "difficulty": "recall"
+    },
+    {
+      "id": "38-q19",
+      "prompt": "On entering fast recovery, why is `cwnd` set to `ssthresh + 3·MSS` rather than simply `ssthresh`?",
+      "options": [
+        "The three duplicate ACKs prove three segments left the network, so three more may be sent without adding load",
+        "The three extra segments reserve space for the retransmission plus its own ACK and the recovery ACK",
+        "It compensates for the three round trips fast recovery needs before congestion avoidance resumes",
+        "It matches the three retransmission attempts allowed before the sender must fall back to an RTO"
+      ],
+      "correctIndex": 0,
+      "explanation": "Window inflation exists because the sender's normal `flight_size` accounting is wrong during recovery: each duplicate ACK is evidence one more packet has drained from the network, so the window is inflated to let one more in, and it is deflated back to `ssthresh` on the recovery ACK. The 'reserving space for the retransmission' answer misreads inflation as bookkeeping for the sender's own packets rather than as an accounting of packets that have already left.",
+      "sourceAnchor": "388-fast-retransmit-and-recovery",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q20",
+      "prompt": "A request/response gateway sends a small burst and goes quiet. The last segment of the burst is lost. What recovers it, and at what cost?",
+      "options": [
+        "Nothing generates duplicate ACKs, so classical TCP needs an RTO — 200 ms+ — while TLP probes after ~2×RTT",
+        "The receiver's out-of-order queue triggers three duplicate ACKs, so fast retransmit recovers it in ~1 RTT",
+        "SACK reports the gap on the next ACK, so the sender retransmits it within one round trip",
+        "Limited Transmit sends a new segment on the first duplicate ACK, eliciting recovery in under an RTT"
+      ],
+      "correctIndex": 0,
+      "explanation": "Tail loss is the pathological case precisely because nothing follows the lost segment to arrive out of order, so no duplicate ACKs are generated and every dup-ACK-based mechanism is inert — only a timeout, or a Tail Loss Probe sent after roughly two RTTs, elicits recovery. The SACK answer is the strongest distractor: SACK reports gaps accurately, but it can only do so on an ACK triggered by *later* data, and here there is none. Limited Transmit likewise needs at least one duplicate ACK to fire.",
+      "sourceAnchor": "388-fast-retransmit-and-recovery",
+      "difficulty": "trap"
+    },
+    {
+      "id": "38-q21",
+      "prompt": "What makes CUBIC fairer to long-RTT flows than Reno?",
+      "options": [
+        "Its window is a cubic function of wall-clock time since the last loss, so growth does not scale with ACK rate",
+        "It reduces the window by a factor of 0.7 on loss rather than 0.5, leaving long-RTT flows more headroom",
+        "It measures the minimum RTT and paces transmissions at the bottleneck rate rather than growing a window",
+        "It grants long-RTT flows a proportionally larger additive increase per round trip than short-RTT flows"
+      ],
+      "correctIndex": 0,
+      "explanation": "Reno's +1 MSS per RTT means a short-RTT flow grows many times faster than a long-RTT one sharing the same bottleneck; CUBIC keys growth to elapsed wall time, so flows with different RTTs climb at comparable rates. The 0.7 reduction factor is real but is about recovery depth, not RTT fairness — that is the true-premise-wrong-conclusion trap. Rate pacing against a measured min-RTT describes BBR, which is a different algorithm family.",
+      "sourceAnchor": "389-reno-cubic-and-bbr",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q22",
+      "prompt": "A candidate proposes switching a colo order-entry host from CUBIC to BBR to cut latency. Why is this a red flag?",
+      "options": [
+        "Colo RTT is tens of microseconds and windows are tiny, so the path is never bandwidth-limited for the algorithm to help",
+        "BBR requires the `fq` qdisc, which is unavailable on the kernels typically deployed in colo environments",
+        "BBR reacts more slowly to loss than CUBIC, so a single dropped order message would stall for longer",
+        "BBR fills intermediate buffers more aggressively than CUBIC, raising queueing delay on a shared fabric"
+      ],
+      "correctIndex": 0,
+      "explanation": "With a colo BDP around 62.5 KB and 50-byte order messages, congestion control simply never binds — message size, Nagle, syscall count, and interrupt handling dominate by orders of magnitude. The pacing-requirement answer is the tempting one because BBR genuinely does need `fq`, but that is a deployment prerequisite rather than the reason the change is pointless. BBR in fact drains queues rather than filling them, which is why it is the right choice on WAN links where bandwidth does bind.",
+      "sourceAnchor": "389-reno-cubic-and-bbr",
+      "difficulty": "trap"
+    },
+    {
+      "id": "38-q23",
+      "prompt": "Linux computes `RTO = SRTT + max(G, 4·RTTVAR)` and then clamps it. What is the practical floor and its consequence?",
+      "options": [
+        "200 ms via `TCP_RTO_MIN`, so a timeout-detected loss on a 50 µs colo link costs four thousand round trips",
+        "1 second per the RFC, so any timeout-detected loss on a colo link costs a full second of stall",
+        "One SRTT, so the floor tracks the measured path and a colo timeout costs roughly 50 µs",
+        "40 ms, matching the delayed-ACK timer so the RTO can never fire before an ACK is due"
+      ],
+      "correctIndex": 0,
+      "explanation": "Linux uses a 200 ms minimum rather than the RFC's 1 second, and that single constant is the most-quoted number in TCP latency discussions because it is wildly out of scale with a datacentre RTT. The 1-second answer is the tempting one for anyone who has read RFC 6298 without checking the implementation. The floor can be lowered per route with `ip route change ... rto_min 5ms`, but only against measured evidence, since too low a value produces spurious retransmissions.",
+      "sourceAnchor": "3810-rtt-estimation-and-retransmission-timeout",
+      "difficulty": "recall"
+    },
+    {
+      "id": "38-q24",
+      "prompt": "Why does Karn's algorithm refuse to sample RTT from a retransmitted segment?",
+      "options": [
+        "The ACK cannot be attributed to the original or the retransmission, so either guess would corrupt SRTT",
+        "Retransmitted segments carry no timestamp option, so no `TSecr` value exists to compute a sample from",
+        "Retransmissions are sent under exponential backoff, so their measured RTT is inflated by the backoff factor",
+        "The receiver delays ACKs for retransmissions differently, making the sample systematically too large"
+      ],
+      "correctIndex": 0,
+      "explanation": "The ambiguity is structural: both copies carry the same sequence number, so an arriving ACK is indistinguishable in origin, and sampling it would skew SRTT in whichever direction the guess was wrong. The timestamp answer inverts the actual relationship — the timestamp option is what *removes* the ambiguity, by echoing the exact `TSval` of whichever copy triggered the ACK, which is one reason timestamps are standard. Backoff is retained across the ambiguity and cleared only on an unambiguous sample.",
+      "sourceAnchor": "3810-rtt-estimation-and-retransmission-timeout",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q25",
+      "prompt": "With a typical connection carrying the 10-byte timestamp option, how many SACK blocks fit in a segment's option space?",
+      "options": [
+        "Three — the 40-byte option budget minus timestamps leaves room for fewer than the protocol maximum of four",
+        "Four — the protocol maximum always fits, since timestamps ride only on the SYN and SYN+ACK",
+        "Eight — the option area expands to 80 bytes whenever SACK and timestamps are both negotiated",
+        "One — only the most recently received range may be reported once timestamps consume option space"
+      ],
+      "correctIndex": 0,
+      "explanation": "Four blocks need `2 + 4×8 = 34` bytes, which fits the 40-byte option area alone, but timestamps consume 10 of those bytes on every data segment, leaving room for only three. The 'timestamps ride only on the SYN' answer confuses negotiation with use: timestamps are negotiated on the SYN and then carried on every subsequent segment, which is what creates the competition. The option area is fixed at 40 bytes by the 4-bit Data Offset field and never expands.",
+      "sourceAnchor": "3811-selective-acknowledgements",
+      "difficulty": "recall"
+    },
+    {
+      "id": "38-q26",
+      "prompt": "`nstat` shows a high `TcpExtTCPDSACKRecv` rate while real loss counters stay near zero. What does this indicate?",
+      "options": [
+        "A reordering path — likely ECMP or LAG spraying one flow across members, provoking spurious retransmissions",
+        "A lossy path where retransmissions succeed on the first attempt, so the loss counters never increment",
+        "A receiver whose SACK blocks are being truncated by the timestamp option, forcing duplicate reports",
+        "A middlebox rewriting sequence numbers, so the sender's ranges no longer match the receiver's"
+      ],
+      "correctIndex": 0,
+      "explanation": "D-SACK reports that a segment arrived twice, so a high rate with negligible real loss means the sender keeps retransmitting data that was merely delayed — the signature of a path spraying a flow across ECMP or LAG members. The 'lossy path' answer is self-contradictory: retransmissions themselves increment loss and retransmit counters, so those would not stay near zero. Block truncation limits how many ranges are reported, not whether duplicates are detected.",
+      "sourceAnchor": "3811-selective-acknowledgements",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q27",
+      "prompt": "State Nagle's rule precisely.",
+      "options": [
+        "If unacknowledged data is outstanding, buffer new sub-MSS data until an ACK arrives or a full MSS accumulates",
+        "Buffer all outgoing data for up to 40 ms so that several small writes can be coalesced into one segment",
+        "Delay each write until the receiver's advertised window is at least one MSS, preventing tiny segments",
+        "Hold data until a full segment accumulates or 200 ms elapses, whichever comes first, regardless of ACK state"
+      ],
+      "correctIndex": 0,
+      "explanation": "Nagle is conditioned entirely on outstanding unacknowledged data — with nothing in flight a small write goes out immediately, which is why the pathology only appears under pipelining or partial ACKs. The 'full segment or 200 ms' rule describes `TCP_CORK`, the deliberate opposite of `TCP_NODELAY`, and confusing the two is common. The 40 ms figure belongs to the receiver's delayed-ACK timer, not to any sender-side hold.",
+      "sourceAnchor": "3812-nagles-algorithm",
+      "difficulty": "recall"
+    },
+    {
+      "id": "38-q28",
+      "prompt": "A gateway sets `TCP_NODELAY` but still writes each message as a separate header `write()` and body `write()`. What remains wrong?",
+      "options": [
+        "Two writes still produce two syscalls, two segments, and two sets of headers — the write pattern is the real defect",
+        "`TCP_NODELAY` is ignored when consecutive writes occur within one RTT, so Nagle still buffers the body",
+        "The header segment is held until the body arrives, because a partial message cannot be pushed to the peer",
+        "The kernel coalesces the two writes anyway, so the setting is redundant and can be safely removed"
+      ],
+      "correctIndex": 0,
+      "explanation": "Disabling Nagle removes the buffering delay but does nothing about the cost the application is imposing on itself: each `write()` is a syscall of roughly 1–3 µs and produces its own segment with its own 40 bytes of header. The correct fix is `writev`/`sendmsg` scatter-gather or serializing into one contiguous buffer. The 'ignored within one RTT' claim is invented — `TCP_NODELAY` is sticky and unconditional once set.",
+      "sourceAnchor": "3812-nagles-algorithm",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q29",
+      "prompt": "In the Nagle plus delayed-ACK deadlock on a 1.5-MSS message, which side withholds what?",
+      "options": [
+        "The sender withholds the sub-MSS remainder because data is unacknowledged; the receiver withholds the ACK hoping to piggyback",
+        "The receiver withholds the sub-MSS remainder from the application; the sender withholds the ACK for the full segment",
+        "The sender withholds both segments until an MSS accumulates; the receiver withholds nothing and ACKs on arrival",
+        "The receiver withholds the ACK because its window is closed; the sender withholds data awaiting a window update"
+      ],
+      "correctIndex": 0,
+      "explanation": "The sender has one full segment in flight and unacknowledged, so Nagle buffers the small trailing piece; the receiver has one segment rather than two and no data of its own to piggyback on, so its delayed-ACK timer runs — each waits on the other until the ~40 ms timer breaks it. The inverted version is the classic misattribution: Nagle is purely a sender-side hold and delayed ACK purely a receiver-side one. Nothing here involves a closed window; both buffers have space throughout.",
+      "sourceAnchor": "3813-delayed-acknowledgements",
+      "difficulty": "trap"
+    },
+    {
+      "id": "38-q30",
+      "prompt": "A latency histogram for an RPC service shows a distinct spike at 40 ms that disappears on loopback and under continuous load. What is the fix?",
+      "options": [
+        "Set `TCP_NODELAY` on the sender and write each message in a single call — the receiver's ACK policy is not yours to change",
+        "Set `TCP_QUICKACK` on the sender so its own ACKs stop being delayed by 40 ms",
+        "Enlarge `SO_SNDBUF` so the trailing partial segment is coalesced with the next message",
+        "Enable `TCP_CORK` so the header and body are emitted as one full-size segment"
+      ],
+      "correctIndex": 0,
+      "explanation": "The 40 ms quantization is Nagle interacting with the peer's delayed-ACK timer, and since you generally cannot dictate the receiver's ACK policy, you remove your own contribution by disabling Nagle and stopping the multi-write pattern that creates sub-MSS trailers. The `TCP_QUICKACK` answer is the near-miss: quickack is a real fix for delayed ACK, but it must be set on the side that *receives* the data, and it is not sticky. `TCP_CORK` deliberately adds batching delay, making things worse.",
+      "sourceAnchor": "3813-delayed-acknowledgements",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q31",
+      "prompt": "What is the non-obvious detail about `TCP_QUICKACK` that distinguishes real usage from list-reading?",
+      "options": [
+        "It is not sticky — Linux reverts to the delayed-ACK heuristic after some ACKs, so it must be re-armed",
+        "It must be set before `connect()` or `accept()`, since ACK policy is fixed at connection establishment",
+        "It applies to the sender's outbound data, disabling Nagle in the same way `TCP_NODELAY` does",
+        "It is mutually exclusive with the timestamp option, since both alter the ACK generation path"
+      ],
+      "correctIndex": 0,
+      "explanation": "Linux enters quickack mode for a limited number of ACKs and then reverts, so code that sets it once at setup and assumes it persists is subtly wrong — correct usage re-arms it after each read. The 'must be set before connect' claim is the plausible-sounding inversion: it can be set at any time, it simply does not last. It is a receiver-side control over ACK timing and has nothing to do with Nagle, which `TCP_NODELAY` governs on the sender.",
+      "sourceAnchor": "3814-tcp_nodelay-tcp_quickack-and-tcp_cork",
+      "difficulty": "trap"
+    },
+    {
+      "id": "38-q32",
+      "prompt": "A server assembles a response from a small header write and a large body write and wants a single full segment. Which option fits, and what does it cost?",
+      "options": [
+        "`TCP_CORK` holds the writes until a full segment forms or 200 ms elapses — throughput-oriented, wrong on a latency path",
+        "`TCP_NODELAY` holds the writes until a full segment forms, then flushes both as one — the standard server setting",
+        "`TCP_QUICKACK` batches the writes into one segment by suppressing the intermediate ACK that would split them",
+        "`TCP_NOTSENT_LOWAT` merges the writes by limiting how many unsent bytes may sit in the send buffer"
+      ],
+      "correctIndex": 0,
+      "explanation": "Cork is the deliberate opposite of `TCP_NODELAY`: it withholds data until an MSS accumulates or 200 ms passes, which is exactly what `sendfile`-based servers want to avoid a runt header segment ahead of a large body. Naming `TCP_NODELAY` here is the inversion trap — it disables buffering rather than imposing it. `TCP_NOTSENT_LOWAT` bounds unsent bytes to surface queueing as backpressure, and `MSG_MORE` gives cork's effect per call without the socket-level state.",
+      "sourceAnchor": "3814-tcp_nodelay-tcp_quickack-and-tcp_cork",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q33",
+      "prompt": "Segment 2 of five is lost; segments 3, 4, and 5 arrive intact and sit in the receiver's kernel buffer. What does the application see?",
+      "options": [
+        "Nothing at all until segment 2 is retransmitted and arrives, because in-order delivery withholds everything behind the hole",
+        "Segments 3, 4, and 5 immediately, with a gap notification the application can act on as it chooses",
+        "Segments 3, 4, and 5 after the kernel's reordering window expires, typically one RTT later",
+        "Segments 3, 4, and 5 only if SACK is enabled, since SACK permits out-of-order delivery upward"
+      ],
+      "correctIndex": 0,
+      "explanation": "Head-of-line blocking is the direct consequence of TCP's in-order guarantee: correct, verified data is held in the kernel because an earlier byte is missing, and the delay is one RTT with fast retransmit or 200 ms+ with an RTO. The SACK answer is the most tempting: SACK does let the *sender* learn exactly which ranges arrived and repair them in one round trip, but it changes nothing about what the receiving application is allowed to see. UDP is the transport that hands data up immediately and lets the application decide.",
+      "sourceAnchor": "3815-tcp-head-of-line-blocking",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q34",
+      "prompt": "A firm multiplexes ten independent order flows over one TCP connection. What is the structural consequence of a single lost packet?",
+      "options": [
+        "All ten flows stall until the hole is repaired, because one byte stream cannot deliver past a gap",
+        "Only the flow whose message was in the lost packet stalls, since each flow has its own sequence space",
+        "The nine unaffected flows continue at half rate, since the window reduction is shared proportionally",
+        "All ten flows stall only if SACK is disabled; with SACK the unaffected flows continue uninterrupted"
+      ],
+      "correctIndex": 0,
+      "explanation": "Logical streams multiplexed over one connection share one sequence space, so transport-level head-of-line blocking stalls all of them — this is exactly the flaw HTTP/2 inherited when it solved HTTP/1.1's application-layer version, and what QUIC fixes with per-stream sequencing over UDP. The per-flow sequence space answer describes QUIC, not TCP. The window does halve on loss, but that is a rate effect distinct from the delivery stall.",
+      "sourceAnchor": "3815-tcp-head-of-line-blocking",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q35",
+      "prompt": "With Linux keepalive defaults, how long before a peer that lost power is declared dead?",
+      "options": [
+        "About 2 hours 11 minutes — 7200 s idle, then 9 probes at 75 s intervals",
+        "About 10 minutes — 75 s idle, then 9 probes spaced 60 s apart",
+        "About 8 seconds — 5 s idle, then 3 probes at 1 s intervals",
+        "About 13 minutes — the `tcp_retries2` backoff sequence applies to probes as well"
+      ],
+      "correctIndex": 0,
+      "explanation": "`tcp_keepalive_time` is 7200 seconds before the first probe, then `tcp_keepalive_probes`=9 at `tcp_keepalive_intvl`=75 seconds, totalling roughly 2 hours 11 minutes — useless for any trading purpose, which is why 'just enable keepalive' is not an answer. The 8-second figure is the tuned configuration you would set explicitly, not the default. The 13-minute figure belongs to `tcp_retries2` exponential backoff on unacknowledged *data*, a separate mechanism.",
+      "sourceAnchor": "3816-tcp-keepalive",
+      "difficulty": "recall"
+    },
+    {
+      "id": "38-q36",
+      "prompt": "A peer process deadlocks but its host stays up. Aggressive TCP keepalive is configured. What happens?",
+      "options": [
+        "The connection stays healthy — the kernel answers probes on behalf of the stuck process, so only an application heartbeat detects it",
+        "Keepalive probes go unanswered because the socket's receive queue is full, so the connection drops in seconds",
+        "Keepalive detects it only if the deadlocked process holds unacknowledged outbound data at the moment it hangs",
+        "Keepalive fails the connection after one probe interval, since a hung process cannot refresh the socket timer"
+      ],
+      "correctIndex": 0,
+      "explanation": "Keepalive probes are generated and answered entirely in the kernel, so a process stuck in an infinite loop, deadlocked, or stalled keeps the connection looking perfectly alive — this is the decisive argument for FIX-style `Heartbeat`/`TestRequest` pairs. The full-receive-queue answer is the plausible near-miss: a full queue affects data delivery, but a keepalive probe carries no payload and is acknowledged regardless. `TCP_USER_TIMEOUT` covers the active-transmission case that keepalive, which probes only idle connections, does not.",
+      "sourceAnchor": "3816-tcp-keepalive",
+      "difficulty": "trap"
+    },
+    {
+      "id": "38-q37",
+      "prompt": "Besides absorbing delayed duplicates from the old connection, why does `TIME_WAIT` exist?",
+      "options": [
+        "So the final ACK can be resent if the peer retransmits its FIN — a closed socket would answer with an RST instead",
+        "So the ephemeral port cannot be reassigned until the local send buffer has finished draining to the peer",
+        "So the congestion-control state for the 4-tuple can be cached and reused by the next connection to that host",
+        "So the peer has time to complete its own active close before the 4-tuple becomes eligible for reuse"
+      ],
+      "correctIndex": 0,
+      "explanation": "If the active closer's last ACK is lost, the peer sitting in `LAST_ACK` retransmits its FIN, and only a socket still in `TIME_WAIT` can re-acknowledge it; a fully closed socket would emit an RST that the peer reports as an error on an otherwise clean shutdown. This is the reason people forget, and stating it distinguishes real understanding from 'it's for old packets'. FIN close already flushes queued data before the FIN is sent, so buffer draining is not what the wait is for.",
+      "sourceAnchor": "3817-time_wait",
+      "difficulty": "recall"
+    },
+    {
+      "id": "38-q38",
+      "prompt": "A client opens short-lived connections to one server IP and port and hits a ceiling near 470 connections per second. What is the cause?",
+      "options": [
+        "Ephemeral port exhaustion — about 28 000 ports each held 60 seconds in `TIME_WAIT` against that one destination",
+        "The server's accept queue saturating, since `somaxconn` caps completed connections at a fixed rate",
+        "`TIME_WAIT` on the server side, which holds the 4-tuple because it performed the active close",
+        "SYN-queue overflow forcing SYN cookies, which throttles new connections to a fixed per-second budget"
+      ],
+      "correctIndex": 0,
+      "explanation": "The default `ip_local_port_range` gives roughly 28 000 ephemeral ports, and Linux holds each 4-tuple in `TIME_WAIT` for a fixed 60 seconds, so 28000/60 lands right at ~470 per second — and the limit is per-destination, since the remote address is part of the tuple. Blaming the server side inverts who pays: `TIME_WAIT` is held by whichever peer closed actively, which here is the client. The correct fix is persistent connections, then `tcp_tw_reuse` with timestamps and a wider port range.",
+      "sourceAnchor": "3817-time_wait",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q39",
+      "prompt": "A tuning guide recommends `net.ipv4.tcp_tw_recycle=1` to relieve `TIME_WAIT` pressure. What is the correct response?",
+      "options": [
+        "It was removed in Linux 4.12 because it rejected NATted clients whose timestamps appeared to move backwards",
+        "It is safe only when timestamps are enabled, which is the same precondition `tcp_tw_reuse` requires",
+        "It applies only to inbound connections, so it helps servers but does nothing for client-side exhaustion",
+        "It is equivalent to shortening `TCP_TIMEWAIT_LEN`, which is the supported way to tune the 60-second wait"
+      ],
+      "correctIndex": 0,
+      "explanation": "`tcp_tw_recycle` keyed its reuse decision on per-source timestamps, so multiple clients behind one NAT presenting unsynchronized timestamps had their connections refused — it was deleted for correctness, and recommending it signals stale knowledge. The timestamps-precondition answer is the dangerous half-truth: that condition is genuinely what makes `tcp_tw_reuse` safe, but it does not rescue recycle, whose failure mode is NAT rather than timestamp availability. `TCP_TIMEWAIT_LEN` is a compile-time constant, not a sysctl.",
+      "sourceAnchor": "3817-time_wait",
+      "difficulty": "trap"
+    },
+    {
+      "id": "38-q40",
+      "prompt": "A 10 Gbit/s Chicago–NY path has a 9 ms RTT. What window is needed to keep the pipe full, and what happens below it?",
+      "options": [
+        "About 11.25 MB; below that, throughput is window/RTT and the link's capacity is irrelevant",
+        "About 11.25 MB; below that, throughput still reaches line rate but with higher queueing delay",
+        "About 62.5 KB; below that, the sender stalls only when the receiver's buffer is also undersized",
+        "About 1.25 MB; below that, slow start compensates by doubling the window every round trip indefinitely"
+      ],
+      "correctIndex": 0,
+      "explanation": "BDP is bandwidth × RTT — 10 Gbit/s × 9 ms is about 11.25 MB — and throughput is `min(window, BDP)/RTT`, so an undersized window leaves the sender idle waiting for ACKs regardless of how fast the link is. The 'still reaches line rate' answer inverts the mechanism: too small a window causes underutilization, not queueing. The 62.5 KB figure is the colo BDP at 50 µs, and slow start stops doubling once `cwnd` hits `ssthresh` or the receiver's window.",
+      "sourceAnchor": "3818-bandwidth-delay-product",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q41",
+      "prompt": "Given a colo BDP of about 62.5 KB, what follows for a 50-byte order message?",
+      "options": [
+        "The path is latency- and per-message-cost-limited, so syscall count, interrupt handling, and message size are what matter",
+        "The path is bandwidth-limited at small message sizes, so batching orders into larger segments is the primary win",
+        "The window must still be tuned to 62.5 KB, since below that even a single order message waits for ACKs",
+        "The BDP determines the RTO floor, so lowering `rto_min` requires first raising the window to the BDP"
+      ],
+      "correctIndex": 0,
+      "explanation": "A 62.5 KB in-flight allowance dwarfs a 50-byte message by three orders of magnitude, so nothing on a colo order path is ever bandwidth-constrained — which is also why congestion-control tuning does essentially nothing there. The batching answer inverts the conclusion: batching trades latency for efficiency, and efficiency is the resource you have in surplus. `rto_min` is a timer clamp set by `TCP_RTO_MIN` and route configuration, entirely independent of the BDP.",
+      "sourceAnchor": "3818-bandwidth-delay-product",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q42",
+      "prompt": "Why is bufferbloat described as a consequence of TCP's own design rather than purely a vendor error?",
+      "options": [
+        "Loss-based congestion control only backs off when a buffer overflows, so it deliberately fills every buffer on the path",
+        "TCP's in-order delivery forces routers to hold reordered packets until the missing one arrives, growing the queue",
+        "TCP's ACK clocking makes senders emit bursts that routers must absorb, so buffers grow to the burst size",
+        "TCP's window scaling permits gigabyte windows, so routers must provision buffers to match the largest window"
+      ],
+      "correctIndex": 0,
+      "explanation": "Loss is the only congestion signal a loss-based algorithm has, and loss happens only at overflow, so CUBIC and Reno probe upward until the bottleneck queue is full by construction — a 1 GB buffer on a 10 Mbit/s link therefore becomes ~800 seconds of standing delay. The ACK-clocking answer has a true premise about burstiness, but bursts create transient queues that drain, whereas bufferbloat is a persistent standing queue. Routers do not reorder or hold packets on TCP's behalf; they are unaware of streams.",
+      "sourceAnchor": "3819-bufferbloat",
+      "difficulty": "recall"
+    },
+    {
+      "id": "38-q43",
+      "prompt": "What advantage does ECN give over dropping a packet as a congestion signal?",
+      "options": [
+        "The sender reduces `cwnd` with no loss and therefore no retransmission or head-of-line blocking behind a gap",
+        "The sender learns the exact queue depth from the CE marking and can size its window to the bottleneck precisely",
+        "The router marks packets before the queue builds, so the sender never has to reduce its window at all",
+        "The receiver can request retransmission of the marked packet immediately rather than waiting for duplicate ACKs"
+      ],
+      "correctIndex": 0,
+      "explanation": "A router experiencing congestion rewrites ECT to CE instead of dropping, the receiver echoes ECE, and the sender reduces `cwnd` and sets CWR — the congestion signal arrives without any data being lost, which removes both the retransmission and the HOL stall a drop would cause. The 'exact queue depth' answer overreaches: CE is a binary mark, and it is DCTCP that infers depth by counting marks proportionally over time. Marked packets are delivered normally, so there is nothing to retransmit.",
+      "sourceAnchor": "3819-bufferbloat",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q44",
+      "prompt": "A length-prefixed framer reads a 4-byte big-endian length and then indexes `4 + len` bytes. Which validation is mandatory before using `len`?",
+      "options": [
+        "Check it against hard minimum and maximum bounds, or `0xFFFFFFFF` becomes a huge allocation or an overflow in `4 + len`",
+        "Check that it is a multiple of the MSS, since a message never spans a partial segment boundary",
+        "Check that the socket's receive buffer is at least `len` bytes, since a larger message can never be assembled",
+        "Check that it matches the byte count returned by the last `recv`, since one read delivers exactly one message"
+      ],
+      "correctIndex": 0,
+      "explanation": "An attacker, a corrupt link, or a version mismatch can present an absurd length, and using it unvalidated produces a 4 GB allocation or wraps the `4 + len` arithmetic — the single most common serious bug in hand-written protocol parsers. The MSS and recv-size checks both encode the fallacy that segment or read boundaries align with message boundaries; TCP is a byte stream, so a message can span reads and one read can deliver several messages plus a partial tail.",
+      "sourceAnchor": "3820-tcp-message-framing",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q45",
+      "prompt": "Which change most reduces per-message cost in a high-rate TCP message parser?",
+      "options": [
+        "Read large chunks into a buffer and frame many messages in user space, amortizing the ~1–3 µs syscall",
+        "Issue one `recv` per message with an exact length, so no buffer compaction or partial state is needed",
+        "Increase `SO_RCVBUF` substantially so the kernel can deliver each message in a single wakeup",
+        "Enable `TCP_QUICKACK` so acknowledgements return sooner and the sender keeps the receive queue full"
+      ],
+      "correctIndex": 0,
+      "explanation": "A syscall costs roughly 1–3 µs, so one `recv` per message makes syscall overhead the dominant term; reading large chunks and framing in user space is the single biggest win, ideally with a ring buffer instead of a `memmove` compaction and in-place `span`/`string_view` parsing. The one-recv-per-message answer is superficially tidy but maximizes exactly the cost you are trying to eliminate. A bigger `SO_RCVBUF` also disables autotuning and does not change syscall count.",
+      "sourceAnchor": "3820-tcp-message-framing",
+      "difficulty": "application"
+    },
+    {
+      "id": "38-q46",
+      "prompt": "A client calls `shutdown(fd, SHUT_WR)` after streaming a request of unknown length. What is the state of the connection?",
+      "options": [
+        "A FIN is sent and the client can still read the peer's response until it sees EOF; the descriptor stays open",
+        "Both directions close, so the client must reopen the connection to read the peer's response",
+        "No FIN is sent; the local send path is disabled and the peer discovers this only via keepalive",
+        "The descriptor is released, but the connection persists until the peer's FIN completes the teardown"
+      ],
+      "correctIndex": 0,
+      "explanation": "`SHUT_WR` closes only the sending half: a FIN goes out, the peer's `recv` returns 0 and knows the request is complete, and the local side can keep reading the reply — this is the half-close idiom. `close()` is the operation that releases the descriptor and stops reading, which is the distinction being tested. `SHUT_RD` is the direction that sends no FIN, and note a forked child holding a duplicate descriptor keeps the connection alive past the parent's `close()`.",
+      "sourceAnchor": "3821-tcp-half-close-and-reconnect-behaviour",
+      "difficulty": "application"
+    }
+  ]
+}

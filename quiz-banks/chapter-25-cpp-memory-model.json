@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-25-cpp-memory-model",
+  "questions": [
+    {
+      "id": "25-q01",
+      "prompt": "Two threads concurrently write different members of `struct T { unsigned a : 4; unsigned b : 4; };` — one writes `t.a`, the other writes `t.b`. Is this a data race?",
+      "options": [
+        "Yes — adjacent non-zero-width bit-fields form a single memory location, so the two writes conflict.",
+        "No — the standard guarantees every named struct member is a separately addressable memory location.",
+        "No — bit-field writes are compiled as read-modify-write instructions, which are indivisible.",
+        "Yes — but only because the struct lacks an `alignas` specifier wide enough to separate the fields."
+      ],
+      "correctIndex": 0,
+      "explanation": "A memory location is a scalar object *or* a maximal run of adjacent non-zero-width bit-fields, so `a` and `b` here share one location and the writes conflict. The tempting answer is the separate-addressability rule, which is real — but it applies to distinct scalar members like `char a; char b;`, not to packed bit-fields. Inserting an unnamed `unsigned : 0;` between them splits the run and removes the race.",
+      "sourceAnchor": "251-data-races",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q02",
+      "prompt": "A worker spins on `while (!done) {}` where `done` is a plain `bool` set by another thread. What is the strongest correct description of the defect?",
+      "options": [
+        "It is a data race and therefore UB; the compiler may hoist the load and emit an unconditional infinite loop.",
+        "It is well-defined but slow, since the load is re-issued from memory on every single iteration.",
+        "It is a benign race: the worst outcome is that the flag update is observed a few cycles late.",
+        "It is unspecified behaviour; the loop reads either the old or the new value, but never any other."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because the compiler may assume race-freedom, it can promote `done` to a register and turn the loop into `if (!done) for(;;);` — a hang, not a delayed update. The 'benign race, just a stale read' framing is the classic weak answer: it treats the race as a visibility issue when it is undefined behaviour that licenses the transformation. Making `done` a `std::atomic<bool>` removes the UB even at `memory_order_relaxed`.",
+      "sourceAnchor": "251-data-races",
+      "difficulty": "trap"
+    },
+    {
+      "id": "25-q03",
+      "prompt": "A hot statistics path uses `std::atomic<uint64_t> counter;` and increments it with `counter++`. What ordering does that expression actually request?",
+      "options": [
+        "`memory_order_seq_cst`, because every `std::atomic` operator overload uses the default order.",
+        "`memory_order_relaxed`, because the compiler infers no ordering is needed for a counter.",
+        "`memory_order_acq_rel`, because `operator++` is a read-modify-write and RMWs default to acq_rel.",
+        "Whatever order was passed to the most recent explicit `store` on that same atomic object."
+      ],
+      "correctIndex": 0,
+      "explanation": "All the operator overloads — `++`, `+=`, `=`, and the implicit conversion to `T` — are hard-wired to `memory_order_seq_cst`; there is no inference from context. The acq_rel guess is seductive because the operation genuinely is an RMW, but RMWs have no special default: the default is the same seq_cst as everything else. On x86 this happens to cost nothing extra, which is why the mistake survives review until the code is built for ARM.",
+      "sourceAnchor": "252-atomic-types-and-lock-freedom",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q04",
+      "prompt": "You place a `std::atomic<T>` in a POSIX shared-memory segment mapped by two processes. Why is `static_assert(std::atomic<T>::is_always_lock_free)` mandatory here?",
+      "options": [
+        "A non-lock-free atomic uses a lock table living in each process's own address space, so the two processes lock different mutexes.",
+        "A non-lock-free atomic stores an embedded mutex inside the object, whose pointer members are invalid in the other mapping.",
+        "Shared memory mappings forbid `lock`-prefixed instructions, so only lock-free atomic types can be placed there at all.",
+        "Without the assertion the object is placed unaligned by the loader, and a misaligned atomic is undefined behaviour."
+      ],
+      "correctIndex": 0,
+      "explanation": "The fallback is a static array of mutexes indexed by a hash of the object's address, and that array is process-local — so each process serialises against itself and neither sees the other, silently destroying atomicity. The 'embedded mutex' variant sounds right but is wrong about the mechanism: nothing extra is stored inside the atomic object, which is why the breakage is invisible to inspection. The same process-local table is also why non-lock-free atomics can deadlock in signal handlers.",
+      "sourceAnchor": "252-atomic-types-and-lock-freedom",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q05",
+      "prompt": "You hold an `std::atomic_ref<double> r{data[i]}` over one element of a plain `double` array. While `r` is alive, another thread reads `data[i]` directly with a plain load. What is the status of that plain read?",
+      "options": [
+        "It is a data race — while any `atomic_ref` to an object exists, every access to it must go through an `atomic_ref`.",
+        "It is fine, because `atomic_ref` makes the referenced object itself atomic for as long as the reference lives.",
+        "It is fine as long as the plain access is a read, since only concurrent writers need to use the `atomic_ref`.",
+        "It is fine provided the element meets `atomic_ref<double>::required_alignment`, which suppresses tearing."
+      ],
+      "correctIndex": 0,
+      "explanation": "`atomic_ref` changes how *accesses through it* behave; it does not change the object, so a plain access concurrent with an atomic_ref write is an ordinary conflicting-unordered-access race. The reader-only exemption is the most tempting distractor and is false — a race needs only one writer, and here the `atomic_ref` side is the writer. Alignment is a separate precondition: satisfying `required_alignment` is necessary but buys no protection against undisciplined plain access.",
+      "sourceAnchor": "253-stdatomic_ref",
+      "difficulty": "trap"
+    },
+    {
+      "id": "25-q06",
+      "prompt": "On x86-64, why is `if (flags.fetch_or(BIT, std::memory_order_relaxed) & BIT)` meaningfully more expensive than the same call with the result discarded?",
+      "options": [
+        "`lock or` cannot return the previous value, so needing it forces the compiler to emit a `cmpxchg` retry loop.",
+        "Reading the result forces the relaxed order to be upgraded to seq_cst, which adds an `mfence` after the RMW.",
+        "The comparison against `BIT` introduces a branch the CPU cannot predict, costing a pipeline flush per call.",
+        "`lock or` operates on the whole word, so extracting one bit requires a second locked access to re-read it."
+      ],
+      "correctIndex": 0,
+      "explanation": "The value-discarding form maps to a single `lock or`; the moment you need the old value the compiler must synthesise it with a compare-exchange loop, which is both longer and contended. The seq_cst-upgrade story is fabricated — memory order is a property of the operation you wrote and is never silently strengthened by how you consume the result. `fetch_and` and `fetch_xor` behave identically.",
+      "sourceAnchor": "254-atomic-read-modify-write-operations",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q07",
+      "prompt": "Ten threads each call `counter.fetch_add(1, std::memory_order_relaxed)` a thousand times. Why is the final total guaranteed to be exactly 10000?",
+      "options": [
+        "An RMW is guaranteed to read the immediately preceding value in that object's modification order, so no increment is lost.",
+        "`relaxed` still inserts a full barrier around each RMW on every architecture, which serialises the increments.",
+        "The compiler promotes `relaxed` to `acq_rel` for read-modify-write operations, which is what prevents lost updates.",
+        "Cache coherence gives each thread exclusive ownership of the line for the whole thousand-iteration burst."
+      ],
+      "correctIndex": 0,
+      "explanation": "Lost updates are prevented by the modification-order rule for RMWs, not by ordering: each RMW sees the latest write in the total order for that object and writes immediately after it, so there is no window in which two increments read the same value. The barrier-based explanations get the right answer for the wrong reason — relaxed emits no barrier on ARM at all, yet the count is still exact. Ordering is what relaxed gives up; atomicity and per-object coherence are what it keeps.",
+      "sourceAnchor": "254-atomic-read-modify-write-operations",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q08",
+      "prompt": "In the canonical loop `while (!a.compare_exchange_weak(old, f(old), rel, relaxed)) ;`, why is there no explicit reload of `old` in the loop body?",
+      "options": [
+        "On failure the compare-exchange writes the actual observed value back into `expected`, refreshing `old` for free.",
+        "The loop condition re-evaluates `a.load()` implicitly each iteration, which is what updates `old`.",
+        "`old` is captured by reference in `f`, so calling `f(old)` re-reads the atomic before computing the new value.",
+        "`compare_exchange_weak` retries internally until the comparison matches, so `old` never needs refreshing."
+      ],
+      "correctIndex": 0,
+      "explanation": "`expected` is an in-out parameter: a failing compare-exchange stores the value it actually saw there, which is precisely what makes the loop free of a redundant reload. The 'retries internally' answer describes something no compare-exchange does — that would make the operation unable to fail, and `strong` differs from `weak` only in filtering *spurious* failure, not real mismatch. Note the refresh also happens after a spurious failure, which is why the loop stays correct on LL/SC hardware.",
+      "sourceAnchor": "255-compare-exchange-loops",
+      "difficulty": "recall"
+    },
+    {
+      "id": "25-q09",
+      "prompt": "A CAS loop over `std::atomic<struct { char c; int i; }>` spins forever on some builds even with no contention. What is the cause?",
+      "options": [
+        "Compare-exchange compares object representations, so uninitialised padding bytes can never match `expected`.",
+        "Compare-exchange calls the type's `operator==`, which is implicitly deleted for structs with mixed member types.",
+        "The struct is not trivially copyable, so `std::atomic` falls back to the lock table and the CAS always fails.",
+        "The struct's size is not a power of two, so the platform has no compare-exchange instruction wide enough."
+      ],
+      "correctIndex": 0,
+      "explanation": "CAS is a bitwise comparison of the object representation, and the padding byte between `c` and `i` can hold arbitrary garbage that differs between the value in memory and the value in `expected`, so the comparison never succeeds. The `operator==` answer inverts the actual rule — CAS deliberately does *not* use it, which is also why `+0.0` and `-0.0` misbehave. Guard with `static_assert(std::has_unique_object_representations_v<T>)`.",
+      "sourceAnchor": "255-compare-exchange-loops",
+      "difficulty": "trap"
+    },
+    {
+      "id": "25-q10",
+      "prompt": "Why does `compare_exchange_weak` exist alongside `compare_exchange_strong`?",
+      "options": [
+        "On LL/SC hardware the store-conditional can fail for unrelated reasons, and `strong` must add a filtering loop to hide it.",
+        "`weak` omits the write-back of the observed value into `expected`, which saves a store on every failed attempt.",
+        "`weak` permits a weaker memory order than the success order requested, which `strong` is not allowed to do.",
+        "`weak` compares only the low word of wide types, which is why it can be implemented without `cmpxchg16b`."
+      ],
+      "correctIndex": 0,
+      "explanation": "On ARM pre-LSE, POWER and RISC-V the exclusive monitor can be cleared by an interrupt, a context switch, or a write anywhere in the cache line, so `stxr` fails spuriously; `strong` must wrap the sequence in an extra retry loop to filter that out, and a caller already inside a loop should not pay for it. The claim that `weak` skips updating `expected` is false and dangerous — both forms refresh `expected`, including after a spurious failure, which is what keeps the canonical loop correct. On x86 both compile to the same `lock cmpxchg`; the distinction is portability.",
+      "sourceAnchor": "256-spurious-compare-exchange-failure",
+      "difficulty": "recall"
+    },
+    {
+      "id": "25-q11",
+      "prompt": "With `std::atomic<int> x{0}, y{0}` and both threads using `memory_order_seq_cst`, T1 runs `x.store(1); r1 = y.load();` and T2 runs `y.store(1); r2 = x.load();`. Which outcome is forbidden?",
+      "options": [
+        "`r1 == 0 && r2 == 0`, since a single total order over the seq_cst operations cannot place both loads first.",
+        "`r1 == 1 && r2 == 1`, since the two stores cannot both be globally visible before either load executes.",
+        "`r1 == 0 && r2 == 1`, since a total order must make the threads observe the stores in the same direction.",
+        "`r1 == 1 && r2 == 0`, since the thread that stores first must be the thread whose load returns zero."
+      ],
+      "correctIndex": 0,
+      "explanation": "Sequential consistency means some single total order consistent with program order exists; whichever store comes first in that order, the load that follows it in the other thread must see it, so both reading zero is impossible. Both threads reading 1 is perfectly legal — it happens whenever both stores precede both loads in the total order. This is the Store Buffer test, and dropping to release/acquire or relaxed makes the double-zero outcome reachable on real x86 hardware.",
+      "sourceAnchor": "257-sequential-consistency",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q12",
+      "prompt": "On x86-64, which statement about the cost of `memory_order_seq_cst` is accurate?",
+      "options": [
+        "Loads are plain `mov` and free; stores cost a locked `xchg` or an `mfence` to drain the store buffer.",
+        "Stores are plain `mov` and free; loads need an `lfence` to prevent speculative reordering ahead of them.",
+        "Both loads and stores are plain `mov`, since x86-TSO already forbids every reordering seq_cst forbids.",
+        "Both loads and stores require a full `mfence`, which is why seq_cst is avoided on latency-critical paths."
+      ],
+      "correctIndex": 0,
+      "explanation": "x86-TSO already forbids load-load, load-store and store-store reordering, so only store-load needs fixing — and mainstream compilers put the barrier on the store side, typically using `xchg` because it is a locked instruction and faster than `mov; mfence`. The 'both are free' answer would make seq_cst identical to acquire/release on x86, which is exactly the Store Buffer outcome TSO permits and seq_cst must forbid. This is why downgrading seq_cst to acquire/release on x86 usually buys something only on the store side.",
+      "sourceAnchor": "257-sequential-consistency",
+      "difficulty": "recall"
+    },
+    {
+      "id": "25-q13",
+      "prompt": "Which pair correctly states the one-way barrier direction of acquire and release?",
+      "options": [
+        "Release blocks earlier operations from sinking below it; acquire blocks later operations from rising above it.",
+        "Release blocks later operations from rising above it; acquire blocks earlier operations from sinking below it.",
+        "Both block movement in both directions, but release applies to stores only and acquire to loads only.",
+        "Release blocks earlier stores from sinking below it; acquire blocks later stores from rising above it."
+      ],
+      "correctIndex": 0,
+      "explanation": "A release store is a downward one-way barrier — nothing written before it may be delayed past it, which is what makes it a commit — while an acquire load is an upward one-way barrier, so nothing after it may be hoisted before. The swapped version is the single most common error and is self-defeating: it would let the constructor's stores drift past the release store and let the consumer's reads be hoisted above the acquire load, breaking publication in both directions. Traffic in the permitted direction is legal and expected under both.",
+      "sourceAnchor": "258-acquire-and-release-ordering",
+      "difficulty": "recall"
+    },
+    {
+      "id": "25-q14",
+      "prompt": "T1 does `data = 42; ready.store(1, release);`. T2 does a single `if (ready.load(acquire) == 0) { r = data; }` and takes that branch. Does T2 read 42?",
+      "options": [
+        "No guarantee — the acquire did not read the release's value, so no synchronizes-with edge was created.",
+        "Yes — the acquire load orders the subsequent read of `data` regardless of which value it observed.",
+        "Yes — the release store already flushed `data` to memory before `ready` became visible to any thread.",
+        "No guarantee — but only on architectures that permit load-load reordering, so x86 is safe here."
+      ],
+      "correctIndex": 0,
+      "explanation": "Synchronizes-with fires only when the acquire operation actually reads the value written by the release (or a value in its release sequence); reading the older zero creates no edge at all, so `data` is read racily. The 'acquire orders whatever follows it' answer confuses the local reordering restriction with the cross-thread edge — the local restriction holds, but with no edge there is nothing on T1's side for it to order against. This is precisely why the publication idiom uses a loop that waits until the flag is observed set.",
+      "sourceAnchor": "258-acquire-and-release-ordering",
+      "difficulty": "trap"
+    },
+    {
+      "id": "25-q15",
+      "prompt": "A colleague argues that release/acquire is enough for a Dekker-style handoff because it is transitive through the happens-before graph. Where does the reasoning break?",
+      "options": [
+        "Transitivity needs a chain of release/acquire on the same objects; two independent release stores are never ordered against each other.",
+        "Transitivity holds only within a single thread, so any happens-before chain crossing more than two threads is invalid.",
+        "Transitivity requires every link in the chain to use `acq_rel`, and a plain release store cannot participate.",
+        "Transitivity is broken by the compiler rather than the CPU, so the chain works on hardware but not after optimisation."
+      ],
+      "correctIndex": 0,
+      "explanation": "Release/acquire really is transitive — T1 releases `x`, T2 acquires `x` then releases `y`, T3 acquires `y`, and T1's writes reach T3 — but only because each link is a matched release/acquire pair on a shared object. Dekker involves two independent stores that nobody chains together, so there is no edge and both threads can read zero. The 'only within a thread' claim contradicts the entire point of inter-thread happens-before; the real limitation is the absence of a chain, not a limit on chain length.",
+      "sourceAnchor": "258-acquire-and-release-ordering",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q16",
+      "prompt": "Which guarantee does `memory_order_relaxed` still provide?",
+      "options": [
+        "A single modification order per atomic object that all threads agree on, so one thread never sees a value regress.",
+        "A guarantee that a store becomes visible to every other thread within a bounded, implementation-defined interval.",
+        "Ordering with respect to other relaxed operations on the same object issued by the same thread's later code.",
+        "Freedom from reordering by the compiler, though the CPU remains free to move the access in either direction."
+      ],
+      "correctIndex": 0,
+      "explanation": "Relaxed keeps atomicity and per-object coherence: each atomic has one modification order all threads agree on, so a thread that reads 1 from a counter cannot subsequently read 0 from it. Bounded visibility is the closest wrong answer — the standard only *recommends* that stores become visible in finite time, and that recommendation is unenforceable, though coherent hardware makes it microseconds in practice. Relaxed also does not restrain the compiler, which may freely hoist or CSE relaxed loads.",
+      "sourceAnchor": "259-relaxed-ordering",
+      "difficulty": "recall"
+    },
+    {
+      "id": "25-q17",
+      "prompt": "In a reference-counted object, why is the increment safe at `relaxed` while the decrement needs `acq_rel`?",
+      "options": [
+        "You already hold a reference when incrementing, but the thread dropping the count to zero must see every other owner's writes before destroying.",
+        "Increment is a single instruction on all targets while decrement compiles to a compare-exchange loop that needs the stronger order.",
+        "Increment can never lose an update at relaxed, whereas a relaxed decrement can lose one and let the count skip past zero.",
+        "The decrement must also publish the destructor's writes to any thread that later reallocates the same memory block."
+      ],
+      "correctIndex": 0,
+      "explanation": "Incrementing orders nothing because the caller already owns a reference and the object cannot die underneath it; the final decrement is different, since the destroying thread must acquire everything the other owners released before it can safely run the destructor. The lost-update answer is wrong on the facts: relaxed RMWs never lose updates in either direction, because an RMW reads the immediately preceding value in modification order. `libstdc++`'s `shared_ptr` uses exactly the relaxed-increment, acq_rel-decrement split.",
+      "sourceAnchor": "259-relaxed-ordering",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q18",
+      "prompt": "Why is `while (!stop.load(std::memory_order_relaxed)) work();` acceptable, while the same loop with an empty body is not?",
+      "options": [
+        "An opaque call blocks the compiler from hoisting the relaxed load, whereas with no body it may hoist it and spin forever.",
+        "A relaxed load is only re-issued when a function call has clobbered the register cache, so an empty body reads a stale copy.",
+        "The empty loop is a data race because a relaxed load with no intervening operation is treated as a non-atomic access.",
+        "The empty loop never yields the core, so the store from the setting thread cannot become visible in the coherence fabric."
+      ],
+      "correctIndex": 0,
+      "explanation": "Relaxed removes the undefined behaviour but not the compiler's freedom to move or coalesce the load; the call to an opaque `work()` is what keeps it from being hoisted out. The 'stale copy' phrasing gets close but describes a cache effect that does not exist — the problem is a purely compile-time transformation, and coherent hardware would deliver the update if the load were actually executed. Correctness should never depend on the loop body happening to defeat an optimisation, which is why a spin flag deserves acquire or a fence on exit.",
+      "sourceAnchor": "259-relaxed-ordering",
+      "difficulty": "trap"
+    },
+    {
+      "id": "25-q19",
+      "prompt": "What is the practical status of `memory_order_consume` in mainstream toolchains today?",
+      "options": [
+        "Every mainstream compiler promotes it to acquire, discarding the benefit; C++17 formally discourages its use.",
+        "It is fully implemented on ARM and POWER, where it emits no barrier, and degraded to acquire only on x86.",
+        "It was removed from the standard in C++20 after P0371, so the enumerator no longer names a valid order.",
+        "It is implemented by tracking dependency chains, but only for accesses marked `[[carries_dependency]]`."
+      ],
+      "correctIndex": 0,
+      "explanation": "Consume was meant to order only data-dependent operations, which real hardware other than Alpha already does for free, but preserving dependency chains through optimisation defeated every implementer, so all of them upgrade it to acquire and C++17 discourages it via P0371. The 'implemented on weak platforms' answer inverts reality — those are precisely the platforms where a correct implementation would pay off, and precisely where it does not exist. The enumerator is still in the standard; it is discouraged, not removed.",
+      "sourceAnchor": "2510-consume-ordering",
+      "difficulty": "recall"
+    },
+    {
+      "id": "25-q20",
+      "prompt": "A candidate says \"the store definitely runs before the load in wall-clock time, so it happens-before it.\" What is wrong?",
+      "options": [
+        "Happens-before is a partial order built from sequenced-before and synchronizes-with; real-time precedence establishes no edge.",
+        "Happens-before is a real-time relation, but it needs the two operations to be separated by at least one scheduler quantum.",
+        "Happens-before does follow from wall-clock order, but only for operations on the same atomic object.",
+        "Happens-before is a total order over all operations, so any two operations are always ordered one way or the other."
+      ],
+      "correctIndex": 0,
+      "explanation": "Happens-before is defined purely structurally — sequenced-before within a thread, unioned with the transitive closure of synchronizes-with edges — and says nothing about clocks; two operations can be strictly ordered in time yet unordered by happens-before, which is exactly the racy case. The same-object variant is tempting because per-object coherence does exist, but coherence constrains what a read may return given existing happens-before edges; it does not manufacture one from timing. Every ordering question reduces to naming the release, the acquire, and the fact that the acquire read the release's value.",
+      "sourceAnchor": "2511-happens-before-and-synchronizes-with",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q21",
+      "prompt": "Which of these does the standard specify as creating a synchronizes-with edge?",
+      "options": [
+        "A mutex `unlock()` and a subsequent `lock()` on the same mutex that acquires it.",
+        "Two `memory_order_relaxed` stores to the same atomic object performed by different threads.",
+        "A `std::atomic_signal_fence(memory_order_seq_cst)` executed on each of two different threads.",
+        "Two `memory_order_seq_cst` loads of the same atomic object performed by different threads."
+      ],
+      "correctIndex": 0,
+      "explanation": "Mutex release/acquire is one of the enumerated synchronizes-with sources, alongside thread construction and `join`, `promise::set_value` with `future::get`, `call_once`, latches and semaphores. The pair of seq_cst loads is the most tempting distractor: they do join the single total order S, but two loads write nothing, and an edge always needs a read that observes some write. `atomic_signal_fence` orders only against handlers on the same thread and creates no inter-thread edge whatsoever.",
+      "sourceAnchor": "2511-happens-before-and-synchronizes-with",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q22",
+      "prompt": "Thread A reads 1 from `std::atomic<int> c` using `relaxed`, then reads `c` again with `relaxed`. Can the second read return 0?",
+      "options": [
+        "No — read-read coherence forbids going backwards in one object's modification order within one thread.",
+        "Yes — with `relaxed` there is no ordering between the two loads, so either may observe either value.",
+        "Yes — but only on architectures that are not multi-copy atomic, such as POWER.",
+        "No — but only because the compiler will have coalesced the two relaxed loads into one."
+      ],
+      "correctIndex": 0,
+      "explanation": "Every atomic object has a single modification order that all threads agree on, and the coherence rules hold regardless of memory order, so a thread that has observed a later write cannot subsequently observe an earlier one on that same object. The 'no ordering, so anything goes' answer overgeneralises correctly-remembered advice: relaxed drops cross-object ordering, not per-object coherence. The multi-copy-atomicity distractor is about disagreement between threads over *different* objects, which is a real phenomenon but not this one.",
+      "sourceAnchor": "2512-modification-order-and-coherence",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q23",
+      "prompt": "Under release/acquire only, can thread T observe `x == 1, y == 0` while thread U simultaneously observes `x == 0, y == 1` for two independently written atomics?",
+      "options": [
+        "Yes — the C++ model permits this; only `seq_cst` imposes a total order across distinct objects.",
+        "No — release/acquire already establishes a single global order over all atomic operations.",
+        "No — the modification order of each object is global, so all threads must agree on the interleaving.",
+        "Yes — but only if at least one of the two writes uses `relaxed` rather than `release`."
+      ],
+      "correctIndex": 0,
+      "explanation": "This is IRIW, and the C++ model allows the two observers to disagree under release/acquire; POWER exhibits it, while x86 and ARMv8 are multi-copy atomic and do not, which is exactly what lulls x86-only testers into thinking it is impossible. The modification-order answer states a true fact and draws a false conclusion: the per-object total orders are global, but there is no requirement that they be interleavable into one order consistent with every thread's observations. Making all four operations `seq_cst` forbids it.",
+      "sourceAnchor": "2512-modification-order-and-coherence",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q24",
+      "prompt": "T0 writes `data = 42;` then `count.store(0, release)`. T1 and T2 each do `count.fetch_add(1, relaxed)`. T3 sees `count.load(acquire) == 2` and reads `data`. Is T3's read ordered?",
+      "options": [
+        "Yes — read-modify-writes by any thread extend the release sequence headed by the store, so the acquire still synchronizes with it.",
+        "No — T3 read a value written by a relaxed RMW, not by the release store, so there is no synchronizes-with edge.",
+        "Yes — but only because the two RMWs themselves use `acq_rel`, which chains the ordering forward to T3.",
+        "No — release sequences were removed by P0982 in C++20, so only reading the exact released value synchronizes."
+      ],
+      "correctIndex": 0,
+      "explanation": "The release sequence headed by the store is the maximal contiguous run of the modification order starting there, and RMWs by *any* thread stay inside it, so an acquire reading 2 synchronizes with the original release store and sees `data == 42`. The 'not the released value' answer is exactly the reasoning the release-sequence rule exists to overturn — without it, counting semaphores and reference counts would not compose. P0982 removed only the same-thread relaxed-store clause; the RMW clause is intact.",
+      "sourceAnchor": "2513-release-sequences",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q25",
+      "prompt": "What did P0982 change about release sequences in C++20?",
+      "options": [
+        "It removed the clause letting relaxed stores by the releasing thread extend the sequence, leaving only RMWs.",
+        "It removed the clause letting read-modify-writes by other threads extend the sequence, leaving only same-thread stores.",
+        "It extended sequences to include relaxed stores by any thread, making multi-producer handoffs simpler to write.",
+        "It restricted sequences so that only `seq_cst` operations may extend them, tightening the POWER mapping."
+      ],
+      "correctIndex": 0,
+      "explanation": "The same-thread relaxed-store clause was unimplementable on POWER without extra fences and was found unsound, so it was struck; RMWs by any thread remain the only extenders. Removing the RMW clause instead would be the far more destructive change and is the natural wrong guess if you remember only that something was cut. Practically, `x.store(1, release); x.store(2, relaxed);` with a consumer reading 2 no longer synchronizes — and code relying on it was already broken on POWER.",
+      "sourceAnchor": "2513-release-sequences",
+      "difficulty": "recall"
+    },
+    {
+      "id": "25-q26",
+      "prompt": "What does `std::atomic_thread_fence(std::memory_order_relaxed)` do?",
+      "options": [
+        "Nothing at all — it is a no-op with no compile-time or run-time ordering effect.",
+        "It acts as a compiler barrier, preventing reordering of accesses across it without emitting an instruction.",
+        "It orders relaxed operations against each other while leaving stronger operations free to move.",
+        "It flushes pending store-buffer entries without imposing any ordering on subsequent loads."
+      ],
+      "correctIndex": 0,
+      "explanation": "A relaxed fence imposes no ordering whatever and is simply dead code; the table of fence semantics lists it as a no-op. The compiler-barrier answer is the most tempting because that behaviour genuinely exists in the library — but it belongs to `std::atomic_signal_fence`, which orders against handlers on the same thread and emits zero instructions. Writing a relaxed thread fence usually signals that the author meant acquire, release, or seq_cst.",
+      "sourceAnchor": "2514-atomic-fences",
+      "difficulty": "recall"
+    },
+    {
+      "id": "25-q27",
+      "prompt": "You spin on a flag with relaxed loads and then execute one `atomic_thread_fence(acquire)` after the loop exits, instead of using `ldar`-style acquire loads. Why?",
+      "options": [
+        "It pays the barrier once on exit rather than on every poll, replacing N acquire loads with N plain loads plus one fence.",
+        "It avoids the undefined behaviour of polling an atomic with `relaxed`, which the fence retroactively legalises.",
+        "It is required because relaxed loads inside a loop are not guaranteed to be re-read from memory.",
+        "It is faster on x86 specifically, where an acquire load emits a barrier but an acquire fence does not."
+      ],
+      "correctIndex": 0,
+      "explanation": "The whole point is amortisation: on ARM the loop becomes N cheap `ldr`s plus a single `dmb` on exit, rather than an `ldar` per iteration. The x86-flavoured answer inverts the facts — on x86 both an acquire load and an acquire fence emit no instruction at all, so there is nothing to win there; the technique pays off on weakly ordered hardware. Relaxed polling is also perfectly defined behaviour on its own, which is what makes the fence a pure optimisation rather than a fix.",
+      "sourceAnchor": "2514-atomic-fences",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q28",
+      "prompt": "Where must fences sit for `data = 42; /*F1*/ flag.store(1, relaxed);` in the producer and `while (!flag.load(relaxed)); /*F2*/ r = data;` in the consumer to synchronize?",
+      "options": [
+        "F1 is a release fence before the store and F2 is an acquire fence after the load.",
+        "F1 is an acquire fence before the store and F2 is a release fence after the load.",
+        "F1 is a release fence before the store and F2 is a release fence after the load.",
+        "F1 is an acquire fence after the store and F2 is an acquire fence before the load."
+      ],
+      "correctIndex": 0,
+      "explanation": "A release fence must precede the store it is publishing and an acquire fence must follow the load that observed it; then the release fence synchronizes with the acquire fence even though both atomic accesses are relaxed. Putting the acquire fence before the load is the classic bug and is especially nasty because both fences compile to nothing on x86, so it passes every x86 test and then breaks on ARM. Mixing works too: a release fence plus relaxed store pairs with a plain acquire load, and a release store pairs with a relaxed load plus acquire fence.",
+      "sourceAnchor": "2515-fence-atomic-synchronization",
+      "difficulty": "trap"
+    },
+    {
+      "id": "25-q29",
+      "prompt": "In the Store Buffer test with all accesses relaxed, where do you place `atomic_thread_fence(seq_cst)` to forbid the double-zero outcome?",
+      "options": [
+        "One fence in each thread, between that thread's store and its subsequent load of the other variable.",
+        "One fence in each thread, immediately before that thread's store and after nothing else.",
+        "A single fence in one of the two threads, since a seq_cst fence joins the global total order S.",
+        "One fence in each thread, immediately after that thread's load of the other variable."
+      ],
+      "correctIndex": 0,
+      "explanation": "The reordering being exploited is store-to-load, so the barrier has to sit between the store and the load in each thread — that is exactly what `mfence` does on x86, and it is the standard recipe for buying sequential consistency only where it is needed. The single-fence answer misreads what joining order S buys: a fence constrains only the operations around it, so a thread with no fence is still free to let its own load overtake its own store. A fence placed after both loads constrains nothing that matters here.",
+      "sourceAnchor": "2515-fence-atomic-synchronization",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q30",
+      "prompt": "Kernel-style code places `asm volatile(\"\" ::: \"memory\")` before a store where it needs store-load ordering. What is the defect?",
+      "options": [
+        "A compiler barrier emits no instruction, so it cannot drain the store buffer or restrain the CPU at all.",
+        "The `\"memory\"` clobber only covers objects whose address escaped, so register-promoted locals stay reordered.",
+        "Inline asm with an empty body is discarded by the optimiser, so even the compiler-level barrier is lost.",
+        "The barrier orders stores against stores but places no constraint on loads issued in either direction."
+      ],
+      "correctIndex": 0,
+      "explanation": "Compiler reordering and CPU reordering are independent sources of trouble, and an empty asm with a memory clobber addresses only the first — it emits literally zero instructions, so the store buffer is untouched and store-load reordering survives. The escaped-address answer misstates the clobber's semantics: it tells the compiler the asm may touch any memory, forcing live values to be spilled and reloaded, so it is strictly stronger than described. Using `barrier()` where `smp_mb()` is required is a recurring real-world bug class.",
+      "sourceAnchor": "2516-compiler-barriers-and-cpu-fences",
+      "difficulty": "trap"
+    },
+    {
+      "id": "25-q31",
+      "prompt": "A reviewer proposes replacing `ptr.store(w, release)` with `ptr.store(w, relaxed)` in a publication, arguing x86 never reorders stores. What is the flaw?",
+      "options": [
+        "x86-TSO constrains the hardware, but the compiler may still sink the constructor's stores past the relaxed pointer store.",
+        "x86-TSO permits store-store reordering when the two stores target different cache lines, which is the case here.",
+        "The relaxed store would tear on a 64-bit pointer, exposing a half-written address to the consumer.",
+        "The consumer's acquire load has no matching release, so the relaxed store becomes a data race and is UB."
+      ],
+      "correctIndex": 0,
+      "explanation": "The premise about the hardware is true and the conclusion still fails: on x86 the entire observable effect of writing `release` instead of `relaxed` is on the optimiser, and if the constructor is inlined nothing stops it from moving those initialising stores after the pointer publication. Store-store reordering genuinely is forbidden by x86-TSO, cache line or not, so that distractor contradicts the model. On ARM you additionally lose the hardware guarantee, and the consumer can dereference a pointer to uninitialised memory.",
+      "sourceAnchor": "2517-safe-publication",
+      "difficulty": "trap"
+    },
+    {
+      "id": "25-q32",
+      "prompt": "Classic double-checked locking with a plain `Singleton* instance` has two independent defects. What are they?",
+      "options": [
+        "The unlocked read races the guarded write, and the pointer may become visible before the constructor's stores complete.",
+        "The mutex is acquired in the wrong order relative to the check, and the second check is redundant with the first.",
+        "The allocation may throw while the mutex is held, and the pointer is never reset if construction fails.",
+        "The inner check reads a cached register copy, and the mutex fails to publish the write to other cores."
+      ],
+      "correctIndex": 0,
+      "explanation": "Bug one is a data race — an unsynchronised read concurrent with a write, hence UB in its own right; bug two survives even if you wave away the first, because `new Singleton()` is allocate-construct-assign and nothing stops the assignment becoming visible first, letting a second thread sail through the outer check and use a half-built object. The register-caching answer names a real phenomenon but blames the mutex, which does publish correctly — the inner check under the lock is fine, and can even be `relaxed`. Marking the pointer `volatile` fixes neither, which is what motivated the C++11 memory model.",
+      "sourceAnchor": "2518-double-checked-locking",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q33",
+      "prompt": "What does the fast path of a C++11 magic static — `Singleton& get() { static Singleton s; return s; }` — cost after initialisation?",
+      "options": [
+        "A relaxed load of a guard byte plus a well-predicted branch, so roughly a couple of cycles on x86.",
+        "A call into `__cxa_guard_acquire` on every invocation, which takes and releases a process-wide mutex.",
+        "An `mfence` before the guard check, needed so the initialised object's writes are visible to the caller.",
+        "An uncontended atomic compare-exchange on the guard variable, which costs a locked instruction each call."
+      ],
+      "correctIndex": 0,
+      "explanation": "The Itanium ABI guard is checked with an ordinary load and a branch that predicts perfectly once initialisation is done; `__cxa_guard_acquire` is only entered on the slow path. The per-call guard-acquire answer describes the cost people fear and is why they hand-roll DCL, but it is simply not how the fast path works — correct DCL is not cheaper. On a truly hot path the right move is to eliminate the check entirely with eager `constinit` or `call_once` initialisation at startup.",
+      "sourceAnchor": "2518-double-checked-locking",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q34",
+      "prompt": "Message Passing: T1 does `x = 1; f.store(1, relaxed);` and T2 does `while (!f.load(relaxed)); r = x;`. On which platforms can `r == 0`?",
+      "options": [
+        "On ARM and POWER, where store-store and load-load reordering are permitted; not on x86-TSO hardware.",
+        "On x86 only, since store-to-load is the single reordering that x86-TSO permits.",
+        "On no platform, because the loop guarantees the flag is observed before `x` is read.",
+        "On every platform equally, since relaxed operations carry no ordering by definition anywhere."
+      ],
+      "correctIndex": 0,
+      "explanation": "MP needs store-store ordering in the producer and load-load ordering in the consumer; ARM and POWER supply neither, so the stale read is reachable there, while x86-TSO forbids both and hides the bug. The 'every platform equally' answer confuses the language model with the hardware — the language certainly permits `r == 0`, but the question asks where it is observable, and x86 will not produce it. That gap is exactly why an x86-only test suite passes on code that corrupts data on Graviton.",
+      "sourceAnchor": "2519-memory-model-litmus-tests",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q35",
+      "prompt": "Load Buffer: T1 does `r1 = x.load(relaxed); y.store(1, relaxed);` and T2 does `r2 = y.load(relaxed); x.store(1, relaxed);`. Is `r1 == 1 && r2 == 1` observable on x86?",
+      "options": [
+        "No — x86-TSO forbids load-to-store reordering, so a load cannot be delayed past a following store.",
+        "Yes — this is the same store-buffer effect that makes the Store Buffer test's double-zero outcome reachable.",
+        "No — but only because both operations are relaxed; using acquire loads would make the outcome reachable.",
+        "Yes — relaxed operations may be reordered arbitrarily by the compiler regardless of the hardware model."
+      ],
+      "correctIndex": 0,
+      "explanation": "LB requires the load to move after the store in at least one thread, and store-to-load is the *only* reordering x86-TSO permits, so the outcome is unreachable there while ARM and POWER allow it. Reaching for the store buffer is the natural wrong move: the store buffer explains why the store in SB is delayed past a later load, which is the opposite direction from what LB needs. Strengthening loads to acquire would forbid the outcome further, never enable it.",
+      "sourceAnchor": "2519-memory-model-litmus-tests",
+      "difficulty": "trap"
+    },
+    {
+      "id": "25-q36",
+      "prompt": "Which tool is appropriate for finding a missing `release` in a lock-free queue when your CI runs only on x86?",
+      "options": [
+        "A stateless model checker such as GenMC or CDSChecker, which explores executions against the formal C++ model.",
+        "ThreadSanitizer, whose vector-clock happens-before tracking flags any operation whose memory order is too weak.",
+        "Helgrind, which unlike TSan models the weak hardware orderings that x86 does not exhibit.",
+        "A long randomised stress test under `-O3`, since missing ordering manifests statistically over enough runs."
+      ],
+      "correctIndex": 0,
+      "explanation": "Model checkers exhaustively explore the executions the abstract machine permits, so they surface an ordering bug that x86 hardware would never exhibit; `herd7`/`litmus7` serve the same purpose for litmus fragments. TSan is the most tempting answer because it does track happens-before — but it reports races only between conflicting *executed* accesses, and atomics with insufficient ordering are not races, so it stays silent. Stress testing cannot help either, since the offending interleaving is not reachable on the hardware you are running.",
+      "sourceAnchor": "2519-memory-model-litmus-tests",
+      "difficulty": "application"
+    },
+    {
+      "id": "25-q37",
+      "prompt": "\"An aligned 8-byte store is atomic on x86-64, so I do not need `std::atomic` for this `uint64_t`.\" What is wrong?",
+      "options": [
+        "The hardware guarantee is real but irrelevant — the compiler is free to split the store into two narrower ones.",
+        "x86-64 guarantees single-instruction atomicity only for 4-byte accesses; 8-byte stores require a `lock` prefix.",
+        "The store is atomic but the matching load is not, so the reader can still observe half of the new value.",
+        "Alignment is not guaranteed for `uint64_t` on x86-64, where `alignof(uint64_t)` is only 4 bytes."
+      ],
+      "correctIndex": 0,
+      "explanation": "The claim about the hardware is true and the inference still fails: nothing obliges the compiler to emit one instruction, and it may store a 64-bit constant as two 32-bit `mov`s to avoid a `movabs`, or vectorise a struct copy. Blaming the load side sounds symmetrical but concedes the wrong point — both directions are exposed, and for the same compile-time reason. `std::atomic<T>` never tears, and that is precisely its defining property.",
+      "sourceAnchor": "2520-atomic-tearing-and-alignment",
+      "difficulty": "trap"
+    },
+    {
+      "id": "25-q38",
+      "prompt": "Why is a misaligned `lock`-prefixed read-modify-write on x86 a severe tail-latency hazard?",
+      "options": [
+        "It crosses a cache line, so the CPU asserts a bus lock and stalls every core on the system for microseconds.",
+        "It raises an alignment fault that the kernel emulates in software, costing one trap per access on the faulting core.",
+        "It forces the line into Modified state on two cache lines at once, doubling the coherence traffic per operation.",
+        "It disables the store buffer for the duration of the instruction, serialising the issuing core's later stores."
+      ],
+      "correctIndex": 0,
+      "explanation": "Cache-line locking only works when the access fits inside one line; otherwise the CPU falls back to a full bus lock, which is a system-wide stall measured in microseconds and can blow a trading box's latency budget by orders of magnitude. Linux exposes `split_lock_detect=warn|fatal` for exactly this. The trap-and-emulate answer describes AArch64 behaviour, which faults outright on misaligned exclusives rather than degrading silently — the x86 failure mode is worse precisely because it stays functional.",
+      "sourceAnchor": "2520-atomic-tearing-and-alignment",
+      "difficulty": "recall"
+    },
+    {
+      "id": "25-q39",
+      "prompt": "Which claim about `volatile int flag;` used as a cross-thread synchronisation flag is correct?",
+      "options": [
+        "It prevents the compiler eliding the access, but adds no barriers, no indivisibility, and does not remove the race.",
+        "It prevents the compiler eliding the access and orders it against surrounding non-volatile accesses on all compilers.",
+        "It emits acquire semantics on loads and release semantics on stores, as the ISO standard specifies for volatile.",
+        "It makes `flag++` indivisible, since volatile forbids the compiler from splitting the access into separate steps."
+      ],
+      "correctIndex": 0,
+      "explanation": "Volatile means only that the access may not be elided, duplicated, cached, or reordered with other volatile accesses; it emits no barriers, does not make `flag++` anything other than load-add-store, and leaves the data race — and therefore the UB — fully intact. The acquire/release answer is true only under MSVC's `/volatile:ms`, a legacy extension that is the default on x86/x64 Windows, which is why so much Windows code appears to work and is unportable. Use `std::atomic<T>` with relaxed instead: on x86 it emits the identical `mov`.",
+      "sourceAnchor": "2521-volatile-is-not-synchronization",
+      "difficulty": "recall"
+    },
+    {
+      "id": "25-q40",
+      "prompt": "Two threads each hold their own `std::shared_ptr<Widget>` copy referring to one object. A third pattern has two threads reading and writing a single shared `shared_ptr` instance. Which is safe without extra synchronisation?",
+      "options": [
+        "Only the distinct-copies case — the control block's refcount is atomic, but the two-pointer object itself is not.",
+        "Only the single-instance case — the control block serialises all operations that touch the same object.",
+        "Both, because every `shared_ptr` operation is internally serialised by the control block's atomic refcount.",
+        "Neither, because copying any `shared_ptr` mutates a refcount that is only atomic under `std::atomic_ref`."
+      ],
+      "correctIndex": 0,
+      "explanation": "Distinct `shared_ptr` objects sharing a control block may be copied and destroyed concurrently because the refcount is atomic; one instance read and written concurrently is a data race, since the object is two independent pointers and a reader can see a mismatched pair or increment a control block being destroyed. The 'both are safe' answer overextends the genuine refcount guarantee to the handle itself, which is the single most common misreading. `std::atomic<std::shared_ptr<T>>` (C++20) fixes it correctly, but is almost always spinlock-backed and too slow for a hot path.",
+      "sourceAnchor": "2522-atomic-shared-pointers",
+      "difficulty": "application"
+    }
+  ]
+}

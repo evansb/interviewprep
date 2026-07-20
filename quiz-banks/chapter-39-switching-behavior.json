@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-39-switching-behavior",
+  "questions": [
+    {
+      "id": "39-q01",
+      "prompt": "What is the defining latency cost of store-and-forward switching?",
+      "options": [
+        "The frame must be fully serialized in before any of it is serialized out, so port-to-port latency grows with frame size.",
+        "The frame is forwarded once the destination MAC has arrived, so port-to-port latency is a constant independent of frame size.",
+        "The frame is held only until the first 64 bytes arrive, so port-to-port latency is fixed at the minimum-frame threshold.",
+        "The frame is buffered only when the egress port is already busy, so port-to-port latency depends purely on contention."
+      ],
+      "correctIndex": 0,
+      "explanation": "Store-and-forward buffers the whole frame so it can validate the trailing FCS before forwarding, which costs one full serialization delay of the frame at the ingress rate plus lookup and fabric time. The tempting answer is the one describing forwarding after the destination MAC with constant latency — that is cut-through, and the frame-size dependence is precisely what distinguishes the two modes. Waiting for the first 64 bytes describes fragment-free, a third mode.",
+      "sourceAnchor": "391-store-and-forward-switching",
+      "difficulty": "recall"
+    },
+    {
+      "id": "39-q02",
+      "prompt": "On a 10 GbE switch sold as cut-through you measure 1.90 µs port-to-port with 64-byte frames and 3.06 µs with 1500-byte frames. What does the measurement tell you?",
+      "options": [
+        "It is store-and-forward on that path: the ~1.16 µs delta is exactly the serialization difference between those frame sizes at 10 G.",
+        "It is cut-through under load: the ~1.16 µs delta is queueing from other traffic that happened to coincide with the large frames.",
+        "It is cut-through as advertised: cut-through latency also rises with frame length because the pipeline is deeper for long frames.",
+        "It is a layer-1 crosspoint path: the ~1.16 µs delta is the per-byte replication cost the crosspoint pays at 10 G."
+      ],
+      "correctIndex": 0,
+      "explanation": "The chapter's diagnostic is to diff a 64-byte and a 1500-byte measurement: a cut-through path shows a flat difference of a few nanoseconds, while store-and-forward shows the full serialization delta, about 1.16 µs at 10 G. The queueing explanation is the most tempting because contention really can add microseconds, but contention is random and would not reproduce a delta that matches the serialization arithmetic so exactly. Cut-through latency is frame-size independent by construction, and a layer-1 device forwards bits without parsing at 4–5 ns.",
+      "sourceAnchor": "391-store-and-forward-switching",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q03",
+      "prompt": "A flow enters a cut-through switch on a 10 G port and leaves on a 1 G port. Why is this flow always store-and-forwarded?",
+      "options": [
+        "Any ingress/egress rate step-down forces store-and-forward, because the switch cannot cut through across a speed mismatch.",
+        "The 1 G port negotiates a half-duplex fallback, and half-duplex links require fragment-free rather than cut-through forwarding.",
+        "The FCS must be recomputed whenever the line rate changes between ports, and that computation needs the entire frame.",
+        "The interpacket gap is a different number of bytes at 1 G than at 10 G, so the frame must be re-framed inside a buffer."
+      ],
+      "correctIndex": 0,
+      "explanation": "A speed mismatch between ingress and egress makes cut-through impossible for that flow, and this is the single most common reason a switch advertised as cut-through silently behaves as store-and-forward. The FCS answer is the tempting one because store-and-forward really does validate the FCS — but that is a consequence of already having the whole frame, not a rate-change requirement, and the FCS covers frame contents that the rate change does not touch. The interpacket gap is 12 bytes at every Ethernet rate.",
+      "sourceAnchor": "391-store-and-forward-switching",
+      "difficulty": "trap"
+    },
+    {
+      "id": "39-q04",
+      "prompt": "A layer-1 switch achieves ~4–5 ns port-to-port. What is it unable to do as a direct consequence of that design?",
+      "options": [
+        "Make forwarding decisions, detect frame errors, or arbitrate contention, because it replicates the bit stream without parsing it.",
+        "Replicate one input to many outputs, because a crosspoint holds a single path at a time and needs an L2 stage for fan-out.",
+        "Carry frames larger than the standard 1500-byte MTU, because the crosspoint stages exactly one maximum-size frame.",
+        "Reach latencies under 100 ns on optical ports, because the retiming and reclocking stage costs several hundred nanoseconds."
+      ],
+      "correctIndex": 0,
+      "explanation": "A layer-1 device is an electrical or optical crosspoint that copies bits, so it has no view of frame boundaries, headers, or the FCS — which is exactly why it costs nanoseconds rather than hundreds of nanoseconds. The fan-out answer inverts the device's whole purpose: one-source-to-many fan-out of an exchange multicast feed is its standard colo role, and contention is impossible there by construction. Frame size is irrelevant to a device that never delimits frames.",
+      "sourceAnchor": "392-cut-through-switching",
+      "difficulty": "recall"
+    },
+    {
+      "id": "39-q05",
+      "prompt": "You need under 150 ns port-to-port on a 10 GbE path that must still make L2/L3 forwarding decisions and enforce an ACL. Which device class fits?",
+      "options": [
+        "An Exablaze / Cisco Nexus 3550-F class ultra-low-latency L2/L3 switch, at roughly 95–120 ns port-to-port.",
+        "A Cisco Nexus 3548 running Algo Boost warp mode, at roughly 190–250 ns port-to-port for minimum-size frames.",
+        "An Arista 7130 / Metamako layer-1 crosspoint device, at roughly 4–5 ns port-to-port with deterministic per-port latency.",
+        "An Arista 7150S built on Fulcrum Alta silicon, at roughly 350 ns port-to-port for minimum-size frames on one ASIC."
+      ],
+      "correctIndex": 0,
+      "explanation": "The 3550-F / Exablaze class is the fastest device in the chapter's table that still parses headers and forwards at L2/L3, landing inside the 150 ns budget. The layer-1 option is the trap: 4–5 ns is far faster, but a crosspoint cannot parse a frame at all, so it can neither forward on address nor apply an ACL. Warp mode at 190–250 ns and the 7150S at ~350 ns both do the right kind of work but miss the stated budget.",
+      "sourceAnchor": "392-cut-through-switching",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q06",
+      "prompt": "Two ingress ports on a cut-through switch begin sending frames toward the same idle egress port at the same instant. What happens?",
+      "options": [
+        "One frame is queued for the duration of the other's serialization; cut-through removes the store step, not the queue.",
+        "Both frames are forwarded concurrently, because a non-blocking crossbar allows simultaneous delivery to one egress port.",
+        "The switch reverts to store-and-forward for both ingress ports until the contending burst has completely cleared.",
+        "The later frame is discarded immediately, because a shallow-buffer cut-through switch has no egress queue to hold it."
+      ],
+      "correctIndex": 0,
+      "explanation": "An egress port transmits exactly one frame at a time, so the loser of the arbitration waits in the egress queue for the winner's serialization time — cut-through eliminates the store step, never the queue. The non-blocking crossbar answer is the tempting one because the fabric genuinely is non-blocking on modern silicon; the bottleneck is the single egress serializer downstream of it, not the fabric. Shallow-buffer switches do have egress queues; shallow means small, not absent.",
+      "sourceAnchor": "392-cut-through-switching",
+      "difficulty": "trap"
+    },
+    {
+      "id": "39-q07",
+      "prompt": "How much wire time does a minimum-size 64-byte Ethernet frame consume on a 10 GbE link?",
+      "options": [
+        "67.2 ns — 84 bytes on the wire (672 bits) once the preamble, SFD and interpacket gap are counted.",
+        "51.2 ns — 64 bytes on the wire (512 bits), since the frame size already includes all framing overhead.",
+        "60.8 ns — 76 bytes on the wire (608 bits), counting the preamble and SFD but not the interpacket gap.",
+        "70.4 ns — 88 bytes on the wire (704 bits), counting a 24-byte framing overhead per transmitted frame."
+      ],
+      "correctIndex": 0,
+      "explanation": "A frame occupies 7 bytes of preamble, 1 byte of SFD, the 64-byte frame itself and 12 bytes of interpacket gap: 84 bytes, 672 bits, 67.2 ns at 10 Gbps. The 51.2 ns answer is the classic interview slip — it computes from frame size alone and omits the 20 bytes of framing overhead that software never sees and that dominates for small packets. The overhead is 20 bytes, not 12 and not 24.",
+      "sourceAnchor": "393-serialization-delay",
+      "difficulty": "recall"
+    },
+    {
+      "id": "39-q08",
+      "prompt": "One 64-byte market-data packet crosses 30 m of fibre and one 10 G cut-through switch (~350 ns). What is the wire-to-wire floor before the receiving NIC does anything?",
+      "options": [
+        "≈630 ns — 67 ns serialization at the source, 150 ns propagation, 350 ns switch, 67 ns re-serialization on egress.",
+        "≈500 ns — 350 ns switch plus 150 ns propagation, because the source's serialization is already inside the switch figure.",
+        "≈420 ns — 67 ns serialization plus 350 ns switch, because propagation over 30 m of fibre is negligible at this scale.",
+        "≈980 ns — 350 ns switch plus 150 ns propagation plus a 480 ns store-and-forward penalty for the minimum-size frame."
+      ],
+      "correctIndex": 0,
+      "explanation": "Serialization is paid per hop and propagation per metre: 67 ns in at the source NIC, 30 m at ~5 ns/m is 150 ns, 350 ns through the switch, and the switch re-serializes on egress for another 67 ns. The answer that drops the source serialization is the tempting one, since datasheet port-to-port figures do include the switch's internal handling — but they do not include the sender clocking its own bits onto the wire. Fibre propagation at 5 ns/m is not negligible: 30 m already exceeds two serialization times.",
+      "sourceAnchor": "393-serialization-delay",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q09",
+      "prompt": "Your 64-byte order frame reaches an egress port at 10 G that has just begun transmitting a 9000-byte jumbo frame. What is the worst-case wait?",
+      "options": [
+        "About 7.2 µs — the full serialization of the jumbo frame, because a switch will not preempt a frame mid-transmission.",
+        "About 1.23 µs — the serialization of one maximum-size standard frame, which is the bound on any single blocking event.",
+        "About 720 ns — the jumbo frame's serialization time, since egress ports clock jumbo payloads at a boosted rate.",
+        "Essentially zero — 802.3br frame preemption suspends the jumbo frame at the next fragment boundary for the order."
+      ],
+      "correctIndex": 0,
+      "explanation": "9000 bytes at 10 G is 7.2 µs, and Ethernet transmits a frame to completion, so the small urgent frame inherits the whole jumbo transmission as blocking delay — this is why trading networks standardize on a 1500-byte MTU on hot paths. The preemption answer is tempting because 802.3br genuinely exists, but it is essentially absent from datacenter switches, so the inference that it saves you does not follow. 1.23 µs is the 1500-byte figure, and 720 ns is the jumbo figure at 100 G, not 10 G.",
+      "sourceAnchor": "393-serialization-delay",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q10",
+      "prompt": "In production, what dominates the variance in a datacenter switch's port-to-port latency?",
+      "options": [
+        "Output-port contention — frames queued behind other frames destined for the same egress port.",
+        "Forwarding-decision time — variability in the MAC and route lookup as table occupancy changes.",
+        "FCS validation — the CRC-32 check whose cost varies with the contents of each arriving frame.",
+        "Crossbar arbitration — contention inside the non-blocking fabric between ingress-side schedulers."
+      ],
+      "correctIndex": 0,
+      "explanation": "The datasheet number is the unloaded figure; in production the variance comes from an egress port that drains at rate R while N ingress ports may offer N×R to it, so frames wait for everything queued ahead of them. Crossbar arbitration is the most tempting alternative because a scheduler is genuinely involved, but modern fabrics are non-blocking and the fabric is not the bottleneck — the single egress serializer is. Lookup and CRC cost are fixed pipeline stages, not sources of microsecond-scale spread.",
+      "sourceAnchor": "394-switch-output-port-contention",
+      "difficulty": "recall"
+    },
+    {
+      "id": "39-q11",
+      "prompt": "Your frame arrives at a 10 G egress queue that already holds ten 1500-byte frames. How much delay does the backlog add, relative to the switch's own 350 ns forwarding latency?",
+      "options": [
+        "About 12 µs — ten frames at 1.23 µs each — roughly 35× the switch's own forwarding latency.",
+        "About 3.5 µs — the switch's 350 ns forwarding latency applied once for each of the ten queued frames.",
+        "About 1.23 µs — one frame time, because the eight per-class egress queues drain the backlog in parallel.",
+        "About 350 ns — unchanged, because cut-through overlaps queued frames with the frame currently in flight."
+      ],
+      "correctIndex": 0,
+      "explanation": "Queueing delay is simply the serialization time of everything ahead of you: each 1500-byte frame costs 1.23 µs at 10 G, so ten of them is 12 µs and dwarfs the 350 ns forwarding latency by about 35×. The parallel-queues answer is the tempting one because per-class queues do exist, but they share one egress serializer — the scheduler chooses which queue drains next, it does not drain several at once. Cut-through overlaps the head and tail of a single frame, not distinct queued frames.",
+      "sourceAnchor": "394-switch-output-port-contention",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q12",
+      "prompt": "Market data is in a strict-priority class on a shared 10 G egress port, with bulk traffic in a DWRR class beneath. What residual blocking can a market-data frame still suffer?",
+      "options": [
+        "Exactly one frame — whatever is already being transmitted on the wire when it arrives, which is the anti-jumbo argument.",
+        "Zero — strict priority preempts the frame in flight at the next byte boundary and transmits the high-priority frame first.",
+        "One frame from each of the eight class queues, because the scheduler visits every non-empty queue once per service cycle.",
+        "One full DWRR cycle of the lower classes, since the weights must be honoured before priority traffic can be served."
+      ],
+      "correctIndex": 0,
+      "explanation": "Strict priority always drains the highest non-empty class, so a market-data frame is blocked only by the frame currently on the wire — which is exactly why the maximum frame size on that port matters and why jumbo frames are banned on hot paths. The preemption answer is the tempting near-miss: scheduling decisions happen between frames, and Ethernet does not interrupt a transmission in progress. The DWRR-cycle and round-robin answers describe weighted schedulers, which is what strict priority deliberately is not.",
+      "sourceAnchor": "394-switch-output-port-contention",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q13",
+      "prompt": "A congested egress queue uses tail-drop. Which behaviour does that specifically cause, and what fixes it?",
+      "options": [
+        "TCP global synchronization — many flows lose a packet at once and halve their windows together, sawtoothing utilization; WRED/ECN desynchronizes them.",
+        "TCP global synchronization — WRED's probabilistic drops land on all flows within one averaging interval; reverting to tail-drop restores independence.",
+        "TCP global synchronization — ECN marks every packet resident in the queue at the moment of overflow; disabling ECN restores independence.",
+        "TCP global synchronization — strict priority starves the lower classes in lockstep at each overflow; adding DWRR beneath restores independence."
+      ],
+      "correctIndex": 0,
+      "explanation": "Tail-drop discards on overflow, so every flow with a packet in the queue at that instant takes a loss simultaneously and they all back off together, producing the characteristic utilization sawtooth. RED/WRED is the fix, not the cause: it drops probabilistically as average depth rises, so flows are hit at different times, and ECN goes further by marking rather than dropping, which is the basis of DCTCP and DCQCN. Starvation under strict priority is a real risk but it is an ordering effect between classes, not synchronized window collapse.",
+      "sourceAnchor": "394-switch-output-port-contention",
+      "difficulty": "trap"
+    },
+    {
+      "id": "39-q14",
+      "prompt": "What is a network microburst?",
+      "options": [
+        "A period, typically 10 µs to a few milliseconds, when instantaneous arrival rate exceeds the egress line rate despite low average utilization.",
+        "A period of several seconds when offered load exceeds the egress line rate, which any 30-second SNMP utilization sample will reveal.",
+        "A burst of TCP retransmissions following a congestion event, measured over the connection's round-trip time on the affected path.",
+        "A brief collapse in achievable line rate caused by PAUSE frames arriving from a downstream receiver whose buffer is filling."
+      ],
+      "correctIndex": 0,
+      "explanation": "A microburst is a sub-millisecond-to-millisecond excursion to line rate that averaging hides completely, which is why a link reported at 15% utilization can be dropping packets. The multi-second answer is tempting because it describes real congestion, but anything visible in a 30-second SNMP sample is ordinary oversubscription, not the phenomenon that breaks naive capacity planning. Retransmission bursts and PAUSE-induced stalls are downstream consequences of congestion, not the definition of the burst itself.",
+      "sourceAnchor": "395-network-microbursts",
+      "difficulty": "recall"
+    },
+    {
+      "id": "39-q15",
+      "prompt": "A 10 GbE port shows 1.5 Gbps average utilization on SNMP and is dropping packets. What is the most likely explanation?",
+      "options": [
+        "It can be idle for 850 ms and at full 10 G line rate for 150 ms; anything offered above line rate during the burst queues and then drops.",
+        "SNMP counts only bytes that were successfully transmitted, so the real offered average is near 10 G and the port is simply oversubscribed.",
+        "Queueing cannot occur below 50% mean load, so the losses must be FCS errors from a marginal optic rather than congestion drops.",
+        "The 1.5 Gbps average already exceeds the ASIC's shared-pool alpha allowance for that port, so the buffer manager drops preemptively."
+      ],
+      "correctIndex": 0,
+      "explanation": "Average utilization says nothing about the instantaneous arrival pattern: the same 1.5 Gbps average is consistent with long idle stretches punctuated by full-rate bursts, and the buffer only ever sees the instantaneous rate. The SNMP-undercount answer is the tempting one because drops really are invisible in a transmitted-bytes counter, but a 15% reading cannot conceal a 10 G sustained average — the discrepancy is timescale, not accounting. Queueing has no 50% threshold, and alpha caps a port's share of the shared pool, not its average rate.",
+      "sourceAnchor": "395-network-microbursts",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q16",
+      "prompt": "A switch port has 10 MB of buffer available at 10 G. What sampling granularity do you need to actually observe what fills it?",
+      "options": [
+        "Sub-millisecond — the buffer drains in about 8 ms at 10 G, so the filling event is shorter than that.",
+        "About 30 seconds — matching the SNMP poll interval that already reported the port's average utilization.",
+        "About one second — microbursts last a few hundred milliseconds, so per-second counters resolve them adequately.",
+        "Once per round-trip time — bursts are congestion-window artifacts and are therefore paced by the RTT."
+      ],
+      "correctIndex": 0,
+      "explanation": "The granularity you need is roughly the buffer drain time: 10 MB at 10 G is about 8 ms of drain, so the event that filled it is shorter still and only sub-millisecond sampling can see it. This is what LANZ-class microsecond queue-depth telemetry provides, and what a hardware-timestamped capture reconstructs offline from per-packet arrival deltas. The per-second answer is tempting but assumes hundreds-of-milliseconds bursts, whereas the defining timescale starts around 10 µs.",
+      "sourceAnchor": "395-network-microbursts",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q17",
+      "prompt": "Why is TSO/GSO left enabled on a latency-critical transmit path a microburst source?",
+      "options": [
+        "A 64 KB segment handed to the NIC becomes a back-to-back burst of MTU frames occupying the egress port for ~54 µs at 10 G.",
+        "TSO holds application writes until a 64 KB buffer has filled, so each write inherits up to 54 µs of sender-side queueing delay.",
+        "TSO emits frames larger than the path MTU onto the wire, forcing every switch on the path into store-and-forward for that flow.",
+        "TSO suppresses the interpacket gap between segments, so downstream switches must re-frame each segment in an ingress buffer."
+      ],
+      "correctIndex": 0,
+      "explanation": "Segmentation offload converts smoothly-paced application writes into wire-level bursts: the NIC emits the whole segment as back-to-back MTU frames, monopolizing the egress port for about 54 µs at 10 G and blocking anything queued behind it. The sender-side-buffering answer is the tempting one because it also produces a 54 µs figure, but the delay is imposed on other traffic at the egress port, not on the offloading writer waiting for its buffer to fill. TSO never puts oversize frames or gapless frames on the wire — segmentation produces legal MTU-sized frames.",
+      "sourceAnchor": "395-network-microbursts",
+      "difficulty": "trap"
+    },
+    {
+      "id": "39-q18",
+      "prompt": "What does adding switch buffer actually buy you under sustained overload?",
+      "options": [
+        "Nothing structural — buffer converts a drop into a delay; if offered load exceeds egress capacity for long enough you drop anyway.",
+        "Extra effective drain rate — a deep buffer lets the egress scheduler clock queued frames out faster than the nominal line rate.",
+        "Removal of queueing latency — absorbing the burst off the critical path lets subsequent frames be forwarded at unloaded latency.",
+        "Additional isolation — a deeper pool lets the scheduler maintain more traffic classes, so critical flows stop sharing a queue."
+      ],
+      "correctIndex": 0,
+      "explanation": "Buffer does not create bandwidth; it only trades loss for delay, and whether that trade is good depends entirely on the traffic — deep buffers help TCP bulk transfer, where a drop costs a retransmit RTT plus window collapse, and hurt market data, where a stale packet is worthless. The isolation answer is the tempting one because class isolation is a real lever, but it comes from the scheduling discipline and the per-class queue structure, not from the size of the pool. Nothing makes a port drain faster than its line rate.",
+      "sourceAnchor": "396-shallow-and-deep-switch-buffers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "39-q19",
+      "prompt": "A deep-buffer switch on your market-data path absorbs a burst and delivers a multicast packet 20 ms late instead of dropping it. Why is that outcome worse?",
+      "options": [
+        "The data is stale and the market has moved; A/B arbitration would have supplied the other copy long before 20 ms elapsed.",
+        "The delay is fine for the book builder, but the 20 ms of buffer occupancy blocks IGMP snooping from refreshing group state.",
+        "It is actually better: an exchange retransmit request costs well over 20 ms, so absorbing the burst beats requesting recovery.",
+        "It is neutral: the feed handler's reorder window absorbs the late packet, so no gap is declared and no recovery is triggered."
+      ],
+      "correctIndex": 0,
+      "explanation": "For market data a delayed packet is worthless — a price 20 ms old cannot be traded on — so you would rather drop it and let A/B arbitration deliver the disjoint copy, which arrives on the order of microseconds rather than milliseconds. The retransmit-cost answer is tempting because that reasoning is genuinely correct for TCP bulk transfer, but it does not transfer to a feed with a redundant path already carrying the same sequence number. Reorder windows are sized in packets or tens of microseconds, nowhere near 20 ms.",
+      "sourceAnchor": "396-shallow-and-deep-switch-buffers",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q20",
+      "prompt": "An unrelated bulk transfer congests one port on a shared-buffer ASIC, and your market-data port on the same chip starts dropping. What is the mechanism?",
+      "options": [
+        "The congested port's alpha lets it claim a large share of the dynamic shared pool, leaving too little for the market-data port.",
+        "Alpha caps total on-chip buffer, so a congested port raises the chip-wide limit and shrinks every other port's reservation.",
+        "Alpha sets the WRED drop-probability slope, so a congested port steepens the curve applied to all other ports on the chip.",
+        "Alpha reserves per-class PFC headroom, so a congested port consumes the headroom other ports need to remain lossless."
+      ],
+      "correctIndex": 0,
+      "explanation": "Most ASICs give each port a small dedicated reservation plus access to a large dynamic shared pool, and alpha caps how much of that pool one congested port may take — set high, a single port starves the others, which is exactly this failure. Lowering alpha on non-critical ports is the standard hardening step. The PFC-headroom answer is the tempting one because headroom reservations really do consume large amounts of a shallow-buffer chip, but headroom is a separate per-port-per-class reservation for lossless operation, not the shared-pool occupancy cap.",
+      "sourceAnchor": "396-shallow-and-deep-switch-buffers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "39-q21",
+      "prompt": "Under uniform random traffic, a pure input-queued switch with one FIFO per ingress port saturates at what throughput, and why?",
+      "options": [
+        "58.6% — the front frame of each input FIFO blocks everything behind it whenever its target egress is busy.",
+        "58.6% — the crossbar matching algorithm can pair at most that fraction of ingress ports per scheduling cycle.",
+        "58.6% — the per-class queue structure limits each input to that share once all eight traffic classes are active.",
+        "58.6% — the header parse in cut-through mode cannot be pipelined, capping the forwarding engine at that rate."
+      ],
+      "correctIndex": 0,
+      "explanation": "The Karol/Hluchyj result, 2 − √2, comes from head-of-line blocking in a single FIFO per input: the frame at the head waits for its egress, and frames behind it destined for idle egress ports wait too. That is why no modern switch is purely input-queued — VOQ gives each ingress a separate queue per egress and recovers close to 100% throughput. The crossbar-matching answer is the tempting one because a matching scheduler is genuinely part of VOQ designs, but a maximal matching over VOQs is what removes the limit rather than what imposes it.",
+      "sourceAnchor": "397-switch-head-of-line-blocking",
+      "difficulty": "recall"
+    },
+    {
+      "id": "39-q22",
+      "prompt": "Frames queued for an idle egress port are stalled behind a frame whose egress port is congested. What distinguishes this from ordinary output contention?",
+      "options": [
+        "In head-of-line blocking the stalled frames are destined somewhere that is not congested, so the delay is pure structural waste.",
+        "In head-of-line blocking the stalled frames share the congested egress port, so the delay reflects real bandwidth scarcity.",
+        "In head-of-line blocking many senders converge on one receiver, so the delay grows with the number of simultaneous sources.",
+        "In head-of-line blocking a downstream pause propagates upstream, so the delay requires priority flow control to be enabled."
+      ],
+      "correctIndex": 0,
+      "explanation": "The defining feature of head-of-line blocking is that the blocked traffic could have been forwarded — its destination is idle — so the queue structure, not the bandwidth, is the constraint. The answer describing frames sharing the congested egress is exactly ordinary contention, which is the distinction being tested. Many-senders-to-one-receiver is incast, and upstream pause propagation is PFC-induced congestion spreading, which is one specific variant of HOL blocking rather than its definition.",
+      "sourceAnchor": "397-switch-head-of-line-blocking",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q23",
+      "prompt": "A multicast group is replicated to 30 subscriber ports and one subscriber's port becomes congested. On cheaper ASIC silicon, what happens?",
+      "options": [
+        "Replication stalls behind the congested port, so delivery degrades for all 30 subscribers rather than just the congested one.",
+        "The payload is physically duplicated 30 times in buffer, so the congested copy exhausts the shared pool and drops the group.",
+        "The frame is discarded for the whole group as soon as any one egress queue for that group reaches its drop threshold.",
+        "IGMP snooping withdraws the congested port from the group until its queue drains, protecting the other 29 subscribers."
+      ],
+      "correctIndex": 0,
+      "explanation": "The replication engine holds its replication resource until the fan-out completes, and silicon that does not decouple per-egress replication queues lets one congested subscriber stall delivery to everyone else — a genuinely nasty and hard-to-attribute market-data failure. The duplication answer is tempting because fan-out sounds expensive, but the ASIC writes the frame to buffer once and enqueues only a per-port descriptor to each egress, so replication is cheap in internal bandwidth. IGMP snooping tracks group membership; it does not react to queue depth.",
+      "sourceAnchor": "397-switch-head-of-line-blocking",
+      "difficulty": "trap"
+    },
+    {
+      "id": "39-q24",
+      "prompt": "A single TCP connection runs over a 4×10 G LAG. What bandwidth can it achieve, and why?",
+      "options": [
+        "10 G — the 5-tuple hash pins every packet of the flow to one member, because splitting it would reorder the stream.",
+        "40 G — the LAG presents one logical link and the sending switch stripes the flow's frames across all four members.",
+        "20 G — 802.3ad permits a flow to occupy two members before the reordering risk is considered unacceptable.",
+        "30 G — one member is held in reserve for LACP control traffic, so a flow may use the remaining three members."
+      ],
+      "correctIndex": 0,
+      "explanation": "Both LAG and ECMP choose a member by hashing header fields, and hashing rather than round-robin is chosen precisely so that all packets of a flow follow one path and arrive in order — the price is that one flow never exceeds one member's rate. The 40 G answer is what candidates get dinged for: aggregate capacity is 40 G, but it is only reachable with many flows. LACP control traffic is negligible and reserves no member, and there is no two-member allowance in the standard.",
+      "sourceAnchor": "398-ecmp-and-lag-hashing",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q25",
+      "prompt": "You add a fifth member to a 4-member LAG carrying TCP traffic. What is the immediate effect, and what prevents it?",
+      "options": [
+        "N changes, so hash mod N remaps most flows and produces a reordering burst and spurious fast retransmits; resilient hashing avoids it.",
+        "Only flows that would newly hash to the added member move, so existing flows keep their paths and no reordering occurs at all.",
+        "Existing flows stay pinned by MAC learning and only newly established flows can select the added member, so nothing reorders.",
+        "LACP drains the member queues before rebalancing, so flows are redistributed evenly without any packets arriving out of order."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because member selection is `hash mod N`, changing N changes the result for most flows at once, so a large fraction of the traffic switches to a path with different latency and reorders — on TCP that shows up as a wave of spurious fast retransmits. Resilient (consistent) hashing exists specifically for this: it uses a lookup table remapped only for the affected member's flows. The answer claiming only newly-hashing flows move describes what resilient hashing achieves, not what plain modulo hashing does.",
+      "sourceAnchor": "398-ecmp-and-lag-hashing",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q26",
+      "prompt": "In a Clos fabric, every switch uses the same hash function, seed, and field set. What is the consequence?",
+      "options": [
+        "Flows that collide onto one member at one tier collide again at every subsequent tier, so imbalance compounds instead of averaging out.",
+        "Flows are rehashed independently at each tier, so packets of one flow diverge across tiers and arrive at the receiver reordered.",
+        "Collisions cannot persist, because equal-cost paths in a Clos fabric are by construction interchangeable for any given flow.",
+        "Collisions are resolved at the spine, because spine switches load-balance per packet rather than per flow across their uplinks."
+      ],
+      "correctIndex": 0,
+      "explanation": "Identical hashing across tiers correlates the outcomes: two flows that land on the same member at the leaf will land together again at the spine, so a bad placement is repeated rather than smoothed out — vendors mitigate with per-device hash seeds, and verifying that seeds actually differ is a real troubleshooting step. The rehashing-and-reordering answer is tempting because rehashing does cause reordering, but a stable per-tier hash keeps a flow on one path at each tier; reordering comes from topology changes, not from consistent hashing.",
+      "sourceAnchor": "398-ecmp-and-lag-hashing",
+      "difficulty": "trap"
+    },
+    {
+      "id": "39-q27",
+      "prompt": "A TCP flow's throughput is capped, `netstat -s` shows rising retransmits and DSACK counts, and interface error and drop counters are clean. What is happening?",
+      "options": [
+        "Persistent mild reordering is triggering fast retransmit on three dup-ACKs, halving the window even though nothing was lost.",
+        "A switch buffer is overflowing; the drops occur mid-path, so they never appear in either host's interface counters.",
+        "Frames are failing FCS at the far-end NIC and being discarded there, which the local interface counters cannot observe.",
+        "The receiving application is slow, so the advertised window collapses and throttles the sender without any packet loss."
+      ],
+      "correctIndex": 0,
+      "explanation": "DSACK is the decisive clue: it reports a segment received twice, which means the retransmission was unnecessary — the original arrived, just late. Reordering therefore caps throughput with zero packet loss, and RACK-TLP or a tuned `net.ipv4.tcp_reordering` is the mitigation. The mid-path buffer overflow answer is the tempting one because switch drops genuinely are invisible to host counters, but real loss produces no DSACKs. Receiver-window throttling would suppress throughput without generating retransmissions at all.",
+      "sourceAnchor": "399-packet-reordering",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q28",
+      "prompt": "Which reordering source lives on the receiving host rather than in the network?",
+      "options": [
+        "RSS steering packets of one flow to different queues, or RPS/RFS migrating a flow between cores mid-stream.",
+        "Interrupt coalescing, which batches completions and hands packets up the stack in a different order than they arrived.",
+        "NAPI polling, which drains each receive ring in descriptor order rather than in packet arrival order across rings.",
+        "Hardware timestamping, which reorders the receive queue so packets are delivered sorted by their capture timestamps."
+      ],
+      "correctIndex": 0,
+      "explanation": "Receiver-side multi-queue steering is a genuine and frequently overlooked reordering source: if RSS hashes a flow's packets across queues, or RPS/RFS moves the flow between cores, packets can be delivered out of order with no network involvement. Interrupt coalescing is the tempting distractor because it does perturb timing and does create wire bursts on transmit, but it batches delivery without changing order within a ring. Timestamping only stamps arrival time; it never resequences anything.",
+      "sourceAnchor": "399-packet-reordering",
+      "difficulty": "recall"
+    },
+    {
+      "id": "39-q29",
+      "prompt": "Beyond loss masking, what is the second benefit of subscribing to both the A and B copies of an exchange multicast feed?",
+      "options": [
+        "You receive the minimum of two arrival times, so the effective latency distribution tightens even when both paths have equal means.",
+        "You receive twice the aggregate bandwidth for the feed, so bursts are split across the two paths and neither path queues.",
+        "You receive guaranteed in-order delivery, because arbitration sorts the merged stream by sequence number before delivery.",
+        "You receive half the serialization delay per packet, because each path carries alternate packets of the same sequence space."
+      ],
+      "correctIndex": 0,
+      "explanation": "Taking whichever copy arrives first makes your latency the min of two draws, which pulls in the tail considerably even with identical mean path latency — this is the benefit people forget when they think of A/B purely as redundancy. The in-order-delivery answer is tempting because arbitration does key on sequence numbers, but A/B merge is itself listed as a reordering source: arbitration deduplicates, it does not resequence. Both paths carry the full identical stream, so there is no bandwidth or serialization split.",
+      "sourceAnchor": "3910-redundant-network-paths",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q30",
+      "prompt": "Host CPU on the receive path jumps sharply across every server in a rack, with no change to the multicast groups they subscribe to. What should you check first?",
+      "options": [
+        "IGMP snooping — if the querier is gone the switch floods multicast as broadcast and NIC filters overflow into promiscuous mode.",
+        "Egress queue watermarks — a rising per-queue peak occupancy pushes packet processing from the ASIC onto the host stack.",
+        "The shared-pool alpha — an exhausted pool forces the switch to hand overflow frames to the CPU for software forwarding.",
+        "PFC class mapping — a mismatched mapping between peers redirects paused classes into the host's slow-path receive queue."
+      ],
+      "correctIndex": 0,
+      "explanation": "Broken IGMP snooping makes the switch treat multicast as broadcast and flood the VLAN, so every NIC receives every feed; once hardware MAC filters overflow, the NIC drops into multicast promiscuous mode and all filtering moves to the host CPU — hence a CPU rise with no subscription change. Confirm with `show ip igmp snooping groups` against NIC RX counters and expected feed rates. The queue-watermark answer is tempting because watermarks are the right leading indicator for congestion, but queue depth adds latency and drops on the switch and never migrates work onto a host.",
+      "sourceAnchor": "3910-redundant-network-paths",
+      "difficulty": "application"
+    },
+    {
+      "id": "39-q31",
+      "prompt": "Why should 802.3x global PAUSE be disabled on a 10 G link carrying market data?",
+      "options": [
+        "PAUSE stops the entire link for up to 33.5 µs regardless of class, so an unrelated slow receiver can stall the market-data flow.",
+        "PAUSE stops only the lowest traffic class for up to 33.5 µs, which starves bulk traffic and triggers TCP retransmit storms.",
+        "PAUSE stops the entire link for up to 335 µs at 10 G, and the receiver must reserve one full jumbo frame of headroom to use it.",
+        "PAUSE stops the entire link until the receiver sends an explicit resume frame, so a lost resume wedges the link indefinitely."
+      ],
+      "correctIndex": 0,
+      "explanation": "802.3x PAUSE is link-level and class-blind: one MAC control frame halts every flow on the link, and with a 16-bit quanta field at 512 bit-times each the maximum is 33.5 µs at 10 G (335 µs at 1 G). That is why nonzero, rising pause counters on a latency-critical port are an incident rather than a statistic. The per-class answer describes 802.1Qbb PFC, which is precisely the refinement 802.3x lacks; and PAUSE expires on its own timer, so no resume frame is required.",
+      "sourceAnchor": "3911-ethernet-flow-control-and-pfc",
+      "difficulty": "recall"
+    },
+    {
+      "id": "39-q32",
+      "prompt": "A RoCEv2 fabric using PFC wedges: several switches sit indefinitely paused after a link failure caused rerouting. What happened, and what would have contained it?",
+      "options": [
+        "A cyclic buffer dependency deadlocked the paused class; a PFC watchdog force-drops a queue paused past a threshold, trading loss for liveness.",
+        "A cyclic buffer dependency deadlocked the paused class; deeper per-port headroom absorbs the cycle so the pauses expire on their own.",
+        "The pause quanta expired and were not renewed, so the class stalled; a PFC watchdog reissues the pause frames to keep the class flowing.",
+        "The class mapping diverged between peers, so PFC degraded to loss; deeper per-port headroom restores lossless behaviour end to end."
+      ],
+      "correctIndex": 0,
+      "explanation": "PFC deadlock is a cyclic buffer dependency — reachable in a Clos fabric once a failure reroutes traffic — where every switch in the cycle waits for a peer to resume, and nothing breaks the cycle without intervention. A watchdog that detects a queue paused beyond a threshold and forcibly drops is the standard containment; deploying PFC without one is negligence. Headroom is the tempting fix because sizing it correctly is genuinely required for losslessness, but headroom governs how much in-flight data a receiver can absorb, and no amount of it breaks a dependency cycle.",
+      "sourceAnchor": "3911-ethernet-flow-control-and-pfc",
+      "difficulty": "trap"
+    }
+  ]
+}

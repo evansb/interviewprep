@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-49-market-fundamentals",
+  "questions": [
+    {
+      "id": "49-q01",
+      "prompt": "A participant sends a marketable sell order that executes against a resting buy order at the best bid. How is this described?",
+      "options": [
+        "The seller hit the bid and is the aggressor/taker; the resting buyer is the maker.",
+        "The seller lifted the offer and is the aggressor/taker; the resting buyer is the maker.",
+        "The seller hit the bid and is the maker; the incoming resting buyer is the taker.",
+        "The seller lifted the offer and is the maker; the resting buyer is the aggressor."
+      ],
+      "correctIndex": 0,
+      "explanation": "Hitting the bid means selling into a resting buy order, and the incoming order is always the aggressor/taker while the resting one is the maker. The version that calls it lifting the offer is the tempting near-miss: lifting the offer describes buying from a resting sell order, which is the opposite direction. Getting the aggressor side wrong flips the sign of every fee, rebate and inferred trade direction.",
+      "sourceAnchor": "491-bid-ask-and-spread",
+      "difficulty": "recall"
+    },
+    {
+      "id": "49-q02",
+      "prompt": "Why does the chapter insist that prices be stored as scaled integers such as `int64_t` rather than `double`?",
+      "options": [
+        "Price-time priority depends on exact equality tests, and binary floating point makes the book non-deterministic.",
+        "Floating-point arithmetic is slower than integer arithmetic on every modern CPU, so the book cannot keep up.",
+        "Doubles cannot represent prices above about one million, so large-notional instruments overflow the mantissa.",
+        "Exchange binary protocols forbid encoding any field as a floating-point value in their wire formats."
+      ],
+      "correctIndex": 0,
+      "explanation": "Matching and priority need exact comparison — `0.1 + 0.2 != 0.3` in binary floating point, so a double-priced book becomes non-deterministic and leaves unmatchable residual quantities. The speed argument is the tempting distractor: floating-point throughput is fine on modern hardware, so performance is not the reason. Correctness of equality, not arithmetic cost, is what forces scaled integers.",
+      "sourceAnchor": "491-bid-ask-and-spread",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q03",
+      "prompt": "Which capability does a market-by-order (MBO) feed give you that a market-by-price (MBP) feed cannot?",
+      "options": [
+        "Computing your own queue position within a price level.",
+        "Computing the book imbalance across the top N price levels.",
+        "Computing the VWAP achieved by walking through several levels.",
+        "Computing the spread between the best bid and the best ask."
+      ],
+      "correctIndex": 0,
+      "explanation": "MBO exposes each individual order with its own ID, so you can see how much quantity rests ahead of yours; MBP only gives a level total, which tells you nothing about your place in it. Book imbalance is the tempting distractor because it sounds order-level, but it is computed from per-level aggregate quantities and works fine on MBP. The same applies to spread and to a depth walk, both of which need only aggregated levels.",
+      "sourceAnchor": "492-market-depth-and-liquidity",
+      "difficulty": "recall"
+    },
+    {
+      "id": "49-q04",
+      "prompt": "Asks are `100.03 x 800`, `100.04 x 300`, `100.05 x 1500`. An aggressive buy of 1500 walks the book. What is the slippage against the best ask?",
+      "options": [
+        "About 0.0085, because the VWAP of 100.0385 exceeds the 100.03 best ask.",
+        "About 0.02, because the walk reaches 100.05 and that is the price paid.",
+        "Zero, because the whole order prints at the 100.03 best ask price.",
+        "About 0.0385, because slippage is measured against the round 100.00 level."
+      ],
+      "correctIndex": 0,
+      "explanation": "The fills are 800 at 100.03, 300 at 100.04 and 400 at 100.05, giving a VWAP of 100.0385 and slippage of 0.0085 versus the 100.03 reference. Taking the deepest level touched (100.05) as the cost is the tempting error: only 400 of the 1500 traded there, so the quantity-weighted average is far tighter than the worst price. Slippage is the difference between the achieved average and the expected reference, not between the reference and the worst print.",
+      "sourceAnchor": "492-market-depth-and-liquidity",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q05",
+      "prompt": "Which statement about displayed depth versus actually available depth is correct?",
+      "options": [
+        "Iceberg and hidden orders mean more can execute than the book displays.",
+        "Iceberg and hidden orders mean less can execute than the book displays.",
+        "Displayed and available depth agree once fleeting orders have been filtered out.",
+        "Fragmentation across venues means one venue displays more than the market holds."
+      ],
+      "correctIndex": 0,
+      "explanation": "An iceberg shows only part of its quantity and a fully hidden order shows none, so executable size can exceed what the book renders. The claim that hidden liquidity makes available depth smaller inverts the mechanism — it is undisplayed size that is nonetheless there. Fragmentation cuts the other way too: one venue's depth is a fraction of the whole market, not more than it.",
+      "sourceAnchor": "492-market-depth-and-liquidity",
+      "difficulty": "trap"
+    },
+    {
+      "id": "49-q06",
+      "prompt": "At bid level 100.01 the FIFO is `[A: 500] [B: 300] [YOU: 200] [C: 900]`. An incoming sell of 900 arrives. What happens to your order?",
+      "options": [
+        "It fills 100 and 100 remains resting at the front of the level.",
+        "It fills 200 completely, because the sell size exceeds the 800 ahead of you.",
+        "It fills nothing, because A and B together absorb the entire incoming 900.",
+        "It fills 100 and the remainder is pushed behind C by the partial execution."
+      ],
+      "correctIndex": 0,
+      "explanation": "The 800 ahead of you is consumed by A and B, leaving 100 of the sell to hit your 200, so you fill 100 and 100 stays resting — and a partial execution retains time priority, so the remainder is now at the front. Believing the remainder drops behind C is the tempting error: if partial fills reset priority, large resting orders would be perpetually pushed back by small aggressors. The sell of 900 is also not fully absorbed by the 800 ahead.",
+      "sourceAnchor": "493-queue-position",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q07",
+      "prompt": "You hold a resting bid and want to improve your price by one tick. What happens to your queue position?",
+      "options": [
+        "You forfeit your place at the old level and join the back of the new one.",
+        "You keep your original place because the modification only improved the price.",
+        "You move to the front of the old level, since price improvement is rewarded.",
+        "You keep your rank number, which is carried across to the new price level."
+      ],
+      "correctIndex": 0,
+      "explanation": "Any price change forfeits queue position — you leave the old level entirely and go to the back of the new one, though at a newly created level that back may also be the front. The idea that improving the price preserves priority is the seductive one, because improvement feels like it should be rewarded; the venue's rule is purely mechanical and does not distinguish improving from worsening moves. Even moving away and back loses your original place.",
+      "sourceAnchor": "493-queue-position",
+      "difficulty": "recall"
+    },
+    {
+      "id": "49-q08",
+      "prompt": "On an aggregated feed your level drops from 2000 to 1700. Why do trade messages help disambiguate this?",
+      "options": [
+        "An execution consumes from the front, so it definitively reduces quantity ahead of you.",
+        "An execution consumes from the back, so it definitively leaves quantity ahead unchanged.",
+        "Trade messages carry the order IDs involved, which identifies exactly whose quantity left.",
+        "Trade messages arrive before the level update, so the ordering resolves the ambiguity."
+      ],
+      "correctIndex": 0,
+      "explanation": "Executions take from the head of the FIFO, so trade-driven decrements unambiguously reduce the quantity ahead of you, whereas cancels could have come from either side of your order. The claim that trades carry order IDs is the tempting one — that is precisely what an aggregated MBP feed does not give you, which is why the ambiguity exists at all. Distinguishing trade-driven from cancel-driven decrements is the whole trick, and the residual uncertainty is bracketed with optimistic and pessimistic estimators.",
+      "sourceAnchor": "493-queue-position",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q09",
+      "prompt": "Bids are `100.01: [A t=10, 500] [B t=25, 300]` and `100.00: [C t=05, 900]`. An incoming sell of 600 at market arrives. Who fills?",
+      "options": [
+        "A fills 500 and B fills 100; C gets nothing despite being oldest.",
+        "C fills 600 in full, because it is the earliest arriving order in the book.",
+        "C fills 500 and A fills 100, splitting by time then by price.",
+        "A fills 500 and C fills 100, since C outranks B on arrival time."
+      ],
+      "correctIndex": 0,
+      "explanation": "Priority is lexicographic on (price, time) with price dominating, so both orders at 100.01 clear before anything at 100.00 is considered. Awarding the fill to C because it arrived at t=05 is the classic inversion: time only breaks ties among orders at the same price. C is at a worse price for a buyer and receives nothing.",
+      "sourceAnchor": "494-price-time-priority",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q10",
+      "prompt": "Under a typical price-time venue, which action causes a resting order to lose its time priority?",
+      "options": [
+        "Increasing the order's quantity.",
+        "Decreasing the order's quantity.",
+        "Receiving a partial execution.",
+        "Having a new order join at the same price."
+      ],
+      "correctIndex": 0,
+      "explanation": "A quantity increase sends the order to the back, because otherwise a participant could hold a front position with a token size and inflate it on demand. Quantity decrease is the tempting counterpart and typically retains priority, though some venues implement it internally as cancel/replace and lose it anyway. Partial fills always retain priority, and an order joining at your price simply queues behind you.",
+      "sourceAnchor": "494-price-time-priority",
+      "difficulty": "recall"
+    },
+    {
+      "id": "49-q11",
+      "prompt": "Why does a correct price-time matching engine never sort orders within a level by timestamp?",
+      "options": [
+        "Insertion order at a level already is time order, so a FIFO gives priority for free.",
+        "Timestamps are supplied by the client, so the engine has no trustworthy value to sort on.",
+        "Sorting is impossible because the engine assigns all orders in a batch the same timestamp.",
+        "Sorting would break the O(1) tail insert, which venue rules require to be constant time."
+      ],
+      "correctIndex": 0,
+      "explanation": "The engine assigns priority when an order becomes resting, so arrival order is already time order — a linked list or ring gives correct priority with O(1) tail insertion and head pop, and any design that stores timestamps and sorts is both slower and prone to resolving ties arbitrarily. The client-timestamp answer is tempting because it is true that client send time must not be used; but the engine does have its own monotonic sequence number, so untrustworthiness is not why sorting is avoided.",
+      "sourceAnchor": "494-price-time-priority",
+      "difficulty": "trap"
+    },
+    {
+      "id": "49-q12",
+      "prompt": "How does a pure pro-rata allocation rule change participant incentives relative to strict FIFO?",
+      "options": [
+        "Fill share follows displayed size rather than arrival time, so participants post size.",
+        "Fill share follows arrival time even more strongly, so the speed race intensifies.",
+        "Fill share is randomized across the level, so neither size nor speed affects outcomes.",
+        "Fill share follows the order's limit price, so participants improve price aggressively."
+      ],
+      "correctIndex": 0,
+      "explanation": "Pro-rata distributes the aggressive quantity in proportion to resting size and ignores time entirely, so the way to get filled is to display size rather than to be first. The intensified-speed answer inverts the mechanism; latency still matters for reacting to news, but not for winning the allocation. Randomized allocation describes speed bumps and batch auctions, which are a different intervention.",
+      "sourceAnchor": "495-pro-rata-allocation",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q13",
+      "prompt": "A candidate implements pro-rata as `qty * (size / total)` in integer arithmetic. What is wrong?",
+      "options": [
+        "The inner division truncates to zero first, so the allocation collapses.",
+        "The multiplication overflows before the division, so allocations wrap negative.",
+        "The expression allocates correctly but omits the top-order priority allocation step.",
+        "The expression rounds up rather than down, so the sum exceeds the incoming quantity."
+      ],
+      "correctIndex": 0,
+      "explanation": "With integers, `size / total` is almost always 0 because size is less than total, so every order is allocated nothing — the correct form is `qty * size / total`, multiplying first. Overflow is the tempting alternative because `q * size` genuinely can exceed 64 bits and needs a 128-bit intermediate, but that is a hazard of the correct ordering, not the bug in this expression. Truncation in the correct form floors rather than rounds up, which is why a residual pass exists.",
+      "sourceAnchor": "495-pro-rata-allocation",
+      "difficulty": "trap"
+    },
+    {
+      "id": "49-q14",
+      "prompt": "On a maker-taker venue, 100 shares trade at $100 with a taker fee of $0.0030/share and a maker rebate of $0.0020/share. What is the outcome?",
+      "options": [
+        "The aggressor pays $0.30, the resting order receives $0.20, the venue keeps $0.10.",
+        "The resting order pays $0.30, the aggressor receives $0.20, the venue keeps $0.10.",
+        "The aggressor pays $0.30, the resting order receives $0.30, the venue keeps nothing.",
+        "Both sides pay $0.30 and the venue rebates $0.20 to whichever side is larger."
+      ],
+      "correctIndex": 0,
+      "explanation": "Maker-taker charges the aggressor who removed liquidity and pays the resting order that provided it, with the venue retaining the difference. Reversing the two sides describes a taker-maker or inverted schedule, which is a real structure but not the one named here. The chapter's arithmetic is exactly $0.30 out, $0.20 in, $0.10 retained.",
+      "sourceAnchor": "496-maker-taker-fees-and-rebates",
+      "difficulty": "recall"
+    },
+    {
+      "id": "49-q15",
+      "prompt": "Why must a fill record persist the venue's liquidity flag rather than infer maker/taker status afterwards?",
+      "options": [
+        "Inference breaks on auctions, routed orders and orders that partly rest then get taken.",
+        "Inference breaks only for hidden orders, which the venue never reports on the tape.",
+        "Inference is accurate but too slow for the hot path, so the flag is cached instead.",
+        "Inference is forbidden by FIX, which requires tag 851 to be echoed back unmodified."
+      ],
+      "correctIndex": 0,
+      "explanation": "Auction fills, routed executions and the case of an aggressive order that adds liquidity by improving price without crossing all defeat any rule you would write, so the venue's own flag (FIX tag 851 `LastLiquidityInd` or a venue code) must be stored verbatim. The 'accurate but slow' answer is the tempting one because fee attribution is indeed off the hot path — but the problem is that inference is wrong, not that it is expensive. Hidden orders are only one of several failing cases.",
+      "sourceAnchor": "496-maker-taker-fees-and-rebates",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q16",
+      "prompt": "The best bid is 100.01 and the best ask 100.02 with a 0.01 tick. Your model wants to post a buy at mid. What must the code do?",
+      "options": [
+        "Round the buy price down to 100.01, since mid falls on an invalid half-tick.",
+        "Round the buy price up to 100.02, since a buy should round toward the ask.",
+        "Submit 100.015 unchanged, since the venue rounds sub-tick prices on entry.",
+        "Submit at 100.02 as a marketable order, since mid is never a postable price."
+      ],
+      "correctIndex": 0,
+      "explanation": "With a one-tick spread the mid is 100.015, which is not on the tick grid, so it must be rounded side-aware — a buy rounds down so you never accidentally cross. Rounding the buy up to 100.02 is the tempting inversion: it lands on the ask and turns a passive quote into an aggressive one. Venues reject off-grid prices rather than silently rounding them.",
+      "sourceAnchor": "497-tick-sizes",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q17",
+      "prompt": "Under the MiFID II RTS 11 regime for EU equities, what determines an instrument's tick size?",
+      "options": [
+        "A published table indexed by price band and average daily transaction count band.",
+        "A published table indexed by price band alone, identical for every EU instrument.",
+        "The instrument's currency and its home venue's operating MIC, fixed for the year.",
+        "The observed minimum price difference on the venue over the prior trading session."
+      ],
+      "correctIndex": 0,
+      "explanation": "RTS 11 makes tick size a function of price band crossed with a liquidity band derived from average daily number of transactions, read from a published table your reference data must carry. The price-band-only answer is the tempting simplification and describes a plain banded regime like the US sub-dollar rule, not MiFID II. Deriving tick from observed prices is explicitly forbidden — illiquid instruments give a wrong tick and a reject storm.",
+      "sourceAnchor": "497-tick-sizes",
+      "difficulty": "recall"
+    },
+    {
+      "id": "49-q18",
+      "prompt": "How does a large tick size relative to an instrument's natural spread affect market structure?",
+      "options": [
+        "Spreads are forced wide and queue position becomes extremely valuable.",
+        "Spreads are forced wide and queue position becomes largely irrelevant.",
+        "Spreads compress toward zero and priority becomes cheap to buy by improving price.",
+        "Spreads become unstable and the venue switches the instrument to pro-rata allocation."
+      ],
+      "correctIndex": 0,
+      "explanation": "A coarse tick prevents anyone from quoting inside, so everyone piles onto the same price and only arrival time separates them — that is exactly the queue-driven regime where position matters most. Saying queue position becomes irrelevant reverses the causation; irrelevance of queue position is the small-tick outcome, where a trivial price improvement buys priority cheaply and queues stay shallow. Allocation algorithm is a venue configuration, not something tick size triggers.",
+      "sourceAnchor": "497-tick-sizes",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q19",
+      "prompt": "An E-mini S&P 500 future has a $50 multiplier and a 0.25 tick. Three contracts are bought at 4300.25. What are the notional and the tick value?",
+      "options": [
+        "Notional $645,037.50 and tick value $12.50 per contract.",
+        "Notional $645,037.50 and tick value $37.50 per contract.",
+        "Notional $12,900.75 and tick value $12.50 per contract.",
+        "Notional $215,012.50 and tick value $50.00 per contract."
+      ],
+      "correctIndex": 0,
+      "explanation": "Notional is price x multiplier x quantity = 4300.25 x 50 x 3 = $645,037.50, and tick value is tick x multiplier = 0.25 x 50 = $12.50 per contract. The $37.50 tick value is the tempting error — it multiplies the per-contract tick value by the three-lot quantity, but tick value is a per-contract property independent of order size. The $215,012.50 figure omits the quantity entirely.",
+      "sourceAnchor": "498-lot-sizes-and-contract-multipliers",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q20",
+      "prompt": "Orders keep getting stuck in a partially-filled state with an absurdly small leaves quantity that never matches. What is the likely cause?",
+      "options": [
+        "Quantities are stored as `double`, leaving a residual of about 10^-15 units.",
+        "Quantities are stored as `int64_t`, which cannot express the venue's fractional lots.",
+        "The venue's minimum order quantity exceeds its minimum quantity increment.",
+        "The `order_qty = cum_qty + leaves_qty + cancelled_qty` invariant is asserted too early."
+      ],
+      "correctIndex": 0,
+      "explanation": "Floating-point quantity arithmetic leaves a residual of roughly 10^-15 units on an order that should have filled completely, and that dust sits in the book forever because it can never match. The int64 answer is the tempting inversion: fractional FX and crypto quantities are handled precisely by scaling them to integers, which is the prescribed fix rather than the cause. A mismatch between minimum quantity and increment produces rejects at entry, not stuck leaves quantity.",
+      "sourceAnchor": "498-lot-sizes-and-contract-multipliers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "49-q21",
+      "prompt": "Why should the hot path key instrument state off the venue's numeric security ID rather than the symbol string?",
+      "options": [
+        "Binary feeds carry the integer natively and it indexes a dense array in O(1).",
+        "Symbol strings are globally unique, so the map they require is unnecessarily large.",
+        "Numeric IDs are stable across sessions, which strings are not, so caching is safe.",
+        "Feed protocols transmit symbols only in definition messages sent after the open."
+      ],
+      "correctIndex": 0,
+      "explanation": "ITCH stock locates, CME `SecurityID` and SBE integer fields are what the wire actually carries, and a direct-indexed array of instrument state removes hashing and string work from the hot path entirely. The stability answer is exactly backwards and is the dangerous one: some venues reassign numeric IDs daily, which is why the map must be rebuilt from definition messages at session start. Symbols are notoriously not globally unique — they are reused across venues and over time.",
+      "sourceAnchor": "499-instrument-symbology",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q22",
+      "prompt": "A feed parses cleanly with no errors, yet every instrument's book is wrong in a uniform way. Which symbology failure fits this signature?",
+      "options": [
+        "A cached security-ID map reused from a venue that reassigns IDs daily.",
+        "A ticker freed by a delisting and reassigned to an unrelated company.",
+        "An ISIN used as the book key across several venues and currencies.",
+        "An OCC-style option symbol whose strike field was parsed at the wrong scale."
+      ],
+      "correctIndex": 0,
+      "explanation": "Stale ID maps point every message at the wrong instrument while every field still decodes validly, which is why this failure is more dangerous than a parse error — nothing alarms. Ticker reuse after a delisting is the tempting alternative but its signature is narrow and historical: one impossible price gap on one date in one symbol. ISIN keying merges venues for cross-listed names rather than corrupting the whole feed uniformly.",
+      "sourceAnchor": "499-instrument-symbology",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q23",
+      "prompt": "Reference data must be updated while the system is running. What is the prescribed mechanism?",
+      "options": [
+        "Publish an immutable versioned snapshot and swap the pointer atomically.",
+        "Mutate the live table in place while holding a writer lock against readers.",
+        "Have each reader thread reload the file itself when a change notice arrives.",
+        "Defer every change to the next session boundary, since runtime updates are unsafe."
+      ],
+      "correctIndex": 0,
+      "explanation": "An immutable snapshot with an atomic pointer swap lets the hot path read reference data with no lock at all, in the RCU-style publication pattern. Taking a writer lock is the tempting conventional answer, but it puts a lock on the hot read path and mutates a table under live readers, which the chapter forbids outright. Deferring everything to the session boundary is also wrong: price bands update intraday from the real-time feed and some venues list instruments intraday.",
+      "sourceAnchor": "4910-reference-data-changes",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q24",
+      "prompt": "A backtest shows a clean -75% single-day return in one symbol, with no such move in any related name. What is the most likely explanation?",
+      "options": [
+        "An unadjusted 4-for-1 stock split on that date.",
+        "A genuine 4-for-1 split that the venue failed to announce in advance.",
+        "An unadjusted merger, which always divides price by exactly four.",
+        "A tick-size table change on the quarterly MiFID II effective date."
+      ],
+      "correctIndex": 0,
+      "explanation": "A 4-for-1 split divides the price by four overnight, and an unadjusted history renders that as a clean -75% day — the discontinuity is exactly the split ratio and confined to one symbol on one date. Blaming the venue's announcement is the tempting misread: splits are announced well in advance, and the defect is in your adjustment pipeline, not in the notification. Mergers have no fixed ratio, and a tick-table change alters price validation rather than the level of the price series.",
+      "sourceAnchor": "4910-reference-data-changes",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q25",
+      "prompt": "A book builder asserts `best_bid < best_ask` after every update and fires the assertion every single morning. Why?",
+      "options": [
+        "The book is legitimately crossed during the pre-open call phase before the uncross.",
+        "The opening burst arrives faster than the builder can apply it, so updates are dropped.",
+        "The overnight session uses a different tick grid, so early prices fail validation.",
+        "The venue sends its opening snapshot before the deltas, so the two are applied out of order."
+      ],
+      "correctIndex": 0,
+      "explanation": "During pre-open and auction call phases, bids above asks are normal and expected — resolving that imbalance is precisely what the uncross does — so the no-cross invariant must be made conditional on continuous session state. The dropped-update explanation is tempting because a genuine sequence gap does produce a crossed book, but that failure appears abruptly and never self-heals rather than recurring punctually every morning. Snapshot/delta races are similarly episodic, not daily and scheduled.",
+      "sourceAnchor": "4911-continuous-trading",
+      "difficulty": "trap"
+    },
+    {
+      "id": "49-q26",
+      "prompt": "Why must session state be driven by venue status messages rather than by a wall clock?",
+      "options": [
+        "Openings are delayed and halts are unscheduled, so the clock diverges from reality.",
+        "Clocks across participants are unsynchronized, so each firm sees a different open time.",
+        "Venue status messages carry the tick table, which the clock cannot supply.",
+        "The clock is accurate but its resolution is too coarse to time the uncross instant."
+      ],
+      "correctIndex": 0,
+      "explanation": "A system that resumes quoting at 09:30:00.000 while the instrument is still halted or has a delayed open sends orders into a venue that will reject them — or worse, accept them. Clock synchronization is the tempting distractor: it is a real concern elsewhere in the book, but even a perfectly synchronized clock cannot know that an opening was delayed. The correct design is event-driven with the clock kept only as a sanity check that alarms on divergence.",
+      "sourceAnchor": "4911-continuous-trading",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q27",
+      "prompt": "In the chapter's uncross example, executable(99)=150, executable(100)=400 and executable(101)=200. What is the auction outcome?",
+      "options": [
+        "Price 100 with volume 400, and a surplus of 100 unfilled on the buy side.",
+        "Price 99 with volume 150, since the lowest candidate price is chosen first.",
+        "Price 101 with volume 200, since the highest candidate price maximizes value.",
+        "Price 100 with volume 900, since all buy interest at or above 100 executes."
+      ],
+      "correctIndex": 0,
+      "explanation": "The first criterion is maximum executable volume, and 400 at price 100 beats both alternatives outright, leaving 500 cumulative buy against 400 sell — a surplus of 100 on the buy side. The 900 figure is the tempting error: it is the cumulative buy quantity at 99, not what can execute, and execution is capped by the min of the two cumulative sides. Price is only decided by surplus side or reference price when the volume criterion ties, which it does not here.",
+      "sourceAnchor": "4912-opening-and-closing-auctions",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q28",
+      "prompt": "A risk system marks end-of-day positions at the last continuous trade. When does this diverge from everyone else's P&L?",
+      "options": [
+        "On days with a large closing auction, since the official close is the auction price.",
+        "On days with no closing auction, since the last continuous trade is then undefined.",
+        "On every day by a fixed amount equal to half the closing spread.",
+        "Only on days when the instrument is halted into the close and never reopens."
+      ],
+      "correctIndex": 0,
+      "explanation": "The official closing price used for settlement, index calculation and marking is the auction price, not the last continuous print, so the discrepancy shows up whenever the auction moves the price meaningfully away from the last trade — which is exactly on heavy-auction days. Attributing a constant half-spread error is the plausible-sounding distractor, but the gap is not a fixed offset; it is the auction's price impact and can be zero or large. Halts into the close are a rare special case, not the general one.",
+      "sourceAnchor": "4912-opening-and-closing-auctions",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q29",
+      "prompt": "Under LULD, the best offer sits at the band edge continuously for 15 seconds. What happens next?",
+      "options": [
+        "A 5-minute trading pause begins and the stock reopens through an auction.",
+        "A 5-minute trading pause begins and the stock resumes straight into continuous trading.",
+        "A 15-minute market-wide halt begins and all trading stops for that period.",
+        "The band widens automatically and continuous trading proceeds inside the new band."
+      ],
+      "correctIndex": 0,
+      "explanation": "Fifteen continuous seconds in the limit state converts it into a 5-minute pause, and the instrument is always brought back through a reopening auction rather than dropped straight into continuous matching. Resuming directly into continuous trading is the tempting version and matters operationally: your first post-halt fills arrive as an auction burst at a single price. The 15-minute figure belongs to the market-wide circuit breaker at the 7% and 13% index thresholds, not to a single-stock pause.",
+      "sourceAnchor": "4913-trading-halts-and-price-bands",
+      "difficulty": "recall"
+    },
+    {
+      "id": "49-q30",
+      "prompt": "An order rests at an apparently crossing price during a volatile period and never fills, with no reject received. Which venue behaviour explains this?",
+      "options": [
+        "Execution banding, which accepts the order but blocks execution outside the band.",
+        "Price banding on entry, which rejects orders priced outside the band at the gateway.",
+        "A cancel-on-disconnect rule, which quietly voided the order at the session gateway.",
+        "A market-wide circuit breaker, which cancels all resting orders on activation."
+      ],
+      "correctIndex": 0,
+      "explanation": "Execution banding accepts the order and lets it rest but prevents it from trading outside the band, producing exactly this silent non-fill. Entry banding is the tempting sibling and is the other of the two behaviours you must distinguish — but its signature is rejects clustering at extreme prices, and here no reject was received. Cancel-on-disconnect semantics do not cover halts or bands at all.",
+      "sourceAnchor": "4913-trading-halts-and-price-bands",
+      "difficulty": "application"
+    },
+    {
+      "id": "49-q31",
+      "prompt": "Your single-venue book shows bid 100.04 against ask 100.02 during continuous trading. What should you conclude and do?",
+      "options": [
+        "Treat it as your bug, stop quoting that instrument, and request a snapshot re-sync.",
+        "Treat it as a real arbitrage, quote aggressively into it, and log the opportunity.",
+        "Treat it as normal cross-venue behaviour and continue quoting the instrument.",
+        "Treat it as a venue fault, halt the entire system, and wait for an exchange notice."
+      ],
+      "correctIndex": 0,
+      "explanation": "A single matching engine cannot cross during continuous trading, because an order that would cross is matched rather than rested — so the state is almost certainly a missed delete, an ignored sequence gap, an A/B arbitration bug, a snapshot/delta race or a parse error. Calling it cross-venue is the tempting confusion: cross-venue locks and crosses are genuinely real, but this book is one venue's. Fail closed per instrument and recover it; stopping the whole system is the wrong blast radius.",
+      "sourceAnchor": "4914-locked-and-crossed-markets",
+      "difficulty": "trap"
+    },
+    {
+      "id": "49-q32",
+      "prompt": "Which condition describes a locked market, as distinct from a crossed one?",
+      "options": [
+        "Best bid equals best ask, so the spread is exactly zero.",
+        "Best bid exceeds best ask, so the spread is strictly negative.",
+        "Best bid and best ask are one tick apart, the tightest legal spread.",
+        "Best bid or best ask is missing, so no spread can be computed at all."
+      ],
+      "correctIndex": 0,
+      "explanation": "Locked means bid equals ask and the spread is exactly zero; crossed is the stronger inversion where the bid exceeds the ask and the spread goes negative. The one-tick-apart answer is the tempting near-miss — that is a tight but perfectly normal market, since the spread is bounded below by one tick in a well-formed book. Reg NMS Rule 610 prohibits displaying quotations that lock or cross another venue's protected quotation, which is why an unexpected lock in a consolidated view usually points at your data.",
+      "sourceAnchor": "4914-locked-and-crossed-markets",
+      "difficulty": "recall"
+    }
+  ]
+}

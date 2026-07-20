@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-50-orders-and-matching",
+  "questions": [
+    {
+      "id": "50-q01",
+      "prompt": "Asks are 100.03 × 800, 100.04 × 300, 100.05 × 1500. A BUY 1500 MARKET arrives at a venue that fills market orders against the book. What executes?",
+      "options": [
+        "800 at 100.03, 300 at 100.04, then 400 at 100.05, for a VWAP of roughly 100.0385.",
+        "All 1500 at 100.03, because a market order is entitled to the touch price for its whole size.",
+        "All 1500 at 100.05, because a market order pays the deepest level it reaches on every share.",
+        "Only 800 at 100.03, with 700 cancelled, because a market order never sweeps past the touch."
+      ],
+      "correctIndex": 0,
+      "explanation": "A market order walks successive price levels, consuming each at that level's own resting price until the quantity is exhausted, which is why the effective cost is a volume-weighted average rather than any single quote. The tempting error is the 'whole size at the touch' answer: the touch only had 800 available, and there is no rule that reprices deeper liquidity down to the best quote. Nor does the whole order pay the deepest price — each tranche settles at the level it consumed.",
+      "sourceAnchor": "501-market-orders",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q02",
+      "prompt": "Why is encoding a market order as a limit priced at `INT64_MAX` a defect rather than a clever shortcut?",
+      "options": [
+        "The sentinel overflows the first time any code computes `price * multiplier * qty` or `price + ticks`, so carry an explicit order-type discriminant and make price optional.",
+        "Signed comparisons saturate at the extremes of `int64_t`, so two market orders sharing the sentinel cannot be ordered within a price level by arrival time.",
+        "The sentinel makes the order match at `INT64_MAX` itself, so the aggressor is charged its own limit price rather than the resting order's price.",
+        "The wire encoding cannot represent a nineteen-digit price field, so the venue rejects the message before the matching engine ever sees the order."
+      ],
+      "correctIndex": 0,
+      "explanation": "The hazard is arithmetic, not matching: notional and tick-offset calculations multiply and add prices, and a sentinel at the type's maximum overflows in the first such expression it touches. The 'saturating comparison' answer is wrong on its premise — integer comparison does not saturate, and overflow on signed types is undefined rather than clamped. Matching itself would still execute at the resting price, so the aggressor-pays-its-limit claim also misstates the engine's rule.",
+      "sourceAnchor": "501-market-orders",
+      "difficulty": "trap"
+    },
+    {
+      "id": "50-q03",
+      "prompt": "The book is bid 100.01 × 500 / ask 100.03 × 800. A BUY 2000 @ 100.04 limit order arrives. What happens?",
+      "options": [
+        "It takes 800 at 100.03, then rests the remaining 1200 at 100.04, which becomes the new best bid.",
+        "It takes 800 at 100.04, then rests the remaining 1200 at 100.04, since the aggressor pays its limit.",
+        "It takes 800 at 100.03 and the remaining 1200 is cancelled, since a crossing limit order never rests.",
+        "It rests all 2000 at 100.04 without trading, since a buy priced above the ask does not cross the book."
+      ],
+      "correctIndex": 0,
+      "explanation": "A limit order is aggressive only for the portion that crosses: 800 is available at 100.03 and executes at that resting price, and the residual rests at the order's own limit of 100.04, improving the bid. The 'pays its limit' variant fails on the price-improvement rule — the maker's price sets the terms. The 'never rests' variant confuses a plain limit with an IOC, and the 'does not cross' variant inverts the crossing condition for a buy.",
+      "sourceAnchor": "502-limit-orders",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q04",
+      "prompt": "A buy limit at 100.05 crosses a resting offer at 100.03. At what price does the trade print?",
+      "options": [
+        "100.03 — the resting order's price, so price improvement accrues to the aggressor.",
+        "100.05 — the aggressor's limit, which is the price it declared it was willing to pay.",
+        "100.04 — the midpoint of the two prices, splitting the improvement between the parties.",
+        "100.03 for displayed size and 100.05 for any hidden size the resting level conceals."
+      ],
+      "correctIndex": 0,
+      "explanation": "The trade executes at the maker's price because the resting order was there first and set the terms, so the aggressor keeps the two ticks of improvement. The midpoint answer is the most frequently offered wrong one and describes no continuous-matching venue — midpoint pricing belongs to midpoint-pegged order types, not to ordinary crossing. Hidden size does not get a separate price either; the resting price governs regardless of display.",
+      "sourceAnchor": "502-limit-orders",
+      "difficulty": "recall"
+    },
+    {
+      "id": "50-q05",
+      "prompt": "Why is encoding 'sell' and 'sell short' as the same side value in a US equities order type a defect?",
+      "options": [
+        "Short sales are a distinct regulated side with locate requirements and a Reg SHO Rule 201 price test that restricts them to prices above the national best bid.",
+        "Short sales clear through a separate settlement pipeline, so the value collision produces breaks in end-of-day allocation rather than any pre-trade problem.",
+        "Short sales carry a different taker fee schedule, so collapsing the values silently misprices the strategy's expected cost on every marketable order.",
+        "Short sales are blocked outright for the remainder of the session once a Rule 201 circuit breaker fires, so the collision guarantees rejects after any sharp decline."
+      ],
+      "correctIndex": 0,
+      "explanation": "Sell-short is a regulated side, not a flag: locates must be obtained, and after a 10% decline Rule 201 permits short sales only at prices above the NBB, so the venue must be told which one you are sending. The 'blocked outright' answer is the closest miss — Rule 201 restricts the price at which shorts may execute rather than banning them, so an order priced above the bid still trades. The fee and settlement framings both understate this as an accounting issue when it is a compliance one.",
+      "sourceAnchor": "502-limit-orders",
+      "difficulty": "recall"
+    },
+    {
+      "id": "50-q06",
+      "prompt": "An instrument trades at 100.00. Where do buy stops and sell stops sit relative to the market?",
+      "options": [
+        "Buy stops sit above the market and sell stops below — the inverse of where limit orders sit.",
+        "Buy stops sit below the market and sell stops above, exactly as buy and sell limits do.",
+        "Both sit above the market, since a stop is defined as a trigger on an upward price move.",
+        "Both sit at the touch, since a stop triggers on the first trade that reaches the current quote."
+      ],
+      "correctIndex": 0,
+      "explanation": "A sell stop fires when the market falls to or below its stop price and a buy stop when it rises to or above, so buy stops live above and sell stops below — the reverse of limits, which is why the two get confused. The 'same as limits' answer is the reliable trap: a buy limit does sit below the market, but a buy stop is protective of a short position and must sit above it. Nothing about a stop requires it to be at the touch or on the upside only.",
+      "sourceAnchor": "503-stop-orders",
+      "difficulty": "recall"
+    },
+    {
+      "id": "50-q07",
+      "prompt": "After a violent one-directional move, you find a triggered stop-limit sell order resting untouched far above the current market. What does this indicate?",
+      "options": [
+        "Normal stop-limit behaviour: the market gapped through the limit before the order could execute, so the position was never actually protected.",
+        "A venue defect: a triggered stop-limit is converted to a market order, so it must fill and cannot be left resting anywhere.",
+        "A rejected trigger: the stop condition was met but the engine declined the order, which is why it shows a price but no executions.",
+        "A stale book: the order in fact executed at the stop price, and only the local order record failed to receive the execution report."
+      ],
+      "correctIndex": 0,
+      "explanation": "A stop-limit becomes a limit order on trigger, and in a fast move the market has already passed that limit, so the order rests with nothing to trade against — the exact signature described here, and the reason a position everyone believes is protected is not. The 'converts to market' answer is the tempting one because it correctly describes stop-market orders, which is the other half of the pair; the whole point of the two types is that stop-market always fills with no price control while stop-limit controls price and may not fill.",
+      "sourceAnchor": "503-stop-orders",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q08",
+      "prompt": "A market maker replaces a static limit order with a primary-peg order to keep it at the touch. What does it give up?",
+      "options": [
+        "Time priority: each reprice is a price change, so an order tracking a jittering bid lives permanently at the back of the queue.",
+        "Nothing measurable: the venue preserves priority across reprices because the order ID and the resting quantity are both unchanged.",
+        "Priority only on downward reprices: moving to a worse price re-queues the order, while following the bid upward keeps its position.",
+        "Nothing but display: pegged orders keep their arrival priority but are excluded from the depth the venue publishes to the feed."
+      ],
+      "correctIndex": 0,
+      "explanation": "Repricing is a price change and a price change forfeits time priority, so the peg trades queue position for price tracking — that trade-off is precisely why a peg does not dominate a static limit. The 'ID is unchanged so priority survives' answer is the intuitive miss: priority attaches to the (price, arrival-time) position in the level's FIFO, not to the order identifier. The directional variant invents a rule the venue does not have; any reprice re-queues.",
+      "sourceAnchor": "504-pegged-orders",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q09",
+      "prompt": "A BUY order is entered as a primary peg with offset 0 and limit price 100.05. The bid is 100.01 and then moves to 100.06. What is the order's effective price?",
+      "options": [
+        "100.05 — the peg follows the bid up to its limit price and is capped there.",
+        "100.06 — the limit bounds the execution price only, not the resting price the peg takes.",
+        "It has none — the engine cancels a peg once its reference moves beyond the limit price.",
+        "100.06, but the order is switched to non-displayed until the reference falls back."
+      ],
+      "correctIndex": 0,
+      "explanation": "The limit on a peg is the safety net that bounds how far the order will follow its reference, so the engine reprices to 100.05 and stops rather than chasing the bid to 100.06. The cancellation answer is the plausible near-miss — a cap that fired would leave the order resting, not remove it, and an uncapped peg is exactly the danger the limit exists to prevent. Nothing here alters display treatment, which is a separate flag.",
+      "sourceAnchor": "504-pegged-orders",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q10",
+      "prompt": "Your venue applies the 'slide' behaviour for post-only orders. Why is slide the most dangerous of the three post-only behaviours?",
+      "options": [
+        "The order rests at a price you never sent, so any logic assuming the sent price equals the resting price is now wrong.",
+        "The order is charged the taker fee anyway, since the venue treats the attempt as an intent to remove liquidity.",
+        "The order is silently converted to an IOC, so the quantity you believe is resting has already been cancelled.",
+        "The order is placed at the front of the queue at its new price, which distorts the fill model of everyone behind it."
+      ],
+      "correctIndex": 0,
+      "explanation": "Sliding adjusts the price to the best non-crossing level and rests it there, so a system that quotes from its own record of what it sent is now out of sync with the venue and must read the price back from the acknowledgement — the classic bug is a two-sided quoter re-quoting in a loop because its bid slid a tick. The 'charged the taker fee' answer inverts the purpose of the type, which exists precisely to avoid taker fees and unintended aggression. Slide rests the order; it neither cancels it nor grants it front-of-queue standing.",
+      "sourceAnchor": "505-post-only-orders",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q11",
+      "prompt": "A strategy using post-only orders starts producing bursts of rejects. What pattern should you expect if the cause is ordinary post-only semantics rather than a bug?",
+      "options": [
+        "Rejects cluster at the moments the spread narrows to one tick, and their rate tracks volatility rather than message volume.",
+        "Rejects cluster when the spread widens, because the quoting logic falls behind the touch and prices itself through the book.",
+        "Rejects scale with outbound message rate, because the venue's throttle rejects whatever exceeds the session's order-entry quota.",
+        "Rejects concentrate in the opening minutes, because an empty book makes every submitted price marketable against the other side."
+      ],
+      "correctIndex": 0,
+      "explanation": "The intended passive price becomes marketable exactly when the spread collapses to a single tick, so post-only rejects arrive in bursts correlated with volatility, and treating each as an incident produces constant false alarms. The 'spread widens' answer inverts the mechanism: a wider spread gives your passive price more room and makes crossing less likely, not more. Throttle rejects carry a different reason code entirely and scale with your own send rate, not with the book.",
+      "sourceAnchor": "505-post-only-orders",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q12",
+      "prompt": "Asks are 100.03 × 300 and 100.04 × 1000. A BUY 1000 @ 100.03 IOC arrives. What is the outcome?",
+      "options": [
+        "300 fills at 100.03 and the remaining 700 is cancelled immediately.",
+        "300 fills at 100.03 and the remaining 700 rests at 100.03 until cancelled.",
+        "300 fills at 100.03 and 700 fills at 100.04, since an IOC sweeps to complete.",
+        "Nothing fills and the whole 1000 is cancelled, since the order cannot fill in full."
+      ],
+      "correctIndex": 0,
+      "explanation": "IOC executes whatever is available at or better than its limit and cancels the rest, and only 300 is offered at or below 100.03. The 'sweeps to complete' answer ignores the limit price — the 100.04 liquidity is outside what the order authorized. The all-or-nothing answer describes fill-or-kill; permitting partial fills is exactly what distinguishes IOC from FOK, and an IOC never rests.",
+      "sourceAnchor": "506-immediate-or-cancel-orders",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q13",
+      "prompt": "An IOC order finds no liquidity at or better than its limit and executes zero quantity. How should your order-management system classify the venue's response?",
+      "options": [
+        "As a normal cancel or expiry — the order was valid and simply found nothing to trade with.",
+        "As a reject, and it should count toward the session's reject-rate budget with the venue.",
+        "As a reject caused by a stale local book, since a correctly priced IOC always fills something.",
+        "As a resting order that will be purged at the end of the current packet's processing."
+      ],
+      "correctIndex": 0,
+      "explanation": "A zero-fill IOC is an ordinary cancel or expire: nothing about the order was invalid, so treating it as a reject pollutes reject metrics and alarms on routine behaviour. The 'stale book' answer is the seductive one because a zero-fill often does correlate with stale data, but the correct inference is about your data quality, not about the message class the venue sent. And an IOC never rests, not even briefly.",
+      "sourceAnchor": "506-immediate-or-cancel-orders",
+      "difficulty": "trap"
+    },
+    {
+      "id": "50-q14",
+      "prompt": "Asks are 100.03 × 300 and 100.04 × 500. A BUY 800 @ 100.03 FOK arrives. What happens?",
+      "options": [
+        "Killed with zero executions — only 300 is available at or below the 100.03 limit.",
+        "Fills 300 at 100.03 and 500 at 100.04, because a FOK sweeps until its size is complete.",
+        "Fills 300 at 100.03 and kills the residual 500, since partial fills count toward a FOK.",
+        "Fills all 800 at 100.04, the level at which the full requested quantity becomes available."
+      ],
+      "correctIndex": 0,
+      "explanation": "FOK requires the entire quantity to be executable at acceptable prices, and only 300 sits at or below the limit, so the feasibility check fails and nothing executes. The 'partial fill then kill' answer is the standard confusion with IOC — FOK admits no partials at all. The sweep-to-complete answer ignores the limit, and no rule reprices the 100.03 liquidity up to a common clearing level in continuous trading.",
+      "sourceAnchor": "507-fill-or-kill-orders",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q15",
+      "prompt": "How should a matching engine implement FOK?",
+      "options": [
+        "Two passes: a non-mutating feasibility walk that stops as soon as sufficiency is proven, then an execution sweep that is guaranteed to complete.",
+        "One pass that matches as it goes and rolls back book state plus any already-emitted executions if the accumulated quantity falls short.",
+        "Rest the order at its limit price until enough contra quantity accumulates, then execute the entire size in a single atomic step.",
+        "Take a lock over the whole contra side, execute optimistically, and release the lock only once the full quantity has been confirmed."
+      ],
+      "correctIndex": 0,
+      "explanation": "The dry-run pass proves sufficiency without mutating anything and can break early — you need only prove the total is enough, not compute it — after which the execution pass cannot fail. The match-then-rollback design is the tempting alternative and is far worse: it requires undoing book mutations and retracting executions already published to participants. Resting until fillable describes AON, not FOK, and locking has no place in a single-threaded deterministic matching core.",
+      "sourceAnchor": "507-fill-or-kill-orders",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q16",
+      "prompt": "You send simultaneous FOK orders for two legs of a spread to two different venues. What have you guaranteed?",
+      "options": [
+        "Nothing across venues — both can fill, both can kill, or one fills and one kills, leaving unwanted exposure.",
+        "Cross-venue atomicity, because neither order can partially fill and so neither can leave a residual position.",
+        "Cross-venue atomicity, provided both venues settle through the same clearing house on the same cycle.",
+        "Sequenced execution, because the venues' sequencers agree on a total order across their combined message streams."
+      ],
+      "correctIndex": 0,
+      "explanation": "FOK is an all-or-nothing guarantee about one order at one venue and says nothing about any other venue, so the four-way outcome space is intact and a single unmatched leg is exactly the exposure you were trying to avoid. The atomicity answer is the trap: 'no partial fills' is true of each order individually, but that property does not compose across independent engines. Genuine multi-leg atomicity requires a venue-native spread or combination instrument whose engine matches the legs as a unit; clearing arrangements and sequencers are per-venue and do not coordinate.",
+      "sourceAnchor": "507-fill-or-kill-orders",
+      "difficulty": "trap"
+    },
+    {
+      "id": "50-q17",
+      "prompt": "Why do automated low-latency systems overwhelmingly prefer DAY or IOC orders over GTC?",
+      "options": [
+        "GTC carries state across process restart, the boundary where state is least trustworthy, and drags durable journaling, cross-session ID uniqueness and corporate-action handling with it.",
+        "GTC orders forfeit time priority at every session boundary, so they re-enter the queue at the back each morning and are systematically behind fresh orders.",
+        "GTC orders are excluded from continuous matching and are only eligible in the opening and closing auctions, which makes them useless for intraday quoting.",
+        "GTC orders incur a per-day carry fee at most venues, which makes them uneconomic relative to re-establishing the same order at each session start."
+      ],
+      "correctIndex": 0,
+      "explanation": "The objection is state, not economics: a GTC order outlives your process, so the venue believes it exists whether you do or not, and correctness then depends on durable journaling plus mandatory startup reconciliation. The priority answer is the plausible one — priority is a real cost of repricing, but it is not what session rollover does to a carried-over GTC, and it is not why these systems avoid the type. DAY or IOC with explicit re-establishment makes state derivable rather than inherited.",
+      "sourceAnchor": "508-good-till-cancelled-and-dated-orders",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q18",
+      "prompt": "How should the expiry of a GTD order be stored?",
+      "options": [
+        "As an explicit venue-plus-local-date pair, since the date is interpreted in the venue's timezone and against the venue's calendar.",
+        "As a UTC instant computed from the venue's published close time, which removes timezone ambiguity from every downstream comparison.",
+        "As a UTC date, since the wire protocol defines all date fields as UTC and venues normalize them on receipt.",
+        "As a local-date plus a roll rule, since an expiry falling on a venue holiday always rolls forward to the next trading day."
+      ],
+      "correctIndex": 0,
+      "explanation": "The expiry means 'the close of that date's session at that venue', which only the venue's timezone and trading calendar can resolve, so the pair must be stored explicitly rather than reconstructed by your own arithmetic. The UTC-instant answer is the most attractive wrong one — deriving an instant bakes in your assumption about that venue's close, and the failure signature is orders expiring exactly one session early or late, clustered in venues whose offset crosses a date boundary relative to yours. Holiday behaviour is venue-defined, not a universal roll-forward.",
+      "sourceAnchor": "508-good-till-cancelled-and-dated-orders",
+      "difficulty": "recall"
+    },
+    {
+      "id": "50-q19",
+      "prompt": "Your gateway receives an execution report for a client order ID it has never seen, moments before the corresponding new-order acknowledgement arrives. What does this mean?",
+      "options": [
+        "It is expected: a fill can precede its ack, so the order record must be created before the message is sent and keyed by client order ID.",
+        "It is impossible on a correctly configured session: the venue sequences the acknowledgement ahead of any execution for the same order.",
+        "It is expected, and the right handling is to buffer unrecognized fills briefly and discard any that no acknowledgement claims.",
+        "It happens only on the drop-copy feed, so an order session may safely create its order records when the acknowledgement arrives."
+      ],
+      "correctIndex": 0,
+      "explanation": "The venue emits an execution as soon as it happens, and ordering across message types is not guaranteed end to end, so a fill genuinely can arrive first — which is why creating the record on acknowledgement drops fills. The buffer-and-discard answer accepts the premise but draws the wrong conclusion: discarding an unmatched execution is an untracked position, and the rule is to never silently drop an inbound message you cannot correlate. Restricting the phenomenon to drop copy simply denies it on the order session where it also occurs.",
+      "sourceAnchor": "509-order-lifecycle-state-machine",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q20",
+      "prompt": "Which set of quantity invariants should an order record assert on every transition?",
+      "options": [
+        "`order_qty == cum_qty + leaves_qty + canceled_qty`, `cum_qty` non-decreasing, and `leaves_qty == 0` exactly when the state is terminal.",
+        "`order_qty == cum_qty + leaves_qty`, with `canceled_qty` tracked outside the identity because cancelled size was never part of the order.",
+        "`cum_qty == leaves_qty + canceled_qty`, with `order_qty` permitted to move freely because a replace can change it at any time.",
+        "`order_qty == cum_qty + leaves_qty + canceled_qty`, with `leaves_qty == 0` for Filled orders only and non-zero retained on Canceled ones."
+      ],
+      "correctIndex": 0,
+      "explanation": "The three-way decomposition accounts for every unit of the original quantity, monotonic `cum_qty` is what makes duplicate or out-of-order execution processing detectable, and zero remaining quantity is equivalent to termination in both directions. The variant that keeps a non-zero `leaves_qty` on a cancelled order is the closest miss and breaks the equivalence: cancelled quantity moves into `canceled_qty`, leaving nothing working, which is the whole point of a terminal state.",
+      "sourceAnchor": "509-order-lifecycle-state-machine",
+      "difficulty": "recall"
+    },
+    {
+      "id": "50-q21",
+      "prompt": "A `PendingNew` order has received no response after its timeout expires. What is the correct action?",
+      "options": [
+        "Move it to an Unknown state that risk treats as fully live, stop trading that instrument, and query via order status or drop copy.",
+        "Resend the same order with a fresh client order ID so the venue's duplicate detection can reject whichever copy is redundant.",
+        "Mark it rejected and release its risk budget, since the absence of an acknowledgement means the venue never accepted it.",
+        "Leave it pending and wait for cancel-on-disconnect, since an unacknowledged order is by definition not working at the venue."
+      ],
+      "correctIndex": 0,
+      "explanation": "Two of the four possible realities after a timeout — resting and filled — are dangerous, so the only safe posture is to assume the order may be live, fail closed on that instrument, and resolve by querying. The resend answer is the seductive one and is self-defeating: duplicate detection keys on the client order ID, so sending a *fresh* ID defeats the very mechanism invoked to justify it and gives you two live orders. Marking it rejected asserts the one outcome you have no evidence for.",
+      "sourceAnchor": "509-order-lifecycle-state-machine",
+      "difficulty": "trap"
+    },
+    {
+      "id": "50-q22",
+      "prompt": "You send a cancel for a resting order and receive a fill followed by a cancel-reject reading 'too late to cancel'. What happened?",
+      "options": [
+        "The cancel and the fill crossed on the wire — a cancel is a request, never a guarantee, so risk must treat a pending cancel as fully live.",
+        "The venue processed your messages out of order, so resending the cancel will remove whatever quantity remains resting.",
+        "Your client order ID was wrong, which is both why the cancel failed and why the fill appears unmatched to any request.",
+        "The fill is a duplicate replay, since an order that reached a terminal filled state cannot also produce a cancel reject."
+      ],
+      "correctIndex": 0,
+      "explanation": "The execution was already emitted at the venue before your cancel arrived, so both messages are correct and simply crossed in flight; the practical consequence is that a pending-cancel order must be carried in risk at its full size, which is how firms avoid blowing position limits. The out-of-order answer misreads a race as a venue defect and prescribes a resend against an order that no longer has anything working. A wrong ID would produce an 'unknown order' reject, which is a different reason code.",
+      "sourceAnchor": "5010-cancel-replace-and-fill-races",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q23",
+      "prompt": "An order for 1000 is resting. You send a replace reducing it to 400, but 700 has already executed. What does a FIX-semantics venue typically do?",
+      "options": [
+        "Reject the replace because the new quantity is at or below `cum_qty`, leaving the original order working with 300 still exposed.",
+        "Clamp the new quantity up to `cum_qty` and report the order Filled at 700, closing it out with no remaining exposure.",
+        "Apply the reduction to the remaining quantity, so 400 continues to work on top of the 700 already executed.",
+        "Cancel the original and insert a fresh 400 order, which re-enters the level's queue at the back with a new identifier."
+      ],
+      "correctIndex": 0,
+      "explanation": "A replace to a quantity at or below the already-executed amount is generally rejected, and the crucial consequence is that the original stays working — your intended reduction silently did not happen and you hold more exposure than you believe. The 'applies to the remainder' answer is the natural but wrong reading: the replace specifies an absolute new `order_qty`, not a delta against `leaves_qty`, which is why you must never compute a replace from a stale remaining quantity. The clamp-to-filled and cancel-and-reinsert behaviours are not what the rejection produces.",
+      "sourceAnchor": "5010-cancel-replace-and-fill-races",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q24",
+      "prompt": "A cancel/replace request in a chain X to X-prime is rejected by the venue. What is the state of the orders afterwards?",
+      "options": [
+        "The original order remains working and must continue to be monitored, since a rejected replace changes nothing at the venue.",
+        "Neither is working, because the venue removes the original as soon as a replace request for it is accepted for processing.",
+        "The replacement is working, because the reject applies only to the field the venue could not honour, not to the order itself.",
+        "Both are briefly working, until the chain resolves itself at the venue's next sequence boundary for that instrument."
+      ],
+      "correctIndex": 0,
+      "explanation": "A rejected replace is a no-op at the venue, so the original is still live and can still fill — systems that optimistically mark it replaced then receive executions for an order they consider dead. The 'neither is working' answer captures a real hazard from the wrong model: the cancel-then-insert replace model does have a window in which nothing is live, but that window belongs to a replace being *processed*, not to one that was rejected. Correlating fills by the venue's stable order ID is what keeps the chain tractable.",
+      "sourceAnchor": "5010-cancel-replace-and-fill-races",
+      "difficulty": "trap"
+    },
+    {
+      "id": "50-q25",
+      "prompt": "Your system times out waiting for a new-order acknowledgement. Why is 'assume it was not sent' the wrong default?",
+      "options": [
+        "Two of the four possible realities — resting and filled — make that assumption wrong in ways that leave an unmonitored order or an unknown position.",
+        "All four possible realities make that assumption wrong, since a timeout on a TCP session cannot occur unless the message reached the venue.",
+        "It is wrong only under gateway queueing, so it is a safe default on venues that publish an acknowledgement-latency service level.",
+        "It is wrong because the venue will replay the acknowledgement later, and the replay collides with the record you have already discarded."
+      ],
+      "correctIndex": 0,
+      "explanation": "Of never-arrived, rejected, resting and filled, the first two leave you correct or only cosmetically wrong while the last two leave you with live exposure you are not tracking — so the danger is asymmetric and the safe posture is to assume the order may be live. The 'all four are wrong' answer overstates it on a false premise: a timeout can absolutely occur with the message never reaching the venue, which is why the state is unknown rather than known-live. A latency service level bounds the typical case and says nothing about the tail you just hit.",
+      "sourceAnchor": "5011-late-acknowledgements",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q26",
+      "prompt": "An acknowledgement arrives for an order your system already moved to a terminal state after a timeout. What should the handler do?",
+      "options": [
+        "Count it, reopen the order as Unknown, and resolve the true state via a status query or drop copy before trading the instrument again.",
+        "Discard it, since terminal states accept no further transitions and applying it would violate the state machine's invariants.",
+        "Apply it directly as a New transition, since the venue is authoritative and its acknowledgement means the order is working.",
+        "Log it and leave the order terminal, since an acknowledgement arriving after the close cannot alter a completed lifecycle."
+      ],
+      "correctIndex": 0,
+      "explanation": "The late ack is evidence that the order may actually be working at the venue, so the terminal conclusion your timeout reached was a guess that has now been contradicted — reopen as Unknown and go find out. The 'discard, terminal states are terminal' answer is the most tempting because it is a correct statement of the state machine used to justify exactly the wrong action; the rule is that terminal states reject transitions, not that late messages may be silently dropped. Blindly applying it as New is equally unsafe, because a fill or cancel may have followed the ack you are now seeing out of order.",
+      "sourceAnchor": "5011-late-acknowledgements",
+      "difficulty": "trap"
+    },
+    {
+      "id": "50-q27",
+      "prompt": "An execution report arrives where `msg.cum_qty` is strictly greater than `order.cum_qty + msg.last_qty`. What does this mean?",
+      "options": [
+        "A gap — an earlier fill was missed, so the handler must recover rather than simply applying this report.",
+        "A duplicate — the recorded total already includes this execution, so the report should be discarded silently.",
+        "Normal — the totals are consistent and monotonically increasing, so the report should be applied as usual.",
+        "Stale ordering — the report predates the current state, so it should be discarded but raised as an alarm."
+      ],
+      "correctIndex": 0,
+      "explanation": "The venue's running total has advanced further than your own total plus this fill can account for, which means an execution between the two never reached you — a gap, and at least as dangerous as a duplicate because it understates your position. A duplicate is signalled by `msg.cum_qty` equalling your existing total, and a stale report by it being lower; both of those are discard cases, whereas a gap demands recovery. This four-way test on `cum_qty` is the single most useful check in an execution handler.",
+      "sourceAnchor": "5012-duplicate-execution-messages",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q28",
+      "prompt": "What role should `PossDupFlag` play in an execution handler's deduplication logic?",
+      "options": [
+        "Only alarm classification — deduplication must key unconditionally on the venue's execution identifier, because duplicates also arrive unflagged.",
+        "It is the authoritative signal, so a report that does not carry the flag can be applied without consulting any seen-set.",
+        "It is set by your own engine on resend and is never present on inbound reports, so it has no role in an execution handler.",
+        "It is exact when combined with the session sequence number, so the pair together can replace a seen-set entirely."
+      ],
+      "correctIndex": 0,
+      "explanation": "The flag is a hint in one direction only: a flagged message may be a duplicate, but reconnect replay, redundant sessions and drop copy all deliver genuine duplicates with no flag at all, so identity-based dedupe on the execution ID is the only sound defence. Treating the flag as authoritative is the tempting shortcut and fails precisely on the unflagged sources. Sequence numbers are per-session and cannot identify the same execution arriving on two different sessions.",
+      "sourceAnchor": "5012-duplicate-execution-messages",
+      "difficulty": "recall"
+    },
+    {
+      "id": "50-q29",
+      "prompt": "Which two indices does a market-by-order limit order book require, and why?",
+      "options": [
+        "An ordered price-to-level index and an order-ID-to-node index, because cancels are the most frequent operation and arrive carrying only an ID.",
+        "An ordered price-to-level index alone, because a cancel message carries the order's price and the level can therefore be located directly.",
+        "A price-to-level index plus an arrival-timestamp index, so that time priority within a level can be recomputed whenever a level is rebuilt.",
+        "An order-ID-to-node index alone, because the best price can be derived by scanning that index whenever the touch is read."
+      ],
+      "correctIndex": 0,
+      "explanation": "A cancel arrives with an order ID and nothing else, so without a direct ID-to-node index you must search price levels — O(n) on the single most frequent operation, which is disqualifying in an interview. The 'price is in the cancel message' answer is the plausible miss and is simply false about the wire format. Time priority is maintained structurally by FIFO order in the level, so no timestamp index is needed, and deriving the best price by scanning orders inverts the required O(1) cost of the most-read value in the system.",
+      "sourceAnchor": "5013-limit-order-book-representation",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q30",
+      "prompt": "A feed handler holds its books in an `unordered_map<std::string, Book>` keyed by symbol and looks one up on every message. What is the primary defect?",
+      "options": [
+        "It hashes a string and chases a pointer per message, where a dense array indexed by the venue's numeric security ID would be one index.",
+        "It rehashes as the instrument universe grows, and the resulting latency spikes are the dominant cost on the message path.",
+        "It invalidates references to existing `Book` objects whenever an insertion occurs, so cached book pointers become dangling.",
+        "It cannot preserve insertion order, so books are visited in an order that varies between runs and destroys replay determinism."
+      ],
+      "correctIndex": 0,
+      "explanation": "Venues supply a compact numeric security ID precisely so that book lookup can be a single array index; hashing a symbol string per message adds a hash, a probe, and cache misses to the hottest path in the system. The rehash answer identifies a real property of the container but the wrong dominant cost — the per-message hashing is paid on every message, whereas rehashing is amortized and rare. The invalidation claim is false: node-based hash containers keep references to elements stable across insertion.",
+      "sourceAnchor": "5013-limit-order-book-representation",
+      "difficulty": "trap"
+    },
+    {
+      "id": "50-q31",
+      "prompt": "A price ladder for an equity spanning $10 to $1000 at a $0.01 tick needs about 99,000 slots, which is far too much memory across thousands of instruments. What is the standard mitigation?",
+      "options": [
+        "A windowed ladder covering a few hundred ticks around the market, a map for far-away prices, and an O(window) re-centring operation.",
+        "Compress the ladder to store only the occupied slots, which keeps the direct index arithmetic while dropping the memory to the live levels.",
+        "Enlarge the internal tick size so the slot count falls, then round submitted and published prices back onto the real grid.",
+        "Replace the ladder with a hash map from price to level, which retains O(1) best-price access while removing the empty slots."
+      ],
+      "correctIndex": 0,
+      "explanation": "Windowing keeps the O(1) index arithmetic where the activity actually is — at and near the touch — while a slow-path map covers the rare far prices, and the delicate part is re-centring in O(window) without losing orders. The 'store only occupied slots' answer is self-contradictory: direct indexing works precisely because slot position is computable from price, and compaction destroys that. A hash map does remove the empty slots but gives up ordered access, so best-price maintenance becomes the hard problem rather than a free one.",
+      "sourceAnchor": "5014-price-level-data-structures",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q32",
+      "prompt": "What problem does an occupancy bitmap alongside a price ladder solve?",
+      "options": [
+        "Finding the next occupied level in a sparse ladder, turning an unbounded slot scan into a bit scan of a few words with `countr_zero`.",
+        "Caching aggregate quantity per block of levels, so depth and imbalance queries can be answered without touching the individual levels.",
+        "Marking which levels lie inside the current price bands, so an add at an out-of-band price can be rejected in constant time.",
+        "Recording which levels changed during the current packet, so the published BBO delta can be computed without re-reading the book."
+      ],
+      "correctIndex": 0,
+      "explanation": "Sparsity is the ladder's weakness: after the best level empties, the next occupied slot may be many ticks away, and a linear scan is unbounded in a thin book. One bit per slot lets a single 64-bit word cover 64 levels and a count-trailing-zeros instruction locate the next occupied one in a couple of instructions, which is what keeps best-price maintenance O(1) in practice. The aggregate-caching answer describes a different and genuinely useful structure, but it does not address the empty-best-level case that the bitmap exists for.",
+      "sourceAnchor": "5014-price-level-data-structures",
+      "difficulty": "recall"
+    },
+    {
+      "id": "50-q33",
+      "prompt": "A candidate proposes storing each price level's orders in a vector and cancelling with swap-remove for O(1) deletion. What is wrong with this?",
+      "options": [
+        "Swap-remove moves the last order into the removed slot, destroying FIFO order and therefore time priority within the level.",
+        "Swap-remove is not actually O(1), because the index of the order being removed must first be found by scanning the vector.",
+        "Swap-remove leaves the level's `total_qty` inconsistent, because the moved element's quantity is counted twice after the swap.",
+        "Swap-remove is fine under price-time priority but breaks pro-rata allocation, which depends on the stored order sequence."
+      ],
+      "correctIndex": 0,
+      "explanation": "Time priority is encoded by position in the level's queue, and swap-remove deliberately reorders the container, so the order that was last to arrive jumps into the vacated position and gets filled ahead of everyone behind it — disqualifying under price-time allocation. The O(n)-lookup answer is the plausible near-miss: an auxiliary ID-to-index map does make the removal itself constant time, so the complexity objection is answerable while the correctness objection is not. Pro-rata allocation, by contrast, splits by size and is the rule least sensitive to sequence.",
+      "sourceAnchor": "5015-order-queues-at-a-price-level",
+      "difficulty": "trap"
+    },
+    {
+      "id": "50-q34",
+      "prompt": "An iceberg order's displayed tranche is fully executed and a new tranche is drawn from the hidden reserve. How must the book model handle it?",
+      "options": [
+        "Unlink the order, decrement the reserve, and re-append it at the tail of the level with the new display quantity.",
+        "Decrement the reserve in place and leave the node where it is, since the order itself never left the price level.",
+        "Re-insert the order at the head of the level, since its original arrival preceded every order currently queued behind it.",
+        "Distribute the remaining reserve across the nearby levels so the hidden quantity stays reachable by an aggressor."
+      ],
+      "correctIndex": 0,
+      "explanation": "Replenishment puts the new tranche at the back of the queue, so the model must unlink and re-append rather than mutate quantity in place. Decrementing in place is the tempting shortcut precisely because it is simpler and looks equivalent, but it silently grants the iceberg queue priority it does not have and biases fill simulation optimistic in exactly the direction that costs money. Nothing about replenishment moves the order to the head or spreads it across levels.",
+      "sourceAnchor": "5015-order-queues-at-a-price-level",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q35",
+      "prompt": "An exchange packet contains a cancel at the current best bid followed by an add at a better price. Why must the BBO be published once at the packet boundary rather than after each message?",
+      "options": [
+        "Publishing per message emits transient never-real states, including momentarily empty or crossed books that downstream logic will act on.",
+        "Publishing per message is correct but too costly, so batching is purely a throughput optimization with no effect on what consumers observe.",
+        "Publishing per message is safe once transient crossed states are clamped, so the real reason to batch is to reduce feed bandwidth.",
+        "Publishing per message breaks sequence numbering, because each emitted delta consumes a sequence value the venue has not assigned."
+      ],
+      "correctIndex": 0,
+      "explanation": "The two messages together form one logical transition, and the state between them — bid removed, replacement not yet added — never existed as a real market condition, so publishing it hands strategy and risk a book to react to that was an artifact of message granularity. The 'purely throughput' answer is the tempting one because batching does reduce volume; the point is that it is a correctness requirement first, and the diagnostic signature of getting it wrong is transient crossed-book alarms that always resolve within one packet. Clamping the transient hides the defect rather than fixing it.",
+      "sourceAnchor": "5016-best-bid-offer-maintenance",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q36",
+      "prompt": "How should a book represent a legitimately empty bid side, as occurs pre-open or after a halt purge?",
+      "options": [
+        "With an explicit presence flag or optional-style bit that every consumer is required to handle before reading a price.",
+        "With a sentinel price of zero for an empty bid and `INT64_MAX` for an empty ask, which keeps comparisons sorting correctly.",
+        "By retaining the last known best bid, since a side is rarely empty for long and the stale value keeps consumers simple.",
+        "By raising a crossed-book alarm, since a side with no resting quantity cannot occur during a valid trading session."
+      ],
+      "correctIndex": 0,
+      "explanation": "Emptiness is a real, legitimate state, so it must be represented as a state rather than smuggled in as a price — a sentinel will eventually be used in spread, mid or notional arithmetic and produce nonsense. The sentinel answer is attractive because the values do sort in the right direction, which is exactly what makes the bug survive code review; sorting correctly is not the same as being safe to compute with. Retaining a stale bid manufactures liquidity that is not there, and an empty side is not an error condition to alarm on.",
+      "sourceAnchor": "5016-best-bid-offer-maintenance",
+      "difficulty": "recall"
+    },
+    {
+      "id": "50-q37",
+      "prompt": "A feed handler applies every trade message on the tape to its book. What goes wrong?",
+      "options": [
+        "It double-counts, because the book change is usually already carried by the corresponding execute or delete messages.",
+        "It under-counts, because auction and off-book prints are excluded from the tape and so never reach the book at all.",
+        "It is safe, because every trade message carries the resting order ID needed to locate and decrement the right level.",
+        "It is required, because execute messages report only displayed quantity and omit any hidden portion of the fill."
+      ],
+      "correctIndex": 0,
+      "explanation": "Tape prints and book-affecting executions are different message classes: a trade message may refer to hidden liquidity, an auction, or an off-book trade, and where it does correspond to book activity the venue has usually already sent the execute or delete that mutates the level. The 'carries the order ID' answer is the plausible one and is false about the message content — a bare trade print has no order reference, which is exactly why it cannot be applied blindly. The signature of getting this wrong is level quantities drifting negative, and clamping a negative quantity is always a bug being concealed.",
+      "sourceAnchor": "5017-add-cancel-modify-and-execute-events",
+      "difficulty": "trap"
+    },
+    {
+      "id": "50-q38",
+      "prompt": "A MODIFY event reduces an order's quantity from 900 to 400 at the same price. How should the book apply it?",
+      "options": [
+        "Adjust the quantity in place and subtract 500 from the level total, keeping the order's existing FIFO position.",
+        "Unlink and re-append the order at the tail of the same level, since any modify is a fresh instruction from the participant.",
+        "Adjust in place only if the level's total quantity is unchanged; otherwise treat the modify as a delete followed by an add.",
+        "Unlink and re-append, since a decrease forfeits priority and only a price improvement is permitted to retain it."
+      ],
+      "correctIndex": 0,
+      "explanation": "Priority is lost on a price change or a quantity increase and preserved on a quantity decrease, so the correct handling is an in-place mutation plus an incremental adjustment to the level total. The 'any modify re-appends' answer describes what a feed that expresses modifications as delete-plus-add would do — unambiguous but a different wire representation — and encoding it against a venue that has a real modify message makes your queue-position model wrong in the participant's favour, which biases simulation optimistic.",
+      "sourceAnchor": "5017-add-cancel-modify-and-execute-events",
+      "difficulty": "application"
+    },
+    {
+      "id": "50-q39",
+      "prompt": "Why is a matching engine single-threaded per instrument, and how does it scale?",
+      "options": [
+        "Determinism is a requirement — identical inputs must yield identical executions for replay failover, journal recovery and dispute adjudication — so it scales by partitioning instruments.",
+        "Lock contention on price levels dominates the profile, so a single thread is chosen as a performance optimization and it scales by faster cores.",
+        "Matching is dominated by journal and publication I/O, so extra threads add nothing, and it scales by widening the outbound publication path.",
+        "The language memory model cannot express the ordering that a shared order book requires, so it scales by replicating the whole engine per region."
+      ],
+      "correctIndex": 0,
+      "explanation": "Concurrency inside one instrument's matching would make allocation order depend on thread scheduling, which would break replay-based replication, journal recovery and the ability to adjudicate a disputed fill — so the constraint is correctness, and the scaling axis is instrument partitioning. The lock-contention answer is the common misread: single-threading does avoid locks and is fast, but treating that as the reason gets the priority backwards and would justify abandoning it as soon as a faster concurrent design appeared. The memory model can express shared-book ordering; determinism is what it cannot give you.",
+      "sourceAnchor": "5018-matching-engine-design",
+      "difficulty": "recall"
+    },
+    {
+      "id": "50-q40",
+      "prompt": "Your firm sends an aggressive buy that would match your own resting sell under a cancel-oldest self-trade-prevention policy. What is the surprising consequence?",
+      "options": [
+        "Your own resting sell is cancelled as a side effect of your aggressive buy, which then continues matching against the rest of the book.",
+        "Your aggressive buy is cancelled and the resting sell survives untouched, since prevention policies always protect existing book liquidity.",
+        "The match executes and is flagged as a self-trade for regulatory reporting, since prevention is a reporting rather than a matching mechanism.",
+        "Nothing happens, since prevention is keyed per account and orders from different accounts of one firm are never considered a collision."
+      ],
+      "correctIndex": 0,
+      "explanation": "Cancel-oldest removes the resting side and lets the incoming order continue, so sending an aggressive order can silently destroy passive liquidity you were relying on — genuinely surprising the first time it occurs. The 'always cancels the incoming order' answer describes the cancel-newest policy, which is a real option but not this one; the policy is configured, not universal. Prevention acts in the matching path rather than at reporting time, and the grouping key is configurable up to firm level rather than fixed at the account.",
+      "sourceAnchor": "5018-matching-engine-design",
+      "difficulty": "trap"
+    }
+  ]
+}

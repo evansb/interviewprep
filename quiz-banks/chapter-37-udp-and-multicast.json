@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-37-udp-and-multicast",
+  "questions": [
+    {
+      "id": "37-q01",
+      "prompt": "What does UDP add on top of raw IP, and nothing more?",
+      "options": [
+        "Port numbers for demultiplexing and an optional checksum.",
+        "Port numbers, an optional checksum, and in-order delivery.",
+        "Port numbers, a mandatory checksum, and duplicate suppression.",
+        "Port numbers, an optional checksum, and a receive window."
+      ],
+      "correctIndex": 0,
+      "explanation": "UDP is a thin demux layer: ports plus an optional checksum, with an 8-byte header. Everything TCP provides — ordering, retransmission, flow control, congestion control, connection state — is absent by design. The in-order-delivery choice is the tempting one because reordering is rare on a clean colo LAN, but rarity is not a guarantee, and every feed handler must still be written for reordering.",
+      "sourceAnchor": "371-udp-semantics-and-datagrams",
+      "difficulty": "recall"
+    },
+    {
+      "id": "37-q02",
+      "prompt": "A feed handler calls `recvfrom` with a 1024-byte buffer and a 1300-byte datagram is queued. What happens?",
+      "options": [
+        "It returns 1024 bytes and the remaining 276 are discarded silently; `recvmsg` would set `MSG_TRUNC`.",
+        "It returns 1024 bytes and the remaining 276 stay queued for the next `recvfrom` call.",
+        "It fails with `EMSGSIZE` and the datagram stays queued until a large enough buffer is supplied.",
+        "It truncates to 1024 bytes but returns 1300 so the caller can always detect the shortfall."
+      ],
+      "correctIndex": 0,
+      "explanation": "Datagram boundaries are preserved, so one `recvfrom` consumes exactly one datagram and anything that does not fit is dropped without any error — the classic silent-truncation bug. The idea that the remainder stays queued is the tempting one because that is exactly what a byte stream would do; UDP has no stream to leave a remainder in. Only `recvmsg` reports the loss, via `MSG_TRUNC` in `msg_flags`.",
+      "sourceAnchor": "371-udp-semantics-and-datagrams",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q03",
+      "prompt": "A high-rate UDP sender calls `connect()` on its socket before sending. Which effect is real?",
+      "options": [
+        "ICMP port-unreachable is reported as `ECONNREFUSED` on a later call; unconnected sockets discard such errors.",
+        "A handshake is performed with the peer, so the first send fails immediately if the peer is down.",
+        "Datagrams from any source are still delivered, because a UDP socket cannot filter by peer address.",
+        "`sendto` is still required, because `connect` only fixes the socket's local source port."
+      ],
+      "correctIndex": 0,
+      "explanation": "Connecting a UDP socket sets a default peer: it enables `send`/`write` (skipping the per-call address copy and route lookup), filters inbound datagrams to that peer, and delivers asynchronous ICMP errors. The handshake answer is the tempting one, but `connect()` on UDP transmits nothing — the error only surfaces on a subsequent operation after an ICMP message actually comes back.",
+      "sourceAnchor": "371-udp-semantics-and-datagrams",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q04",
+      "prompt": "What does the 16-bit Length field in the UDP header count?",
+      "options": [
+        "Header plus payload, so the smallest legal value is 8.",
+        "Payload only, so the smallest legal value is 0.",
+        "Header plus payload plus pseudo-header, minimum 20.",
+        "Payload only, and it must equal the IP Total Length."
+      ],
+      "correctIndex": 0,
+      "explanation": "UDP's Length covers the 8-byte header and the payload, so 8 is the minimum and a zero-length datagram is perfectly legal. The payload-only reading is the tempting one because that is what an application thinks of as the message size; it also makes the field's known redundancy with the IP Total Length impossible to explain. The 12-byte pseudo-header is never transmitted and never counted.",
+      "sourceAnchor": "372-udp-headers-and-checksums",
+      "difficulty": "recall"
+    },
+    {
+      "id": "37-q05",
+      "prompt": "A UDP checksum computation over an IPv4 datagram yields `0x0000`. What is placed in the header?",
+      "options": [
+        "`0xFFFF`, because `0x0000` is reserved to mean 'no checksum computed'.",
+        "`0x0000`, and receivers treat a zero result as a successful verification.",
+        "`0x0001`, because one's-complement arithmetic cannot represent zero.",
+        "`0x0000`, and the sender sets a header flag marking the value as valid."
+      ],
+      "correctIndex": 0,
+      "explanation": "One's-complement arithmetic has two representations of zero, so the encoding uses `0xFFFF` for a genuine computed zero and reserves `0x0000` for 'checksum absent' — a distinction only IPv4 needs, since the checksum is mandatory in IPv6. Transmitting `0x0000` and calling it valid is the tempting answer, but it is exactly the value that tells a receiver to skip verification entirely. There is no spare flag bit in the 8-byte UDP header.",
+      "sourceAnchor": "372-udp-headers-and-checksums",
+      "difficulty": "trap"
+    },
+    {
+      "id": "37-q06",
+      "prompt": "`tcpdump` on your own sending host reports 'bad udp cksum' on every outgoing multicast packet, yet receivers parse them fine. Why?",
+      "options": [
+        "TX checksum offload: the NIC fills the field after the capture point, so the capture is expected to look wrong.",
+        "RX offload marked the frames `CHECKSUM_UNNECESSARY`, so `tcpdump` printed a placeholder value.",
+        "`SO_NO_CHECK` is set, so the field is zero and `tcpdump` reports a zero checksum as bad.",
+        "The pseudo-header was omitted from the computation, a mismatch receivers happen to tolerate."
+      ],
+      "correctIndex": 0,
+      "explanation": "`tcpdump` taps the stack before the NIC, so with `tx-checksumming` enabled it sees an unfilled or partial field — normal, not a bug, and confirmable with `ethtool -k eth0`. The `SO_NO_CHECK` answer is the tempting one because zero-checksum multicast is a real exchange practice, but a zero field means 'not computed' and is reported as such rather than as bad. Receivers would not tolerate a genuinely wrong checksum; they would drop the datagram.",
+      "sourceAnchor": "372-udp-headers-and-checksums",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q07",
+      "prompt": "In production, in what order should a feed handler's loss-recovery mechanisms be attempted?",
+      "options": [
+        "Arbitration across redundant feeds, then unicast retransmission, then snapshot, then full restart.",
+        "Unicast retransmission, then arbitration across feeds, then snapshot, then full restart.",
+        "Snapshot recovery, then arbitration across feeds, then unicast retransmission, then full restart.",
+        "Forward error correction, then arbitration, then unicast retransmission, then snapshot."
+      ],
+      "correctIndex": 0,
+      "explanation": "The layering follows cost: arbitration is free and recovers uncorrelated loss at zero added latency, retransmission costs a millisecond-scale round trip and loads a shared server, and snapshots cost up to a full cycle of seconds. Putting retransmission first is the tempting ordering because it is the most explicit mechanism, but it spends a request on losses the B feed would have covered for nothing. FEC is rare in equities precisely because its bandwidth cost is paid continuously.",
+      "sourceAnchor": "373-application-level-loss-recovery",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q08",
+      "prompt": "A conflated top-of-book feed publishes current best bid/offer as state, not as an event log. One update is lost. What is the correct response?",
+      "options": [
+        "Ignore the loss and wait for the next update, since the next message restates current state.",
+        "Buffer all later updates and publish nothing until the missing one is retransmitted.",
+        "Reset the instrument and request a full snapshot for every single lost message.",
+        "Interpolate the missing price from the updates immediately before and after the gap."
+      ],
+      "correctIndex": 0,
+      "explanation": "For a state-snapshot data model each message supersedes the last, so a lost update is repaired by the next one and stale data is simply less useful, not wrong. Blocking until a retransmit arrives is the tempting choice because it is correct for an event-log feed such as ITCH — but there the book is a replayed log where one missing 'order add' is permanently unrecoverable, which is what makes recovery mandatory in that case and pointless here.",
+      "sourceAnchor": "373-application-level-loss-recovery",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q09",
+      "prompt": "A book builder detects a gap and the fill has not arrived yet. Which statement about the handling is correct?",
+      "options": [
+        "A gap must never silently yield a wrong book; the standard approach is to mark data stale and let risk decide.",
+        "Applying later deltas across the gap is acceptable, because the book converges once the fill arrives.",
+        "Blocking until the gap fills is the only defensible option, since correctness always outranks latency.",
+        "Dropping the affected instrument without signalling downstream is safest, since no wrong price is published."
+      ],
+      "correctIndex": 0,
+      "explanation": "Continuing to apply deltas across a known gap produces a confidently wrong book, which is the worst outcome in market data; publishing degraded with a staleness flag is the standard design because it lets the risk layer refuse to quote. Blocking is the tempting answer since it sounds maximally safe, but it introduces unbounded latency and memory growth while the strategy keeps trading on prices it believes are current unless told otherwise.",
+      "sourceAnchor": "373-application-level-loss-recovery",
+      "difficulty": "trap"
+    },
+    {
+      "id": "37-q10",
+      "prompt": "A MoldUDP64 packet carries sequence number 5000 and a message count of 5. What is the next expected sequence?",
+      "options": [
+        "5005 — the header sequence names the first message in the packet and the count advances it.",
+        "5001 — the header sequence is a per-packet counter, so each datagram advances it by one.",
+        "5006 — the count excludes the first message, which the header numbers separately.",
+        "5000 — the count is a redundancy field and the next packet restates the sequence."
+      ],
+      "correctIndex": 0,
+      "explanation": "MoldUDP64 sequences messages, not packets: the header names the first message's sequence and the count says how many follow it in that datagram, so `next = seq + count`. The per-packet-counter reading is the tempting one and is a real production bug — under batching it produces phantom gaps, because a packet carrying five messages appears to advance the stream by only one.",
+      "sourceAnchor": "374-sequence-number-gap-detection",
+      "difficulty": "trap"
+    },
+    {
+      "id": "37-q11",
+      "prompt": "Your handler sees `s > expected`. Why should it not fire a retransmit request immediately?",
+      "options": [
+        "Reordering and loss look identical at detection, so a short gap timer avoids spurious requests under stress.",
+        "The retransmit server rejects any request issued within 10 ms of the original transmission.",
+        "The kernel withholds reordered datagrams until a timer tick drains the socket receive queue.",
+        "Sequence numbers only become valid once the entire packet batch has been received."
+      ],
+      "correctIndex": 0,
+      "explanation": "Only elapsed time distinguishes a reordered packet from a lost one, so the correct design sets a gap timer — 1–10 ms, or tens of microseconds on a clean colo LAN — and escalates only if the hole survives it. The B feed will usually have delivered the packet by then anyway. The server-side-rejection answer is tempting because retransmit services really do enforce rate limits, but the limit governs request volume, not how soon after transmission you may ask.",
+      "sourceAnchor": "374-sequence-number-gap-detection",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q12",
+      "prompt": "Why must `expected` be keyed by `(session, channel)` rather than by channel alone?",
+      "options": [
+        "A session change resets the sequence to 1; a handler ignoring the session ID reads that as a huge backwards jump and discards everything as duplicates.",
+        "A session change continues the sequence across sessions, so the session ID is purely descriptive metadata for logging.",
+        "A session change is signalled by a wrap of the 64-bit sequence space, so wrap-safe comparison already covers the case.",
+        "A session change presents as an ordinary forward gap, so the normal retransmit path recovers it without extra logic."
+      ],
+      "correctIndex": 0,
+      "explanation": "Sequence numbers are only meaningful within a session — a trading day, or a MoldUDP64 session ID — and a new session restarts at 1. A receiver tracking sequence alone sees a catastrophic backwards jump and, with the usual `s < expected` rule, silently classifies the entire rest of the day as duplicates. The wrap-safe-arithmetic answer is the tempting one because both cases look like a backwards jump, but wrap-safe comparison is about modular width, not about a deliberate restart, and would not resurrect the stream.",
+      "sourceAnchor": "374-sequence-number-gap-detection",
+      "difficulty": "trap"
+    },
+    {
+      "id": "37-q13",
+      "prompt": "Which expression correctly tests 'sequence `a` is after `b`' for a 32-bit space that can wrap?",
+      "options": [
+        "`int32_t(a - b) > 0` — modular subtraction reinterpreted as signed.",
+        "`a > b` — unsigned comparison, since sequences increase monotonically.",
+        "`int32_t(a) > int32_t(b)` — signed reinterpretation of each value.",
+        "`(a - b) > 0` — unsigned difference, non-zero whenever they differ."
+      ],
+      "correctIndex": 0,
+      "explanation": "Subtracting in the unsigned space and reinterpreting the difference as signed makes the comparison relative to the wrap point rather than to zero — the same trick TCP uses for its 32-bit sequence space. Plain unsigned `a > b` is the tempting answer and is right until the counter wraps (~71 minutes at 1 Mmsg/s), at which point it inverts and reports false gaps or false duplicates exactly when the feed is busiest.",
+      "sourceAnchor": "374-sequence-number-gap-detection",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q14",
+      "prompt": "Which pairing of IPv4 multicast ranges to purposes is correct?",
+      "options": [
+        "`232.0.0.0/8` is source-specific multicast; `239.0.0.0/8` is administratively scoped.",
+        "`232.0.0.0/8` is administratively scoped; `239.0.0.0/8` is source-specific multicast.",
+        "`233.0.0.0/8` is source-specific multicast; `232.0.0.0/8` is the GLOP AS-derived range.",
+        "`224.0.0.0/24` is administratively scoped; `239.0.0.0/8` is link-local network control."
+      ],
+      "correctIndex": 0,
+      "explanation": "`232/8` is reserved for SSM channels and `239/8` is the RFC 2365 administratively scoped range — the RFC 1918 of multicast, used for in-house and many venue feeds. Swapping `232/8` and `233/8` is the tempting error since both carry exchange traffic, but `233/8` is GLOP, allocated from AS numbers, while SSM semantics attach specifically to `232/8`. `224.0.0.0/24` is link-local control, never forwarded and sent with TTL 1.",
+      "sourceAnchor": "375-ip-multicast-groups",
+      "difficulty": "recall"
+    },
+    {
+      "id": "37-q15",
+      "prompt": "Your NIC is programmed to filter for group `239.1.2.3`. Which other group's frames does that same MAC filter entry also admit?",
+      "options": [
+        "`239.129.2.3`, because only the low 23 bits of the group enter the `01:00:5e` MAC.",
+        "`239.1.2.131`, because only the high 23 bits of the group enter the MAC address.",
+        "`239.2.1.3`, because the mapping swaps the middle two octets before truncating.",
+        "`239.1.130.3`, because the bit dropped by the mapping lies in the third octet."
+      ],
+      "correctIndex": 0,
+      "explanation": "The MAC is `01:00:5e` plus the low 23 bits of the group with bit 24 forced to zero, so the high bit of the second octet is discarded — `239.1.2.3` and `239.129.2.3` both become `01:00:5e:01:02:03`. That is 28 significant group bits squeezed into 23, giving 32 groups per MAC. Placing the dropped bit in the third octet is the tempting near-miss; it gets the truncation idea right but the boundary wrong, and the consequence is real: a MAC-only filter admits unwanted feeds, so the stack must also check destination IP.",
+      "sourceAnchor": "375-ip-multicast-groups",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q16",
+      "prompt": "On a multi-homed host, a publisher's multicast never appears on the trading VLAN but is visible on the management NIC. What is the cause?",
+      "options": [
+        "`IP_MULTICAST_IF` was not set, so the kernel picked the egress interface from the route table.",
+        "`IP_MULTICAST_TTL` was left at its default of 1, which confines traffic to the management NIC.",
+        "`IP_MULTICAST_LOOP` was left enabled, which diverts the outbound copy to the wrong NIC.",
+        "`SO_REUSEADDR` was not set, so the kernel bound the sending socket to the wrong interface."
+      ],
+      "correctIndex": 0,
+      "explanation": "Multicast egress interface selection is explicit; without `IP_MULTICAST_IF` the kernel falls back to the route table, which on a multi-homed trading host usually points at the management NIC. The default TTL of 1 is the tempting answer because it is the other famous default in that snippet, but TTL 1 constrains how far traffic travels, not which interface it leaves by — it would still be on the correct VLAN's local switch.",
+      "sourceAnchor": "375-ip-multicast-groups",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q17",
+      "prompt": "Which statement about IGMP versions is correct?",
+      "options": [
+        "v2 adds Leave Group and group-specific queries; v3 adds INCLUDE/EXCLUDE source filtering.",
+        "v2 adds INCLUDE/EXCLUDE source filtering; v3 adds Leave Group and group-specific queries.",
+        "v1 adds Leave Group; v2 adds source filtering; v3 adds report suppression on shared VLANs.",
+        "v2 adds group-specific queries; v3 adds Leave Group and shortens the query interval to 60 s."
+      ],
+      "correctIndex": 0,
+      "explanation": "IGMPv1 had reports only, with leaves inferred from query timeout; v2 added the explicit Leave Group message and group-specific queries for fast leave; v3 added source lists, which is why SSM requires it. Attaching source filtering to v2 is the tempting swap because `IP_ADD_SOURCE_MEMBERSHIP` exists as a v2-era socket call — but the wire protocol that carries INCLUDE/EXCLUDE lists is v3.",
+      "sourceAnchor": "376-igmp",
+      "difficulty": "recall"
+    },
+    {
+      "id": "37-q18",
+      "prompt": "With a 125 s query interval, 10 s max response time and robustness 2, what does the resulting ~260 s interval bound?",
+      "options": [
+        "The worst-case time a router keeps forwarding a group after the last receiver disappears without a leave.",
+        "The maximum time a host may wait before it is permitted to send its first unsolicited report.",
+        "The interval after which a snooping switch must re-flood the group to rediscover its receivers.",
+        "The time a router waits after a Leave before it sends its first group-specific query for that group."
+      ],
+      "correctIndex": 0,
+      "explanation": "Group membership interval is `robustness × query_interval + max_response_time` = 2×125 + 10 ≈ 260 s, the staleness bound on router and switch forwarding state when a receiver vanishes silently. Reading it as a join-latency bound is the tempting inversion: joins do not wait for queries at all — `IP_ADD_MEMBERSHIP` triggers an unsolicited report immediately, repeated `robustness` times, so join latency is sub-millisecond to a few milliseconds on a LAN.",
+      "sourceAnchor": "376-igmp",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q19",
+      "prompt": "What did IGMPv3 change about membership report suppression?",
+      "options": [
+        "It removed suppression, so every host reports and snooping switches can build accurate per-port state.",
+        "It added suppression, so only one host per group answers a query and query-response load stays flat.",
+        "It kept suppression but restricted it to group-specific queries, leaving general queries unsuppressed.",
+        "It removed suppression only on ports the switch has classified as multicast router (mrouter) ports."
+      ],
+      "correctIndex": 0,
+      "explanation": "In v1 and v2 a host that saw another host's report for the same group stayed quiet, which saved traffic but hid per-port membership from a snooping switch; v3 removed suppression so every host reports and the switch learns exactly which ports want the group. The 'v3 added suppression' answer is tempting because suppression sounds like an efficiency refinement a newer version would introduce — but it is the older behaviour, and its removal is precisely what makes v3 snooping accurate.",
+      "sourceAnchor": "376-igmp",
+      "difficulty": "recall"
+    },
+    {
+      "id": "37-q20",
+      "prompt": "What changes when a venue's feed moves from any-source multicast to source-specific multicast?",
+      "options": [
+        "Subscription becomes `(S,G)`, so collisions and rogue senders are filtered by the network; IGMPv3 is required.",
+        "Subscription stays `(*,G)`, but the rendezvous point filters rogue senders on each receiver's behalf.",
+        "Subscription stays `(*,G)`, and the first-hop router enforces the sender's TTL scope per source instead.",
+        "Subscription becomes `(S,G)`, which makes application sequence numbers unnecessary for gap detection."
+      ],
+      "correctIndex": 0,
+      "explanation": "SSM changes the subscription unit from a group to a channel, so `(S1,G)` and `(S2,G)` are distinct: address collisions disappear, a decommissioned test publisher cannot reach subscribers, and the network needs IGMPv3 end to end. The claim that sequence numbers become unnecessary is the tempting overreach — SSM controls *who* may send to you, but it does nothing about packets dropped by a switch queue or a full socket buffer.",
+      "sourceAnchor": "377-source-specific-multicast",
+      "difficulty": "recall"
+    },
+    {
+      "id": "37-q21",
+      "prompt": "An exchange migrates a feed to new publisher infrastructure. Why does this repeatedly cause SSM subscriber outages?",
+      "options": [
+        "The publisher's source IP is subscriber configuration, so an un-updated `(S,G)` join silently stops matching at cutover.",
+        "The group address is subscriber configuration, but SSM keys only on the source, so the migration is transparent.",
+        "PIM-SSM relearns the new source from the rendezvous point, so only receivers behind a stale RP are affected.",
+        "IGMPv3 EXCLUDE mode auto-admits the replacement source, but only after the old source stops transmitting."
+      ],
+      "correctIndex": 0,
+      "explanation": "SSM's benefit and its cost are the same fact: naming the source pins it into every subscriber's configuration, so a publisher migration breaks everyone who did not update it. The mitigation is versioned reference data plus joining both old and new `(S,G)` across the migration window. The rendezvous-point answer is tempting because RP-based relearning is exactly how ASM copes with source changes — but PIM-SSM has no RP at all; it builds a shortest-path tree toward the source the receiver named.",
+      "sourceAnchor": "377-source-specific-multicast",
+      "difficulty": "trap"
+    },
+    {
+      "id": "37-q22",
+      "prompt": "How does PIM-SSM build its distribution tree compared with PIM-SM?",
+      "options": [
+        "Straight toward the named source on a shortest-path tree, with no RP and no shared-to-shortest switchover.",
+        "Toward the rendezvous point first, then it prunes the RP away once the first packet has arrived.",
+        "Toward the rendezvous point for registration only, then it skips the shared-tree phase entirely.",
+        "By flooding and pruning as in PIM-DM, then pinning the surviving branch toward the source."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because the receiver already names the source, PIM-SSM joins directly toward it — no rendezvous point to discover via Auto-RP, BSR or static config, no shared tree, no SPT switchover with its brief disruption, and less router state. Any answer keeping the RP in the path is the tempting near-miss: it correctly describes PIM-SM's sequence, which is precisely the machinery SSM eliminates, and eliminating it is what makes SSM joins faster and more deterministic.",
+      "sourceAnchor": "377-source-specific-multicast",
+      "difficulty": "recall"
+    },
+    {
+      "id": "37-q23",
+      "prompt": "After a config change adds many multicast groups, `ip link show eth0` reports `ALLMULTI` and `rx_multicast_packets` far exceeds the joined feeds' rate. What happened?",
+      "options": [
+        "The exact-filter table overflowed, so the driver fell back to hash and then all-multicast, DMAing every multicast frame.",
+        "IGMP snooping failed on the switch, so the driver put the interface into all-multicast to compensate for flooding.",
+        "The socket receive buffer overflowed during a microburst, so the kernel raised `ALLMULTI` to recover the losses.",
+        "Installed `ethtool` n-tuple rules disabled the hash filter, so the exact table now matches every group."
+      ],
+      "correctIndex": 0,
+      "explanation": "NIC exact-match tables hold only 16–128 MAC entries; exceeding them silently escalates to a hash bitmap (collisions admit unwanted traffic) and then to all-multicast, where every multicast frame on the segment is DMAed and thrown away in software — PCIe and memory bandwidth burned, plus jitter on the packets you wanted. Blaming switch flooding is the tempting answer since it produces similar volume, but flooding never sets `ALLMULTI` on the host; that flag is set by the driver as a fallback.",
+      "sourceAnchor": "378-multicast-nic-filtering",
+      "difficulty": "trap"
+    },
+    {
+      "id": "37-q24",
+      "prompt": "A kernel-bypass feed handler filters arriving frames only on destination MAC. What goes wrong?",
+      "options": [
+        "Up to 32 groups share one MAC, so it will parse another feed's packets and produce sequence-number chaos.",
+        "MAC filtering is exact for multicast, so the only risk is a small waste of CPU on already-joined groups.",
+        "The 32:1 collision applies solely to IPv6 multicast, whose MACs use the `33:33` prefix instead.",
+        "The NIC compares the IP header itself, so software need only add a destination-port check."
+      ],
+      "correctIndex": 0,
+      "explanation": "The three-layer funnel exists because layer 1 is imprecise: even a perfect MAC filter admits up to 32 groups, so the destination-IP check at layer 2 is not optional, and on a bypass stack you implement it. Assuming the NIC resolves the collision is the tempting answer because the kernel does hide this work from you — but the NIC filters on MAC, and it is the stack above that compares IPs. The fix is a `(dst_ip, dst_port)` hash set, or better, a hardware flow rule.",
+      "sourceAnchor": "378-multicast-nic-filtering",
+      "difficulty": "trap"
+    },
+    {
+      "id": "37-q25",
+      "prompt": "What do hardware n-tuple / flow-director rules (`ethtool -N eth0 flow-type udp4 ...`) accomplish?",
+      "options": [
+        "They match the 5-tuple in hardware and steer a feed to a chosen receive queue, isolating it per core.",
+        "They replace the exact MAC filter table, raising exact-match capacity to thousands of multicast groups.",
+        "They run in the kernel after DMA, so they cut CPU cost but leave PCIe and memory bandwidth unchanged.",
+        "They apply only to TCP flows, since UDP has no connection state for the NIC to steer on."
+      ],
+      "correctIndex": 0,
+      "explanation": "Flow steering gives per-feed queue isolation: feed A to queue 3 on core 3, feed B to queue 4, so neither adds jitter to the other — combined with per-queue interrupt affinity and core isolation, this is the standard deterministic feed-handler architecture. The 'kernel-side after DMA' answer is the tempting one because software RPS does work that way; n-tuple rules are evaluated in the NIC, which is what makes the queue placement free.",
+      "sourceAnchor": "378-multicast-nic-filtering",
+      "difficulty": "recall"
+    },
+    {
+      "id": "37-q26",
+      "prompt": "A market-data feed on an isolated layer-2 VLAN works for about four minutes after startup, then goes dead. What is the cause?",
+      "options": [
+        "IGMP snooping is on with no querier on the VLAN, so the snooping entries aged out after ~260 s.",
+        "IGMP snooping is off, so the switch aged out its flooding entries and stopped forwarding after ~260 s.",
+        "The host's unsolicited report was lost on join, so the group was never programmed into the switch.",
+        "Fast-leave fired on the host's port because the host stopped repeating reports after its join."
+      ],
+      "correctIndex": 0,
+      "explanation": "Snooping is passive: hosts report unsolicited on join and thereafter only in response to General Queries, and a pure L2 VLAN has no router to be the querier — so nothing refreshes the entries and they expire at the group membership interval. The lost-join answer is tempting but contradicts the symptom: a join that never landed gives you no data at all, not four good minutes. Confirm with `tcpdump -i ethX igmp`; no query every ~125 s means no querier.",
+      "sourceAnchor": "379-igmp-snooping-and-queriers",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q27",
+      "prompt": "What does a switch do with multicast frames on a VLAN where IGMP snooping is disabled?",
+      "options": [
+        "Treats them like broadcast and floods every multicast frame to every port in the VLAN.",
+        "Drops them, because without snooping it holds no forwarding entry for the group.",
+        "Forwards them only out its multicast router port and lets the router handle replication.",
+        "Forwards them only to ports that sent a membership report at link-up time."
+      ],
+      "correctIndex": 0,
+      "explanation": "With no snooping there is no per-port group state, so multicast degrades to broadcast — a 100 Mbit/s feed across 40 ports becomes 4 Gbit/s of switching plus a NIC on every host discarding traffic it never asked for, with the CPU and jitter cost that implies. The 'drops them' answer is the tempting inversion: no forwarding entry means flood, not discard, and that default is exactly why the failure is wasteful rather than obvious.",
+      "sourceAnchor": "379-igmp-snooping-and-queriers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "37-q28",
+      "prompt": "A switch port carries several receivers of the same group. Why is enabling fast-leave on that port dangerous?",
+      "options": [
+        "Fast-leave drops the port from the group on any Leave without a group-specific query, cutting off receivers that did not leave.",
+        "Fast-leave sends the group-specific query before removal, so the risk is only a brief pause for the remaining hosts.",
+        "Fast-leave applies exclusively to multicast router ports, so ordinary host-facing ports are never affected by it.",
+        "Fast-leave defers removal by the full membership interval, so late-leaving receivers lose about 260 s of data."
+      ],
+      "correctIndex": 0,
+      "explanation": "Fast-leave trades the confirmation step for speed: it removes the port immediately on a Leave instead of asking 'anyone else want G?', which is correct only when the port has exactly one receiver — not on an uplink to another switch or a host running several containers. The 'it queries first' answer is tempting because that is the standard IGMPv2 behaviour; skipping precisely that query is what fast-leave means.",
+      "sourceAnchor": "379-igmp-snooping-and-queriers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "37-q29",
+      "prompt": "Unicast pings to the multicast publisher's IP succeed perfectly, but no multicast arrives. What is the most likely cause?",
+      "options": [
+        "RPF failure — the multicast arrives on an interface other than the one unicast to the source uses, so it is dropped.",
+        "TTL exhaustion — multicast carries a separate TTL field from unicast, and that one expired en route.",
+        "Snooping with no mrouter port — reports reach the router but its unicast table then has no route.",
+        "Socket receive buffer overflow — it discards multicast bursts while leaving unicast probes untouched."
+      ],
+      "correctIndex": 0,
+      "explanation": "PIM uses the unicast routing table, so a router accepts a multicast packet only if it arrived on the interface unicast to the source would use; asymmetric routing, an ECMP path change or a policy route breaks that and the packet is silently discarded. The precise signature is exactly the one stated — unicast fine, multicast absent — and `show ip rpf <source>` versus `show ip mroute` confirms it. Buffer overflow is the tempting alternative since it is the most common host-side loss, but it costs you bursts, not the entire stream.",
+      "sourceAnchor": "3710-multicast-routing-failures",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q30",
+      "prompt": "A feed peaks at 1 Gbit/s and your worst-case application stall is 10 ms. How large should `SO_RCVBUF` be?",
+      "options": [
+        "About 1.25 MB — peak rate times worst-case stall, far above the ~208 KB default.",
+        "About 1.25 MB, but only once the kernel's automatic doubling of the requested size is disabled.",
+        "About 125 KB — peak rate times stall, divided again by the eight-bits-per-byte conversion.",
+        "About 10 MB — the buffer must cover a full second of feed to survive any scheduler delay."
+      ],
+      "correctIndex": 0,
+      "explanation": "Multicast senders never slow down for you, so the buffer must absorb `peak_rate × max_stall`: 1 Gbit/s is 125 MB/s, and 10 ms of that is 1.25 MB — which also requires raising `net.core.rmem_max`. The 'disable the doubling' variant is the tempting one because the kernel really does double the requested value, but that is headroom accounting, not something you turn off, and it never invalidates the sizing. Watch `netstat -su` receive buffer errors to confirm.",
+      "sourceAnchor": "3710-multicast-routing-failures",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q31",
+      "prompt": "Where should you begin diagnosing an intermittently lossy multicast feed?",
+      "options": [
+        "At the host, with `netstat -su` and `ethtool -S` — it is the most common culprit and the cheapest to check.",
+        "At the router, with `show ip mroute` — RPF is the most common cause of multicast loss overall.",
+        "At the switch's snooping table — flooding and premature pruning explain most host-visible drops.",
+        "On the wire with `tcpdump` — host counters cannot distinguish where in the path drops occurred."
+      ],
+      "correctIndex": 0,
+      "explanation": "Bottom-up is right because the host owns the most frequent failure (socket receive buffer overflow and NIC ring exhaustion) and checking it costs two commands. Starting at the router is the tempting order since RPF is the most distinctive multicast failure — but distinctive is not the same as common, and it has its own unmistakable signature (unicast works, multicast does not) that tells you when to skip ahead.",
+      "sourceAnchor": "3710-multicast-routing-failures",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q32",
+      "prompt": "What is ACK implosion, and what does it imply for reliable multicast design?",
+      "options": [
+        "Every receiver acknowledging every message scales sender inbound load with N, so practical schemes are NAK-based.",
+        "Every receiver NAKing every gap scales sender inbound load with N, so practical schemes are ACK-based.",
+        "Routers aggregating acknowledgements saturate the tree, so receivers must acknowledge only to the RP.",
+        "Per-receiver sender windows exhaust memory, so receivers must acknowledge in periodic batches instead."
+      ],
+      "correctIndex": 0,
+      "explanation": "The whole appeal of multicast is that the publisher's cost is independent of receiver count, and per-message ACKs from N receivers destroys exactly that. NAK-based designs cost nothing in the healthy case and O(losses) under loss, which is why every practical scheme — PGM, NORM, SRM, MoldUDP64's retransmit service — is NAK-based. The mirrored answer is tempting because NAKs really can implode too, but only when many receivers miss the same packet, which is what randomized backoff and multicast NAKs address.",
+      "sourceAnchor": "3711-reliable-multicast-patterns",
+      "difficulty": "recall"
+    },
+    {
+      "id": "37-q33",
+      "prompt": "Why is forward error correction rarely used on equity market data despite needing no feedback channel?",
+      "options": [
+        "It costs `(n−k)/k` extra bandwidth continuously and adds decode buffering, which directly opposes the latency goal.",
+        "It costs bandwidth only when loss actually occurs, but its parity packets cannot be sequenced for gap detection.",
+        "It requires a feedback channel to negotiate `k` and `n` per receiver, so it does not scale past a few hundred.",
+        "It removes the need for sequence numbers, so a feed handler loses its only means of detecting duplicates."
+      ],
+      "correctIndex": 0,
+      "explanation": "FEC's virtues — no feedback, bounded recovery latency, perfect scaling — are real, but you pay redundant bandwidth all the time and you must wait for enough of the `n` packets before reconstructing anything, and waiting is the one thing a low-latency feed cannot do when a free B feed already delivers the copy. The 'costs bandwidth only under loss' answer is the tempting one: it confuses FEC with retransmission, whose cost genuinely is loss-proportional.",
+      "sourceAnchor": "3711-reliable-multicast-patterns",
+      "difficulty": "trap"
+    },
+    {
+      "id": "37-q34",
+      "prompt": "A feed handler starts at 10:30, millions of messages into the session. What is the correct recovery sequence?",
+      "options": [
+        "Join incrementals and buffer, then join the snapshot, discard buffered messages at or below its sequence, replay the rest.",
+        "Join the snapshot first to establish state, then join incrementals and apply everything received from that point on.",
+        "Request the entire missing range from the retransmit service, which retains the full session for exactly this case.",
+        "Wait for the next session boundary, since a mid-session start cannot be reconciled with the sequence space."
+      ],
+      "correctIndex": 0,
+      "explanation": "Joining incrementals first is the non-negotiable ordering: anything published between the snapshot's cut and your incremental join is otherwise lost with no way to detect it, producing a silently wrong book. Reaching for retransmission is the tempting alternative because it is the explicit recovery channel, but the retention window is seconds to minutes or a fixed count (often 10 000 – 1 000 000 messages), nowhere near a multi-million-message backlog.",
+      "sourceAnchor": "3712-retransmission-channels",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q35",
+      "prompt": "What is the consequence of exceeding an exchange's retransmit request rate limit?",
+      "options": [
+        "Recovery access is typically disabled, turning a recoverable gap into a mandatory feed-handler restart.",
+        "Requests are queued server-side, so the only cost is additional latency on the responses you receive.",
+        "The exchange temporarily raises the limit, because widespread loss naturally produces many simultaneous requests.",
+        "The limit is enforced per multicast group rather than per subscriber, so one client cannot exhaust it alone."
+      ],
+      "correctIndex": 0,
+      "explanation": "Rate limits (requests per second, messages per request, requests per day) are strictly enforced, and losing access converts a gap you could have filled in milliseconds into a full restart — hence the client-side token bucket with exhaustion treated as an alarm. Assuming the server queues you is the tempting reading, and it is exactly the assumption behind the cascade failure: thousands of subscribers retrying into a saturated recovery server is congestion collapse in the recovery channel.",
+      "sourceAnchor": "3712-retransmission-channels",
+      "difficulty": "trap"
+    },
+    {
+      "id": "37-q36",
+      "prompt": "A snapshot arrives with last-included sequence L, but the oldest buffered incremental you hold is L+40. What must the handler do?",
+      "options": [
+        "Treat the snapshot as too old — the hole from L+1 to L+39 is unfillable, so wait for the next snapshot cycle.",
+        "Apply the snapshot and resume from the oldest buffered message, since a snapshot supersedes any earlier hole.",
+        "Rewind `expected` to L and reprocess every buffered message, since duplicates are discarded harmlessly anyway.",
+        "Discard the snapshot and rebuild from the incremental stream alone, which self-heals within one cycle."
+      ],
+      "correctIndex": 0,
+      "explanation": "The algorithm only works when the buffered incrementals reach back to L+1; a hole between the snapshot's cut and your oldest buffered message means the intervening deltas are gone, and the next snapshot cycle is the fix. Applying it anyway and resuming from L+40 is the tempting choice because the snapshot looks authoritative — but it silently omits 39 updates, which is the 'confidently wrong book' outcome the whole design exists to prevent.",
+      "sourceAnchor": "3713-snapshot-recovery",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q37",
+      "prompt": "Why should a gap affecting two instruments not trigger a reset of the entire book universe?",
+      "options": [
+        "Snapshot recovery latency scales with the instruments in the cycle, so a universe reset turns one lost message into a multi-second outage.",
+        "The snapshot feed carries one instrument per cycle, so a universe reset would need thousands of separate cycles to complete.",
+        "A universe reset must be performed over the TCP replay service, which venues rate-limit per subscriber per trading day.",
+        "Applying a snapshot mutates existing state rather than replacing it, so re-snapshotting healthy instruments corrupts them."
+      ],
+      "correctIndex": 0,
+      "explanation": "The multicast snapshot cycles through the whole instrument list, so a venue with 10 000 symbols may take 30 s to come round — during which every reset instrument is stale and untradeable. Per-instrument (or per-channel) recovery keeps the blast radius proportional to the actual loss. The 'snapshots mutate state' answer is the tempting inversion: snapshot application is idempotent precisely because it replaces state, which is what makes a duplicate snapshot harmless.",
+      "sourceAnchor": "3713-snapshot-recovery",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q38",
+      "prompt": "An A/B arbitrator reads the B socket only after A reports a gap, to save CPU. What is wrong with this?",
+      "options": [
+        "B's socket buffer overflows while A is winning, so B has already lost the packets you need at the moment A drops one.",
+        "Reading B late is fine for loss coverage but forfeits the `min(t_A, t_B)` jitter benefit, which is the larger effect.",
+        "B's sequence numbers drift from A's when B is not drained, so the arbitrator can no longer match the two streams.",
+        "The kernel stops delivering to an undrained multicast socket and issues an implicit leave for that group."
+      ],
+      "correctIndex": 0,
+      "explanation": "Multicast has no flow control, so an undrained socket simply overflows: by the time A gaps, B's buffer has been discarding the very sequences you now want, and the redundancy is decorative. Both feeds must be drained continuously, on separate cores and NICs. The jitter-only answer is the tempting near-miss — it is true that this design forfeits first-arrival-wins, but it understates the damage by implying loss coverage still works.",
+      "sourceAnchor": "3714-redundant-multicast-feeds",
+      "difficulty": "trap"
+    },
+    {
+      "id": "37-q39",
+      "prompt": "Your arbitration metrics show feed A winning close to 100% of sequence numbers. What does this indicate?",
+      "options": [
+        "B's path is systematically slower, so it protects far less than assumed — a path or configuration asymmetry to investigate.",
+        "B is healthy and simply loses the tie-break, which the arbitrator resolves in A's favour by design.",
+        "B is delivering only duplicates that the arbitrator suppresses, so a one-sided win ratio is the expected steady state.",
+        "A and B are properly independent; a balanced win ratio would instead indicate shared queueing on both paths."
+      ],
+      "correctIndex": 0,
+      "explanation": "On genuinely disjoint paths with independent jitter, the win ratio should fluctuate around a mix; a near-total A win means B consistently arrives later and therefore covers you for much less than the design assumes. The 'B only sends duplicates' framing is the tempting misreading — every B message is a duplicate of an A message by construction, which is exactly why the win ratio, not the duplicate count, is the health metric. A dead or degraded B is invisible until the day A drops something.",
+      "sourceAnchor": "3714-redundant-multicast-feeds",
+      "difficulty": "application"
+    },
+    {
+      "id": "37-q40",
+      "prompt": "Why is A/B arbitration the primary recovery mechanism rather than a fallback?",
+      "options": [
+        "Loss is usually local and uncorrelated, and taking `min(t_A, t_B)` per sequence also trims mean and tail latency.",
+        "Loss is usually correlated upstream, so the second feed's main value is covering publisher-side drops.",
+        "The B feed is sequenced independently, letting the arbitrator reconstruct ordering from whichever copy arrives.",
+        "Arbitration adds a bounded millisecond delay but removes the need for a retransmit channel altogether."
+      ],
+      "correctIndex": 0,
+      "explanation": "Queue overflows, microbursts, bad optics and dropped ring frames are local events, so a packet lost on A almost always arrives on B — recovered at zero added latency and zero request traffic, plus a few microseconds of 99th-percentile improvement from first-arrival-wins. The correlated-loss answer inverts the premise: correlated losses are precisely the residue arbitration cannot fix, which is why retransmission and snapshots still exist. Note also that arbitration requires identical sequence numbers across A and B — independent sequencing would make it impossible.",
+      "sourceAnchor": "3714-redundant-multicast-feeds",
+      "difficulty": "application"
+    }
+  ]
+}

@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-26-lock-free-programming",
+  "questions": [
+    {
+      "id": "26-q01",
+      "prompt": "Which statement states the **lock-free** progress guarantee correctly?",
+      "options": [
+        "Some thread in the system completes an operation in a bounded number of steps, though any individual thread may starve indefinitely.",
+        "Every thread completes its own operation in a bounded number of its own steps, no matter how many other threads contend.",
+        "A thread completes its operation provided it eventually runs in isolation for long enough with all other threads paused.",
+        "Every operation completes within a bound that does not depend on how many threads are participating in the structure."
+      ],
+      "correctIndex": 0,
+      "explanation": "Lock-freedom is a system-wide statement: at least one thread always makes progress, which is why killing a thread mid-operation cannot wedge the structure, but an unlucky thread can retry forever. The tempting near-miss is the per-thread bounded-steps wording, which is the definition of wait-freedom, a strictly stronger class; the thread-count-independent bound is wait-free population-oblivious, stronger still. Progress only under isolation is obstruction-freedom, the weakest non-blocking class.",
+      "sourceAnchor": "261-obstruction-free-lock-free-and-wait-free-progress",
+      "difficulty": "recall"
+    },
+    {
+      "id": "26-q02",
+      "prompt": "A colleague argues that `while (!head.compare_exchange_weak(expected, n)) {}` is wait-free because no instruction in it can block. How should the loop be classified?",
+      "options": [
+        "Lock-free: each failed CAS implies some other thread's CAS landed, so the system progresses, but one thread can retry without bound.",
+        "Wait-free: CAS failures are bounded by the number of participating threads, so every thread finishes within a fixed step count.",
+        "Obstruction-free: the loop is only guaranteed to terminate if the thread eventually runs while every other thread is paused.",
+        "Blocking: a thread preempted inside the retry loop prevents all other threads from completing their own exchanges."
+      ],
+      "correctIndex": 0,
+      "explanation": "A CAS failure is evidence that somebody else succeeded, which is exactly the system-wide progress that lock-freedom requires — but nothing bounds how many times one particular thread loses the race. The claim that retries are bounded by thread count is the tempting one and is false: a thread can be beaten by the same fast neighbour arbitrarily often. `fetch_add` and `exchange` are wait-free precisely because they cannot fail and so have no loop.",
+      "sourceAnchor": "261-obstruction-free-lock-free-and-wait-free-progress",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q03",
+      "prompt": "Under heavy contention your lock-free Treiber stack benchmarks slower than the same workload behind a futex-backed `std::mutex`. What is the best explanation?",
+      "options": [
+        "Every failed CAS costs a cache-line transfer and throws away its work, while the mutex parks the loser and stops it generating coherence traffic.",
+        "Spurious failures of `compare_exchange_weak` dominate the cost; switching to `compare_exchange_strong` removes the retries and restores the win.",
+        "Lock-freedom guarantees throughput but not latency, so the benchmark measures the wrong property and the stack's tail latency is worse too.",
+        "The measurement must be faulty: lock-freedom is defined as a bounded per-operation cost, so the structure cannot lose to a blocking design."
+      ],
+      "correctIndex": 0,
+      "explanation": "Lock-freedom is a progress guarantee, not a speed guarantee — retry loops convert contention into wasted work plus coherence traffic, whereas a parking mutex removes losers from the bus entirely. The `compare_exchange_strong` answer is the most seductive because spurious failure is a real phenomenon, but strong is itself implemented as a retry loop over the weak form and does nothing about contention failures. Lock-freedom's real payoff is tail latency and immunity to preemption or page faults inside a critical section.",
+      "sourceAnchor": "261-obstruction-free-lock-free-and-wait-free-progress",
+      "difficulty": "trap"
+    },
+    {
+      "id": "26-q04",
+      "prompt": "A review claims a queue is lock-free because its source contains no `std::mutex`. Which observation actually refutes the claim?",
+      "options": [
+        "`push` calls `new` for every node, and `operator new` can take a lock or fault, putting an unbounded blocking step on the hot path.",
+        "The head is a `std::atomic<Node*>`, and pointer atomics are only lock-free when the pointed-to object is itself 16-byte aligned.",
+        "Several loads use `memory_order_relaxed`, and a lock-free structure must use at least acquire/release on every shared access.",
+        "The class has a non-trivial destructor that walks and frees the node list, and any such destructor makes the type blocking."
+      ],
+      "correctIndex": 0,
+      "explanation": "A hidden lock is still a lock: allocation, I/O, syscalls, and any `std::atomic<T>` that is not `is_always_lock_free` all destroy the guarantee even though no mutex is spelled out. The relaxed-ordering answer is the most plausible-sounding trap but confuses two independent axes — memory ordering affects visibility, not progress, and correct lock-free code uses relaxed loads routinely. Alignment of the pointee and destructor triviality have no bearing on either property.",
+      "sourceAnchor": "261-obstruction-free-lock-free-and-wait-free-progress",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q05",
+      "prompt": "What is the *linearization point* of a concurrent operation?",
+      "options": [
+        "The single instant between invocation and response at which the operation appears to take effect, almost always one atomic instruction.",
+        "The instant the operation's caller regains control, which is what makes the resulting history match the caller's program order.",
+        "The point at which every other thread has actually observed the operation's writes, established by a `seq_cst` fence at its end.",
+        "The moment the operation gains exclusive ownership of the cache line it modifies, as ordered by the coherence protocol."
+      ],
+      "correctIndex": 0,
+      "explanation": "Linearizability asks that each operation collapse to one instant inside its invocation-response interval, and naming that instruction for every operation is the whole correctness proof obligation. The 'when everyone has observed it' framing is the most tempting because it sounds stronger, but linearizability never requires universal observation — only the existence of a consistent instant. Coherence ownership is a hardware event that may not coincide with the operation's semantic effect at all.",
+      "sourceAnchor": "262-linearizability-and-linearization-points",
+      "difficulty": "recall"
+    },
+    {
+      "id": "26-q06",
+      "prompt": "Why do lock-free queues expose a single `try_pop(T&)` rather than `std::queue`'s `front()` followed by `pop()`?",
+      "options": [
+        "The split pair is two operations with a gap between them, so there is no single instant of effect and another consumer can take the element in between.",
+        "`front()` returns a reference, and forming a reference to an element of an atomic-backed buffer is ill-formed, so the API cannot be expressed.",
+        "`pop()` returns `void`, which stops the compiler from ordering it after `front()`, so the optimizer is free to swap the two calls.",
+        "`front()` cannot be marked `const` on a lock-free queue, so it would force every reader to dirty the head's cache line on each call."
+      ],
+      "correctIndex": 0,
+      "explanation": "The two-call idiom has no linearization point for the composite 'look then remove' operation, so between the calls the queue can legally change underneath the caller — the element observed by `front()` may already belong to someone else. The compiler-reordering answer is the plausible distractor, but reordering across two calls on the same object is not what breaks here; the interleaving of *other threads* is, and that is a design flaw the API must remove rather than an optimization to suppress.",
+      "sourceAnchor": "262-linearizability-and-linearization-points",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q07",
+      "prompt": "In the SPSC ring of §26.3, why do `head_` and `tail_` need no compare-exchange at all?",
+      "options": [
+        "Each index has exactly one writer, so a plain release store publishes it and the other side's acquire load observes it safely.",
+        "Power-of-two masking makes each index update a single instruction, and single-instruction updates are atomic by construction on x86.",
+        "`std::atomic` promotes plain stores to read-modify-write operations automatically whenever only one thread writes the variable.",
+        "The buffer is preallocated, so an index never has to be updated atomically together with the element it refers to."
+      ],
+      "correctIndex": 0,
+      "explanation": "The single-writer principle is what removes CAS: nobody is racing to update the same index, so the only obligation left is ordering, discharged by the release/acquire pair that publishes `buf_[t]`. The 'single instruction is atomic on x86' answer is tempting and half-true at the hardware level, but it is irrelevant — atomicity was never the problem, and the argument would not survive a second writer. Preallocation removes allocation from the hot path but says nothing about index updates.",
+      "sourceAnchor": "263-spsc-queues",
+      "difficulty": "recall"
+    },
+    {
+      "id": "26-q08",
+      "prompt": "What does the producer-private `cached_head_` buy in an SPSC queue, and what does removing it cost?",
+      "options": [
+        "Without it every push loads a line the consumer dirties, costing a coherence miss per operation; with it the producer touches that line only near full.",
+        "It removes the need for an acquire fence on ARM, since a producer-private copy needs no ordering at all, roughly halving push latency.",
+        "It lets the producer distinguish full from empty without wasting a slot, which the `next == head` formulation would otherwise require.",
+        "It caches the most recently pushed payload, so pushing the same value twice can skip the store into the ring buffer entirely."
+      ],
+      "correctIndex": 0,
+      "explanation": "The cached opposite index converts a guaranteed cross-core line transfer per operation (~40-100 ns) into a rare one taken only when the queue looks full, which is why it routinely doubles or triples throughput. The wasted-slot answer is the tempting confusion: the one-slot waste comes from the `next == head means full` encoding and is fixed by free-running counters, not by caching. Caching changes no ordering requirement — the acquire load is still needed when the cache is refreshed.",
+      "sourceAnchor": "263-spsc-queues",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q09",
+      "prompt": "An SPSC queue declares `head_` and `tail_` as adjacent members with no `alignas`. Throughput is a third of the padded version. What is happening?",
+      "options": [
+        "Both indices sit on one cache line, so the consumer's head store invalidates the producer's copy of that line on every single operation.",
+        "The unaligned indices force the compiler to emit locked read-modify-write instructions instead of plain stores, tripling their cost.",
+        "This is true sharing, which padding cannot fix; the only remedy is to shard into one queue per producer and merge at the consumer.",
+        "Without `alignas` the atomics are not naturally aligned, so they fall back to the lock table and take a mutex on each access."
+      ],
+      "correctIndex": 0,
+      "explanation": "Two independent variables on one line is the textbook definition of false sharing: the algorithm never asked the two cores to communicate, but the coherence protocol makes them, converting a wait-free queue into a coherence-bound one. The true-sharing answer is the sharp distractor — it uses the right vocabulary but misapplies it, since the producer and consumer touch *different* variables that merely share a line, and `perf c2c` would show two distinct offsets. Padding is precisely the correct fix here.",
+      "sourceAnchor": "263-spsc-queues",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q10",
+      "prompt": "In the Vyukov intrusive MPSC queue, `push` does `head_.exchange(n, acq_rel)` and then `prev->next.store(n, release)`. Why is `push` wait-free?",
+      "options": [
+        "`exchange` cannot fail, so a producer's claim completes in a bounded number of its own steps with no retry loop anywhere in the path.",
+        "The `release` store to `next` targets a node no other producer can reach, and any uncontended operation is wait-free by definition.",
+        "The single consumer serializes the producers, guaranteeing that each producer's `exchange` succeeds on its very first attempt.",
+        "`exchange` compiles to a CAS loop that the hardware bounds to at most one retry per competing core, giving a fixed worst case."
+      ],
+      "correctIndex": 0,
+      "explanation": "Unconditional read-modify-writes such as `exchange` and `fetch_add` have no failure mode, so there is no loop and therefore a bound on each thread's own steps — this is exactly why the design is the standard choice for a logging queue whose producers must never stall. The 'uncontended is wait-free' answer is the tempting one but the inference is wrong: absence of contention is a runtime accident, while a progress guarantee must hold under adversarial scheduling. Note that `pop` on this queue is only lock-free, because of the unlinked window.",
+      "sourceAnchor": "264-mpsc-queues",
+      "difficulty": "recall"
+    },
+    {
+      "id": "26-q11",
+      "prompt": "The consumer of a Vyukov MPSC queue occasionally sees a non-null head whose `next` pointer is still null. What is the correct interpretation?",
+      "options": [
+        "A producer is between its `exchange` and its `next` store, so the consumer must spin or report temporarily empty; `empty()` is not linearizable here.",
+        "The `next` store used `release` where `seq_cst` was required, and strengthening that one store closes the window completely.",
+        "The stub node was omitted so the consumer-private tail is null; adding a dummy node at construction makes the window disappear.",
+        "The consumer loaded `head_` with acquire instead of `seq_cst`, so it observed a stale link that a stronger load would have avoided."
+      ],
+      "correctIndex": 0,
+      "explanation": "The gap between claiming the head and linking the predecessor is inherent to the design — that is the price paid for a wait-free push — so the consumer must treat a null `next` as 'a push is in flight' rather than as end of list. The `seq_cst` answer is the most tempting, and it is wrong for the reason that recurs throughout the chapter: no memory ordering can make two separate stores happen at once. The dummy node solves a different problem, namely avoiding a null tail on an empty queue.",
+      "sourceAnchor": "264-mpsc-queues",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q12",
+      "prompt": "Why does the Vyukov bounded MPMC queue need neither an ABA fix nor a memory-reclamation scheme?",
+      "options": [
+        "Each cell carries a monotonically increasing sequence encoding ticket and lap, and no cell is ever freed, so no value is ever recycled.",
+        "Consumers hold a hazard pointer on the cell they drain, which pins the memory and makes the per-cell sequence check redundant.",
+        "The CAS targets the enqueue counter rather than a pointer, and counter CAS is ABA-immune because hardware tracks the line's writes.",
+        "The queue is bounded, and boundedness by itself guarantees no cell can be reused while a producer still holds a reference to it."
+      ],
+      "correctIndex": 0,
+      "explanation": "Monotonicity is what defeats ABA — a sequence number that only ever grows cannot present a stale observer with a value it saw before — and a fixed array of cells means there is nothing to free, so the entire reclamation problem never arises. The 'counter CAS is hardware-tracked' answer confuses CAS with LL/SC: only `ldxr`/`stxr` fail on any write to the reservation, whereas `cmpxchg` compares values and is blind to intervening writes. Boundedness alone guarantees nothing about reuse timing.",
+      "sourceAnchor": "265-mpmc-queues",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q13",
+      "prompt": "A Vyukov bounded MPMC queue is used across ordinary preemptible threads. What is its dominant failure mode?",
+      "options": [
+        "A producer preempted after winning the CAS but before storing `seq` blocks consumers at that one cell, stalling the queue behind it.",
+        "A preempted producer's ticket is lost, so the enqueue counter runs ahead of the cells and the queue permanently reports itself full.",
+        "Consumers reclaim the cell once the retire threshold is crossed, so the preempted producer writes into freed memory when it resumes.",
+        "The coherence protocol rolls back the preempted producer's CAS, so its element is silently dropped without incrementing any counter."
+      ],
+      "correctIndex": 0,
+      "explanation": "The queue is lock-free, not wait-free: a thread that has claimed a ticket owns that cell, and until it publishes `seq` the consumer holding the matching dequeue ticket cannot proceed, which is why these queues want pinned, non-preempted threads. The reclamation answer is tempting for anyone pattern-matching from linked structures, but this design never frees anything — there is no retire list and no hazard scanning. A CAS that has already succeeded is never undone by hardware.",
+      "sourceAnchor": "265-mpmc-queues",
+      "difficulty": "trap"
+    },
+    {
+      "id": "26-q14",
+      "prompt": "A bounded ring marks each slot with a per-slot `bool ready` flag instead of a sequence number. What goes wrong?",
+      "options": [
+        "A delayed reader can observe a `ready` flag set during the previous lap of the buffer — an ABA across laps that a sequence number would expose.",
+        "A `bool` is not a distinct memory location from its neighbours, so setting one slot's flag races with a write to the adjacent slot's flag.",
+        "A `bool` cannot be made atomic without widening it to a machine word, so the compiler silently routes the access through the lock table.",
+        "The producer must set the flag before writing the payload, so a consumer necessarily observes uninitialized data on every lap of the ring."
+      ],
+      "correctIndex": 0,
+      "explanation": "A one-bit state cannot encode which lap it belongs to, so a stale observer cannot distinguish 'ready, this lap' from 'ready, one lap ago' — the same ABA failure that per-cell sequence numbers eliminate by being monotonic. The memory-location answer is the plausible-sounding trap: distinct `bool` objects genuinely are separate memory locations in the C++ model, so writing neighbouring flags is not a data race, only potential false sharing. Nothing forces the producer to publish before writing; that ordering is the programmer's choice.",
+      "sourceAnchor": "266-bounded-lock-free-ring-buffers",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q15",
+      "prompt": "Why do well-built rings store free-running 64-bit sequence counters and mask only at indexing time?",
+      "options": [
+        "`size()` becomes a subtraction that stays correct across unsigned wraparound, and monotonic values structurally cannot produce ABA.",
+        "Free-running counters can be loaded with relaxed ordering, whereas pre-wrapped indices require an acquire load on every read to stay consistent.",
+        "Applying the mask only at indexing lets the capacity be any value at all, since the wrap no longer has to divide the counter's range.",
+        "Pre-wrapped indices overflow into undefined behaviour at the capacity boundary, while free-running unsigned counters wrap in a defined way."
+      ],
+      "correctIndex": 0,
+      "explanation": "Two wins fall out of monotonicity: occupancy is `tail - head` with no branch and no full/empty ambiguity, and a value that never repeats leaves a stale observer no way to be fooled. The 'any capacity' answer is the tempting one, but masking is exactly what *requires* a power of two — a non-power-of-two capacity forces a modulo or a conditional subtract. Unsigned arithmetic never has undefined overflow, so the UB framing is simply wrong regardless of which encoding is used.",
+      "sourceAnchor": "267-queue-wraparound-and-sequence-counters",
+      "difficulty": "recall"
+    },
+    {
+      "id": "26-q16",
+      "prompt": "A ring compares a cell's sequence against a ticket with `if (seq < pos) return false;`. The chapter calls this the classic bug. Why?",
+      "options": [
+        "Once the two counters straddle the wrap point the direct comparison inverts; the correct test is the sign of the difference, `(intptr_t)(seq - pos) < 0`.",
+        "The comparison must be done on the masked indices rather than the raw counters, because only masked values are guaranteed to be in range.",
+        "Loading `seq` with acquire and `pos` with relaxed makes the pair non-atomic, so the comparison can mix values drawn from two different laps.",
+        "Unsigned comparison is defined to be modular, so `<` already wraps correctly and the real bug is mixing signed and unsigned operands."
+      ],
+      "correctIndex": 0,
+      "explanation": "The values are points on a circle, not on a line, so only their *difference* carries meaning — the same reasoning behind Linux's `time_after()` and TCP sequence comparison. The modular-comparison answer is the trap: unsigned arithmetic wraps, but unsigned *comparison* does not, so `<` on values straddling the wrap gives exactly the inverted result. Masking before comparing destroys the lap information the sequence number exists to carry.",
+      "sourceAnchor": "267-queue-wraparound-and-sequence-counters",
+      "difficulty": "trap"
+    },
+    {
+      "id": "26-q17",
+      "prompt": "A 1024-slot ring on a market-data path runs about half full at 1 M msg/s and never overflows. What should you conclude?",
+      "options": [
+        "It is adding roughly 512 microseconds of latency by Little's law; a routinely non-empty queue is a latency defect even with zero drops.",
+        "It is correctly sized: the absence of any overflow demonstrates that the ring is absorbing microbursts exactly as it was intended to.",
+        "The depth should be doubled, since a half-full ring is one burst away from dropping, and dropped messages are always worse than added latency.",
+        "The consumer must be faster than the producer, because a queue can only hold a steady half-full depth when the drain rate exceeds the fill rate."
+      ],
+      "correctIndex": 0,
+      "explanation": "Queue depth is a latency budget, not a memory budget: latency equals depth divided by throughput, so 512 buffered messages at 1 M/s is half a millisecond of pure queueing delay on a path measured in microseconds. The 'correctly sized' answer is the natural production instinct and is exactly backwards — no overflow only means the alarm was set on the wrong thing, which is why you alarm on watermarks rather than on overflow alone. A steadily half-full queue means the rates match, not that the consumer is winning.",
+      "sourceAnchor": "268-queue-backpressure-policies",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q18",
+      "prompt": "A seqlock reader copies the payload and then reloads `seq`, with no fence between the two. It passes every x86 test and corrupts data on ARM. Why?",
+      "options": [
+        "Nothing prevents the second `seq` load from being hoisted above the payload copy; an acquire fence between them is required and x86's TSO hides its absence.",
+        "ARM's store buffer lets the writer's payload stores become visible before its odd `seq` store, a writer-side defect that no reader-side fence can repair.",
+        "The payload copy is a data race, and on ARM the compiler vectorizes it into unaligned accesses that tear; using `memcpy` restores the ordering.",
+        "ARM has no total store order, so the writer can observe the reader's two `seq` loads in the opposite order, inverting the validation result."
+      ],
+      "correctIndex": 0,
+      "explanation": "Validation only means something if the second sequence read happens *after* the copy it is validating; without a fence the hardware or compiler may satisfy that load early, so a reader can certify data it read while the writer was already mutating it. x86 does not reorder loads with loads, which is why the bug is invisible there and shows up immediately on a weakly ordered core. Blaming the writer's ordering misses that the writer already has a release fence after making the sequence odd.",
+      "sourceAnchor": "269-seqlocks",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q19",
+      "prompt": "What is formally wrong with a seqlock's bulk payload copy, and what is the rigorous fix?",
+      "options": [
+        "It races with the writer's copy, which is undefined behaviour; the rigorous fix is per-word relaxed atomics or `atomic_ref` plus explicit fences.",
+        "It is not atomic, so the fix is to guard the payload with a `std::shared_mutex` taken only by readers, leaving the writer entirely wait-free.",
+        "It can be sunk below the second sequence load, so the fix is to declare the payload `volatile`, which forbids the compiler from moving it.",
+        "It can observe a trap representation, so the fix is to widen the sequence counter to 128 bits and publish it with a `cmpxchg16b` update."
+      ],
+      "correctIndex": 0,
+      "explanation": "The read of the payload genuinely overlaps a concurrent non-atomic write, which is a data race and therefore UB by the letter of the memory model — TSan flags it, and discarding the value on validation failure does not launder the UB. Per-word relaxed atomics emit the same instructions on real hardware for aligned words, at the cost of blocking vectorization of the copy. The `volatile` answer is the classic misconception: `volatile` constrains the compiler's motion of those accesses but supplies no inter-thread ordering and does not remove the race.",
+      "sourceAnchor": "269-seqlocks",
+      "difficulty": "trap"
+    },
+    {
+      "id": "26-q20",
+      "prompt": "Which statement describes the ABA problem correctly?",
+      "options": [
+        "A CAS succeeds because the location returned to its original value, even though the state the thread reasoned about has since been destroyed.",
+        "A CAS fails repeatedly because two threads alternately overwrite the location, so neither of them ever finds the value it expected to see.",
+        "A thread reads a stale value because its load was reordered ahead of another thread's release store and so never saw the published data.",
+        "A thread dereferences a node that was freed after it loaded the pointer, corrupting the traversal before any exchange is even attempted."
+      ],
+      "correctIndex": 0,
+      "explanation": "ABA is a failure of CAS to distinguish 'unchanged' from 'changed back': the comparison sees matching bits and concludes nothing happened, while in reality the structure was rearranged and the node possibly recycled by the allocator. The freed-node answer is the closest miss and describes use-after-free — a distinct and worse bug that travels with ABA but is not fixed by ABA countermeasures such as tagging. Reordering is a memory-ordering issue and is unrelated: no ordering strength affects ABA at all.",
+      "sourceAnchor": "2610-the-aba-problem",
+      "difficulty": "recall"
+    },
+    {
+      "id": "26-q21",
+      "prompt": "A Treiber stack corrupts under load. A colleague proposes changing every atomic operation in it to `seq_cst`. What is the effect?",
+      "options": [
+        "None on the bug: no memory ordering lets a CAS notice that a value changed and changed back, so the recycled-pointer failure survives unchanged.",
+        "It fixes it: `seq_cst` imposes one total order over the CAS operations, so a value that changed and changed back is ordered before the stale retry.",
+        "It fixes it on x86 only, where `seq_cst` lowers to `lock cmpxchg` and the lock prefix rejects any line that was written in the meantime.",
+        "It makes it worse: `seq_cst` widens the window between the initial load and the CAS, and that window is exactly where the recycling occurs."
+      ],
+      "correctIndex": 0,
+      "explanation": "ABA is not a visibility problem — the stale thread sees a perfectly up-to-date value that merely happens to equal what it saw before — so the fixes are monotonic sequence numbers, tagged pointers or DCAS, index-plus-generation handles, or deferred reclamation. The x86 answer is the sharpest distractor because it borrows LL/SC's actual behaviour: `stxr` does fail on any write to the reservation, but `lock cmpxchg` compares values and has no such property. Stronger ordering also does not meaningfully widen the load-to-CAS window.",
+      "sourceAnchor": "2610-the-aba-problem",
+      "difficulty": "trap"
+    },
+    {
+      "id": "26-q22",
+      "prompt": "Why is an `ldxr`/`stxr` pair on AArch64 immune to ABA in a way that x86's `cmpxchg` is not?",
+      "options": [
+        "The store-conditional fails if the reservation granule was written at all, regardless of whether the value ended up matching the original.",
+        "The exclusive monitor keeps the line in a modified state for the whole sequence, so no other core is able to write it in between.",
+        "`stxr` compares a hidden per-line generation counter maintained by the hardware, which is what a software tagged pointer duplicates.",
+        "ARM's acquire and release variants order the pair more strongly than x86, so a recycled pointer cannot become visible mid-sequence."
+      ],
+      "correctIndex": 0,
+      "explanation": "LL/SC is write-sensitive rather than value-sensitive, so an A-to-B-to-A round trip still clears the reservation and the store-conditional fails; ABA cannot arise by construction. The exclusive-monitor answer is the tempting one: the monitor does track the granule, but it does not lock other cores out — it merely records that a write occurred so the store-conditional can fail. That same distinction warns that an algorithm verified on LL/SC can be subtly wrong once ported to a CAS machine.",
+      "sourceAnchor": "2610-the-aba-problem",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q23",
+      "prompt": "You pack a 16-bit ABA tag into the top bits of a 64-bit pointer word. Which portability hazard is real?",
+      "options": [
+        "AArch64's top-byte-ignore and MTE claim the top byte, and 5-level paging widens addresses to 57 bits, so the tag can alias or trip a tag fault.",
+        "The `std::atomic<uint64_t>` holding the packed word is not lock-free without `cmpxchg16b`, so the exchange silently falls back to a lock table.",
+        "Storing a tag in the high bits violates strict aliasing, so the compiler may assume the pointer is unchanged across the whole CAS loop.",
+        "A pointer plus a 16-bit tag is a ten-byte quantity, so the compiler inserts padding into the word and the comparison can never succeed."
+      ],
+      "correctIndex": 0,
+      "explanation": "High-bit tagging assumes address bits nobody else wants, and that assumption has been eroded from both ends — 5-level paging on Ice Lake and later widens the canonical range, while ARM's TBI and MTE actively use the top byte. Alignment-guaranteed low bits are the safer packing, and an index-plus-generation word avoids address assumptions entirely. The lock-table answer is a genuine hazard for the *128-bit* tagged-pointer form only; a single 8-byte atomic is lock-free everywhere this discussion applies.",
+      "sourceAnchor": "2611-tagged-pointers",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q24",
+      "prompt": "You add a version tag to every pointer CAS in a lock-free stack, and it still crashes intermittently inside `pop`. What is the remaining bug?",
+      "options": [
+        "A stale thread can dereference `A->next` after `A` was freed, before it ever reaches its CAS; the tag needs type-stable memory alongside it.",
+        "The tag must be bumped on every load as well as every store, otherwise two separate loads of the same pointer end up sharing one version.",
+        "Version tags only order a CAS against other CAS operations, so the plain loads of the head must be strengthened to `seq_cst` as well.",
+        "The tag must be wider than the thread count, otherwise two threads can compute the same version for two genuinely different states."
+      ],
+      "correctIndex": 0,
+      "explanation": "Tagging makes the CAS reject a recycled value, but the crash happens earlier: the thread reads through a pointer it captured before the node was freed, and no amount of versioning at the exchange prevents that dereference. The fix is memory that, once used for a `Node`, is only ever reused as a `Node` and never unmapped — a preallocated slab gives exactly that, which is the argument for index-plus-generation handles. Tag width governs how often the counter wraps, not collisions between threads.",
+      "sourceAnchor": "2611-tagged-pointers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "26-q25",
+      "prompt": "Reader threads live in a general-purpose server pool and can block on I/O partway through a traversal. Which reclamation scheme is the safe choice, and why?",
+      "options": [
+        "Hazard pointers: unreclaimed memory stays bounded at roughly threads times slots plus the retire threshold even when a reader stalls indefinitely.",
+        "Epoch-based reclamation: a stalled reader simply keeps its stale epoch while the retirer advances past it, so total memory remains bounded.",
+        "QSBR: the kernel declares a quiescent state on the reader's behalf when it enters the syscall, so a blocked thread stops pinning the epoch.",
+        "Per-node reference counting: the increment is uncontended on read-heavy paths, and reclamation becomes immediate instead of being deferred."
+      ],
+      "correctIndex": 0,
+      "explanation": "Hazard pointers announce per pointer, so a stalled reader holds back only the specific nodes it named and the total is bounded by construction — precisely the property epochs lack. The epoch answer inverts reality: the retirer cannot advance past a participant, which is exactly why one blocked reader pins the epoch and lets retired objects accumulate without limit. Reference counting is not uncontended either; every traversal read-modify-writes a shared line per node, which is what makes it unusable on read-heavy paths.",
+      "sourceAnchor": "2612-memory-reclamation",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q26",
+      "prompt": "In the hazard-pointer protocol the announce store is `seq_cst` and is followed by a re-read of `head`. What breaks if the announce is made relaxed on x86?",
+      "options": [
+        "The store can sit in the store buffer past the re-reading load — the one reordering x86 permits — so a retirer scans before seeing the hazard and frees the node.",
+        "A relaxed store may never propagate to other cores at all, so the retirer's scan can keep reading an arbitrarily stale hazard slot forever.",
+        "The relaxed store is unordered against the earlier load of `head`, so a reader can end up announcing a pointer it never actually read.",
+        "x86 reorders loads with earlier loads, so the re-read of `head` returns its pre-announce value and the validation check always passes."
+      ],
+      "correctIndex": 0,
+      "explanation": "The whole protocol rests on store-to-load ordering: announce, then confirm the pointer is still linked, so that any retirer either sees the hazard or unlinked after it was published. Store-load is the single reordering x86's TSO allows, so the announce needs an `mfence`-class store — or an asymmetric barrier issued by the retirer instead. The 'never propagates' answer is wrong because relaxed stores still become visible; relaxed constrains ordering, not eventual visibility, and x86 does not reorder load with load.",
+      "sourceAnchor": "2613-hazard-pointers",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q27",
+      "prompt": "How does using `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)` improve a hazard-pointer implementation?",
+      "options": [
+        "The retirer forces a barrier on every other core, so readers can announce with a relaxed store and the fence cost moves onto the rare path.",
+        "It lets the retirer skip scanning the hazard slots entirely, because the barrier itself proves every reader has already published its pointer.",
+        "It bounds the number of retired nodes by flushing each thread's retire list, replacing the threshold heuristic with an exact reclamation point.",
+        "It removes the announce store altogether, because the kernel snapshots each thread's registers at the moment the barrier is issued."
+      ],
+      "correctIndex": 0,
+      "explanation": "This is the asymmetric-barrier trick: reads are hot and retires are rare, so pay the ordering cost once per retire by interrupting every core rather than once per read by fencing. Readers keep a relaxed announce plus the re-validating load, and correctness still depends on the retirer scanning the hazard slots after its barrier — which is why the 'skip the scan' answer fails, since the barrier orders the announcements but never tells the retirer what they contain. The same technique underlies `sys_membarrier` RCU and Windows' `FlushProcessWriteBuffers`.",
+      "sourceAnchor": "2613-hazard-pointers",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q28",
+      "prompt": "An epoch-based reclaimer's memory grows without bound in production, though the algorithm has no visible leak. What is the most likely cause?",
+      "options": [
+        "A reader page-faulted or blocked inside its critical section, pinning the epoch so the retirer can never advance far enough to free anything.",
+        "Three buckets are too few: a reader that entered at epoch e can hold pointers retired four epochs earlier, so one generation never becomes eligible.",
+        "Retired objects go into the current epoch's bucket rather than the next one, so the modulo arithmetic revisits a bucket before it has drained.",
+        "The epoch advances once per retire rather than once per grace period, so at high retire rates the counter wraps and bucket indices go backwards."
+      ],
+      "correctIndex": 0,
+      "explanation": "Unbounded memory under a stalled reader is EBR's defining weakness: reclamation requires every participant's local epoch to reach the current one, so a single thread that faults, is preempted, or blocks on a syscall inside its section freezes the whole scheme. The three-bucket answer is the tempting technical one but the count is right — a reader entering at epoch e can only hold pointers unlinked at e or later, so two advances plus the current epoch suffice. The mitigations are tiny non-blocking sections, isolated cores, and a watchdog on epoch advance.",
+      "sourceAnchor": "2614-epoch-based-reclamation",
+      "difficulty": "trap"
+    },
+    {
+      "id": "26-q29",
+      "prompt": "You protect an instrument reference table with RCU so strategy threads can read it while it is reloaded. What is true of the *writers*?",
+      "options": [
+        "They serialize among themselves, normally under a plain mutex: RCU optimizes reads absolutely and accepts slow, blocking updates in exchange.",
+        "They are lock-free, since the release store that publishes the new copy is the update's linearization point and needs no mutual exclusion.",
+        "They must run inside `rcu_read_lock()` as well, because the copy step reads the current version through an `rcu_dereference` load.",
+        "They become wait-free once `call_rcu()` is used, because deferring the free removes the only unbounded step from the update path."
+      ],
+      "correctIndex": 0,
+      "explanation": "The asymmetry is the entire design: `rcu_read_lock()` is free or nearly so and readers never write shared state, while updaters copy, publish, wait out a grace period, and only then free — with concurrent updaters excluded by an ordinary lock. The lock-free-writer answer is tempting because the publish really is a single release store, but the read-copy-modify sequence around it is not atomic, so two writers would lose an update. `call_rcu()` stops the updater blocking on the grace period; it does not make anything wait-free.",
+      "sourceAnchor": "2615-read-copy-update",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q30",
+      "prompt": "Which profile signature points at false sharing rather than at ordinary lock contention?",
+      "options": [
+        "Throughput that falls as cores are added with no lock contention visible, and `perf c2c` attributing HITM events to two offsets in one line.",
+        "A rising instruction count per operation with flat cache-miss counters, which shows up in `perf stat` as steadily improving IPC under load.",
+        "A jump in page faults on the shared structure, which `pahole` reports as a field straddling a page boundary in the enclosing type.",
+        "Growing futex wait time in the profile, because the coherence transfer pushes the surrounding mutex onto its kernel slow path."
+      ],
+      "correctIndex": 0,
+      "explanation": "False sharing costs a cache-line transfer per access with no lock involved, so it presents as negative scaling that a lock profiler cannot see; `perf c2c` is the diagnostic because it reports hit-modified events by line *and* offset, and two distinct offsets in one line is the signature. The futex answer is tempting since both look like contention, but false sharing needs no lock present at all to occur. `pahole` shows field layout within a cache line, not page straddling.",
+      "sourceAnchor": "2616-false-sharing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "26-q31",
+      "prompt": "Eight threads increment `counters[tid]` in a `uint64_t counters[8]`, and separately all eight increment one shared `total`. Which fix applies to which?",
+      "options": [
+        "`counters` is false sharing, cured by padding each entry to a line; `total` is true sharing, cured only by per-core shards summed on read.",
+        "Both are false sharing: padding `counters` and giving `total` its own aligned cache line removes the coherence traffic in both cases.",
+        "Both are true sharing, since every increment is a read-modify-write on a line other cores also modify, so only batching helps either one.",
+        "`counters` is true sharing because the array is a single object; `total` is false sharing with whichever field follows it in its struct."
+      ],
+      "correctIndex": 0,
+      "explanation": "The distinction is whether the threads touch the same *variable* or merely the same *line*: eight `uint64_t` counters fit into one 64-byte line by accident, which padding fixes, whereas `total` is genuine contention that padding cannot touch. The all-false-sharing answer is the common mistake and the reason people pad a hot counter and see no improvement — the only remedies for true sharing are sharding, batching, or a different algorithm. `perf c2c` separates the two by whether the HITM offsets within the line differ.",
+      "sourceAnchor": "2616-false-sharing",
+      "difficulty": "application"
+    },
+    {
+      "id": "26-q32",
+      "prompt": "What is the objection to using `std::hardware_destructive_interference_size` inside an ABI-visible type?",
+      "options": [
+        "It is a compile-time constant, so the type's layout becomes tied to one compiler's guess about line size — GCC warns about exactly this use.",
+        "It is only defined when the target's line size is 64 bytes, so the type fails to compile on Apple Silicon and on 128-byte-line POWER cores.",
+        "It reports the largest size that should share a line, so using it as a padding target under-pads every object by a full cache line.",
+        "It is computed at run time from CPUID, so it cannot appear in an `alignas` clause and the padding must be written as an explicit array."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because the value is baked in at compile time, two translation units built with different compilers or versions can disagree about the size and layout of the same type, which is why GCC ships `-Winterference-size` and libc++ withheld the constants for years. The 'largest size that should share a line' description belongs to `hardware_constructive_interference_size`, the companion constant, and is the tempting confusion. Both are perfectly usable in `alignas`; most shops simply write `alignas(64)` and measure, since 128 is right on Apple Silicon and under Intel's adjacent-line prefetcher.",
+      "sourceAnchor": "2617-cache-line-padding",
+      "difficulty": "recall"
+    }
+  ]
+}

@@ -1,0 +1,355 @@
+{
+  "slug": "chapter-13-strings-and-non-owning-views",
+  "questions": [
+    {
+      "id": "13-q01",
+      "prompt": "Which statement about `std::string`'s storage guarantees is correct as of C++11 and later?",
+      "options": [
+        "Its elements are contiguous and `s[s.size()]` is a valid read yielding `'\\0'`; `data()` and `c_str()` return the same pointer.",
+        "Its elements are contiguous, but the terminator exists only after a call to `c_str()`, which may copy the buffer to add it.",
+        "Its elements are contiguous and `capacity()` counts the terminator, so the implementation allocates exactly `capacity()` bytes.",
+        "Its elements have been contiguous since C++98, which is why copy-on-write implementations were never conforming."
+      ],
+      "correctIndex": 0,
+      "explanation": "C++11 nailed down both contiguity and the readable terminator at index `size()`, and `data()`/`c_str()` are the same pointer. The `c_str()`-may-copy answer describes pre-C++11 folklore that the standard closed. `capacity()` excludes the terminator (the implementation allocates `capacity()+1`), and contiguity was *not* guaranteed in C++03 — which is exactly what let libstdc++ ship COW strings before the GCC 5 ABI break.",
+      "sourceAnchor": "131-stdstring",
+      "difficulty": "recall"
+    },
+    {
+      "id": "13-q02",
+      "prompt": "A tokenizer loop calls `s.substr(off, len)` once per field and profiling shows an allocation per token. What is the cause and the fix?",
+      "options": [
+        "`string::substr` returns a new `std::string` that owns a copy; take a `string_view` over `s` and use `sv.substr`, which is O(1) pointer arithmetic.",
+        "`string::substr` returns a view into `s`, and the per-token cost is the temporary `string` the loop later builds from it; hoist that build out.",
+        "`string::substr` allocates only when `s` itself is heap-allocated; reserving capacity on `s` up front removes the per-token allocation.",
+        "`string::substr` is O(n·m) because it re-runs `find` internally; switching to `std::search` with `boyer_moore_searcher` removes the cost."
+      ],
+      "correctIndex": 0,
+      "explanation": "`string::substr` constructs and returns a fresh `string`, so it copies the bytes; `string_view::substr` just adjusts a pointer and a length. The 'returns a view' option is the tempting inversion — that is `string_view::substr`'s behaviour, not `string`'s. Reserving on the source changes nothing about the returned object, and `substr` does no searching at all.",
+      "sourceAnchor": "131-stdstring",
+      "difficulty": "application"
+    },
+    {
+      "id": "13-q03",
+      "prompt": "Two `std::string`s hold bytes above 0x7F. On a platform where `char` is signed, how does `s1 < s2` order them?",
+      "options": [
+        "As unsigned byte comparison, because `char_traits<char>::compare` is specified to behave like `memcmp`.",
+        "As signed byte comparison, matching the platform's `char` signedness, so ARM and x86 can disagree.",
+        "As unsigned comparison only since C++20, when `operator<=>` replaced the older signed relational operators.",
+        "According to the current global locale's collation order, as `std::collate` is consulted by the comparison operators."
+      ],
+      "correctIndex": 0,
+      "explanation": "`char_traits<char>::compare` compares as `unsigned char` (i.e. `memcmp` semantics), so ordering is platform-independent even where plain `char` is signed. The signedness answer is the natural but wrong inference from `char`'s type. The `<=>` rewrite in C++20 changed the syntax of the operators, not their byte semantics, and `std::string` comparison never consults a locale — that is `std::collate`'s separate job.",
+      "sourceAnchor": "131-stdstring",
+      "difficulty": "trap"
+    },
+    {
+      "id": "13-q04",
+      "prompt": "After building a large `std::string`, code calls `s.reserve(0)` hoping to release memory. What does C++20 specify?",
+      "options": [
+        "`reserve` with an argument below `capacity()` is a no-op; releasing memory requires `shrink_to_fit()`, which is itself non-binding.",
+        "`reserve` with an argument below `capacity()` is a binding shrink request, so the buffer is reallocated down to `size()`.",
+        "`reserve` with an argument below `capacity()` is undefined behaviour, so the call must be guarded by a capacity check.",
+        "`reserve(0)` is guaranteed to return the string to its inline SSO buffer whenever `size()` fits inside it."
+      ],
+      "correctIndex": 0,
+      "explanation": "C++20 made shrinking `reserve` calls a no-op; `shrink_to_fit()` is the intended spelling and even it is only a non-binding request. The 'binding shrink' answer describes what people *want* and what pre-C++20 `reserve` was vaguely permitted to attempt. The call is well-defined, not UB, and no operation is guaranteed to move a heap-allocated string back into the inline buffer.",
+      "sourceAnchor": "131-stdstring",
+      "difficulty": "recall"
+    },
+    {
+      "id": "13-q05",
+      "prompt": "Which pairing of `sizeof(std::string)` with inline SSO capacity (characters, excluding the NUL) is correct?",
+      "options": [
+        "libstdc++ 32 bytes / 15 chars; libc++ 24 bytes / 22 chars.",
+        "libstdc++ 24 bytes / 22 chars; libc++ 32 bytes / 15 chars.",
+        "libstdc++ 32 bytes / 23 chars; libc++ 32 bytes / 15 chars.",
+        "libstdc++ 32 bytes / 15 chars; MSVC 24 bytes / 22 chars."
+      ],
+      "correctIndex": 0,
+      "explanation": "libstdc++ spends 32 bytes on {pointer, size, union{buf[16], cap}} for 15 inline chars; libc++ packs {pointer, size, capacity} into 24 bytes and overlays a 23-byte buffer for 22 usable chars. The reversed pairing is the classic mix-up. libstdc++'s inline buffer is 16 bytes but one is the terminator, and MSVC matches libstdc++ at 32/15 rather than libc++.",
+      "sourceAnchor": "132-small-string-optimization",
+      "difficulty": "recall"
+    },
+    {
+      "id": "13-q06",
+      "prompt": "Why is `data()` branchless on libstdc++ but typically a branch or `cmov` on libc++?",
+      "options": [
+        "libstdc++ always stores a valid pointer, aimed at the inline buffer when short; libc++ must test the flag bit to decide which layout is active.",
+        "libc++ always stores a valid pointer to the inline buffer, while libstdc++ must test the union's discriminator to pick a layout.",
+        "Both store a pointer unconditionally; the difference is that libc++'s `data()` also has to mask off the low flag bit from that pointer.",
+        "Neither stores a pointer when short, so both branch; libstdc++ merely hoists its branch into the constructor rather than `data()`."
+      ],
+      "correctIndex": 0,
+      "explanation": "libstdc++ pays 8 bytes for an always-valid pointer that self-points at the inline buffer when short, so `data()` is one load. libc++ reuses those 8 bytes as buffer space and encodes long/short in the low bit of the first byte, so `data()` must select. The reversed option is the obvious trap; the masking option is wrong because the flag bit lives in the size/capacity word, not in a stored pointer.",
+      "sourceAnchor": "132-small-string-optimization",
+      "difficulty": "application"
+    },
+    {
+      "id": "13-q07",
+      "prompt": "A hot loop wraps every short `std::string` in `std::move` to avoid copies. What actually happens for a string inside the SSO threshold?",
+      "options": [
+        "The inline buffer is copied byte-for-byte and the source is reset, so the move costs about the same as a copy.",
+        "The pointer is stolen and the source is left empty, so the move is O(1) exactly as it is for long strings.",
+        "The destination allocates a heap buffer to receive the bytes, so the move is strictly more expensive than a copy.",
+        "The two objects' inline buffers are swapped in place, which is cheaper than the corresponding copy would be."
+      ],
+      "correctIndex": 0,
+      "explanation": "There is no pointer to steal when the data lives inside the object, so a short-string move is a `memcpy` of the inline buffer plus zeroing the source — `std::move` buys nothing. The 'steal the pointer' answer is true only for the long representation, which is exactly why the misconception survives. Moving never allocates, and the move constructor does not swap.",
+      "sourceAnchor": "132-small-string-optimization",
+      "difficulty": "trap"
+    },
+    {
+      "id": "13-q08",
+      "prompt": "Why do libraries like folly treat libstdc++'s `std::string` as *not* naively relocatable by `memcpy`, while libc++'s short form is fine?",
+      "options": [
+        "libstdc++'s always-valid pointer points into the object itself when short, so a raw `memcpy` leaves it aimed at the old address.",
+        "libc++'s flag bit encodes the object's own address, so only libstdc++'s representation survives being copied to a new address.",
+        "libstdc++ strings hold an allocator reference that must be rebound, whereas libc++ stores the allocator out of line.",
+        "Both are trivially relocatable, since a `std::string` is trivially copyable and can always be moved with `memcpy`."
+      ],
+      "correctIndex": 0,
+      "explanation": "A self-pointer is what breaks naive relocation: libstdc++'s short strings point at their own inline buffer, so `memcpy`ing the object leaves a dangling pointer to the source. libc++'s short form stores no pointer at all and is self-contained. The reversed claim about the flag bit is the tempting inversion, and `std::string` is definitely not trivially copyable — it has a user-provided copy constructor and destructor.",
+      "sourceAnchor": "132-small-string-optimization",
+      "difficulty": "application"
+    },
+    {
+      "id": "13-q09",
+      "prompt": "What is the representation and size of a `std::string_view` on a 64-bit platform?",
+      "options": [
+        "A `const char*` plus a `size_t` — 16 bytes, trivially copyable, with no null-termination guarantee.",
+        "A `const char*` plus a `size_t` — 16 bytes, trivially copyable, with a guaranteed terminator at `data()[size()]`.",
+        "A `const char*`, a `size_t` size and a `size_t` capacity — 24 bytes, matching libc++'s long-string layout.",
+        "A reference to the owning `std::string` plus an offset pair — 16 bytes, keeping the owner alive while the view exists."
+      ],
+      "correctIndex": 0,
+      "explanation": "A view is exactly {pointer, length}: 16 bytes, trivially copyable, and deliberately without any terminator guarantee or `c_str()`. The terminated variant is the single most dangerous misconception, since it makes `sv.data()` look safe for C APIs. A view carries no capacity and holds no reference to any owner — it cannot extend anything's lifetime.",
+      "sourceAnchor": "133-stdstring_view",
+      "difficulty": "recall"
+    },
+    {
+      "id": "13-q10",
+      "prompt": "Given a live `std::string s` and a live `std::vector<char> buf`, which initialization leaves `v` dangling once the statement finishes?",
+      "options": [
+        "`std::string_view v = s + \"x\";`",
+        "`std::string_view v = s;`",
+        "`std::string_view v = \"literal\";`",
+        "`std::string_view v{buf.data(), buf.size()};`"
+      ],
+      "correctIndex": 0,
+      "explanation": "`s + \"x\"` materializes a temporary `std::string`; the view records its pointer and the temporary dies at the semicolon, so `v` dangles. Viewing a live `s` is fine as long as `s` is not reallocated or destroyed. A string literal has static storage duration, and a view over an untouched `vector`'s buffer stays valid until that buffer is reallocated or destroyed.",
+      "sourceAnchor": "133-stdstring_view",
+      "difficulty": "application"
+    },
+    {
+      "id": "13-q11",
+      "prompt": "Binding a temporary to `const std::string&` extends its lifetime, but binding one to `std::string_view` does not. Why?",
+      "options": [
+        "Lifetime extension applies to a reference bound directly to a temporary; a view is a separate object holding a pointer, so the temporary still dies at the end of the full expression.",
+        "Lifetime extension applies here too, but only until the end of the enclosing block, which is shorter than the reference case and so usually looks like a dangle.",
+        "Extension is blocked because `string_view`'s converting constructor is not `constexpr`, so the compiler cannot prove the binding is direct.",
+        "Extension works for views over arrays and string literals but is disabled for views built from class-type temporaries by an explicit language rule."
+      ],
+      "correctIndex": 0,
+      "explanation": "Extension is a property of binding a reference to a temporary, and a `string_view` is not a reference — it is an ordinary object that happens to store an address, so nothing keeps the temporary alive past the full expression. The 'extends to end of block' answer inverts the actual rule for references, which extends to the *reference's* lifetime. Constexpr-ness is irrelevant, and there is no special carve-out for literals: those simply have static storage.",
+      "sourceAnchor": "133-stdstring_view",
+      "difficulty": "application"
+    },
+    {
+      "id": "13-q12",
+      "prompt": "Profiling shows `std::map<std::string, int>::find(sv)` allocating on every lookup, where `sv` is a `string_view`. What is happening and what fixes it?",
+      "options": [
+        "The key type is `std::string`, so a temporary key is constructed per lookup; declare the map with `std::less<>` to enable heterogeneous lookup.",
+        "The key type is `std::string`, so each lookup copies the found key out; capture the result by `const&` to elide the copy.",
+        "`string_view` converts to `std::string` without allocating, so the allocation must come from the map's node allocator instead.",
+        "`find` is a compile error for a `string_view` argument until you add a conversion, so what you are measuring is `operator[]` inserting a node."
+      ],
+      "correctIndex": 0,
+      "explanation": "Without a transparent comparator, `find` takes the container's `key_type`, so the view is converted to a fresh `std::string` on every call. `std::less<>` (C++14 for the ordered containers, or a transparent hash plus `equal_to<>` for `unordered_map` in C++20) lets the view be compared directly. The 'copies the found key out' answer misplaces the allocation on the result rather than the argument; the conversion does allocate for non-SSO keys, and `find` compiles fine because the implicit conversion exists.",
+      "sourceAnchor": "133-stdstring_view",
+      "difficulty": "application"
+    },
+    {
+      "id": "13-q13",
+      "prompt": "A parser has a `std::string_view field` and calls `std::strtod(field.data(), nullptr)`. What is wrong?",
+      "options": [
+        "`data()` is not null-terminated, so `strtod` reads past the field into whatever follows in the buffer.",
+        "`data()` is `const char*` while `strtod` needs a mutable buffer, so the call fails to compile without a `const_cast`.",
+        "`data()` is fine here because a `string_view` writes a terminator into its own storage on construction.",
+        "`data()` is fine here provided the view is non-empty; only empty views may return an unterminated pointer."
+      ],
+      "correctIndex": 0,
+      "explanation": "A view borrows a range and adds nothing, so `data()[size()]` is whatever byte happens to follow — `strtod` will keep scanning past the field. There is deliberately no `c_str()`. The 'writes a terminator' answer is impossible: the view owns no storage and the underlying buffer is `const`. Emptiness is irrelevant, and `strtod` takes `const char*`, so the call compiles cleanly — which is what makes this trap silent.",
+      "sourceAnchor": "133-stdstring_view",
+      "difficulty": "trap"
+    },
+    {
+      "id": "13-q14",
+      "prompt": "For a `std::string_view sv` holding the characters `abc`, how do `sv == \"abc\"` and `sv.data() == \"abc\"` differ?",
+      "options": [
+        "The first compares contents through `char_traits::compare`; the second compares two pointers and is almost always false.",
+        "The first compares contents through `char_traits::compare`; the second also compares contents, because the array decays before the comparison.",
+        "Both compare pointers, since the literal decays to `const char*` on each side before any overload is selected.",
+        "The first compares contents only when the lengths match exactly; otherwise it falls back to comparing the two addresses."
+      ],
+      "correctIndex": 0,
+      "explanation": "`sv == \"abc\"` selects `string_view`'s content comparison (the literal converts to a view), while `sv.data() == \"abc\"` is a plain `const char*` comparison of two addresses. Believing the second also compares content is the classic C-string mistake that `strcmp` exists to fix. The length check in `operator==` is a fast path that returns `false` early, never a switch to pointer comparison.",
+      "sourceAnchor": "133-stdstring_view",
+      "difficulty": "application"
+    },
+    {
+      "id": "13-q15",
+      "prompt": "A function takes `const std::span<int> s` and writes `s[0] = 42;`. What does the compiler do?",
+      "options": [
+        "It accepts the write, because the `const` applies to the span's own pointer and size rather than to the elements.",
+        "It rejects the write, because `const` on a span propagates to the elements exactly as it does for `const std::vector<int>`.",
+        "It rejects the write, because `operator[]` on a `const` span returns by value rather than by reference.",
+        "It accepts the write but the behaviour is undefined, since writing through a `const` view is a violation of the object's constness."
+      ],
+      "correctIndex": 0,
+      "explanation": "`span` does not propagate `const`: a `const span<int>` is an immutable handle to mutable elements, mirroring `int* const` rather than `const int*`. Use `span<const T>` when you mean read-only. The `vector` analogy is the trap — the standard containers do propagate const through their member functions, which is precisely why people expect `span` to. The write is well-defined, not UB, because the underlying `int`s are not themselves const.",
+      "sourceAnchor": "134-stdspan",
+      "difficulty": "trap"
+    },
+    {
+      "id": "13-q16",
+      "prompt": "A fixed 48-byte message body is passed as `std::span<const std::byte, 48>` instead of `std::span<const std::byte>`. What concretely changes?",
+      "options": [
+        "The span becomes pointer-sized and the loop trip count is a compile-time constant, so the body can be fully unrolled with no remainder loop.",
+        "The span stays 16 bytes but gains a bounds check on `operator[]`, since the compile-time extent lets the library assert cheaply.",
+        "The span becomes pointer-sized and constructs implicitly from any dynamic span, since narrowing the extent is a safe conversion.",
+        "The span stays 16 bytes and the size field becomes `constexpr`, letting the compiler unroll while still storing the length."
+      ],
+      "correctIndex": 0,
+      "explanation": "A static extent moves the size into the type: `sizeof` drops to 8 (pointer only) and the trip count is a constant, which is what enables full unrolling and vectorization without a remainder loop. Static extent adds no bounds checking — `span` has none by default in either form. The conversion direction is the other way round: static converts implicitly to dynamic, while dynamic to static must be spelled out explicitly.",
+      "sourceAnchor": "134-stdspan",
+      "difficulty": "application"
+    },
+    {
+      "id": "13-q17",
+      "prompt": "Why is `std::span<const T>` usually a better parameter type than `const std::vector<T>&`?",
+      "options": [
+        "It is trivially copyable and passed in two registers, and it accepts arrays, `std::array` and subranges rather than forcing the caller to own a `vector`.",
+        "It is trivially copyable and passed in one register, and it keeps the referenced buffer alive for as long as the span itself exists.",
+        "It performs bounds checking on `operator[]` by default, and unlike a reference parameter it can never be bound to a dangling range.",
+        "It allows the callee to resize the underlying sequence, which a `const` reference to a `vector` explicitly forbids."
+      ],
+      "correctIndex": 0,
+      "explanation": "A 16-byte trivially copyable aggregate goes in two registers under the SysV ABI, and the span accepts any contiguous range with the right element type. The one-register option is doubly wrong: the size cannot fit alongside the pointer, and a span owns nothing so it extends no lifetimes. `span` has no default bounds checking and dangles just as readily as a reference, and it can never resize the sequence — it has no access to the owner.",
+      "sourceAnchor": "134-stdspan",
+      "difficulty": "application"
+    },
+    {
+      "id": "13-q18",
+      "prompt": "Code takes `std::span<int> s{v}` over a `std::vector<int> v`, then calls `v.push_back(1)` and reads `s[0]`. What is the situation?",
+      "options": [
+        "The `push_back` may reallocate, after which the span points at freed memory and the read is a silent use-after-free.",
+        "The span tracks the vector's data pointer, so it stays valid after reallocation but its stored size becomes stale by one element.",
+        "The read is safe because reading element 0 never touches the region a reallocation would move, only appended elements are affected.",
+        "The `push_back` fails to compile, because constructing a span from a vector freezes that vector against modification."
+      ],
+      "correctIndex": 0,
+      "explanation": "A span is a snapshot of {pointer, size}; a reallocating `push_back` frees the old buffer and the span keeps pointing at it, with no diagnostic and no iterator-invalidation machinery to warn you. The 'tracks the pointer' answer imagines a link the span does not have. Reallocation moves *every* element including index 0, and nothing about constructing a span constrains the vector.",
+      "sourceAnchor": "134-stdspan",
+      "difficulty": "trap"
+    },
+    {
+      "id": "13-q19",
+      "prompt": "A row-major matrix is viewed as `std::mdspan<double, dextents<size_t,2>>` with the default layout, and the loop nest iterates the first index innermost. What is the consequence?",
+      "options": [
+        "Results are correct but access becomes strided, defeating the prefetcher and costing an order of magnitude on large matrices.",
+        "Results are silently wrong, because `layout_right` maps index pairs assuming the first index varies fastest.",
+        "The compiler rejects the loop, since `layout_right` constrains which index may appear in the inner subscript expression.",
+        "Access stays unit-stride, because `mdspan` reorders the index mapping to match the observed loop order at compile time."
+      ],
+      "correctIndex": 0,
+      "explanation": "`layout_right` makes the *last* index vary fastest, so iterating the first index innermost walks one row-stride per step: one cache line per element instead of one per eight doubles. The mapping is still correct — that is what makes this dangerous, since it is a performance bug with no wrong answer to catch it in testing. `mdspan` never reorders anything; the layout is a fixed part of the type, which is the whole reason it is spelled out as a template parameter.",
+      "sourceAnchor": "135-stdmdspan",
+      "difficulty": "application"
+    },
+    {
+      "id": "13-q20",
+      "prompt": "How do static and dynamic entries in an `mdspan`'s `extents` affect the object?",
+      "options": [
+        "Static extents cost no storage and constant-fold into the index arithmetic; only dynamic extents are stored alongside the pointer.",
+        "Static extents are stored as `constexpr` members for reflection, so an all-static `mdspan` is still larger than a bare pointer.",
+        "Dynamic extents cost no storage because they are recomputed from the underlying range's size on each subscript.",
+        "Both kinds are stored identically; the distinction only controls whether out-of-range subscripts are diagnosed at compile time."
+      ],
+      "correctIndex": 0,
+      "explanation": "`extents` stores only the dynamic values, so an all-static `mdspan` is exactly pointer-sized and its offset computation folds to constants. Static extents are pure type information and occupy no bytes, which is why the 'still larger than a pointer' answer is wrong. A dynamic extent must be stored — an `mdspan` has no underlying range to ask — and neither kind enables bounds diagnostics, since `mdspan` does not bounds check at all by default.",
+      "sourceAnchor": "135-stdmdspan",
+      "difficulty": "recall"
+    },
+    {
+      "id": "13-q21",
+      "prompt": "What does `std::submdspan(m, std::full_extent, 2)` produce for a 2-D `mdspan m`?",
+      "options": [
+        "A 1-D `layout_stride` view of column 2 over the same buffer, with no elements copied.",
+        "A 1-D `layout_right` view of column 2, copied into a fresh contiguous buffer so the result is unit-stride.",
+        "A 1-D `layout_stride` view of row 2 over the same buffer, since `full_extent` selects the trailing dimension.",
+        "A 2-D `mdspan` with the second extent reduced to one, preserving the original rank and layout policy."
+      ],
+      "correctIndex": 0,
+      "explanation": "A scalar index in a `submdspan` call drops that rank and `full_extent` keeps its dimension whole, so this yields a rank-1 view of column 2; the non-unit spacing is expressed by `layout_stride`, and nothing is copied. Copying would defeat the point of a view type. `full_extent` occupies the *first* slot here, so it is the leading dimension that survives, and slicing reduces the rank rather than shrinking an extent.",
+      "sourceAnchor": "135-stdmdspan",
+      "difficulty": "application"
+    },
+    {
+      "id": "13-q22",
+      "prompt": "A price parser using `strtod` returns 3.0 for the field `3.14` on one deployment but 3.14 on another. What is the cause, and what fixes it?",
+      "options": [
+        "`strtod` honours `LC_NUMERIC`, so a locale using a comma separator stops at the dot; `std::from_chars` has no locale at all.",
+        "`strtod` honours `LC_NUMERIC`, so the fix is to call `std::stod`, which parses the classic locale regardless of the global setting.",
+        "`strtod` truncates rather than rounding when the input is not null-terminated; `std::from_chars` avoids it by taking an end pointer.",
+        "`strtod` uses a fast path that loses precision beyond two decimals; `std::from_chars` avoids it via its Eisel-Lemire algorithm."
+      ],
+      "correctIndex": 0,
+      "explanation": "`strtod` is locale-sensitive: under `LC_NUMERIC=de_DE` the separator is a comma, so parsing stops at the dot and yields 3.0 — a genuine production incident class. `from_chars` is specified to be locale-independent, always. `std::stod` is the tempting fix and is just as locale-aware as `strtod`. Termination and the Eisel-Lemire fast path are real properties of these functions but have nothing to do with the wrong value here.",
+      "sourceAnchor": "136-character-conversion-with-from_chars-and-to_chars",
+      "difficulty": "application"
+    },
+    {
+      "id": "13-q23",
+      "prompt": "`std::from_chars` returns `ec == std::errc::result_out_of_range` for an integer target. What is the state of the output variable?",
+      "options": [
+        "Unmodified — the caller's prior value is still there, so reading it as a parse result is a bug.",
+        "Clamped to the target type's `max()` or `min()` according to the sign of the input value.",
+        "Set to zero, mirroring what `strtol` writes into `errno` situations of the same kind.",
+        "Holding the wrapped result of the conversion, since overflow of the accumulator is well-defined for unsigned targets."
+      ],
+      "correctIndex": 0,
+      "explanation": "`from_chars` leaves the output untouched on any failure, `invalid_argument` and `result_out_of_range` alike, so code that reads the variable after a failed parse silently uses stale data. Clamping is what `strtol` does (it stores `LONG_MAX`/`LONG_MIN` and sets `errno`), which is exactly why the expectation carries over wrongly. Nothing is zeroed and no wrapped value is written.",
+      "sourceAnchor": "136-character-conversion-with-from_chars-and-to_chars",
+      "difficulty": "trap"
+    },
+    {
+      "id": "13-q24",
+      "prompt": "An integer field arrives as `\" +42\"` and `std::from_chars` is called over the whole field. What is the result?",
+      "options": [
+        "It fails with `invalid_argument`, because the integer overloads accept neither leading whitespace nor a leading `+`.",
+        "It succeeds and returns 42, with `ptr` pointing one past the last digit, matching `strtol`'s handling of the same input.",
+        "It succeeds and returns 42, but `ptr` points at the leading space because whitespace is not counted as consumed.",
+        "It fails with `result_out_of_range`, which `from_chars` reports for any character it is unable to consume."
+      ],
+      "correctIndex": 0,
+      "explanation": "The integer overloads are deliberately minimal: no whitespace skipping and no unary plus, so the very first character is already a parse failure and `ec` is `invalid_argument`. `strtol` does accept both, which is why callers migrating from it hit this. `result_out_of_range` is reserved for values that parse but do not fit the target type.",
+      "sourceAnchor": "136-character-conversion-with-from_chars-and-to_chars",
+      "difficulty": "application"
+    },
+    {
+      "id": "13-q25",
+      "prompt": "What does `std::to_chars` guarantee when formatting a `double` with no format or precision argument?",
+      "options": [
+        "The shortest decimal string that parses back to the identical `double`, so 0.1 prints as `0.1`.",
+        "Exactly 17 significant digits, the smallest count that round-trips every `double`, so 0.1 prints as `0.10000000000000001`.",
+        "The same output as `printf(\"%g\")` but computed faster, so the default precision is six significant digits.",
+        "The shortest string within one unit in the last place of the value, which may parse back to an adjacent `double`."
+      ],
+      "correctIndex": 0,
+      "explanation": "Default `to_chars` for floating point produces the shortest representation that round-trips exactly, the Steele & White guarantee implemented by Ryū/Grisu-derived algorithms — hence `0.1` rather than a 17-digit expansion. `%.17g` round-trips too but is not shortest, which is what makes that option tempting. The default is nothing like `%g`'s six digits, and 'round-trips' is exact by definition: an adjacent `double` would not qualify.",
+      "sourceAnchor": "136-character-conversion-with-from_chars-and-to_chars",
+      "difficulty": "recall"
+    }
+  ]
+}

@@ -1,0 +1,649 @@
+{
+  "slug": "chapter-56-reliability-and-risk",
+  "questions": [
+    {
+      "id": "56-q01",
+      "prompt": "A gateway can either append the outbound order to its journal and make it durable before writing to the socket, or write to the socket first and journal afterwards. What distinguishes the two orderings after a crash landing between the two steps?",
+      "options": [
+        "Journal-first leaves a possible duplicate, which the venue rejects on `ClOrdID`; send-first leaves a live order the system has no record of.",
+        "Send-first leaves a possible duplicate, which the venue rejects on `ClOrdID`; journal-first leaves a live order the system has no record of.",
+        "Both orderings leave the same recoverable residue, because the venue deduplicates by `ClOrdID` whichever write reached the device first.",
+        "Journal-first leaves a stale record with no market effect; send-first is preferred because it overlaps the durable write with transmission."
+      ],
+      "correctIndex": 0,
+      "explanation": "Journaling before sending means recovery may replay and re-send an order that already went out, and the venue kills that duplicate on the `ClOrdID` it has already seen. Sending first and dying before the append leaves exposure in the market that replay will never reconstruct, which is the unrecoverable direction. The mirror-image claim that send-first yields the harmless duplicate is the tempting swap, and the deduplication argument fails because the venue can only dedupe an identifier the firm actually recorded.",
+      "sourceAnchor": "561-write-ahead-trading-journals",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q02",
+      "prompt": "A journal is a preallocated, prefaulted, `mlock`ed `MAP_SHARED` mapping appended with a `memcpy` plus a release store. What durability does that actually buy?",
+      "options": [
+        "Visibility to other processes and survival of a process crash via the page cache, but not survival of power loss without `msync`/`fsync` or replication.",
+        "Full power-loss durability, because `MAP_SHARED` pages are written through to the backing device at the moment the release store retires.",
+        "Full power-loss durability, because `mlock` pins the pages outside the page cache so the kernel commits them synchronously on every dirty write.",
+        "Neither process-crash nor power-loss durability, because dirty pages are discarded by the kernel when the mapping process exits abnormally."
+      ],
+      "correctIndex": 0,
+      "explanation": "The dirty pages live in the page cache, which outlives the process, so another reader sees the record immediately and a crashed process loses nothing — but the kernel flushes asynchronously, so a power cut can lose everything not yet written back. The write-through claim is the usual over-read of `MAP_SHARED`, and `mlock` only prevents eviction to swap rather than forcing device commits. In trading the practical answer is replication to a second host at roughly 10-20 microseconds rather than an NVMe `fsync` at 50-200.",
+      "sourceAnchor": "561-write-ahead-trading-journals",
+      "difficulty": "trap"
+    },
+    {
+      "id": "56-q03",
+      "prompt": "State the correctness condition a checkpoint tagged with journal offset P must satisfy.",
+      "options": [
+        "It must equal the state produced by processing every record strictly before P and no record at or after P.",
+        "It must equal the state produced by processing every record up to and including P, plus any record already durable.",
+        "It must be a superset of the state at P, since replay is idempotent and re-applying a record cannot change the result.",
+        "It must be taken while the writer is quiesced, which is sufficient regardless of which offset the snapshot is tagged with."
+      ],
+      "correctIndex": 0,
+      "explanation": "The condition is exact in both directions: a checkpoint carrying effects of records at or after P double-applies them when replay resumes from P, and one missing effects of records before P loses them outright. The 'superset because replay is idempotent' claim is the seductive one — replay is not idempotent in general, which is precisely why the offset must be an exact cut. Quiescence alone does not help either, since a snapshot taken cleanly but tagged with the wrong offset is still silent corruption.",
+      "sourceAnchor": "562-crash-consistent-sequence-checkpoints",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q04",
+      "prompt": "What is the complete atomic-publish sequence for a new checkpoint file?",
+      "options": [
+        "Write a temporary file, `fsync` the file, `rename()` it into place, then `fsync` the containing directory.",
+        "Write a temporary file, `rename()` it into place, then `fsync` the renamed file to make both durable.",
+        "Write directly over the existing checkpoint, then `fsync` the file and the containing directory in that order.",
+        "Write a temporary file, `msync` the mapping, then hard-link it into place and unlink the previous name."
+      ],
+      "correctIndex": 0,
+      "explanation": "Contents must be durable before the name points at them, and the directory entry created by `rename()` needs its own `fsync` or a power loss can leave the visible name referring to nothing. The variant that renames before syncing the file is the common near-miss: the rename is atomic with respect to readers but says nothing about whether the bytes reached the device. Writing over the existing checkpoint in place destroys the only known-good copy while the new one is still partial.",
+      "sourceAnchor": "562-crash-consistent-sequence-checkpoints",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q05",
+      "prompt": "A gateway restarts after a `SIGKILL`, loads a checkpoint, and replays the journal suffix successfully. Its strategy has profitable signals waiting. What state must it enter next?",
+      "options": [
+        "A no-new-orders state permitting cancels only, until exchange and position reconciliation has completed and been verified.",
+        "Full trading, since a successful replay through the live code path already reproduces the exact pre-crash state.",
+        "A fully halted state rejecting cancels as well, since any outbound message before reconciliation could act on stale beliefs.",
+        "A quote-only state, since passive orders cannot cross the book and therefore add no exposure before reconciliation."
+      ],
+      "correctIndex": 0,
+      "explanation": "Cancels are risk-reducing and idempotent by `ClOrdID`, so they are safe immediately, while new exposure must wait for the exchange mass-status query and position reconciliation to resolve what is actually live. The 'replay reproduced the state so trade' claim ignores that replay only reconstructs what the firm believed, never what the venue did with in-flight orders. Blocking cancels too is the opposite error — it strands working orders exactly when you most want them gone — and passive quotes are still real orders that can fill.",
+      "sourceAnchor": "563-startup-and-replay-recovery",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q06",
+      "prompt": "A team ships a dedicated 'recovery mode' loader that parses journal records with a simplified decoder to make startup fast. Why is this a defect rather than an optimization?",
+      "options": [
+        "Recovery then reconstructs a state the live system would never have produced, and every bug in that decoder stays invisible until the day it runs.",
+        "The simplified decoder cannot read records written with length-last publication, so it necessarily misinterprets every record as torn.",
+        "Parsing speed is irrelevant because journal read throughput is bounded by device latency rather than by decoding cost.",
+        "A second decoder doubles the schema surface, so checkpoint version hashes can no longer be computed deterministically at startup."
+      ],
+      "correctIndex": 0,
+      "explanation": "Replay must run through the same `apply(event)` path as live processing, with outputs merely discarded, so that state transitions are provably identical; a divergent path is exercised only during an incident and is therefore untested where it matters most. The throughput argument is wrong on its premise — an `mmap`ed sequential read runs at roughly 2-5 GB/s, so decoding is not device-bound. Length-last publication is readable by any decoder, and schema hashing is unaffected by having two parsers.",
+      "sourceAnchor": "563-startup-and-replay-recovery",
+      "difficulty": "trap"
+    },
+    {
+      "id": "56-q07",
+      "prompt": "A hot standby keeps its book and position current without any state-shipping channel from the primary. What does it derive from public inputs, and what must still come from the primary?",
+      "options": [
+        "Book and position come from the same multicast feed and drop copy; in-flight orders and strategy state must come from the replicated journal.",
+        "In-flight orders come from the drop copy; book, position, and strategy state must all be shipped from the primary's memory image.",
+        "Everything comes from the multicast feed and drop copy, so a hot standby needs no journal replication channel at all.",
+        "Book state comes from the feed; position, in-flight orders, and limits must be re-derived by querying the venue continuously."
+      ],
+      "correctIndex": 0,
+      "explanation": "Deriving state from the identical inputs removes replication lag, serialization versioning, and any channel by which a corrupt primary could corrupt the standby — but the primary's intent is not public, so unacked orders and internal strategy state arrive over journal replication. The claim that nothing needs replicating is the tempting simplification and is exactly what produces orphaned orders on failover. Shipping the whole memory image reintroduces every problem the derived design avoids.",
+      "sourceAnchor": "564-active-passive-redundancy",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q08",
+      "prompt": "A firm runs a warm standby: process up, checkpoint loaded, not consuming the live feed. During a primary failure, what dominates its time to resume trading relative to a hot standby?",
+      "options": [
+        "It must consume and apply the market data and journal it skipped before its state is current, putting failover in seconds rather than sub-second.",
+        "It must be started and its binary loaded, which is the minutes-scale cost that distinguishes it from a hot standby.",
+        "It is identical to a hot standby in recovery time, since both hold a loaded checkpoint; only hardware cost differs between them.",
+        "It must renegotiate its multicast subscriptions with the exchange, a control-plane operation that dominates every other step."
+      ],
+      "correctIndex": 0,
+      "explanation": "Warm means running with state loaded but not tracking live inputs, so promotion requires catching up on everything missed since the checkpoint — seconds — whereas a hot standby is already continuously current and promotes sub-second. The 'must be started' description belongs to a cold standby, which is the minutes-scale tier. Warm and hot are not equivalent precisely because warm defers the catch-up cost to the worst possible moment.",
+      "sourceAnchor": "564-active-passive-redundancy",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q09",
+      "prompt": "A standby polls a lease service, sees it is leader, and then sends an order. Why is this not fencing?",
+      "options": [
+        "The check and the act are separate, so a stall between them can outlast the lease; only the resource seeing a token per request can enforce exclusivity.",
+        "Lease services are eventually consistent, so a leader read can return a stale value; a strongly consistent quorum read closes the window entirely.",
+        "The check costs a network round trip on the order path, so the resulting latency makes any client-side scheme unusable regardless of correctness.",
+        "The lease has no monotonic identifier, so two leaders cannot be ordered; adding a token to the client's own check makes the scheme sound."
+      ],
+      "correctIndex": 0,
+      "explanation": "This is a time-of-check/time-of-use race, and the stall that caused failover in the first place is exactly the event most likely to land inside the window. Fencing therefore has to be enforced at the resource, which sees a monotonic token on every request and rejects anything below the highest it has observed. The 'add a token to the client check' variant is the most tempting, because it adopts the right mechanism but leaves it on the wrong side of the window; a stale read is a secondary issue, not the structural one.",
+      "sourceAnchor": "565-leader-fencing",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q10",
+      "prompt": "Which fencing point is the one most commonly relied on in practice by a trading firm, and why?",
+      "options": [
+        "The exchange session: only one logon per credential is permitted, so the standby's successful logon is itself the fence and the old primary's socket dies.",
+        "STONITH power-off of the old primary, because it is absolutely decisive and completes within the sub-second budget a failover requires.",
+        "An `flock` on the shared journal file, because it is enforced by the kernel and therefore covers every host that could act as primary.",
+        "A quorum service consulted per order, because it is the only mechanism that provides a monotonic token with no clock assumptions."
+      ],
+      "correctIndex": 0,
+      "explanation": "The venue already serializes access to the one resource that matters, so exclusivity at order entry comes free with a successful fenced logon and needs no additional infrastructure. STONITH is decisive but takes seconds, which is why it is a backstop rather than the routine fence. An `flock` only covers local storage, and a quorum service takes tens to hundreds of milliseconds to grant leadership, so it decides who may be primary and is never consulted per order.",
+      "sourceAnchor": "565-leader-fencing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q11",
+      "prompt": "The same firm runs an order gateway and a market-data distributor. How should the automatic-failover bias differ between them?",
+      "options": [
+        "The distributor should fail over aggressively since unavailability is the worse error; the gateway should stay passive and alarm, promoting only on proven exclusivity.",
+        "Both should fail over aggressively, since the standby derives state from the same inputs and therefore cannot diverge from the primary.",
+        "The gateway should fail over aggressively since working orders are unmanaged while it is down; the distributor can safely tolerate a gap.",
+        "Both should require manual promotion, since any automatic failover admits a partition it cannot distinguish from a crash."
+      ],
+      "correctIndex": 0,
+      "explanation": "The costs are asymmetric: for a distributor a stale or absent feed is the whole failure, while for a gateway a second trading instance doubles position and satisfies every limit twice, which is far worse than a few seconds of not trading. The inverted version is tempting because unmanaged working orders sound urgent — but mass cancel and cancel-on-disconnect address those without promoting a second trader. Requiring manual promotion everywhere over-corrects and makes the distributor needlessly fragile.",
+      "sourceAnchor": "566-split-brain-avoidance",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q12",
+      "prompt": "A design places a Raft quorum check on the order-send path so every order confirms leadership before transmission. What is wrong with this?",
+      "options": [
+        "Leadership acquisition takes tens to hundreds of milliseconds, so quorum decides who may be primary and is never consulted per order.",
+        "Raft cannot provide a monotonic term number, so the check yields no usable fence token even when the round trip is affordable.",
+        "A quorum of an odd-numbered arbiter set can grant leadership to a partitioned minority, so the per-order check permits split-brain anyway.",
+        "The check duplicates the exchange's single-session rule, so it is redundant rather than harmful and can simply be cached per session."
+      ],
+      "correctIndex": 0,
+      "explanation": "Quorum services are correct and well understood, which is why they belong in the control plane deciding leadership — but they are a runtime dependency at millisecond scale and cannot sit on a nanosecond order path. The 'redundant but harmless, just cache it' framing is the trap: caching the result reintroduces the client-side check-then-act window that fencing exists to close. Raft does provide monotonic terms, and a partitioned minority by construction cannot obtain a majority.",
+      "sourceAnchor": "566-split-brain-avoidance",
+      "difficulty": "trap"
+    },
+    {
+      "id": "56-q13",
+      "prompt": "After promotion, a mass-status query returns a live order at the venue that the new primary's replayed state knows nothing about. What is the correct handling?",
+      "options": [
+        "Adopt it as unmanaged and either cancel it or bring it under management by its `ClOrdID`; it must never be left ignored.",
+        "Ignore it, since an order absent from the replicated journal was never durably intended and carries no obligation.",
+        "Treat it as terminal and update the position downward, since the replayed state is the firm's authoritative record of intent.",
+        "Defer it until the old primary is confirmed dead, since adopting it risks two managers acting on the same working order."
+      ],
+      "correctIndex": 0,
+      "explanation": "This is the orphaned-order case: live in the market, outside your model, unmanaged and unhedged, so it must be pulled under control or cancelled immediately. The 'never durably intended, so ignore it' reasoning is the most tempting because the premise is true about the journal record — but the order exists at the venue regardless of what your journal says, and exchange truth governs exposure. Marking it terminal is the handling for the opposite case, where replay shows an order the exchange does not have.",
+      "sourceAnchor": "567-state-convergence-after-failover",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q14",
+      "prompt": "A firm replicates its journal asynchronously: the primary sends the order without waiting for the standby's acknowledgement. What does this buy and what does it cost?",
+      "options": [
+        "It saves a cross-connect round trip of roughly 10-20 microseconds per order, at the cost of a window in which a failover leaves orphaned orders.",
+        "It saves the round trip with no correctness cost, because the drop copy delivers any order the standby missed before reconciliation completes.",
+        "It costs nothing in latency and removes orphans, because asynchronous replication still orders records before the send completes at the venue.",
+        "It saves the round trip but risks double-application on the standby, since unacknowledged records may be replicated twice after promotion."
+      ],
+      "correctIndex": 0,
+      "explanation": "Synchronous replication makes the primary wait for the standby to acknowledge the journal record before transmitting, which closes the orphan window at the price of a network round trip; dropping the wait re-opens it. The drop-copy argument is the seductive one — a drop copy does eventually reveal fills, but the orphan is a working order that must be found by mass-status reconciliation, and the whole point is that the window exists. Asynchronous replication is a defensible choice provided that reconciliation is real and tested.",
+      "sourceAnchor": "567-state-convergence-after-failover",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q15",
+      "prompt": "A hot thread spins on a queue slot whose sequence number never advances because the producer deadlocked. Which watchdog design detects this?",
+      "options": [
+        "One that reads a monotonic counter incremented inside the work loop and alarms when it fails to advance between observations.",
+        "One that checks the thread is scheduled and not in an uninterruptible state, since a deadlocked producer blocks its consumer's runnability.",
+        "One that measures the process's resident set and CPU time, since a wedged loop stops accumulating both within a few milliseconds.",
+        "One that pings the thread over a lock-free mailbox and alarms when no reply arrives within the configured stall threshold."
+      ],
+      "correctIndex": 0,
+      "explanation": "The wedged thread is alive, runnable, and burning CPU, so every existence check passes; only a counter incremented per unit of work distinguishes running from progressing, at about one nanosecond per beat. The CPU-time variant is the closest miss and inverts the signature — a spinning thread accumulates CPU time enthusiastically while doing nothing. A mailbox ping is worse than the counter because a thread wedged before the mailbox drain still services nothing, and it adds work to the hot path.",
+      "sourceAnchor": "568-heartbeats-and-watchdogs",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q16",
+      "prompt": "A watchdog thread runs inside the trading process, pinned to the same core as the worker, with a stall threshold picked as a round 5 ms. What is wrong?",
+      "options": [
+        "It shares fate with what it watches and its threshold is untuned, so it dies with the process, is preempted by the same event, and cancel-alls on normal stalls.",
+        "It shares fate with what it watches, but a same-core placement is correct because it observes the worker's cache state directly with no coherence traffic.",
+        "The threshold is the only defect: an in-process watchdog on the worker's core is the standard placement, since it detects stalls with the least delay.",
+        "The placement is the only defect: thresholds should always be round numbers so operators can reason about them during an incident."
+      ],
+      "correctIndex": 0,
+      "explanation": "Three separate fate-sharing failures apply — a `SIGSEGV` kills both, the same preemption stalls both, and an allocating alarm path stalls under the same memory pressure — so watchdogs must be layered in-process on a housekeeping core, out-of-process, and in hardware. Independently, thresholds must come from the measured distribution of loop intervals over weeks, not intuition, or a minor pause becomes a trading outage. The 'threshold is the only defect' framing is tempting because it fixes something real while leaving the structural problem intact.",
+      "sourceAnchor": "568-heartbeats-and-watchdogs",
+      "difficulty": "trap"
+    },
+    {
+      "id": "56-q17",
+      "prompt": "Which statement gives the governing rule for choosing fail-open versus fail-closed?",
+      "options": [
+        "Fail in the direction that reduces exposure: authorize-new-exposure controls close, remove-exposure controls open, classifiers of received data lean toward processing it.",
+        "Fail closed everywhere on the pre-trade path, since the cost of a missed opportunity is bounded while the cost of an unchecked order is not.",
+        "Fail open wherever the control is not regulator-mandated, so that a control-plane outage can never become a trading outage.",
+        "Fail in whichever direction preserves availability of the venue session, since a disconnected session forfeits queue position and cancel capability."
+      ],
+      "correctIndex": 0,
+      "explanation": "The taxonomy follows one principle applied to exposure rather than to blocking, which is why cancels and kill switches always fail open while position limits and collars close. 'Fail closed everywhere on the pre-trade path' is the most tempting because it is right about position limits and gives the right reasoning for them, but it would block the cancel path and the kill switch, which is where the rule inverts. Availability of the session is a consideration, never the governing criterion.",
+      "sourceAnchor": "569-fail-open-versus-fail-closed-behavior",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q18",
+      "prompt": "A gateway rejects orders with `if (risk_.blocked) return reject();`. The risk evaluation thread crashes. What happens, and what is the fix?",
+      "options": [
+        "The flag stays false forever so the control fails open silently; make permission a positive, freshly-timestamped assertion that decays with staleness.",
+        "The flag stays false so the control fails open, but the fix is to have the supervisor set it on crash detection, which restores fail-closed within milliseconds.",
+        "The flag is left in its last value so the control fails closed, which is safe but produces an unnecessary outage until the evaluator restarts.",
+        "The flag becomes non-atomic garbage so the control's behaviour is undefined; publishing it through a seqlock makes the read well-defined and safe."
+      ],
+      "correctIndex": 0,
+      "explanation": "Absence of a denial is not permission: a dead evaluator never sets the flag, so every order sails through with no risk evaluation and nothing reports an error. Making permission a decaying positive assertion turns any evaluator failure — crash, stall, deadlock, partition — into fail-closed automatically for about two nanoseconds of relaxed loads. The supervisor-sets-the-flag variant is the closest miss: it depends on detecting the failure, so a stall the detector misses still fails open, whereas decay needs no detection at all.",
+      "sourceAnchor": "569-fail-open-versus-fail-closed-behavior",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q19",
+      "prompt": "The inbound duplicate-message filter saturates during a burst and can no longer decide whether a fill report has been seen before. What should it do?",
+      "options": [
+        "Process the message, because dropping a genuine fill corrupts the position silently while a re-processed one is caught by idempotent state transitions.",
+        "Drop the message, because processing a possible duplicate double-counts the fill and inflates the position beyond every limit.",
+        "Drop the message and raise a reconciliation request, because position correctness always dominates and the drop copy will restore truth.",
+        "Block the inbound path until the filter drains, because backpressure preserves both correctness and ordering with no state loss."
+      ],
+      "correctIndex": 0,
+      "explanation": "This control classifies information already received rather than authorizing new exposure, and dropping a real fill produces a silently wrong position with no evidence of the cause, so it fails open. The double-counting objection has a true premise but the wrong conclusion: the order state machine is idempotent by design, so a re-applied fill is absorbed. Blocking the inbound path just moves the loss into the NIC ring, where drops are invisible outside `ethtool` counters.",
+      "sourceAnchor": "569-fail-open-versus-fail-closed-behavior",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q20",
+      "prompt": "A feed peaks at 5 M msg/s, the consumer drains 2 M msg/s, and bursts last 10 ms. What minimum queue capacity does the sizing rule give?",
+      "options": [
+        "About 30,000 entries, from the excess arrival rate of 3 M msg/s sustained across the 10 ms burst.",
+        "About 50,000 entries, since the queue must absorb the full peak arrival rate for the whole burst duration.",
+        "About 20,000 entries, since the queue only needs to cover what the consumer manages to drain during the burst.",
+        "About 2,000 entries, since a 10 ms burst at the difference of the rates in messages per millisecond gives that figure."
+      ],
+      "correctIndex": 0,
+      "explanation": "Capacity must exceed the excess, `(lambda_peak - mu) x T_burst`, which is 3 M/s times 10 ms, so roughly 30,000 entries — about 2 MB at 64 bytes each, trivially cheap against the cost of dropping. Sizing to the full peak ignores that the consumer keeps working through the burst, and sizing to the drained amount inverts which side of the subtraction matters. Queues are cheap and drops are not, so the correct move is to size generously and alarm on watermarks.",
+      "sourceAnchor": "5610-burst-capacity-planning",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q21",
+      "prompt": "A feed handler reports a market-data sequence gap. Switch counters and the upstream capture both show no packet loss anywhere on the network, and the application's queue-depth metrics never exceeded 40%. Where did the packets go?",
+      "options": [
+        "The NIC ring exhausted its descriptors during a microsecond burst and dropped in hardware, visible only in counters such as `rx_missed_errors`.",
+        "The inter-stage software queue dropped them, and the depth metric missed it because averaging hides a queue that filled and drained quickly.",
+        "The multicast group was briefly pruned upstream, which produces exactly this signature because pruning is not counted as loss by switches.",
+        "The sequence numbers were reordered rather than lost, since a gap observed with no loss anywhere always indicates out-of-order arrival."
+      ],
+      "correctIndex": 0,
+      "explanation": "A gap with clean network counters is the textbook signature of a hardware drop between the wire and software: descriptors ran out before the driver drained them, and nothing above the NIC ever sees it. The software-queue explanation is the most plausible-sounding miss, but a full software queue would leave a high-water mark even if the average looks calm, and here it did not — which is exactly why HWM and NIC counters must be correlated. Reordering produces a gap that closes when the late packet arrives, not a persistent one.",
+      "sourceAnchor": "5610-burst-capacity-planning",
+      "difficulty": "trap"
+    },
+    {
+      "id": "56-q22",
+      "prompt": "Why is a queue's high-water mark the more valuable exported statistic than its average depth?",
+      "options": [
+        "A queue that touches 90% for 200 microseconds and drains shows an average near zero, yet it is the leading indicator that loss is approaching.",
+        "The high-water mark is cheaper to compute, since averaging requires a division on the hot path that the maximum avoids entirely.",
+        "The average is biased by the consumer's own sampling, while the high-water mark is sampled by the producer and therefore unbiased.",
+        "The high-water mark converges to the true steady-state occupancy faster, so it detects a structurally slow consumer earlier than the average does."
+      ],
+      "correctIndex": 0,
+      "explanation": "Brief near-full excursions are exactly what precedes drops, and they are invisible in averages and in latency percentiles alike, so HWM must be recorded per interval and reset on export. The 'cheaper to compute' claim is wrong on its premise — depth is computed by an observer thread from existing sequence numbers, so the hot path pays nothing either way. A structurally slow consumer is actually detected by depth rising monotonically across intervals, which is a different signal from the burst that HWM catches.",
+      "sourceAnchor": "5611-queue-watermark-alarms",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q23",
+      "prompt": "A bounded inbound queue applies backpressure rather than dropping. Monitoring shows its depth healthy all session, yet fills are being missed. What is the most likely explanation?",
+      "options": [
+        "Backpressure stalled the producer, so the NIC ring filled and hardware dropped; the software queue looks fine because the loss moved upstream of it.",
+        "Backpressure caused the consumer to skip entries to catch up, so the software depth stayed low while entries were silently discarded on dequeue.",
+        "The depth metric samples the producer sequence only, so a bounded queue under backpressure reports a depth that is structurally always low.",
+        "Backpressure reordered the queue, so fills arrived out of sequence and were rejected downstream as stale rather than actually being lost."
+      ],
+      "correctIndex": 0,
+      "explanation": "A queue that never drops pushes the loss somewhere else, and for a feed handler that somewhere is the NIC ring — which is why software depth must be correlated against NIC drop counters to locate the real bottleneck. The 'consumer skips entries' variant describes a staleness-discard policy, which is a deliberate design that counts what it drops rather than losing fills silently. Depth is computed as the difference of both sequence numbers, and a ring buffer does not reorder.",
+      "sourceAnchor": "5611-queue-watermark-alarms",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q24",
+      "prompt": "A degradation ladder enters level 3 (stop quoting) when queue depth exceeds 90% and returns to level 2 when it falls below 90%. What does this produce and what fixes it?",
+      "options": [
+        "Flapping between quoting and not, which is worse than either state; use separate entry and exit thresholds plus a minimum dwell time.",
+        "Flapping between quoting and not; raise the single threshold until the queue no longer reaches it during ordinary bursts.",
+        "A latching failure in which the system never returns to level 2, fixed by adding a periodic unconditional reset of the ladder state.",
+        "Excessive dwell at level 3, fixed by lowering the exit threshold so the system leaves the degraded mode more readily."
+      ],
+      "correctIndex": 0,
+      "explanation": "A single shared threshold means the signal crosses it repeatedly, so the system oscillates between modes and delivers neither reliable quoting nor a stable reduced service; hysteresis with distinct enter and exit points and a dwell floor is the Schmitt-trigger fix. Raising the single threshold is the most tempting alternative — it does reduce how often the boundary is crossed, but the oscillation reappears at the new level whenever load parks there. Nothing about the design latches, and lowering the exit threshold is the reverse of what hysteresis requires.",
+      "sourceAnchor": "5612-graceful-degradation",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q25",
+      "prompt": "Under overload a feed handler sheds whichever updates do not fit in the queue, regardless of instrument. Why is this worse than shedding by a fixed ranking?",
+      "options": [
+        "It yields a partially updated book whose wrong parts cannot be identified, and an unknown-partial book is worse than a knowingly-stale one.",
+        "It yields a uniformly stale book across all instruments, which defeats the staleness check that would otherwise pull quotes.",
+        "It sheds more total messages than a ranked policy would, because random selection cannot exploit the drain rate that ranking assumes.",
+        "It violates fairness across instruments, so low-volume instruments lose a disproportionate share of their updates during the burst."
+      ],
+      "correctIndex": 0,
+      "explanation": "Random shedding leaves the book in a state where some levels are current and some are not, with no way to tell which, so every decision made against it may be wrong in an untrackable way; ranked shedding preserves risk-reducing actions and core instruments and leaves the rest knowably stale. The 'uniformly stale' description is the tempting inversion — uniform staleness would actually be the safer outcome, and it is what a ranked policy approximates. The total shed count is roughly the same under either policy; what differs is whether you know what you lost.",
+      "sourceAnchor": "5612-graceful-degradation",
+      "difficulty": "trap"
+    },
+    {
+      "id": "56-q26",
+      "prompt": "During a fast one-directional move a price collar computed against a reference frozen 30 seconds earlier begins rejecting a burst of orders. What is the correct reading?",
+      "options": [
+        "The reference is stale, and staleness is symmetric harm: on this side it causes an outage, on the other it would permit exactly the bad orders.",
+        "The collar is working: rejecting during a fast move is the intended behaviour, since fast moves are when fat-finger errors are most likely.",
+        "The band is too wide, since a wide band around a stale reference admits more error than a narrow band around a current one.",
+        "The reference should be switched to the previous close, which is exchange-published and therefore immune to intraday staleness problems."
+      ],
+      "correctIndex": 0,
+      "explanation": "A stale reference does not fail in one direction only — with the market moving away it rejects everything legitimate, and with the market moving toward the frozen level it waves through exactly the orders the collar exists to catch, which is why an explicit staleness bound with fallbacks is mandatory. The 'collar is working' reading is the tempting one because collars should indeed fire more in volatile regimes, but a burst of rejections of legitimate orders is a reference failure, not a catch. The previous close is stable but stale by construction during a real move, so it is a fallback rather than a fix.",
+      "sourceAnchor": "5613-pre-trade-price-collars",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q27",
+      "prompt": "How should collar bounds be represented so that the order path stays within a few nanoseconds?",
+      "options": [
+        "The book builder precomputes `lo_ticks` and `hi_ticks` off the order path, so the check is two integer compares plus a staleness test.",
+        "The band percentage is stored per instrument and multiplied by the current reference on the order path, in fixed point to avoid rounding.",
+        "The bounds are stored as doubles so the percentage arithmetic is exact, with the comparison done in a single fused multiply-add.",
+        "The bounds are recomputed per order from a rolling median of recent trades, which is robust to single bad prints and costs one division."
+      ],
+      "correctIndex": 0,
+      "explanation": "Moving the multiplication to the book builder leaves the hot path with integer comparisons only — no multiply, no divide, no floating point — and the staleness test is the third compare that keeps the control honest. Multiplying the percentage on the order path is the closest miss: it is correct arithmetically and still fixed point, but it puts work on the critical path that has no business being there. Doubles are excluded outright, since precision loss and optimization-dependent boundary behaviour arrive exactly at the threshold the control defines.",
+      "sourceAnchor": "5613-pre-trade-price-collars",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q28",
+      "prompt": "A notional check computes `quantity * price_ticks * tick_value * multiplier` in `int64_t` and compares against a limit. What is the failure mode on a genuinely enormous order?",
+      "options": [
+        "The product wraps to a small value that passes the limit, so the check fails open precisely on the orders it exists to catch.",
+        "The product saturates at the type's maximum, so the check rejects the order but also rejects every subsequent large legitimate one.",
+        "The product traps at runtime, so the order path faults and the gateway fails closed on the order and on everything behind it.",
+        "The product is computed correctly but the comparison against the scaled limit overflows instead, so the order is rejected spuriously."
+      ],
+      "correctIndex": 0,
+      "explanation": "Signed overflow gives an unusable result rather than a large one, so a ten-times-too-big order can produce a tiny product that passes every bound — the failure is inverted from what you want, which is why `__int128` or checked arithmetic is mandatory. The saturation claim is the most common misconception: integers do not clamp, and signed overflow is undefined rather than defined-and-safe. Nor does it trap by default, so nothing announces the problem at runtime.",
+      "sourceAnchor": "5614-fat-finger-and-notional-limits",
+      "difficulty": "trap"
+    },
+    {
+      "id": "56-q29",
+      "prompt": "Which limit in the layered fat-finger battery is the one that catches a runaway loop emitting many individually legal orders?",
+      "options": [
+        "Max notional per second or per interval, since each order passes the per-order bounds and only the aggregate rate reveals the fault.",
+        "Max quantity per order, since a runaway loop's orders are characteristically oversized relative to the strategy's normal ticket.",
+        "Percentage of average daily volume, since a loop's cumulative flow rapidly exceeds the instrument's liquidity on any single order.",
+        "Max notional per order, since the notional of a looped order compounds with each resubmission within the same interval."
+      ],
+      "correctIndex": 0,
+      "explanation": "The defining property of this failure is many individually-legal orders, so every per-order bound is satisfied by construction and only a rate-limited aggregate over a window catches it. The ADV percentage answer is the closest miss — it is a real limit and it is cumulative in spirit, but as specified it bounds order size against liquidity rather than flow per unit time. Per-order notional does not compound across resubmissions; each order is evaluated on its own.",
+      "sourceAnchor": "5614-fat-finger-and-notional-limits",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q30",
+      "prompt": "A position check compares `filled_position + new_qty` against the limit. The strategy sends ten orders in quick succession, none of which has filled or acked yet. What happens?",
+      "options": [
+        "All ten pass, because none has changed the filled position, so aggregate potential exposure can far exceed the limit.",
+        "All ten pass, but the limit still holds, because unacked orders cannot fill until the venue confirms them.",
+        "Only the first passes, because a correct implementation blocks on the acknowledgement of any outstanding order.",
+        "All ten pass and the limit holds, because the drop copy updates the filled position before the next order is evaluated."
+      ],
+      "correctIndex": 0,
+      "explanation": "Exposure must be checked against potential, not realized: the equation is filled position plus working buy quantity plus in-flight buy quantity, with the reservation incremented on send and released on reject, cancel, or expiry. The 'unacked orders cannot fill' claim has a true-sounding premise but the wrong conclusion — an in-flight order might already be live at the venue, which is exactly why it must be reserved against. Nothing in a correct implementation serializes on acknowledgements, and a drop copy is far too slow to close the window.",
+      "sourceAnchor": "5615-position-and-credit-limits",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q31",
+      "prompt": "Two gateway threads share one instrument's position budget. Each reads utilization, finds room, and sends. What is the standard production fix?",
+      "options": [
+        "Shard the limit into per-gateway sub-budgets rebalanced off the hot path, so check-and-reserve is single-writer and needs no contended atomic.",
+        "Guard the counter with a spinlock held across check and reserve, which is correct and costs only a few nanoseconds when uncontended.",
+        "Have each thread re-read utilization after sending and cancel its order if the aggregate turned out to exceed the limit.",
+        "Widen the counter to 128 bits so that net and pending fit in one word, which makes the separate read and write naturally atomic."
+      ],
+      "correctIndex": 0,
+      "explanation": "This is a check-then-act race, so the fix is either to make check and reserve one atomic operation or to remove the sharing entirely; sub-budgeting takes the latter route, trading a little capital efficiency for a non-atomic single-writer path. A CAS loop on a packed word is the correct alternative, but the widening answer misstates it — width alone does not make a separate read and write atomic. Cancelling after the fact accepts the breach and then hopes to undo it, which is not a limit.",
+      "sourceAnchor": "5615-position-and-credit-limits",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q32",
+      "prompt": "A candidate argues the maximum-order-quantity check should be skipped for the lowest-latency strategy. What is the correct rebuttal?",
+      "options": [
+        "It is one load from a cache line already holding the instrument's other limits plus one predictable compare, under a nanosecond amortized.",
+        "It costs roughly 15 nanoseconds, which is acceptable because the venue would reject an oversized order at far greater cost anyway.",
+        "It cannot be skipped for regulatory reasons, so its latency cost is not a legitimate subject of engineering discussion.",
+        "It can be skipped safely if the notional check remains, since notional bounds quantity implicitly through the instrument's price."
+      ],
+      "correctIndex": 0,
+      "explanation": "There is simply no latency argument against it — the limit shares a cache line with the instrument's other bounds and the branch is predictable — which is why interviewers use it to see whether a candidate reflexively resists all hot-path checks or actually reasons about cost. The notional-subsumes-quantity claim is the interesting miss: notional does bound quantity at a given price, but the quantity check catches unit confusion such as lots against shares, which a notional computed from the same wrong unit will not. Falling back on regulation dodges the engineering question being asked.",
+      "sourceAnchor": "5616-maximum-order-quantity",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q33",
+      "prompt": "A gateway validates quantity against the per-instrument maximum on every new order. A strategy sends a cancel/replace raising quantity from 100 to 100,000 and it goes through. Why?",
+      "options": [
+        "Replace paths that skip the size and reservation checks bypass every quantity control, and this is a real, recurring bug class.",
+        "Replace messages carry the original `ClOrdID`, so the limit lookup resolves to the original order's already-approved quantity.",
+        "Quantity-increasing replaces are exempt at most venues, so the gateway correctly defers the check to the exchange's own bound.",
+        "The check ran but the replace quantity is expressed as a delta, so the compared value was 99,900 rather than the resulting total."
+      ],
+      "correctIndex": 0,
+      "explanation": "A replace that increases quantity is new exposure and must be re-checked against both the size limit and the position reservation; systems that validate only on new orders leave the largest hole in the size battery wide open. The venue-exemption claim is invented — venues enforce their own maxima on replaces too, and relying on them costs a rejected round trip and rate-limit budget anyway. Replace quantity is the resulting total rather than a delta in the protocols this chapter assumes.",
+      "sourceAnchor": "5616-maximum-order-quantity",
+      "difficulty": "trap"
+    },
+    {
+      "id": "56-q34",
+      "prompt": "A quoter reads market-by-order data, sees its own new order appear as fresh interest, reacts by requoting, sees that, and reaches thousands of orders per second within milliseconds. What is the better structural fix?",
+      "options": [
+        "Tag and filter the firm's own orders out of the market-data view by exchange `OrderID` before the strategy sees them.",
+        "Add an orders-per-second limit per strategy so the loop is throttled before it can consume the venue's rate budget.",
+        "Add a cancel-to-new ratio check over a one-second window, since the loop is characterised by cycling rather than by raw rate.",
+        "Delay the strategy's view of the book by one round-trip time so its own orders arrive after the decision that caused them."
+      ],
+      "correctIndex": 0,
+      "explanation": "The loop is caused by the strategy misreading its own activity as external interest, so removing that input at the plumbing layer eliminates the feedback path rather than merely bounding its output. A per-strategy rate limit is a genuine and necessary control, but it caps the damage from a loop that still exists, which makes it the containment answer rather than the fix. Delaying the book view is worse than the disease: it degrades every decision to stop one class of misreading.",
+      "sourceAnchor": "5617-runaway-strategy-detection",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q35",
+      "prompt": "Why is a runaway detector implemented as a monitoring dashboard polling once a second inadequate?",
+      "options": [
+        "A runaway can exhaust the rate limit or build a large position in tens of milliseconds, so checks must be inline per order in the sending thread.",
+        "Dashboards sample rather than count, so the reported order rate is an estimate that systematically understates short bursts by a large factor.",
+        "A one-second poll is fast enough for rate detection but cannot compute an order-to-trade ratio, which needs a window of minutes.",
+        "The dashboard runs on a housekeeping core, so its view of the hot path's counters is delayed by cache coherence beyond its poll interval."
+      ],
+      "correctIndex": 0,
+      "explanation": "The time constants decide it: damage accrues in tens of milliseconds, so a control has to be evaluated per order on the order path with a response executable in the same thread from pre-built messages. The 'fast enough for rates' variant is the tempting partial truth — order-to-trade ratio genuinely does use a window of minutes, but that concedes the wrong point, since the fast signals are exactly the ones a one-second poll misses. Cache coherence delays are nanoseconds and are not the issue.",
+      "sourceAnchor": "5617-runaway-strategy-detection",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q36",
+      "prompt": "A firm's kill switch is a single atomic flag checked on the order-send path. The trading process wedges in an infinite loop before that check. What does this reveal?",
+      "options": [
+        "An in-process flag cannot stop a wedged process; it must be layered with an out-of-process supervisor, venue-side controls, and network isolation.",
+        "The flag must be checked more often — at every stage of the pipeline rather than only at send — so a wedge somewhere cannot bypass it.",
+        "The flag should be published through a seqlock in shared memory, so a supervisor can set it and the wedged process observes it immediately.",
+        "The process should have been configured with a hardware watchdog that resets the machine, which is sufficient on its own as a kill mechanism."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each kill-switch requirement excludes a common implementation, and 'must work when the process is stalled or wedged' is precisely the one that rules out any flag the wedged process itself has to read. Layering fixes it: a supervisor can `SIGKILL`, venue-side risk controls work regardless of your building, and a switch-port ACL needs no application cooperation. The seqlock variant is the closest miss — it makes the flag readable, but a wedged process reads nothing at all, so publication is not the problem.",
+      "sourceAnchor": "5618-trading-kill-switches",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q37",
+      "prompt": "An operator fires the kill switch, which mass-cancels immediately and then disables new order entry. Working orders keep reappearing at the venue. Why?",
+      "options": [
+        "The cancel raced orders still being sent, so the sequence must be to disable order entry first, then cancel, then verify with a mass-status query.",
+        "The mass cancel returned before the venue applied it, so the fix is to await its acknowledgement before disabling order entry.",
+        "Cancel-on-disconnect had not been enabled for the session, so the venue reinstated working orders when the session recovered.",
+        "The mass cancel covered only this session, so the reappearing orders came from a second session that the kill switch did not reach."
+      ],
+      "correctIndex": 0,
+      "explanation": "With entry still enabled the strategy keeps producing orders while the cancel executes, so you cancel into a stream of replacements — hence disable first, cancel second, then confirm the working set is empty and clean up stragglers individually. The 'await the ack first' variant is tempting because acknowledgement handling does matter, but waiting on the ack while entry remains open widens the race rather than closing it. Cancel-on-disconnect never reinstates orders, and cross-session scope would not produce a continuous stream tied to your own sending.",
+      "sourceAnchor": "5618-trading-kill-switches",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q38",
+      "prompt": "A supervisor is designed to `SIGKILL` the trading process as the decisive kill mechanism, relying on the venue to clean up. What must be verified before this is safe?",
+      "options": [
+        "That the venue actually cancels on disconnect for this session, since without it the `SIGKILL` orphans every working order in the market.",
+        "That the process handles `SIGKILL` by flushing its journal, since an unflushed journal makes the post-kill reconciliation impossible.",
+        "That the supervisor holds a fence token higher than the trading process, since otherwise the venue rejects the resulting disconnect.",
+        "That the kill is idempotent, since a supervisor that signals twice can terminate the standby that has already been promoted."
+      ],
+      "correctIndex": 0,
+      "explanation": "Killing the process only removes orders if cancel-on-disconnect is configured and its semantics are known and tested; at a venue without it, the most decisive-looking action leaves every working order live and unmanaged. The journal-flush answer is wrong on its premise — `SIGKILL` cannot be handled at all, which is exactly why the journal uses a mapping that survives process death rather than a flush-on-exit path. Fence tokens govern who may act, not whether a local signal is delivered.",
+      "sourceAnchor": "5618-trading-kill-switches",
+      "difficulty": "trap"
+    },
+    {
+      "id": "56-q39",
+      "prompt": "A firm mass-cancels every working order during an incident. What is its risk position afterwards?",
+      "options": [
+        "Unchanged in size: mass cancel removes working orders only, and reducing the position requires new orders the kill switch may have blocked.",
+        "Flat, since cancelling all working orders removes the exposure that those orders and their fills represented.",
+        "Unchanged, and necessarily unreducible, since a firm in a kill state must not send orders until reconciliation completes.",
+        "Reduced in proportion to the working orders cancelled, since each removed order withdraws its share of potential exposure."
+      ],
+      "correctIndex": 0,
+      "explanation": "Cancelling removes potential exposure from unfilled orders but touches nothing already traded, so the position stands and flattening it means sending fresh orders — which is why kill and cancel must be independently controllable, since a kill switch that blocks the hedge increases risk. The 'necessarily unreducible' framing is the near-miss: it correctly notes the tension but treats a policy choice as a hard constraint, and the engineering requirement is precisely that hedging remain possible. Nothing about a cancel unwinds a completed trade.",
+      "sourceAnchor": "5619-mass-cancel",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q40",
+      "prompt": "How should the mass-cancel message be prepared so the path from decision to wire measures under a microsecond?",
+      "options": [
+        "Pre-encoded at startup into a resident warm buffer, with only the `ClOrdID` and sequence number patched before the write to the NIC.",
+        "Constructed on demand from a preallocated arena, which avoids the allocator while keeping the encoding current with session state.",
+        "Cached after the first mass cancel of the session, so the encoding cost is paid once and every subsequent trigger reuses it.",
+        "Built by a dedicated warm thread signalled by the trigger, so the encoding cost never lands on the thread that detected the fault."
+      ],
+      "correctIndex": 0,
+      "explanation": "This path runs when the system is already unhealthy, so the trigger must be set flag, patch two fields, write — no allocation, no formatting, no lock, no lookup, with the buffer resident and warm from startup. Building from a preallocated arena is the closest miss: it removes the allocator but keeps the encoding work, and encoding is what must not happen during the incident. Caching after first use guarantees the very first mass cancel pays full cost, and handing off to another thread adds a wakeup exactly when scheduling is least trustworthy.",
+      "sourceAnchor": "5619-mass-cancel",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q41",
+      "prompt": "A firm configures self-match prevention globally as cancel-oldest. A market-making strategy begins seeing unexplained cancels of resting quotes and retrying them. What went wrong?",
+      "options": [
+        "Cancel-oldest destroys queue position earned over minutes, and a strategy that does not model the cancel retries, which can build into a loop.",
+        "Cancel-oldest cancels the aggressive incoming order, so the market maker's retries are the correct response to a venue-side rejection.",
+        "Global configuration is irrelevant to the symptom; unexplained cancels of resting orders can only come from the venue's own risk controls.",
+        "Cancel-oldest is unsupported for resting quotes, so the venue silently substituted cancel-both, which is why quotes disappear in pairs."
+      ],
+      "correctIndex": 0,
+      "explanation": "Cancel-oldest removes the resting order and lets the aggressor trade, so another of the firm's own strategies is silently destroying queue position that took minutes to earn — and an unmodelled cancel invites exactly the retry behaviour described, which is a runaway precursor. The claim that cancel-oldest kills the incoming order describes cancel-newest, which is the instruction chosen when protecting resting queue position. The instruction must be configured per strategy pair rather than globally, precisely so each side knows which of its orders can be cancelled.",
+      "sourceAnchor": "5620-self-trade-prevention",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q42",
+      "prompt": "A firm maintains its own best bid and ask per instrument and checks a new aggressive order against them before sending. How should this internal check be understood relative to venue-side STP?",
+      "options": [
+        "It is an optimization that saves fees and round trips but cannot be exact, since the market moves between check and match; venue STP is authoritative.",
+        "It is authoritative, since preventing the order from leaving the firm is strictly stronger than any instruction the venue can apply.",
+        "It replaces venue STP wherever the firm trades on a single session, because one session cannot cross its own orders at the venue.",
+        "It is redundant with venue STP and worth keeping only for the audit trail, since the venue applies the same comparison microseconds later."
+      ],
+      "correctIndex": 0,
+      "explanation": "Both layers are needed: the internal check costs two integer comparisons and avoids fees and round trips, but a passive order can become crossing between your check and the venue's match, so only venue-side STP can be exact. The 'strictly stronger because it never leaves the firm' claim is the tempting one — blocking early is genuinely better when it fires, but it cannot fire on a race it does not see. A single session can absolutely cross its own resting orders, which is what STP exists to arbitrate.",
+      "sourceAnchor": "5620-self-trade-prevention",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q43",
+      "prompt": "Message deduplication fails open while order deduplication fails closed. Which account reconciles the two under a single rule?",
+      "options": [
+        "Both follow fail-in-the-direction-that-reduces-exposure: dropping a real fill corrupts position silently, while a duplicate order creates real unintended exposure.",
+        "They follow opposite rules because inbound and outbound paths have opposite defaults: inbound classification is permissive, outbound authorization is restrictive.",
+        "Both follow availability-first: inbound processing must never stall the feed, and outbound blocking must never stall the strategy's decision loop.",
+        "They differ because the venue deduplicates by `ClOrdID` on both paths, so the firm's inbound filter is advisory and its outbound filter is binding."
+      ],
+      "correctIndex": 0,
+      "explanation": "Same word, opposite bias, one principle: an unprocessed fill leaves your position silently wrong, whereas an extra order puts real risk into the market, so exposure reduction points in different directions on the two paths. The inbound/outbound framing is the seductive distractor because it produces the correct behaviour by coincidence, but it is a restatement rather than a reason and it breaks on any inbound control that authorizes exposure. The venue cannot deduplicate an order that carries a fresh `ClOrdID`, which is why the control must be entirely the firm's.",
+      "sourceAnchor": "5621-duplicate-order-protection",
+      "difficulty": "trap"
+    },
+    {
+      "id": "56-q44",
+      "prompt": "An intent-deduplication window is set to five seconds. A quoter that legitimately replenishes an identical quote after each fill starts missing quotes. What is the correct resolution?",
+      "options": [
+        "Shorten the window to tens or hundreds of milliseconds and give the quoter an explicit intended-repeat flag, since dedup must be opt-out per strategy.",
+        "Remove the fingerprint's quantity and price fields so replenishment quotes hash differently from the accidental duplicates being targeted.",
+        "Keep the window and have the quoter vary its quantity by one lot, so successive replenishments produce distinct fingerprints.",
+        "Move the check after the send and cancel any order found to be a duplicate, so legitimate replenishment is never blocked in the first place."
+      ],
+      "correctIndex": 0,
+      "explanation": "A window that is too long converts a safety control into a trading bug, so the design point is a short window plus an explicit intent flag for strategies that genuinely repeat themselves. Weakening the fingerprint is the tempting alternative but it guts the control — price and quantity are exactly what distinguish an intended repeat from a retry bug. Perturbing quantity is a workaround that corrupts the strategy's own sizing, and checking after the send accepts the duplicate exposure it was meant to prevent.",
+      "sourceAnchor": "5621-duplicate-order-protection",
+      "difficulty": "application"
+    },
+    {
+      "id": "56-q45",
+      "prompt": "A whole risk configuration — limits, collar bands, instrument metadata — must be replaced without the hot path ever seeing a mixture of old and new values. What is the mechanism?",
+      "options": [
+        "Build a new immutable image off the hot path into preallocated storage and publish it with one release store of a pointer the hot path acquire-loads.",
+        "Take a writer lock on the configuration and update the fields in place, since the hot path's reader lock is uncontended almost all of the time.",
+        "Update the fields in place in a fixed order chosen so that any intermediate combination remains a valid and conservative configuration.",
+        "Publish each field as its own relaxed atomic, since per-field atomicity composes into consistency when the fields are read in one pass."
+      ],
+      "correctIndex": 0,
+      "explanation": "One release store swaps in an image that is internally consistent forever, so the hot path pays a single acquire load and partially-applied configuration becomes structurally impossible; the old image is reclaimed by deferred free or epochs once no reader can hold it. The ordered-in-place-update answer is the interesting miss — it can be made to work for a single pair of fields, but it does not scale to a whole configuration and it makes every future field addition a correctness proof. Per-field atomics explicitly do not compose: that is the torn-read hazard.",
+      "sourceAnchor": "5622-risk-state-consistency",
+      "difficulty": "recall"
+    },
+    {
+      "id": "56-q46",
+      "prompt": "After a failover, the new primary restores the utilization figure that was last replicated in the journal and resumes checking limits against it. What is wrong?",
+      "options": [
+        "Utilization must be recomputed from reconciled positions; a carried-forward figure lets the incident's accounting error outlive the incident.",
+        "Nothing is wrong provided the figure was journaled with a release store, since the replicated value is by construction internally consistent.",
+        "The figure will be stale by one journal record at most, which is a bounded and acceptable error given the cost of a full recomputation.",
+        "The figure should instead be restored from the checkpoint rather than the journal, since checkpoints carry a schema hash and a checksum."
+      ],
+      "correctIndex": 0,
+      "explanation": "Any event that makes state suspect — crash, failover, reconnect, reconciliation break — requires recomputing utilization from authoritative positions, meaning drop copy plus start-of-day, because a cached figure is a limit that no longer limits. The 'stale by one record, bounded error' argument is the tempting one: it treats the problem as lag when the real problem is that the old primary's belief may have been wrong before it died. Restoring from a checkpoint instead just changes which stale source is trusted; the point is not to carry any of them forward.",
+      "sourceAnchor": "5622-risk-state-consistency",
+      "difficulty": "application"
+    }
+  ]
+}

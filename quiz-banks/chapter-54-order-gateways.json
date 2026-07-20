@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-54-order-gateways",
+  "questions": [
+    {
+      "id": "54-q01",
+      "prompt": "Your logon requests `HeartBtInt=30`; the exchange's logon accept echoes 10. Which interval does your gateway arm its timers with?",
+      "options": [
+        "10 seconds, because the negotiated value is whatever the accept carries, and the venue may lower your request.",
+        "30 seconds, because the initiator's requested value binds and the echoed field is informational only.",
+        "20 seconds, the midpoint, because both sides must agree and neither value is authoritative alone.",
+        "30 seconds outbound and 10 seconds inbound, because each side times its own sends by its own request."
+      ],
+      "correctIndex": 0,
+      "explanation": "Logon is a negotiation, and the response is the negotiated result: the exchange may impose an interval lower than the one requested, so the timers must be armed from the accept. The 'initiator binds' answer is the classic first-day incident — honouring your own request means you send heartbeats too slowly and the venue drops you for timeout. There is no midpoint rule and no per-direction split of the negotiated value.",
+      "sourceAnchor": "541-trading-session-logon-and-logout",
+      "difficulty": "recall"
+    },
+    {
+      "id": "54-q02",
+      "prompt": "A gateway sends `Logout` and immediately calls `close()` on the socket. What is the consequence described in the chapter?",
+      "options": [
+        "Unread inbound data is discarded and RST'd, so the venue records an abnormal disconnect that may trigger cancel-on-disconnect.",
+        "The logout is dropped from the kernel send buffer, so the venue never sees it and holds the session open until heartbeat timeout.",
+        "The session's outbound sequence number fails to persist, so the next logon must set `ResetSeqNumFlag=Y` to recover.",
+        "The venue treats the missing logout echo as a resend request and replays the whole day's outbound stream on reconnect."
+      ],
+      "correctIndex": 0,
+      "explanation": "Closing with unread data in the receive queue makes the kernel emit RST, and the venue classifies the disconnect as abnormal rather than graceful — which at venues where COD fires only on abnormal disconnect can cancel orders you meant to leave resting. The 'logout never gets sent' variant is wrong because close still flushes queued outbound data; the damage comes from the inbound side. The correct shape is send logout, `shutdown(fd, SHUT_WR)`, drain to EOF or a short timer, then close.",
+      "sourceAnchor": "541-trading-session-logon-and-logout",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q03",
+      "prompt": "A candidate says \"after logout I am flat, so I can skip end-of-day reconciliation.\" Where does this break?",
+      "options": [
+        "Logout terminates the session, not the orders; live orders generally survive it, and day orders die at the close rather than at logout.",
+        "Logout cancels only orders entered on that session, so orders from other sessions to the same venue remain live and unreconciled.",
+        "Logout cancels resting orders but not orders still in `PendingNew`, so only the in-flight subset needs reconciling.",
+        "Logout cancels everything but the venue reports the cancels asynchronously, so reconciliation is needed only for timing."
+      ],
+      "correctIndex": 0,
+      "explanation": "A logout is a session operation and carries no order-management semantics: most venues persist live orders across it, and day orders are killed by the closing auction schedule, not by your disconnect. The 'cancels only that session's orders' answer is tempting because session scoping is real for cancel-on-disconnect, but logout itself does not cancel at all. The belief is dangerous precisely because it is silently correct in staging, where no orders are resting.",
+      "sourceAnchor": "541-trading-session-logon-and-logout",
+      "difficulty": "trap"
+    },
+    {
+      "id": "54-q04",
+      "prompt": "Why can't `SO_KEEPALIVE` replace a protocol-level heartbeat on an order session?",
+      "options": [
+        "Its default idle timers run in hours, so a crashed peer or blackholed path stays undetected far past any useful bound.",
+        "It probes only the outbound direction, so it detects a dead peer but never detects that your own writes are stalling.",
+        "It is negotiated per connection rather than per session, so it resets on reconnect and loses the liveness history.",
+        "It operates below TCP's retransmission timer, so its probes are swallowed by retransmission before reaching the peer."
+      ],
+      "correctIndex": 0,
+      "explanation": "The objection is purely one of time bounds: keepalive defaults are measured in hours, whereas an order session needs a liveness bound you choose and control, so the protocol heartbeat is the real detector. The 'only probes outbound' answer misdescribes keepalive, which does elicit peer responses; its failing is latency, not directionality. The remaining framings invent layering and negotiation properties keepalive does not have.",
+      "sourceAnchor": "542-session-heartbeats",
+      "difficulty": "recall"
+    },
+    {
+      "id": "54-q05",
+      "prompt": "A busy session sends application messages continuously and emits no heartbeats for an hour. How should the monitoring system read this?",
+      "options": [
+        "As normal: any outbound message resets the outbound idle timer, so a busy session legitimately sends no heartbeats.",
+        "As a defect: heartbeats are unconditional at the negotiated interval and their absence means the timer thread has died.",
+        "As a warning: heartbeats may be suppressed under load but the venue still counts them and will disconnect on the shortfall.",
+        "As a stall indicator: missing heartbeats on a busy session mean the send path is coalescing and delaying protocol messages."
+      ],
+      "correctIndex": 0,
+      "explanation": "The heartbeat is required only on idle — any outbound traffic proves liveness and resets the timer — so a saturated session naturally emits none and their absence is not evidence of trouble. The 'unconditional at the interval' answer inverts the rule and would generate pointless traffic on exactly the busiest sessions. The venue counts silence, not heartbeats specifically, so there is no shortfall to disconnect on.",
+      "sourceAnchor": "542-session-heartbeats",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q06",
+      "prompt": "Several gateway hosts see exchange-initiated disconnects, but the network team confirms zero packet loss on the wire. What does the chapter say this points to?",
+      "options": [
+        "Local process stalls that delayed your outbound heartbeats past the interval, so the venue timed you out.",
+        "Venue-side heartbeat misconfiguration, since a clean wire means the fault must be on the exchange's timers.",
+        "A negotiated interval set too high, since longer intervals make spurious timeouts more likely to fire.",
+        "TCP window exhaustion on the inbound path, which stops heartbeats arriving without registering as loss."
+      ],
+      "correctIndex": 0,
+      "explanation": "This is the diagnostic signature to memorise: exchange-initiated drops clustered on one host with a clean wire means your own event loop stalled — a page fault, an allocation, a blocking write — and you failed to send on time. Blaming the venue's timers is the tempting misread, but the clustering by host localises the fault to your process. Note that a longer negotiated interval makes spurious timeouts less likely, not more, so that reasoning is inverted.",
+      "sourceAnchor": "542-session-heartbeats",
+      "difficulty": "trap"
+    },
+    {
+      "id": "54-q07",
+      "prompt": "During a resend, the exchange sends `SequenceReset` with `GapFillFlag=Y` and `NewSeqNo=500`. What is it asserting?",
+      "options": [
+        "Messages up to 499 were administrative and are not being replayed, so advance the expected inbound to 500.",
+        "Messages up to 499 were lost by the exchange and cannot be recovered from any source, so treat them as gone.",
+        "Both directions restart at 500, so the outbound counter must also be moved before the next send.",
+        "Messages up to 499 will follow shortly out of order, so buffer until 500 arrives and then reorder."
+      ],
+      "correctIndex": 0,
+      "explanation": "A gap fill collapses the administrative traffic — heartbeats, test requests, logons — that would be meaningless replayed out of time, and simply advances the expected inbound number over that range. The 'permanently lost' reading confuses gap fill with a hard reset: a gap fill is itself sequenced, arrives at the number it claims to start from, and covers only messages that were never application data. Sequence resets are per-direction, so the outbound counter is untouched.",
+      "sourceAnchor": "543-session-sequence-reset",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q08",
+      "prompt": "You disconnect at 10:30 with live orders and reconnect at 10:31 sending logon with `ResetSeqNumFlag=Y`. What is the specific hazard?",
+      "options": [
+        "The exchange discards its queued resend, so any execution report generated during the outage is lost from the session.",
+        "The exchange rejects the logon outright, because sequence reset at logon is only legal at the venue's start-of-day boundary.",
+        "Your live orders are cancelled, because resetting sequence numbers invalidates the session that created them.",
+        "The exchange restarts only its inbound counter, leaving the two directions skewed until the next hard reset."
+      ],
+      "correctIndex": 0,
+      "explanation": "`ResetSeqNumFlag=Y` sets both directions to 1 and thereby tells the exchange to forget everything it was going to resend, including fills produced while you were down — those can then only be recovered from drop copy or the end-of-day file. The 'orders get cancelled' answer conflates sequence state with order state; sequencing is a session-layer concern and does not touch the book. The rule is that reset is a start-of-day operation with no live orders and no unreconciled fills; intraday reconnects resume.",
+      "sourceAnchor": "543-session-sequence-reset",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q09",
+      "prompt": "What is the correct ordering of journaling relative to I/O on each side of a session?",
+      "options": [
+        "Outbound: journal durably, then send. Inbound: process the message, then advance the expected sequence number.",
+        "Outbound: send, then journal on completion. Inbound: advance the sequence number, then process the message.",
+        "Outbound: journal durably, then send. Inbound: advance the sequence number, then process the message.",
+        "Outbound: send, then journal on completion. Inbound: process the message, then advance the sequence number."
+      ],
+      "correctIndex": 0,
+      "explanation": "The asymmetry exists so that a crash at any point degrades to a duplicate rather than a loss: persisting before the send means a crash cannot lose the fact that a message may have gone out, and processing before advancing means a crash cannot skip an unprocessed inbound message. The mirror-image ordering is the tempting one because it feels symmetric, but advance-then-process loses a fill and send-then-journal produces an untracked live order — the two canonical failures.",
+      "sourceAnchor": "543-session-sequence-reset",
+      "difficulty": "recall"
+    },
+    {
+      "id": "54-q10",
+      "prompt": "A responder replaying messages 200-260 must include heartbeats and logons that originally occupied that range. What does it actually send?",
+      "options": [
+        "The application messages with `PossDupFlag=Y` and their original sequence numbers, with gap fills covering the administrative ones.",
+        "Every message verbatim including the heartbeats, since the requester asked for a contiguous range and gaps break its detector.",
+        "Only the application messages, renumbered contiguously from 200 so the requester sees no gaps at all.",
+        "A single hard reset to 261, since a range containing administrative traffic cannot be replayed message by message."
+      ],
+      "correctIndex": 0,
+      "explanation": "A resend response is a mixture: real application messages carry `PossDupFlag=Y`, their original `MsgSeqNum` and `SendingTime`, plus `OrigSendingTime`, while administrative messages are collapsed into gap fills because they are meaningless out of time. Replaying heartbeats verbatim is the tempting answer but it delivers liveness proofs from the past, which is exactly what gap fill exists to prevent. Renumbering would destroy the very invariant the sequence numbers encode.",
+      "sourceAnchor": "544-resend-and-replay",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q11",
+      "prompt": "Your resend request overlapped messages you had already processed, and the duplicates arrive with `PossDupFlag=Y`. Where must they be suppressed?",
+      "options": [
+        "At the application level, because the session layer will hand up both copies whenever the requested range overlaps what you hold.",
+        "At the session layer only, because the sequence comparison fully identifies duplicates before the application ever sees them.",
+        "At the transport layer, because a duplicate at an already-consumed sequence number is a TCP retransmission artefact.",
+        "Nowhere, because the responder omits messages the requester has already acknowledged in the resend request itself."
+      ],
+      "correctIndex": 0,
+      "explanation": "The responder replays whatever range was asked for, so an overlapping request delivers copies of messages you already applied, and the suppression has to happen where order state lives. The 'session layer handles it' answer is the seductive one: sequence comparison flags the duplicate, but the layer still passes both copies up, so relying on it leaves the application double-applying. There is no acknowledgement in a resend request that would let the responder trim the range.",
+      "sourceAnchor": "544-resend-and-replay",
+      "difficulty": "trap"
+    },
+    {
+      "id": "54-q12",
+      "prompt": "A gateway sizes its outbound message store as a ring below the day's message count. What capability is silently lost?",
+      "options": [
+        "The ability to answer a resend request for any range that has already been overwritten by the wrap.",
+        "The ability to assign outbound sequence numbers, since the store's index is the source of the counter.",
+        "The ability to detect inbound gaps, since gap detection compares against the stored outbound high-water mark.",
+        "The ability to journal durably, since a wrapped ring cannot be synced to disk without a full rewrite."
+      ],
+      "correctIndex": 0,
+      "explanation": "The outbound store is an append-only log indexed by sequence number and retained for the session's life; once it wraps, the overwritten range can no longer be retransmitted, so a resend request for it is unanswerable. Gap detection is the wrong target — that compares inbound arrivals against your expected inbound number and needs no outbound history. Sizing for the day's worst case plus margin is cheap: 100k messages at ~200 bytes is about 20 MB.",
+      "sourceAnchor": "544-resend-and-replay",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q13",
+      "prompt": "Your reconnect logic retries every 50 ms after an authentication reject. Why is this the wrong policy?",
+      "options": [
+        "A bad credential never fixes itself, and hammering logon attempts locks the account at venues that permit only a few failures.",
+        "Authentication rejects mean the session is still half-open, so retries collide with the prior session until it times out.",
+        "Auth rejects consume the same throttle budget as order entry, so rapid retries starve the reserved cancel capacity.",
+        "Each rejected logon still increments the outbound sequence number, so rapid retries create a gap the venue must resend."
+      ],
+      "correctIndex": 0,
+      "explanation": "Auth failures need a distinct, much longer backoff or an outright stop requiring operator intervention, because retrying a wrong password only burns the venue's 3-5 failure allowance and locks you out. Transient socket errors get the opposite treatment — an immediate first attempt, then exponential backoff with jitter and a cap. The throttle-budget answer is plausible-sounding but rate limits govern application message flow, not logon attempts, which have their own lockout counter.",
+      "sourceAnchor": "545-reconnect-behavior",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q14",
+      "prompt": "What does including `NextExpectedMsgSeqNum` (tag 789) in a reconnect logon buy you?",
+      "options": [
+        "The exchange begins its resend from that number immediately, removing the detect-gap and `ResendRequest` round trips.",
+        "The exchange discards anything it queued below that number, so recovery skips messages you no longer need.",
+        "The exchange validates your persisted state and rejects the logon if the two sides disagree on the number.",
+        "The exchange guarantees no further gaps for the session, because the declared number pins both counters."
+      ],
+      "correctIndex": 0,
+      "explanation": "Tag 789 makes recovery declarative: you state your expected inbound and the venue starts resending from there, collapsing what would otherwise be logon, gap detection, `ResendRequest`, and replay into a single exchange. The 'discards anything below' reading is the dangerous one — that is what `ResetSeqNumFlag=Y` does, and confusing the two loses execution reports. Tag 789 asks for messages rather than disowning them.",
+      "sourceAnchor": "545-reconnect-behavior",
+      "difficulty": "recall"
+    },
+    {
+      "id": "54-q15",
+      "prompt": "At disconnect, an order was acked and live, and another had a cancel sent but unacked. What posture does the chapter prescribe while down?",
+      "options": [
+        "Treat both as still live and exposed, then on reconnect reconcile the first and re-query or re-cancel the second.",
+        "Treat both as terminal, since a session that cannot manage an order should not carry it in the exposure model.",
+        "Treat the acked order as live and the pending cancel as cancelled, since the venue processes cancels ahead of new flow.",
+        "Treat the acked order as unknown and the pending cancel as live, since the ack is stale once the session breaks."
+      ],
+      "correctIndex": 0,
+      "explanation": "An acked order is assumed live and exposed until reconciliation proves otherwise, and a cancel sent without an ack leaves the order live, so both must remain in the model and be resolved on reconnect. Assuming the pending cancel succeeded is the most tempting error and it produces a phantom-flat position; there is no venue rule prioritising cancels over the disconnect. The design principle is 'session down means its orders are frozen but visible', never that they vanish.",
+      "sourceAnchor": "545-reconnect-behavior",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q16",
+      "prompt": "Which identifier is the only one available to correlate a response with an order that was never acknowledged?",
+      "options": [
+        "`ClOrdID`, because you assign it before the message leaves the building and it exists at the moment of send.",
+        "`OrderID`, because the exchange assigns it on receipt and echoes it on every subsequent response for the order.",
+        "`ExecID`, because it is unique per execution report and therefore resolves any response back to its order.",
+        "`OrigClOrdID`, because it names the prior link in the chain and survives even when the current one is unacked."
+      ],
+      "correctIndex": 0,
+      "explanation": "`ClOrdID` is yours and predates the send, which makes it the only key that exists for an order the exchange may never have seen. `OrderID` is assigned by the exchange on acceptance, so by definition it is absent exactly in the unacked case that matters. `ExecID` identifies an execution report, not an order, and an unacked order has produced none; `OrigClOrdID` only exists for replaces.",
+      "sourceAnchor": "546-client-and-exchange-order-identifiers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "54-q17",
+      "prompt": "An order is new as `ClOrdID=A`, then replaced to B, then replaced to C. What does the chapter say about the exchange `OrderID`?",
+      "options": [
+        "It is invariant across the chain at most venues but not all, so read it from each ack rather than assuming.",
+        "It is invariant across the chain at every venue, which is why `OrigClOrdID` exists to rebuild the client-side chain.",
+        "It changes on every replace at every venue, so the chain must be rebuilt from `OrigClOrdID` on each ack.",
+        "It is reassigned only when a replace changes price, since a quantity-only amendment preserves queue priority."
+      ],
+      "correctIndex": 0,
+      "explanation": "Most venues keep one `OrderID` across the whole replace chain, but some issue a new one per replace, so the safe implementation reads it from the ack every time. The 'invariant everywhere' answer is the trap in the chapter's own list of common errors — it is true often enough to survive testing and then fails at one venue. Tying reassignment to whether price changed invents a rule the chapter does not state.",
+      "sourceAnchor": "546-client-and-exchange-order-identifiers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "54-q18",
+      "prompt": "Your gateway throttles an outbound new order and generates a local reject — but the message was already on the wire. What follows for its `ClOrdID`?",
+      "options": [
+        "It must never be reused, because the order may exist at the venue and a status query on that ID is the only definitive resolution.",
+        "It may be reused immediately, because a locally generated reject means the venue never assigned state to it.",
+        "It may be reused after the session's heartbeat interval, once the venue would have responded had it accepted the order.",
+        "It must be reused for the retry, so that the venue's duplicate check collapses the two attempts into one order."
+      ],
+      "correctIndex": 0,
+      "explanation": "A reject makes an order feel like it never existed, but a locally generated reject says nothing about what reached the exchange, so the ID must stay burned and resolvable — `OrderStatusRequest` on it returns either the order's state or 'unknown order', a definitive answer. Waiting out a heartbeat interval is the plausible-sounding compromise and it fails because silence is not an answer; the venue may simply be slow. Deliberately reusing the ID to trigger a duplicate check inverts the mechanism, which rejects rather than merges.",
+      "sourceAnchor": "546-client-and-exchange-order-identifiers",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q19",
+      "prompt": "Why is `std::unordered_map` disqualified for the `ClOrdID`-to-order table on the ack path?",
+      "options": [
+        "It is node-based, so every lookup chases a pointer, insertion allocates, and erasure frees — each disqualifying on its own.",
+        "Its hashing of integer keys is identity, so counter-derived IDs cluster into one bucket and lookups degrade to a scan.",
+        "Its iterators invalidate on rehash, so an inbound message arriving during a resize resolves to a freed order slot.",
+        "Its load factor is capped at 1.0, so a table sized for the day's peak order count rehashes on nearly every insert."
+      ],
+      "correctIndex": 0,
+      "explanation": "The objection is structural: node-based storage means a pointer chase per lookup and an allocator call per insert and erase, and the measured penalty against a flat open-addressed map is typically 3-10x on lookup with an unbounded insert tail. The identity-hash answer is the closest miss — identity hashing of integers is real in libstdc++, but bucket assignment is modulo the bucket count, so dense counters spread rather than collide. The better answer still is no hash at all when you generate the identifiers.",
+      "sourceAnchor": "547-order-correlation-tables",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q20",
+      "prompt": "Correlation uses `slot = uint32_t(clordid) & (kCapacity - 1)` followed by a comparison of the stored full ID. What does that comparison buy?",
+      "options": [
+        "It turns a wrapped counter or a stale response from an earlier session into a null result instead of a corrupted order.",
+        "It resolves probe collisions between distinct IDs mapping to the same slot, letting the lookup continue to the next slot.",
+        "It confirms the order is still live, since terminated orders zero the stored identifier when their slot retires.",
+        "It validates the exchange's echo of the identifier, catching venues that truncate `ClOrdID` to their own field width."
+      ],
+      "correctIndex": 0,
+      "explanation": "Direct indexing gives you a slot unconditionally, so the verify is what distinguishes 'this really is that order' from 'this slot now holds something else', converting wrap-around and cross-session staleness into a clean null. The collision-probing answer describes an open-addressed map, but this scheme has no probe sequence — the low bits are the slot, and a mismatch is a miss. Retirement deliberately keeps the slot occupied and resolvable rather than zeroing it.",
+      "sourceAnchor": "547-order-correlation-tables",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q21",
+      "prompt": "Under what conditions may a correlation slot be reclaimed after its order reaches a terminal state?",
+      "options": [
+        "After a time bound exceeding the venue's maximum message latency and after every outstanding request on the order resolves.",
+        "Immediately on reaching the terminal state, since no further messages are protocol-legal once an order is terminal.",
+        "At the next inbound sequence gap, since a gap proves the venue has no further messages queued for that order.",
+        "Once the order's `ClOrdID` counter has wrapped, since the verify comparison already protects against a stale hit."
+      ],
+      "correctIndex": 0,
+      "explanation": "Two-phase retirement holds the slot occupied and resolvable past the terminal transition because late acknowledgements and late fills genuinely arrive for orders you consider finished, and a lookup miss on a fill is a position error. 'Immediately on terminal state' is the intuitive answer and it is the named failure mode behind 'fill for unknown order' in the log. The verify comparison protects against misattribution, not against losing the fill entirely.",
+      "sourceAnchor": "547-order-correlation-tables",
+      "difficulty": "recall"
+    },
+    {
+      "id": "54-q22",
+      "prompt": "An order has `cum_qty=300`. A duplicated execution report arrives reporting `LastQty=100`, `CumQty=300`. What does each accounting style produce?",
+      "options": [
+        "Absolute assignment leaves 300; incremental accumulation reaches 400, overstating the position by the duplicated fill.",
+        "Absolute assignment leaves 300; incremental accumulation also leaves 300, because `LastQty` is zero on a replayed report.",
+        "Both reach 400, but absolute assignment then self-corrects on the next report because `CumQty` is authoritative.",
+        "Both leave 300, because the state machine's rank rule rejects the duplicate before either quantity update runs."
+      ],
+      "correctIndex": 0,
+      "explanation": "Cumulative quantity is absolute, so `cum_qty = max(cum_qty, msg.cum_qty)` is unchanged by a repeat, while `cum_qty += last_qty` counts the same 100 shares twice — the canonical order-gateway bug. The 'rank rule already blocks it' answer is the sharpest distractor: rank ordering absorbs backwards state transitions, but a duplicated fill carries the same state, so it passes the rank check and only the quantity comparison stops it. Self-correction on a later report is no defence either, since there may be no later report.",
+      "sourceAnchor": "548-idempotent-order-state-transitions",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q23",
+      "prompt": "Why must a per-order `ExecID` set exist alongside the cumulative-quantity rule?",
+      "options": [
+        "Trade busts and corrections legitimately revise a prior fill, so they must not be idempotently ignored the way duplicates are.",
+        "Partial fills arriving out of order carry decreasing `CumQty`, so identity is the only way to order them correctly.",
+        "`CumQty` is optional at many venues, so an execution report may arrive carrying only `LastQty` and no cumulative field.",
+        "Cancel acknowledgements carry no quantity at all, so they need a separate identity-keyed path to be deduplicated."
+      ],
+      "correctIndex": 0,
+      "explanation": "Exact `ExecID` identity is what lets the gateway distinguish a genuine revision — a bust or correction that must be applied — from a repeat that must be dropped, which the monotone quantity rule alone would wrongly discard. The out-of-order partials answer is tempting but the cumulative rule already handles ordering: taking the maximum is order-independent by construction. Cancel acks are governed by the state-rank rule, not by the quantity path.",
+      "sourceAnchor": "548-idempotent-order-state-transitions",
+      "difficulty": "trap"
+    },
+    {
+      "id": "54-q24",
+      "prompt": "The gateway correctly ignores a duplicate fill for position purposes. Why is that not the end of the idempotency problem?",
+      "options": [
+        "Idempotence of state is not idempotence of side effects; each downstream consumer of the fill stream must be idempotent too.",
+        "The venue still counts the duplicate against the order-to-trade ratio, so the throttle model must observe what position ignores.",
+        "The duplicate still occupies a sequence number, so ignoring it leaves an unfillable gap in the inbound loss detector.",
+        "The duplicate still advances `leaves_qty`, so the exposure released by the ignored fill must be re-added by hand."
+      ],
+      "correctIndex": 0,
+      "explanation": "Suppressing the duplicate in the order model says nothing about a risk system that counts messages rather than quantity, so idempotence has to be an end-to-end property — hence dedup at the gateway boundary plus a monotone sequence number on the internal event stream for downstream stages. The sequence-gap answer is wrong on its premise: a duplicate at a sequence number you already consumed leaves no gap, since the number was delivered. Ignoring a report by definition leaves `leaves_qty` untouched.",
+      "sourceAnchor": "548-idempotent-order-state-transitions",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q25",
+      "prompt": "How do `PossDupFlag=Y` and `PossResend=Y` differ?",
+      "options": [
+        "`PossDup` is a session-layer retransmission at the same sequence number; `PossResend` is an application re-issue at a new one.",
+        "`PossDup` is set by the requester on a resend request; `PossResend` is set by the responder on the replayed messages.",
+        "`PossDup` marks messages replayed from your own journal; `PossResend` marks messages replayed from the venue's store.",
+        "`PossDup` applies to administrative messages only; `PossResend` applies to application messages such as execution reports."
+      ],
+      "correctIndex": 0,
+      "explanation": "The distinction is which layer generated the repeat: `PossDup` repeats a sequence number you can compare against, whereas `PossResend` typically follows an exchange-side failover, arrives at a fresh sequence number, and is invisible to the session layer — only `ExecID` or `ClOrdID` plus state resolves it. The journal-versus-store framing is the appealing miss, but both flags concern the venue's outbound stream, not your replay. A gateway that treats `PossResend` as `PossDup` discards legitimate messages; ignoring it double-counts fills.",
+      "sourceAnchor": "549-duplicate-suppression",
+      "difficulty": "recall"
+    },
+    {
+      "id": "54-q26",
+      "prompt": "The `DupFilter` exhausts its probe budget without finding the ID or an empty slot, and returns true. Why is that the right default?",
+      "options": [
+        "Processing a possible duplicate is caught downstream by the idempotent state machine, whereas dropping a real fill corrupts position silently.",
+        "Returning false would stall the inbound path until the filter is cleared, which cannot happen before the session ends.",
+        "A full probe window proves the identifier is new, since a duplicate would have been placed near its own home slot.",
+        "The state machine reads the filter's return value as advisory, so the value chosen has no effect on the applied state."
+      ],
+      "correctIndex": 0,
+      "explanation": "Failing open preserves the asymmetry that governs the whole chapter: a false duplicate loses a fill invisibly, while a false new is absorbed exactly by the monotone state machine behind it, so uncertainty must resolve toward processing. The 'a full window proves it is new' answer is wrong on its premise — probe exhaustion means the filter has run out of budget, not that it has searched exhaustively. This same error direction is why a Bloom filter is unacceptable here: its errors are false positives.",
+      "sourceAnchor": "549-duplicate-suppression",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q27",
+      "prompt": "A team proposes a Bloom filter for the dedup structure, citing its compactness. What is the objection?",
+      "options": [
+        "Its errors are false positives, so it will claim a genuinely new fill is a duplicate — exactly the unacceptable direction.",
+        "Its errors are false negatives, so duplicates leak through and the position doubles on any replayed execution report.",
+        "Its hash count makes each membership test several dependent loads, which is too slow for the inbound critical path.",
+        "It cannot be cleared per session without a full rebuild, so yesterday's identifiers linger into today's dedup decisions."
+      ],
+      "correctIndex": 0,
+      "explanation": "A Bloom filter never misses a member but may falsely report membership, and here membership means 'already seen', so its error mode is dropping real fills — silent position corruption. The false-negative framing inverts the structure's actual guarantee; leaked duplicates would in fact be the tolerable direction, caught by the idempotent state machine. The latency and clearing objections are secondary at best: a bit array clears trivially.",
+      "sourceAnchor": "549-duplicate-suppression",
+      "difficulty": "trap"
+    },
+    {
+      "id": "54-q28",
+      "prompt": "Which ordering of recovery steps does the chapter prescribe after an unplanned disconnect?",
+      "options": [
+        "Resume sequence, consume the resend, query every in-flight order, reconcile positions, then re-enable order entry.",
+        "Resume sequence, re-enable order entry, consume the resend, query in-flight orders, then reconcile positions.",
+        "Reset sequence, re-enable order entry, query in-flight orders, consume the resend, then reconcile positions.",
+        "Resume sequence, query in-flight orders, re-enable order entry, consume the resend, then reconcile positions."
+      ],
+      "correctIndex": 0,
+      "explanation": "Sending must be the last step: the resend alone resolves most disconnects, the in-flight queries settle what it cannot, and only a reconciled model is safe to trade from. The variants that re-enable entry early are the tempting ones because they minimise downtime, and they are exactly how a gateway duplicates an order it already placed or takes a position on top of one it does not know it holds. Resetting sequence rather than resuming compounds the error by discarding the resend outright.",
+      "sourceAnchor": "5410-disconnect-recovery",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q29",
+      "prompt": "You were disconnected with an order in `PendingNew` and no ack. What is the correct resolution?",
+      "options": [
+        "Send `OrderStatusRequest` on the original `ClOrdID`, which returns either the order's state or a definitive 'unknown order'.",
+        "Resend the original new-order message, relying on the venue's duplicate check to reject it if the order already exists.",
+        "Mark it `Rejected` after the request deadline expires, since an unanswered order is by construction not working.",
+        "Assume it is live and immediately cancel it, since a cancel on a non-existent order is harmless and clears the ambiguity."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because `ClOrdID` is unique and never reused, a status query on it is always answerable, and that definitive answer is the whole payoff of the identifier discipline. Resending is the dangerous option: not every venue keys on client order ID, and where it does not you have created a second real order. Collapsing the unresolved case into `Rejected` is how phantom positions are born — it belongs in a distinct `Unknown` state permitting status queries and cancels but never new exposure.",
+      "sourceAnchor": "5410-disconnect-recovery",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q30",
+      "prompt": "Reconciliation repeatedly finds orders the exchange knows about that your model does not. What does the chapter say to suspect?",
+      "options": [
+        "Journal-after-send ordering, which lets a crash lose the record of a message that in fact went out.",
+        "`ClOrdID` reuse, which makes an earlier order's response resolve onto a later order's slot in your table.",
+        "A throttle rejection your model recorded as sent, leaving an entry you hold that the venue never received.",
+        "A drop-copy gap silently filled, which removes executions from the reconciler's view of the venue side."
+      ],
+      "correctIndex": 0,
+      "explanation": "The direction of the discrepancy names the bug: extra orders on the exchange side means messages left the building without being durably recorded, which is the send-then-journal ordering error. Both the ID-reuse and throttle-rejection answers describe real bugs from the chapter, but they produce the opposite signature — orders you know about that the exchange does not. A silently gap-filled drop copy blinds the reconciler rather than skewing it in a consistent direction.",
+      "sourceAnchor": "5410-disconnect-recovery",
+      "difficulty": "trap"
+    },
+    {
+      "id": "54-q31",
+      "prompt": "Ack latency rises smoothly as your send rate rises and falls back when the rate drops, with no rejects at all. Diagnosis?",
+      "options": [
+        "Venue-side queuing against a rate limit, so the fix is your own throttle rather than the network path.",
+        "Network congestion on the outbound path, so the fix is capacity or a different route to the venue.",
+        "Fixed-window boundary effects, which permit a double-rate burst and then stall the following window.",
+        "Order-to-trade ratio enforcement, which the venue applies by delaying rather than rejecting messages."
+      ],
+      "correctIndex": 0,
+      "explanation": "Silent queuing at the venue's edge is the worst rate-limit response precisely because it produces no error: latency inflates with rate and recovers when rate falls, and your orders arrive late enough to be adversely selected. Network congestion is the intuitive read and it is ruled out by the clean, smooth, rate-proportional relationship and the absence of loss. OTR is a slow ratio measured over minutes and does not track instantaneous send rate.",
+      "sourceAnchor": "5411-exchange-rate-limits",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q32",
+      "prompt": "Why does the chapter insist on running your throttle 5-15% below the venue's contractual limit?",
+      "options": [
+        "The venue's counter is authoritative and unreadable, so clock skew and in-flight messages make your shadow only approximate.",
+        "The venue applies the limit per port rather than per session, so a shared port consumes an unknown share of the budget.",
+        "The venue's window boundary is randomised, so any local window will occasionally align to double your effective rate.",
+        "The venue counts rejected messages against the limit, so each throttle rejection consumes budget you cannot recover."
+      ],
+      "correctIndex": 0,
+      "explanation": "You are shadowing a counter you cannot read, and skew, in-flight messages, and the venue's exact window boundary all make your estimate imprecise, so the headroom absorbs the error — and the reserve exists specifically so cancels are never throttled. The per-port answer is a real complication from the limit-shapes table, but independent per-port budgets are tracked separately rather than papered over with headroom. Randomised window boundaries are not a venue behaviour the chapter describes.",
+      "sourceAnchor": "5411-exchange-rate-limits",
+      "difficulty": "recall"
+    },
+    {
+      "id": "54-q33",
+      "prompt": "The throttle denies an outbound message. Which policy pairs correctly with which message class?",
+      "options": [
+        "Reject to the caller for new orders and quotes; bounded queue for cancels; unconditional bypass for mass cancel and kill switch.",
+        "Bounded queue for new orders and quotes; reject to the caller for cancels; unconditional bypass for mass cancel and kill switch.",
+        "Block the sending thread for all classes, since every message eventually goes out once the bucket refills.",
+        "Reject to the caller for every class, letting the strategy decide, since the gateway cannot rank urgency by message type."
+      ],
+      "correctIndex": 0,
+      "explanation": "A delayed new order is often worse than none, so the caller must decide; risk-reducing cancels must eventually go out, so they queue; and mass cancels and kill switches must never be throttled at all. The inverted pairing is the tempting one because queuing feels safer everywhere, but queuing a stale quote sends it into a market that has moved, and rejecting a cancel abandons risk reduction. Blocking is excluded outright — it is a syscall and a scheduling event on the hot path while the market moves.",
+      "sourceAnchor": "5412-message-throttling",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q34",
+      "prompt": "How should the bounded cancel queue behave when it reaches capacity?",
+      "options": [
+        "It should never reach capacity: size it to the maximum live-order count, which is bounded and known at startup.",
+        "It should drop the oldest entry, since a cancel that has waited longest is most likely already superseded by a fill.",
+        "It should drop the newest entry, preserving arrival order so the earliest risk-reducing intent is never lost.",
+        "It should spill to a secondary allocation, since dropping any cancel is worse than a one-off allocation cost."
+      ],
+      "correctIndex": 0,
+      "explanation": "Drop-oldest is wrong because the oldest cancel is the most urgent, and drop-newest is wrong too, so the resolution is structural: the number of cancellable orders is capped by the venue's order-count limit, making the queue's true bound knowable and preallocatable. The drop-oldest rationale sounds like sensible staleness handling and inverts the actual urgency ordering. Spilling to an allocation puts the allocator on the path you were protecting.",
+      "sourceAnchor": "5412-message-throttling",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q35",
+      "prompt": "Cancel-on-disconnect is enabled for your session. Your link drops at 09:45:00 and the venue's heartbeat timeout is 30 s. What is true of that window?",
+      "options": [
+        "Your orders remain live and can trade until the venue detects the drop, and any fill in that window is legitimate.",
+        "Your orders are cancelled at the moment of the TCP failure, so a fill timestamped after 09:45:00 indicates a venue error.",
+        "Your orders are suspended for the detection interval and then cancelled, so no fill in that window is possible.",
+        "Your orders are cancelled immediately but the cancel reports are withheld until you reconnect and resume sequence."
+      ],
+      "correctIndex": 0,
+      "explanation": "COD is not instantaneous: the venue must first detect the disconnect via a TCP error or its own heartbeat timeout, and until then the orders are working and can execute — fills in that interval are real and must be accepted on reconnect. The 'cancelled immediately, reports withheld' variant is the most seductive because it explains the delayed reports you actually observe, but it misplaces the delay, which is in detection rather than in reporting. This matters because a venue-side event that disconnects you is often correlated with a price move.",
+      "sourceAnchor": "5413-cancel-on-disconnect",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q36",
+      "prompt": "A firm spreads order flow across four sessions to one venue for throughput. What has it also done to its COD protection?",
+      "options": [
+        "Spread it: COD is usually per session, so a drop on one session leaves the other three sessions' orders untouched.",
+        "Strengthened it: any session dropping triggers a firm-level cancel, so four sessions give four independent triggers.",
+        "Neutralised it: venues disable COD for accounts holding more than one concurrent session to the same port.",
+        "Left it unchanged: COD scope follows the account rather than the connection, so session count is irrelevant."
+      ],
+      "correctIndex": 0,
+      "explanation": "COD scope is usually per session, occasionally per port or per firm, so multiplexing flow for throughput fragments the protection along the same lines — a drop on session A does nothing for orders entered on session B. The 'four independent triggers' answer inverts scope into redundancy; per-session scope means narrower coverage, not broader. Combined with GTC exemptions and the detection delay, this is why COD is a backstop rather than a strategy.",
+      "sourceAnchor": "5413-cancel-on-disconnect",
+      "difficulty": "trap"
+    },
+    {
+      "id": "54-q37",
+      "prompt": "The reconciler finds an execution present in the drop copy but absent from the gateway's own fill stream. What has happened?",
+      "options": [
+        "The gateway missed a fill, so the position is wrong — the case that justifies maintaining the drop copy at all.",
+        "The gateway invented a fill, so a dedup or replay leak has injected an execution the venue never produced.",
+        "The drop copy is merely running ahead within its normal delay window, so no action is warranted before end of day.",
+        "The two feeds disagree on `ExecID` formatting, so the match key needs normalising before the comparison is meaningful."
+      ],
+      "correctIndex": 0,
+      "explanation": "Drop-copy-only executions mean a fill never reached your model, and no amount of internal consistency checking finds it because internally you are perfectly consistent and simply wrong. The gateway-only direction is the mirror case and indicates an invented fill from a dedup or replay leak, so attributing it here reverses the diagnosis. Ordinary drop-copy delay is absorbed by the streaming matcher's 30-60 s reorder window; anything unmatched beyond it must alarm.",
+      "sourceAnchor": "5414-drop-copy",
+      "difficulty": "application"
+    },
+    {
+      "id": "54-q38",
+      "prompt": "End-of-day reconciliation shows matching per-instrument quantities but a differing execution count. What class of bug does that signature name?",
+      "options": [
+        "A duplicate collapsed on one side — a dedup or replay-leak issue rather than an arithmetic one.",
+        "A fixed-point scale or lot-multiplier error, which changes totals without altering how many reports were seen.",
+        "An order duplicated across a reconnect, which adds one extra execution near the disconnect boundary.",
+        "A trade bust applied by the venue after your snapshot, which the reconciler must accept as a first-class correction."
+      ],
+      "correctIndex": 0,
+      "explanation": "Quantity agreement with a count mismatch means the same shares were reported under a different number of executions, which is what happens when one side collapsed a duplicate the other retained. The scale-or-multiplier answer describes the opposite signature — count matches while quantity diverges on one instrument, deterministic and reproducible. Reconnect duplication shows up as an extra execution clustered near the disconnect, and busts show as late corrections with everything else matching.",
+      "sourceAnchor": "5415-post-trade-reconciliation",
+      "difficulty": "recall"
+    },
+    {
+      "id": "54-q39",
+      "prompt": "Why is exactly-once delivery unachievable between an order gateway and an exchange?",
+      "options": [
+        "An acknowledgement can itself be lost, leaving the sender to choose between retransmitting and not — a choice no protocol removes.",
+        "Sequence numbers are per direction, so the two sides can never construct a single total order over the combined stream.",
+        "TCP retransmission may duplicate a segment below the session layer, which the sequence numbers cannot observe.",
+        "The venue's clock and yours cannot be synchronised tightly enough to establish which of two copies was sent first."
+      ],
+      "correctIndex": 0,
+      "explanation": "Exactly-once would require the sender to know whether the receiver processed a message, that knowledge requires an ack, and a lost ack forces a choice between a possible duplicate and a possible loss — protocols can move that choice but not eliminate it. The TCP-duplication answer is wrong on its premise: TCP does not deliver duplicate data to the application, and the impossibility is a distributed-agreement result, not a transport artefact. What is achievable is at-least-once delivery plus idempotent, deduplicating consumers keyed on `ClOrdID` and `ExecID`.",
+      "sourceAnchor": "5416-at-least-once-processing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "54-q40",
+      "prompt": "The chapter's rule is 'prefer duplicates to losses at every ambiguous decision.' Where does it explicitly invert?",
+      "options": [
+        "Transmission of new exposure: a duplicated new order is a real second order, so query its status rather than resend it.",
+        "Inbound dedup filtering: an uncertain filter must drop the message, because a duplicated fill corrupts position immediately.",
+        "Journal ordering on the send path: persist after transmitting, so a crash leaves no record of an order that never went out.",
+        "In-flight timeout handling: an expired request must become `Rejected`, because an unresolved order blocks all recovery."
+      ],
+      "correctIndex": 0,
+      "explanation": "The preference for duplicates governs processing, where a repeat is absorbed idempotently; for sending new exposure it inverts, because a duplicated new order is genuinely tradeable and cancelling it costs money if it fills first — hence query rather than resend, backed by venue-side `ClOrdID` rejection. The dedup-filter answer reverses the fail-open rule, which exists precisely because dropping a real fill is the silent failure. Journaling after the send and collapsing timeouts into `Rejected` are both named errors, not sanctioned inversions.",
+      "sourceAnchor": "5416-at-least-once-processing",
+      "difficulty": "application"
+    }
+  ]
+}

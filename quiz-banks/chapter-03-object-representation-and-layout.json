@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-03-object-representation-and-layout",
+  "questions": [
+    {
+      "id": "3-q01",
+      "prompt": "For `struct S { char c; int i; };` on x86-64, how do the object representation and the value representation compare?",
+      "options": [
+        "Object representation is all 8 bytes of storage; value representation is the 5 bytes that actually carry the value, the other 3 being padding.",
+        "Object representation is the 5 value-carrying bytes; value representation is all 8 bytes including padding.",
+        "Both are 8 bytes, since padding bytes are part of the value once the object has been initialized.",
+        "Both are 5 bytes, because `sizeof` reports only the bytes that participate in the value."
+      ],
+      "correctIndex": 0,
+      "explanation": "Object representation is the full `sizeof(T)` sequence of `unsigned char`; value representation is the subset of bits determining the value. They diverge exactly by padding. The tempting 'both are 8' answer treats padding as value-carrying — it is not, and that is precisely why `memcmp` on this struct is unreliable.",
+      "sourceAnchor": "31-object-and-value-representation",
+      "difficulty": "recall"
+    },
+    {
+      "id": "3-q02",
+      "prompt": "After a bad `memcpy` leaves a `bool b` with the object representation `0x02`, why can `b && !b` evaluate to true?",
+      "options": [
+        "`bool` has one value bit and seven padding bits, so `0x02` is not a valid value at all and reading it is UB — the compiler may test different bits in different places.",
+        "`bool` is promoted to `int` in each operand, and `0x02` promotes to 2 in one operand and to 0 in the other.",
+        "`bool` is one byte, so `0x02` is simply `true`, and `!b` is `false`; the expression is short-circuited into being true.",
+        "`bool` objects are stored as bitfields, so two adjacent `bool`s can share a byte and corrupt each other's bit."
+      ],
+      "correctIndex": 0,
+      "explanation": "The storage is a byte but only one bit is a value bit, so `0x02` corresponds to no value of the type and the read is undefined. The promotion answer is tempting because promotion really does happen, but promotion of a valid `bool` is deterministic — the anomaly comes from the invalid representation, not from conversion rules.",
+      "sourceAnchor": "31-object-and-value-representation",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q03",
+      "prompt": "Which claim about reading a struct's padding bytes is correct?",
+      "options": [
+        "Reading padding through `unsigned char` or `std::byte` yields an unspecified value; reading it as part of the member's own type would be undefined behavior.",
+        "Reading padding through any pointer type is fine, since padding is merely unspecified rather than indeterminate.",
+        "Reading padding is undefined behavior through every pointer type, including `unsigned char` and `std::byte`.",
+        "Reading padding is defined only after the struct has been value-initialized with `= {}`, which zeroes it."
+      ],
+      "correctIndex": 0,
+      "explanation": "Indeterminate values are UB to read, with the single carve-out for `unsigned char`/`std::byte`, which yields an unspecified value instead. The '`= {}` zeroes padding' answer is the widespread misconception: `= {}` zeroes members, not padding, so value-initialization does not launder the indeterminacy away.",
+      "sourceAnchor": "32-padding-and-indeterminate-values",
+      "difficulty": "recall"
+    },
+    {
+      "id": "3-q04",
+      "prompt": "A lock-free queue uses `std::atomic<Node>::compare_exchange_strong` where `Node` has internal padding. What is the characteristic failure?",
+      "options": [
+        "The CAS can spin forever because it compares object representations, so differing padding makes the comparison fail even when all member values match.",
+        "The CAS silently succeeds when values differ, because padding bytes are masked out of the comparison before it runs.",
+        "The compiler rejects the code, because `std::atomic<T>` requires `has_unique_object_representations_v<T>` to be true.",
+        "The CAS tears, writing half the members, because a padded struct cannot be stored with a single instruction."
+      ],
+      "correctIndex": 0,
+      "explanation": "CAS is a byte-wise comparison of the object representation, so garbage padding in the expected value never matches and the loop never terminates. The 'requires unique object representations' answer is the near-miss: `atomic<T>` requires only *trivially copyable*, not unique object representations, so a padded type compiles fine and fails at runtime. Fix by adding explicit padding members or CASing an integer.",
+      "sourceAnchor": "32-padding-and-indeterminate-values",
+      "difficulty": "trap"
+    },
+    {
+      "id": "3-q05",
+      "prompt": "Which trait is the precise answer to \"may I `memcmp` and byte-hash this type?\"",
+      "options": [
+        "`std::has_unique_object_representations_v<T>` — true only when the type has no padding bits and equal values always share one representation.",
+        "`std::is_trivially_copyable_v<T>` — true when `memcpy` of the bytes preserves the value, which is the same requirement.",
+        "`std::is_standard_layout_v<T>` — true when member offsets are predictable, which fixes the padding question.",
+        "`std::is_pod_v<T>` — the conjunction of triviality and standard layout, which together rule padding out."
+      ],
+      "correctIndex": 0,
+      "explanation": "Only `has_unique_object_representations_v` speaks about padding bits and representation uniqueness. Trivial copyability is the seductive wrong answer: `struct S { char c; int i; };` is trivially copyable yet full of padding, so `memcpy` is safe while `memcmp` is not. Note the trait is also false for anything containing `float`/`double`, since `+0.0` and `-0.0` compare equal with different bytes.",
+      "sourceAnchor": "32-padding-and-indeterminate-values",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q06",
+      "prompt": "Why is `sizeof(T)` always required to be a multiple of `alignof(T)`?",
+      "options": [
+        "So that array elements stay aligned: `T arr[N]` is contiguous with no gaps, so every element's address must remain a multiple of the alignment.",
+        "So that `alignof(T)` can be computed from `sizeof(T)` by rounding down to the nearest power of two.",
+        "So that `memcpy` of a whole object can always use the widest available load and store instructions.",
+        "So that the compiler can place any object of type `T` at the start of a cache line without extra work."
+      ],
+      "correctIndex": 0,
+      "explanation": "Arrays are contiguous, so element `i` sits at `base + i * sizeof(T)`; only a size that is a multiple of the alignment keeps every element aligned. This is exactly what forces tail padding, making `struct { int; char; }` 8 rather than 5. The `memcpy` answer is a real-sounding benefit but not the reason — wide copies are legal regardless of the size relation.",
+      "sourceAnchor": "33-size-and-alignment",
+      "difficulty": "recall"
+    },
+    {
+      "id": "3-q07",
+      "prompt": "Two threads each increment their own `std::atomic<uint64_t>`, and the two counters are adjacent members of one struct. Throughput collapses. What is happening and what fixes it?",
+      "options": [
+        "False sharing: the counters share a cache line and MESI ping-pongs it between cores; separate them with `alignas(64)` on each.",
+        "A split lock: each atomic RMW straddles a cache line and asserts a bus lock; fix it by shrinking the counters to 32 bits.",
+        "Lock-table contention: `atomic<uint64_t>` is not lock-free, so both threads serialize on one library mutex; fix it with a plain `uint64_t`.",
+        "Store buffering: each core stalls draining its store buffer; fix it by relaxing the memory order on both increments."
+      ],
+      "correctIndex": 0,
+      "explanation": "Independent variables on one 64-byte line cause each write to invalidate the other core's copy, serializing logically independent work at roughly 100ns per operation. The split-lock distractor describes a different pathology — that requires an atomic that *straddles* a line boundary, whereas here each atomic is perfectly aligned and merely shares a line with its neighbour.",
+      "sourceAnchor": "33-size-and-alignment",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q08",
+      "prompt": "Which statement about `alignas` and packing is correct?",
+      "options": [
+        "`alignas` can only strengthen alignment — `alignas(1) int` is ill-formed — so removing padding requires `#pragma pack` or `[[gnu::packed]]`.",
+        "`alignas` can both strengthen and weaken alignment, making `#pragma pack` merely a non-portable spelling of `alignas(1)`.",
+        "`alignas` weakens alignment on members but strengthens it on whole classes, which is why packed structs mix the two.",
+        "`alignas` affects only the address the object is placed at, never `sizeof`, so a packed struct and an aligned one match in size."
+      ],
+      "correctIndex": 0,
+      "explanation": "The standard permits strengthening only; a weaker request is ill-formed, which is why packing is a compiler extension rather than a language feature. The 'alignment never affects `sizeof`' answer is subtly wrong in a common way: `alignas(64)` on a class rounds `sizeof` up to 64 too, because size must stay a multiple of alignment.",
+      "sourceAnchor": "33-size-and-alignment",
+      "difficulty": "recall"
+    },
+    {
+      "id": "3-q09",
+      "prompt": "Code takes `&packed.field` on a `[[gnu::packed]]` struct, passes the pointer to a helper, and dereferences it. It works on x86-64 and crashes on ARM. What is the correct assessment?",
+      "options": [
+        "The pointer may be misaligned, and dereferencing a misaligned pointer is UB regardless of platform — x86 tolerance is luck, not licence; `memcpy` the field out instead.",
+        "It is legal C++ on both platforms; the ARM crash is a toolchain bug and `-mno-unaligned-access` is the correct workaround.",
+        "It is UB only on ARM, since UB is defined relative to the target ABI and x86-64 documents misaligned loads as supported.",
+        "The problem is the packed attribute changing `sizeof`, so the helper reads past the end of the struct on ARM's larger layout."
+      ],
+      "correctIndex": 0,
+      "explanation": "Misaligned access is UB in C++ everywhere; the compiler is entitled to assume alignment and emit aligned SIMD, so 'x86 allows it' is not a defense. GCC flags this with `-Waddress-of-packed-member`. The 'UB only on ARM' answer is the popular rationalization — UB is a property of the abstract machine, not of what a given CPU happens to tolerate.",
+      "sourceAnchor": "33-size-and-alignment",
+      "difficulty": "trap"
+    },
+    {
+      "id": "3-q10",
+      "prompt": "What does `struct Bad { char a; double b; char c; int d; };` occupy, and what does reordering buy?",
+      "options": [
+        "24 bytes; declaring `double b; int d; char a; char c;` gives 16 bytes, cutting waste from 11 bytes to 2.",
+        "16 bytes; reordering cannot help, because the compiler already sorts members by decreasing alignment internally.",
+        "14 bytes; reordering to 16 bytes actually costs space but improves the alignment of the `double`.",
+        "24 bytes; reordering gives 14 bytes, since removing all holes leaves exactly the sum of the member sizes."
+      ],
+      "correctIndex": 0,
+      "explanation": "Laying out in order gives a[1] pad[7] b[8] c[1] pad[3] d[4] = 24; sorting by decreasing alignment gives b[8] d[4] a[1] c[1] pad[2] = 16. The 'reordering gives 14 bytes' answer is the natural off-by-a-concept: the members sum to 14, but tail padding must round the size up to a multiple of `alignof` (8), so 16 is the floor, not 14.",
+      "sourceAnchor": "34-member-layout-and-tail-padding",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q11",
+      "prompt": "Given `struct Base { int i; char c; };` and `struct Derived : Base { char d; };`, what is `sizeof(Derived)` on the Itanium ABI and why?",
+      "options": [
+        "8 — `d` is placed into `Base`'s tail padding, which the ABI may reuse because `Base` is not standard-layout as a subobject here.",
+        "12 — `Base` contributes its full 8 bytes and `d` plus tail padding adds another 4, since padding is never reused.",
+        "16 — the derived object must be aligned to twice the base's alignment to keep the subobject addressable.",
+        "8 — the compiler reorders `d` before `c` to fill the hole, which is permitted across access-control sections."
+      ],
+      "correctIndex": 0,
+      "explanation": "Tail padding of a non-standard-layout base subobject is available to the derived class, so `d` lands at offset 5 and the size stays 8. The 'compiler reorders `d` before `c`' answer reaches the right number by the wrong mechanism — C++ never reorders members to save space; the saving comes purely from reuse. The practical hazard is that `memcpy`ing `sizeof(Base)` bytes over a `Derived` now clobbers `d`.",
+      "sourceAnchor": "34-member-layout-and-tail-padding",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q12",
+      "prompt": "For `struct Empty {}; struct A { Empty e; int i; }; struct B : Empty { int i; };`, what are the sizes?",
+      "options": [
+        "`sizeof(A) == 8` and `sizeof(B) == 4` — an empty member needs a distinct address, but an empty base can occupy zero bytes.",
+        "`sizeof(A) == 4` and `sizeof(B) == 4` — both empty subobjects are elided, since `Empty` has no members to store.",
+        "`sizeof(A) == 8` and `sizeof(B) == 8` — the base subobject also needs a distinct address from the derived object.",
+        "`sizeof(A) == 5` and `sizeof(B) == 4` — the empty member costs one byte and no padding is inserted after it."
+      ],
+      "correctIndex": 0,
+      "explanation": "An empty *member* must have a unique address, so it takes a byte plus 3 bytes of padding before the `int`; the Empty Base Optimization lets an empty *base* take none. The '`sizeof(A) == 5`' answer gets the member cost right but forgets alignment: `i` must land at offset 4, so `A` is 8, not 5. C++20's `[[no_unique_address]]` brings the base behaviour to members.",
+      "sourceAnchor": "34-member-layout-and-tail-padding",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q13",
+      "prompt": "Given `struct Flags { unsigned a : 1; unsigned b : 3; };`, one thread writes `f.a` while another writes `f.b`, with no synchronization. What is the verdict?",
+      "options": [
+        "A data race — adjacent bit-fields form a single memory location; inserting `unsigned : 0;` between them would separate the locations.",
+        "Well-defined — the memory model treats each named bit-field as its own memory location precisely to allow this pattern.",
+        "A data race only on big-endian targets, where the bit allocation order places both fields in the same byte.",
+        "Well-defined provided both writes are through `volatile` bit-fields, which forces read-modify-write to be atomic."
+      ],
+      "correctIndex": 0,
+      "explanation": "Adjacent bit-fields with no zero-width field between them are one memory location, so concurrent writes race even though the fields are logically independent — the read-modify-write of the storage unit clobbers the neighbour. The `volatile` answer is a common misconception: `volatile` orders nothing and provides no atomicity in the C++ memory model.",
+      "sourceAnchor": "34-member-layout-and-tail-padding",
+      "difficulty": "trap"
+    },
+    {
+      "id": "3-q14",
+      "prompt": "Which of these is trivially copyable but **not** trivially default constructible?",
+      "options": [
+        "`struct B { int x = 0; };` — the NSDMI kills trivial default construction while leaving copying trivial.",
+        "`struct C { C(const C&) {} int x; };` — the user-provided copy constructor blocks default construction.",
+        "`struct E { virtual void f(); };` — the vptr must be initialized, which makes both operations non-trivial.",
+        "`struct D { std::string s; };` — the member's own constructor makes the aggregate non-trivial throughout."
+      ],
+      "correctIndex": 0,
+      "explanation": "An in-class initializer means the default constructor has work to do, but it says nothing about copying, so `B` remains trivially copyable. `C` is the mirror image and the tempting swap — a user-provided copy constructor destroys trivial *copyability* while its implicit default constructor stays trivial. Conflating these two axes is one of the chapter's named traps.",
+      "sourceAnchor": "35-trivial-and-trivially-copyable-types",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q15",
+      "prompt": "Why can adding a destructor to an 8-byte type make calls slower under the SysV ABI?",
+      "options": [
+        "It stops being trivially copyable, so the type must be passed by invisible reference in memory rather than in a register.",
+        "The destructor call itself is emitted at every call site, and the call overhead dominates for such a small type.",
+        "The type stops being standard-layout, so the ABI can no longer compute a stable offset for its single member.",
+        "The type gains a hidden vtable pointer for destructor dispatch, doubling its size from 8 bytes to 16."
+      ],
+      "correctIndex": 0,
+      "explanation": "Register passing is available only to trivially copyable types; a non-trivial destructor forces memory passing even for a tiny type — which is why `unique_ptr` is not zero-overhead at ABI boundaries despite being pointer-sized. The vtable answer is wrong on its face: only *virtual* functions add a vptr, and a plain destructor adds nothing to the layout.",
+      "sourceAnchor": "35-trivial-and-trivially-copyable-types",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q16",
+      "prompt": "How do trivial copyability and trivial relocatability relate?",
+      "options": [
+        "Trivial copyability implies trivial relocatability, but not the converse — an SSO `std::string` is relocatable yet not trivially copyable.",
+        "Trivial relocatability implies trivial copyability, but not the converse — relocation is the strictly stronger byte-level guarantee.",
+        "Neither implies the other — a self-referential intrusive-list node is trivially copyable but never trivially relocatable.",
+        "They are one property under two names, and C++26 merely renames the existing trait for clarity."
+      ],
+      "correctIndex": 0,
+      "explanation": "The implication runs one way only: anything `memcpy` preserves can also be moved-and-destroyed by `memcpy`, so trivially copyable types are relocatable. The converse fails, which is the whole reason P1144/P2786 needed a separate trait — relocation is move-plus-destroy-source, which an SSO string satisfies despite its interior pointer making byte copies invalid. The reversed-implication option is the tempting one precisely because relocation *sounds* like the stronger property.",
+      "sourceAnchor": "35-trivial-and-trivially-copyable-types",
+      "difficulty": "trap"
+    },
+    {
+      "id": "3-q17",
+      "prompt": "Which class is **not** standard-layout?",
+      "options": [
+        "`struct NSL { public: int a; private: int b; };` — non-static data members with different access control.",
+        "`struct F { F(int) {} int x; };` — a user-provided constructor prevents predictable member offsets.",
+        "`struct G { int x = 0; int y; };` — an in-class initializer disqualifies the aggregate.",
+        "`struct SLd : SL { };` — a derived class always splits data across the hierarchy."
+      ],
+      "correctIndex": 0,
+      "explanation": "Standard layout requires all non-static data members to share one access control, so mixing `public` and `private` disqualifies `NSL`. The constructor and NSDMI options are the classic confusion with *triviality*: user-provided constructors and in-class initializers cost triviality, not standard layout. And `SLd` is fine because all the data still lives in exactly one class of the chain.",
+      "sourceAnchor": "36-standard-layout-types",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q18",
+      "prompt": "What is the modern answer to \"what is a POD type?\"",
+      "options": [
+        "An obsolete conjunction of trivial and standard-layout, deprecated in C++20 — ask instead which property is needed: `memcpy`-ability or predictable offsets.",
+        "A type with no constructors, destructors, or virtual functions, which C++20 renamed to 'aggregate' without changing the meaning.",
+        "A synonym for trivially copyable, since byte-copyability was always the property the term was reaching for.",
+        "A type whose members are all fundamental types, which is why `std::is_pod` was replaced by concept-based checks."
+      ],
+      "correctIndex": 0,
+      "explanation": "POD bundled two orthogonal properties, which is why `std::is_pod` was deprecated in favour of `is_trivially_copyable` and `is_standard_layout`. The 'synonym for trivially copyable' answer is the most tempting since that is the property people usually want, but POD was strictly stronger — it also demanded standard layout, and aggregates are a third, unrelated notion.",
+      "sourceAnchor": "36-standard-layout-types",
+      "difficulty": "recall"
+    },
+    {
+      "id": "3-q19",
+      "prompt": "Before C++20, why was `void* buf = malloc(sizeof(int)); *static_cast<int*>(buf) = 42;` formally undefined?",
+      "options": [
+        "There was storage but no `int` *object* had ever been created there, and you may not access an object that does not exist.",
+        "`malloc` returns memory aligned only for `char`, so the store to an `int` was a misaligned access.",
+        "`static_cast` from `void*` to `int*` was itself ill-formed without an intervening `reinterpret_cast`.",
+        "Writing through a pointer obtained from a C library function violated strict aliasing, since `malloc` returns `void*`."
+      ],
+      "correctIndex": 0,
+      "explanation": "Lifetime formally begins when an object is created, and nothing in that snippet created one — which meant allocators, ring buffers, deserializers, and `std::vector` itself were all technically UB. C++20's implicit object creation (P0593) made `malloc` create the `int`. The alignment answer is wrong on the facts: `malloc` returns storage suitably aligned for any object of fundamental alignment.",
+      "sourceAnchor": "37-implicit-lifetime-types",
+      "difficulty": "recall"
+    },
+    {
+      "id": "3-q20",
+      "prompt": "You `read()` a `Header`'s bytes into a `char buf[sizeof(Header)]` and want to access them as a `Header` without copying. What is the C++23 tool and what does it cost?",
+      "options": [
+        "`std::start_lifetime_as<Header>(buf)` — it emits no code, simply declaring to the abstract machine that those bytes are a `Header`.",
+        "`std::bit_cast<Header>(buf)` — it emits no code and reinterprets the buffer in place with no object created.",
+        "`std::launder(reinterpret_cast<Header*>(buf))` — it refreshes the pointer so the bytes become a valid `Header`.",
+        "Placement `new (buf) Header{}` — it costs nothing for an implicit-lifetime type and formally creates the object."
+      ],
+      "correctIndex": 0,
+      "explanation": "`start_lifetime_as` is exactly the zero-code declaration that existing bytes are an object, needed because `read()` is not one of the implicitly-creating operations. `bit_cast` is the tempting near-miss: it does produce a `Header`, but by *copying* the bytes into a new object rather than adopting them in place. `launder` only refreshes a pointer to an object that already exists, and placement `new` overwrites the bytes you just read.",
+      "sourceAnchor": "37-implicit-lifetime-types",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q21",
+      "prompt": "Which operation does **not** implicitly create objects of implicit-lifetime types in the storage it touches?",
+      "options": [
+        "`std::launder`, which only refreshes an existing pointer and creates nothing.",
+        "`std::memmove` into a region, which implicitly creates the objects that make the program well-defined.",
+        "`std::allocator::allocate`, which implicitly creates objects in the storage it returns.",
+        "`std::bit_cast`, which implicitly creates the destination object from the source bytes."
+      ],
+      "correctIndex": 0,
+      "explanation": "The implicitly-creating set is the allocation functions, `memcpy`/`memmove`, `bit_cast`, and beginning the lifetime of a `unsigned char`/`std::byte` array. `launder` is not in it — it presupposes an object already exists at the address and merely defeats the compiler's assumption that it is still the *old* one, which is why it cannot rescue a `reinterpret_cast` over foreign bytes.",
+      "sourceAnchor": "37-implicit-lifetime-types",
+      "difficulty": "recall"
+    },
+    {
+      "id": "3-q22",
+      "prompt": "Why does the classic `float fast_inv_sqrt` written with `int i = *(int*)&x;` produce wrong results at `-O2`?",
+      "options": [
+        "Accessing a `float` through an `int` lvalue is UB, and the optimizer assumes `int*` and `float*` never alias, so it keeps stale values in registers.",
+        "The `int` and `float` have different alignments, so the reinterpreted load reads from a shifted address at higher optimization levels.",
+        "The magic constant depends on a specific FPU rounding mode that `-O2` changes by enabling fast-math transformations.",
+        "The compiler narrows the `float` to `int` with a value conversion instead of a bit reinterpretation once inlining exposes the cast."
+      ],
+      "correctIndex": 0,
+      "explanation": "Strict aliasing lets the compiler assume a store through `float*` cannot affect a value loaded through `int*`, so the reads and writes get reordered or elided. The 'narrowing value conversion' answer describes what a `static_cast` would do, not a `reinterpret_cast` — the cast really does reinterpret bits; the breakage is the optimizer's aliasing assumption, not a conversion. `std::bit_cast` or `memcpy` is the correct spelling.",
+      "sourceAnchor": "38-type-punning-and-strict-aliasing",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q23",
+      "prompt": "What is the status of union-based type punning?",
+      "options": [
+        "Legal in C, formally UB in C++, but documented as a supported extension by GCC, Clang, and MSVC.",
+        "Legal in both C and C++ since C++11, when the standard adopted C's active-member reading rules.",
+        "UB in C and in C++, which is why the common initial sequence rule was added to cover the safe cases.",
+        "Legal in C++ but UB in C, which is why C code uses `memcpy` and C++ code uses unions for punning."
+      ],
+      "correctIndex": 0,
+      "explanation": "C explicitly blesses reading a non-active member; C++ never adopted that and the read is UB, though the major compilers document it as working. The 'UB in both C and C++' answer overstates the case in a plausible way: the common initial sequence rule is real but far narrower — it only licenses reading *shared leading members* of layout-compatible standard-layout structs, not arbitrary reinterpretation.",
+      "sourceAnchor": "38-type-punning-and-strict-aliasing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "3-q24",
+      "prompt": "The chapter says the `char*` aliasing exemption is \"one-directional.\" What does that mean concretely?",
+      "options": [
+        "You may read any object's bytes through `char*`, but you may not take a `char` array and read it as an `int` — that needs `start_lifetime_as` or a copy.",
+        "You may write any object's bytes through `char*`, but reading them back requires the object's own type to refresh the value.",
+        "You may alias through `unsigned char*` but not through `char*`, since only the unsigned variant appears in the representation wording.",
+        "You may alias a `char` array as any type, but you may not alias a non-`char` object through `char*` without `std::launder`."
+      ],
+      "correctIndex": 0,
+      "explanation": "The exemption lets a `char`/`unsigned char`/`std::byte` glvalue access any object, but it grants nothing in the reverse direction: raw bytes do not become an `int` object just because you point an `int*` at them. The 'a `char` array may be aliased as any type' answer inverts the rule exactly, which is why it reads convincingly — it is the direction that actually requires the C++23 lifetime tool.",
+      "sourceAnchor": "38-type-punning-and-strict-aliasing",
+      "difficulty": "trap"
+    },
+    {
+      "id": "3-q25",
+      "prompt": "For a big-endian wire protocol, why is the shift-based `read_u32_be` preferred over `ntohl(*(uint32_t*)p)`?",
+      "options": [
+        "The shift form is endianness-independent by construction and needs no aliasing violation or aligned load, yet still folds to one `BSWAP`.",
+        "The shift form is faster because `ntohl` is a library call that cannot be inlined and costs a function call per field.",
+        "The shift form works on 64-bit values, whereas `ntohl` is limited to 16-bit quantities on every POSIX platform.",
+        "The shift form zero-extends correctly, whereas `ntohl` sign-extends its result on big-endian hosts."
+      ],
+      "correctIndex": 0,
+      "explanation": "Indexing bytes and shifting never consults the host's byte order, so no `#ifdef` is needed, and it avoids both the strict-aliasing violation of the cast and the possibly misaligned load — while compilers still fold it to a load plus `BSWAP`. The performance answer is wrong on its premise: `ntohl` is typically a macro or intrinsic, so speed is not the differentiator; correctness is.",
+      "sourceAnchor": "39-endianness-and-byte-swapping",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q26",
+      "prompt": "A bit-field struct that parses a protocol header correctly on x86-64 is recompiled for a big-endian target and misparses. Why?",
+      "options": [
+        "Bit allocation order within a storage unit is ABI-defined — LSB-first on x86 SysV, MSB-first elsewhere — so the fields land on different bits.",
+        "Byte order changed but bit order did not, so only fields that straddle a byte boundary are affected, and only in the widest field.",
+        "The struct's tail padding moved, shifting every field by the size of the padding introduced at the end.",
+        "Bit-fields are always MSB-first by the standard, so only the surrounding non-bit-field members were affected by the endian change."
+      ],
+      "correctIndex": 0,
+      "explanation": "Almost everything about bit-fields is implementation-defined, including which end of the storage unit allocation starts from, so the same declarations map to different bits under a different ABI. The 'bit-fields are always MSB-first' answer is the confident-sounding falsehood: the standard fixes no allocation order at all, which is exactly why the chapter says never to use bit-fields for wire formats.",
+      "sourceAnchor": "39-endianness-and-byte-swapping",
+      "difficulty": "trap"
+    },
+    {
+      "id": "3-q27",
+      "prompt": "`int a[10], b[10];` with `int* p = a + 10;` and `int* q = b;`. At runtime `p == q` is true. Is `*p = 1;` legal?",
+      "options": [
+        "No — `p`'s provenance is the array `a`, so it may only access `a`, regardless of the address it happens to hold.",
+        "Yes — once two pointers compare equal they denote the same object, so either may be used to access it.",
+        "Yes, but only if the write goes through `q`; assigning `p = q` first would launder the provenance.",
+        "No — the comparison itself is UB, since comparing pointers into different objects has no defined result."
+      ],
+      "correctIndex": 0,
+      "explanation": "A pointer carries an origin object as well as an address, and one-past-the-end of `a` may never be used to touch `b` even when the bit patterns match. The 'the comparison itself is UB' answer is a near-miss worth separating: relational comparison (`<`) across distinct objects is unspecified, but `==` is well-defined — the comparison is fine, it is the *access* that is not.",
+      "sourceAnchor": "310-pointer-arithmetic-and-provenance",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q28",
+      "prompt": "For `int a[10];`, which pointer computation is well-defined?",
+      "options": [
+        "`int* p = a + 10;` — one past the end is explicitly blessed, though dereferencing it is not.",
+        "`int* q = a + 11;` — computing an out-of-range pointer is fine as long as it is never dereferenced.",
+        "`int* r = a - 1;` — a symmetric one-before-the-beginning position exists for reverse iteration.",
+        "`int* s = a + 10;` followed by `*s = 0;` — writing to the end position is how `push_back` works."
+      ],
+      "correctIndex": 0,
+      "explanation": "Only the one-past-the-end position is defined, and only as a value — dereferencing it is UB, which rules out writing through the end position with `*s = 0;`. The `a - 1` answer is the tempting symmetry: there is no one-before-the-beginning, which is precisely why `std::reverse_iterator` stores the *next* position and dereferences `*(it - 1)`. Merely computing `a + 11` is already undefined, no dereference required.",
+      "sourceAnchor": "310-pointer-arithmetic-and-provenance",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q29",
+      "prompt": "Given `struct A { int type; int x; }; struct B { int type; double y; }; union U { A a; B b; };` with `u.a` active, what may you legally read?",
+      "options": [
+        "`u.b.type` — it is in the common initial sequence of two layout-compatible standard-layout structs; `u.b.y` would be UB.",
+        "Both `u.b.type` and `u.b.y` — once the union is visible, any member of either struct may be read.",
+        "Neither — reading through a non-active union member is undefined behavior in C++ without exception.",
+        "`u.b.y` only — the shared `type` member aliases across both structs and so must be read via `u.a`."
+      ],
+      "correctIndex": 0,
+      "explanation": "The common initial sequence is the longest run of leading members with layout-compatible types, and reading it through the inactive member is explicitly permitted when both structs are standard-layout and the union is visible. The 'neither member may be read' answer overcorrects with the general union-punning rule — that rule is real, but this carve-out is exactly what makes tagged unions and the `struct sockaddr` family legal.",
+      "sourceAnchor": "311-layout-compatibility-and-offsetof",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q30",
+      "prompt": "When is `offsetof(T, m)` well-defined, and what is its canonical use?",
+      "options": [
+        "For standard-layout `T`; it underpins the `container_of` idiom that recovers an enclosing object from a member pointer in intrusive containers.",
+        "For trivially copyable `T`; it underpins `memcpy`-based field extraction from wire buffers into struct members.",
+        "For any complete `T`; it underpins the vtable-offset arithmetic that virtual inheritance uses to find base subobjects.",
+        "For aggregate `T` only; it underpins aggregate initialization by giving each initializer its destination offset."
+      ],
+      "correctIndex": 0,
+      "explanation": "Standard layout is the condition that makes offsets fixed and computable, and `container_of` — subtracting the offset from a member's address — is why the macro exists, powering the Linux kernel's `list_head` and Boost.Intrusive. The 'any complete `T`, for virtual-inheritance offsets' answer is the exact inversion of the truth: virtual bases are the case where `offsetof` genuinely breaks, because a member's offset is not a compile-time constant at all.",
+      "sourceAnchor": "311-layout-compatibility-and-offsetof",
+      "difficulty": "recall"
+    },
+    {
+      "id": "3-q31",
+      "prompt": "Which single `static_assert` most directly guarantees a wire struct has no padding anywhere in it?",
+      "options": [
+        "`static_assert(std::has_unique_object_representations_v<Order>);`",
+        "`static_assert(std::is_trivially_copyable_v<Order>);`",
+        "`static_assert(std::is_standard_layout_v<Order>);`",
+        "`static_assert(alignof(Order) == sizeof(Order));`"
+      ],
+      "correctIndex": 0,
+      "explanation": "`has_unique_object_representations_v` is false if any padding bit exists anywhere in the type, making it the strongest single assertion in the wire-format checklist. Standard layout is the tempting choice because it is the other name in every ABI discussion, but it fixes member *order and offsets* while saying nothing about holes between them — a standard-layout struct can be mostly padding.",
+      "sourceAnchor": "312-abi-safe-wire-and-shared-memory-layouts",
+      "difficulty": "application"
+    },
+    {
+      "id": "3-q32",
+      "prompt": "A team places `std::atomic<MyStruct>` in a shared-memory segment for cross-process synchronization. What is the hidden failure?",
+      "options": [
+        "If it is not `is_always_lock_free`, the implementation uses a process-local lock table, so there is no cross-process atomicity at all.",
+        "Atomics require page alignment in shared memory, so mapping the segment at a different base address breaks the alignment guarantee.",
+        "`std::atomic` stores a vtable pointer for its lock strategy, which is only valid in the writing process's address space.",
+        "The atomic operations succeed but the memory ordering is downgraded to relaxed, since fences do not propagate across processes."
+      ],
+      "correctIndex": 0,
+      "explanation": "Non-lock-free atomics fall back to a table of mutexes inside the process, so each process locks a different mutex and the operations are not mutually atomic — silently. `static_assert(std::atomic<T>::is_always_lock_free)` is mandatory here. The 'atomic stores a vtable pointer' answer invents a vtable: `std::atomic` has no virtual functions; the process-local state lives in the library's lock table, not in the object.",
+      "sourceAnchor": "312-abi-safe-wire-and-shared-memory-layouts",
+      "difficulty": "trap"
+    }
+  ]
+}

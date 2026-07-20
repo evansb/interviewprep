@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-10-moves-copies-and-errors",
+  "questions": [
+    {
+      "id": "10-q01",
+      "prompt": "Which statement correctly describes the C++17 rules for elision on `return T{args};` versus `T t; return t;`?",
+      "options": [
+        "The prvalue return is guaranteed elided and needs no accessible copy or move constructor; the named-local return remains permitted but never required.",
+        "Both forms are guaranteed elided in C++17, so neither one needs an accessible copy or move constructor to compile.",
+        "The named-local return is guaranteed elided since C++17; the prvalue return stays a permitted optimization requiring a usable move constructor.",
+        "Neither form is guaranteed; C++17 only removed the requirement that the move constructor be accessible when the compiler happens to elide."
+      ],
+      "correctIndex": 0,
+      "explanation": "C++17 reframed a prvalue as an initializer rather than an object, so `return T{...}` constructs directly into the return slot with no copy/move constructor required at all. NRVO on a named local was deliberately left optional, since two `return` statements naming different locals cannot both occupy the return slot. The tempting distractor swaps the two cases; it states the NRVO rule backwards.",
+      "sourceAnchor": "101-rvo-and-nrvo",
+      "difficulty": "recall"
+    },
+    {
+      "id": "10-q02",
+      "prompt": "A function is `std::array<double, 64> f() { std::array<double, 64> a; fill(a); return std::move(a); }`. What is the effect of the `std::move`?",
+      "options": [
+        "It is redundant but harmless: the compiler still applies NRVO because the operand of `std::move` is a named local variable.",
+        "It converts an otherwise mandatory copy into a move, which for a `std::array` of doubles is a cheap pointer steal.",
+        "It makes the return expression an xvalue rather than a name, disabling NRVO and forcing a 512-byte element-wise move that elision would have avoided.",
+        "It has no run-time effect at all, since `std::move` is a cast and `std::array` has no user-declared move constructor."
+      ],
+      "correctIndex": 2,
+      "explanation": "NRVO requires the return expression to name the local; `std::move` turns it into an xvalue, so elision cannot apply and a real move construction is emitted. `std::array` moves element-wise, so that is 512 bytes copied where zero were needed — GCC and Clang flag it with `-Wpessimizing-move`. The 'redundant but harmless' option is the common belief and is wrong precisely because the cast changes the expression's form, not just its category label.",
+      "sourceAnchor": "101-rvo-and-nrvo",
+      "difficulty": "trap"
+    },
+    {
+      "id": "10-q03",
+      "prompt": "When NRVO does not apply to `return t;` where `t` is a local of class type, what does the compiler do with `t`?",
+      "options": [
+        "It copy-constructs the return value, which is why an explicit `std::move` is needed to recover move semantics there.",
+        "Implicit move applies: `t` is treated as an rvalue for overload resolution, so the move constructor is selected without any explicit cast.",
+        "The program is ill-formed unless the return type has an accessible copy constructor, because elision failure is diagnosed at compile time.",
+        "It binds the return slot as a reference to `t` and defers construction until the caller first reads the result."
+      ],
+      "correctIndex": 1,
+      "explanation": "[class.copy.elision]/3 says that when elision is not performed for a return of a local, overload resolution first treats the operand as an rvalue, so you get a move for free. That is exactly why `return std::move(t);` is never needed for the same-type case — it can only cost you elision. The 'copy-constructs' option is the pre-C++11 mental model and is the reason people still write the pessimizing move.",
+      "sourceAnchor": "101-rvo-and-nrvo",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q04",
+      "prompt": "`struct Buf { std::vector<char> data; ~Buf() { log(\"gone\"); } };` — what does `Buf a = std::move(b);` do?",
+      "options": [
+        "It moves the vector, because the vector member's own move constructor is still generated and is used member-wise.",
+        "It fails to compile, since a user-declared destructor deletes rather than suppresses the implicit move constructor.",
+        "It moves the vector, because `std::move` performs the transfer itself regardless of which constructors the class declares.",
+        "It copies the vector, because the user-declared destructor suppressed the implicit move constructor and the `const Buf&` overload wins."
+      ],
+      "correctIndex": 3,
+      "explanation": "A user-declared destructor, copy constructor, or copy assignment operator suppresses implicit generation of the move operations; with no move constructor, overload resolution falls back to the copy constructor, which binds the rvalue to `const Buf&`. Nothing warns. The 'still moves member-wise' option is the trap: member-wise move only happens if the enclosing class actually has a move constructor to perform it, and here it was never generated. Suppression is not deletion, so the code compiles.",
+      "sourceAnchor": "102-move-operations-that-fall-back-to-copying",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q05",
+      "prompt": "`const std::string s = \"...\"; v.push_back(std::move(s));` — why is this a copy?",
+      "options": [
+        "`std::move` refuses to cast a const object and returns an lvalue reference unchanged, so no rvalue is ever produced.",
+        "`push_back` has no rvalue overload for `std::string`, so every insertion of a string into a vector copies regardless of constness.",
+        "`std::move(s)` yields a `const std::string&&`, which cannot bind to the `string&&` parameter and instead binds to the `const string&` copy overload.",
+        "The compiler rejects moving from a const object and emits a diagnostic requiring `const_cast` before the move can bind."
+      ],
+      "correctIndex": 2,
+      "explanation": "`std::move` is just `static_cast<T&&>` and it happily preserves const, producing `const std::string&&`; that does not bind to `string&&`, so the `const string&` overload is viable and copies silently. Returning `const T` by value causes the same thing at every call site. The 'std::move refuses' option misdescribes the cast — it always produces an xvalue, the constness is what defeats the move.",
+      "sourceAnchor": "102-move-operations-that-fall-back-to-copying",
+      "difficulty": "trap"
+    },
+    {
+      "id": "10-q06",
+      "prompt": "What does the standard guarantee about a `std::string` that has been moved from?",
+      "options": [
+        "It is in a valid but unspecified state: precondition-free operations like `size()` and `clear()` are legal, but no particular value may be assumed.",
+        "It is guaranteed empty, which is why calling `clear()` on a moved-from string is redundant on every conforming implementation.",
+        "It is in an indeterminate state, so any use other than destruction or assignment is undefined behavior.",
+        "It retains its original contents unless the implementation chose to steal the buffer, so its value is implementation-defined but stable."
+      ],
+      "correctIndex": 0,
+      "explanation": "The library requirement is valid-but-unspecified: you may call anything with no precondition, but you may not assume a value. libstdc++ happens to leave the string empty, which is exactly what makes the 'guaranteed empty' answer so tempting and so wrong — depending on it is a portability bug. `std::unique_ptr` is the one type with a specified moved-from state, namely null.",
+      "sourceAnchor": "102-move-operations-that-fall-back-to-copying",
+      "difficulty": "recall"
+    },
+    {
+      "id": "10-q07",
+      "prompt": "`Widget(std::string&& s) : name_(s) {}` — what does the member initializer do, and why?",
+      "options": [
+        "It moves, because the parameter's declared type is an rvalue reference and that type is what overload resolution sees.",
+        "It copies, because a member of class type can only be initialized from an lvalue in a member initializer list.",
+        "It moves, because the compiler applies implicit move to any parameter that is about to go out of scope.",
+        "It copies, because a named parameter of type `std::string&&` is itself an lvalue inside the function body."
+      ],
+      "correctIndex": 3,
+      "explanation": "The rule is that a named rvalue reference is an lvalue expression; the type is `string&&` but the expression category is lvalue, so `name_(s)` selects the copy constructor. Writing `name_(std::move(s))` restores the move. The 'declared type is what matters' option is the exact misconception the rule exists to correct — overload resolution works on the expression's value category, not the parameter's declaration.",
+      "sourceAnchor": "102-move-operations-that-fall-back-to-copying",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q08",
+      "prompt": "`std::vector<T>` is reallocating on `push_back`. `T` has a throwing move constructor and is copy-constructible. What does the implementation do and why?",
+      "options": [
+        "It moves each element and catches any throw, restoring the original buffer from the elements already transferred.",
+        "It copies each element, because a throw partway through a move would leave both buffers gutted and the strong guarantee unrecoverable.",
+        "It moves each element, because `move_if_noexcept` only falls back to copying when the type has no move constructor at all.",
+        "It copies each element, because `std::vector` always copies on reallocation and only uses moves for `insert` and `erase`."
+      ],
+      "correctIndex": 1,
+      "explanation": "`move_if_noexcept` moves only when the move constructor is `noexcept` or the type is not copy-constructible; here `T` is copyable with a throwing move, so it copies, keeping the old buffer pristine so a throw can be rolled back. The 'moves and catches' option is impossible: once elements have been moved out, the originals are gutted and there is nothing to restore from. That is the whole reason `noexcept` on moves is mandatory for performance.",
+      "sourceAnchor": "103-noexcept-move-operations",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q09",
+      "prompt": "A class has all defaulted special members and one member whose move constructor is potentially throwing. What is the class's move constructor's exception specification?",
+      "options": [
+        "`noexcept`, because defaulted special members are unconditionally `noexcept` in C++11 and later.",
+        "Potentially throwing, because a defaulted move constructor is `noexcept` only if every base and member's corresponding operation is `noexcept`.",
+        "Potentially throwing, but only if the member is also the first one declared, since the computed specification stops at the first subobject.",
+        "`noexcept`, because the compiler wraps the throwing member's move in an implicit `try`/`catch` when defaulting the enclosing operation."
+      ],
+      "correctIndex": 1,
+      "explanation": "Implicitly-generated and `= default`ed move operations get a computed exception specification: `noexcept` iff every base and member's corresponding operation is `noexcept`. One legacy member with a throwing move therefore poisons the whole class, which is why a `static_assert(std::is_nothrow_move_constructible_v<T>)` next to the class is the deliverable. The 'unconditionally noexcept' answer confuses defaulted moves with destructors, which really are `noexcept` by default.",
+      "sourceAnchor": "103-noexcept-move-operations",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q10",
+      "prompt": "Which claim about marking a function `noexcept` is accurate?",
+      "options": [
+        "It speeds up the function's body directly, because the compiler can skip the per-call exception bookkeeping the body would otherwise perform.",
+        "It is a hint the optimizer may ignore, so a `noexcept` function that throws simply propagates the exception to the nearest handler.",
+        "It removes the function's entries from `.eh_frame`, which is what makes `noexcept` a prerequisite for backtraces to work.",
+        "It lets callers omit landing pads and unwind bookkeeping around the call, but does not accelerate the function's straight-line body under the table model."
+      ],
+      "correctIndex": 3,
+      "explanation": "In the table model the happy path already costs nothing, so `noexcept` cannot make straight-line code faster; its real wins are unlocking move-based library algorithms, letting callers drop cleanup code, and shrinking `.eh_frame`/`.gcc_except_table`. The 'speeds up the body' option is the single most common misconception about `noexcept`. It is also a hard promise, not a hint: a throw calls `std::terminate` immediately rather than seeking a handler.",
+      "sourceAnchor": "103-noexcept-move-operations",
+      "difficulty": "recall"
+    },
+    {
+      "id": "10-q11",
+      "prompt": "How does a `scope_fail` guard determine that the scope is being left via an exception?",
+      "options": [
+        "It records `std::uncaught_exceptions()` at construction and fires only if the count is higher when the destructor runs.",
+        "It calls the singular `std::uncaught_exception()` in its destructor and fires whenever that returns true.",
+        "It installs a `std::set_terminate` handler on construction and fires from that handler if unwinding reaches it.",
+        "It wraps the enclosing scope in an implicit `try`/`catch(...)` block and fires from the generated handler."
+      ],
+      "correctIndex": 0,
+      "explanation": "Comparing the plural count at construction and destruction is what distinguishes 'an exception was already in flight when I was created' from 'a new one started inside my scope'. The singular `uncaught_exception()` could not make that distinction, which is exactly why it was deprecated and removed in C++20 — making that option the historically tempting wrong answer. A destructor cannot synthesize a `try` block around a scope it does not control.",
+      "sourceAnchor": "1013-scope-guards",
+      "difficulty": "recall"
+    },
+    {
+      "id": "10-q12",
+      "prompt": "`struct Immovable { Immovable(); Immovable(const Immovable&) = delete; Immovable(Immovable&&) = delete; };` — which use is well-formed in C++17?",
+      "options": [
+        "Storing `Immovable` objects in a `std::vector` that later grows past its capacity, since reallocation constructs in place.",
+        "Returning a named local `Immovable` by value, since NRVO became mandatory in C++17 for types with deleted moves.",
+        "Returning `Immovable{}` by value from a factory function, since guaranteed elision means no constructor is needed for the return.",
+        "Passing an `Immovable` by value to a function, since guaranteed elision constructs the parameter directly from the argument."
+      ],
+      "correctIndex": 2,
+      "explanation": "C++17 guaranteed elision for prvalues makes `return Immovable{};` legal — the prvalue initializes the caller's storage directly and no copy or move constructor is ever considered. Vector reallocation genuinely needs to relocate existing objects, so it still requires a move or copy. NRVO was not made mandatory in C++17, and passing an existing object by value is a copy/move of a real object, not a prvalue initialization.",
+      "sourceAnchor": "104-move-only-types",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q13",
+      "prompt": "Why does `std::vector<std::unique_ptr<int>> v{std::make_unique<int>(1)};` fail to compile?",
+      "options": [
+        "`std::vector` requires its element type to be `CopyConstructible` in all cases, so it cannot hold move-only types at all.",
+        "`std::make_unique` returns a prvalue, and initializer-list construction only accepts named lvalue arguments.",
+        "Brace initialization with a single argument always selects the size-and-value constructor, which needs a copyable fill value.",
+        "`std::initializer_list` elements are const, so the vector must copy them, and `unique_ptr` has no copy constructor."
+      ],
+      "correctIndex": 3,
+      "explanation": "Elements of a `std::initializer_list` are const, so the vector can only copy out of it, and copying a `unique_ptr` is deleted. Containers of move-only types otherwise work fine — `push_back(std::make_unique<int>(1))` compiles — so the 'vector requires CopyConstructible' option is the tempting overgeneralization. The restriction is specific to initializer lists, not to `vector`.",
+      "sourceAnchor": "104-move-only-types",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q14",
+      "prompt": "Why does the Itanium ABI split unwinding into a search phase and a cleanup phase?",
+      "options": [
+        "So that destructors run before handler matching, which lets a handler observe a fully cleaned-up stack when it is entered.",
+        "So that 'no matching handler anywhere' is detected before any destructor runs, letting terminate fire with the stack still intact.",
+        "So that the two passes can run concurrently on separate threads, halving the latency of a deep unwind.",
+        "So that the personality routine only needs to consult `.eh_frame` in one phase and `.gcc_except_table` in the other, halving table lookups."
+      ],
+      "correctIndex": 1,
+      "explanation": "Phase 1 walks the stack asking each frame's personality routine whether it has a matching handler, destroying nothing; only if one is found does phase 2 walk again running landing pads. That is exactly why an uncaught exception gives a usable core dump. The 'destructors first' option inverts the order — running cleanups during the search would destroy the very state the core dump needs.",
+      "sourceAnchor": "105-exception-handling-and-stack-unwinding",
+      "difficulty": "recall"
+    },
+    {
+      "id": "10-q15",
+      "prompt": "Inside `catch (const std::exception& e)`, what is the difference between `throw;` and `throw e;`?",
+      "options": [
+        "`throw;` copies the exception object into a new allocation; `throw e;` reuses the original object and is therefore the cheaper form.",
+        "`throw;` may only appear in a `catch (...)` block; `throw e;` is the only legal rethrow form inside a typed handler.",
+        "`throw;` rethrows the same exception object unchanged; `throw e;` throws a fresh `std::exception` sliced from the static type of `e`.",
+        "The two are equivalent when the handler catches by const reference, since no copy is made from a reference binding."
+      ],
+      "correctIndex": 2,
+      "explanation": "A bare `throw;` propagates the in-flight exception object itself with no copy and full dynamic type. `throw e;` copy-initializes a new exception object from `e`'s *static* type, slicing away everything derived — a classic bug that turns an `out_of_range` into a bare `exception`. Catching by const reference avoids slicing at the catch, but it does not protect the rethrow, which is why the 'equivalent' option is wrong.",
+      "sourceAnchor": "105-exception-handling-and-stack-unwinding",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q16",
+      "prompt": "A `throw` of a small user type crosses a handful of frames in a multithreaded process. What dominates the cost?",
+      "options": [
+        "Exception-object allocation, unwind-table decoding, and a process-global lock taken while locating frame descriptions for shared libraries.",
+        "The `try` block entry and exit records that each frame pushed and popped on the way in, which must now be walked in reverse.",
+        "The cost of copying the exception object once per frame as it is rethrown up the stack toward the handler.",
+        "Cache misses on the landing pads, which the compiler places inline in hot code so that unwinding stays branch-predictable."
+      ],
+      "correctIndex": 0,
+      "explanation": "Throws land in the 1-10 microsecond range, dominated by the allocation, CFI decoding, and on many implementations a global mutex in `dl_iterate_phdr` — which is why exception throughput collapses under multithreading. The `try`-record option describes the SJLJ model, not the table model used by every modern mainstream target, where entering a `try` is genuinely free. The exception object is allocated once, not copied per frame, and landing pads live in cold sections.",
+      "sourceAnchor": "105-exception-handling-and-stack-unwinding",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q17",
+      "prompt": "Which exception-safety guarantee does `std::vector::insert` in the middle of the range provide for an element type with a throwing move?",
+      "options": [
+        "Basic: no leaks and invariants hold, but the elements have been shuffled by move-assignment and their values are unspecified.",
+        "Strong: the implementation buffers the shifted elements so the vector is bit-for-bit unchanged if the insertion throws.",
+        "No-throw: `insert` is specified never to propagate an exception once the reallocation itself has succeeded.",
+        "None: a throw during the shift may leave the vector with a broken size invariant and leaked element storage."
+      ],
+      "correctIndex": 0,
+      "explanation": "Middle insertion shifts elements by move-assignment in place, and a throw partway leaves them scrambled — the container is intact and leak-free, but the values are unspecified, which is exactly the basic guarantee. `push_back` and `reserve` are the strong ones (conditional on `move_if_noexcept`); assuming `insert` shares that is a very common and costly mistake. The 'none' option understates it: the standard library never leaves broken invariants.",
+      "sourceAnchor": "106-exception-safety-guarantees",
+      "difficulty": "trap"
+    },
+    {
+      "id": "10-q18",
+      "prompt": "`Widget& operator=(const Widget& rhs) { Widget tmp(rhs); swap(*this, tmp); return *this; }` — what makes this give the strong guarantee?",
+      "options": [
+        "The temporary's destructor runs after the swap, and a destructor is guaranteed to undo any partial state the assignment created.",
+        "The copy constructor is required to be `noexcept` for this pattern, so nothing in the function body can throw at all.",
+        "All fallible work happens on the temporary, and the commit step is a `noexcept` swap that cannot fail partway.",
+        "The self-assignment check implied by the swap ensures that no state is modified when the source and target are the same object."
+      ],
+      "correctIndex": 2,
+      "explanation": "The pattern is: do everything that can throw on a copy, then commit with an operation that cannot throw. If `Widget tmp(rhs)` throws, `*this` was never touched. The destructor option confuses cleanup with rollback — the destructor releases the old state after a successful commit, it does not undo a failed one. Self-assignment safety is a bonus of the idiom, not the source of the strong guarantee, and the copy constructor here is free to throw.",
+      "sourceAnchor": "106-exception-safety-guarantees",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q19",
+      "prompt": "`registry.insert(k, v); ScopeExit rollback{[&]{ registry.erase(k); }}; index.add(k); rollback.dismiss();` — what does this achieve?",
+      "options": [
+        "The basic guarantee only: the guard prevents leaks but the registry keeps the new entry whether or not `index.add` succeeds.",
+        "The strong guarantee: if `index.add` throws, the guard undoes the insert; on success `dismiss()` commits and the guard does nothing.",
+        "Nothing useful: `dismiss()` runs before the destructor, so the erase is skipped on both the throwing and the normal path.",
+        "The no-throw guarantee: the guard's destructor is `noexcept`, so neither the insert nor `index.add` can propagate an exception."
+      ],
+      "correctIndex": 1,
+      "explanation": "This is commit-or-rollback without paying for copy-and-swap: the guard is armed across the fallible step and disarmed only once everything has succeeded, so a throw from `index.add` unwinds through the destructor and erases the entry. The 'nothing useful' option misreads the control flow — `dismiss()` is never reached when `index.add` throws. The guard's `noexcept` destructor is a requirement on the cleanup action, not a promise about the guarded operations.",
+      "sourceAnchor": "1013-scope-guards",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q20",
+      "prompt": "What distinguishes the table-based exception model from the SJLJ model?",
+      "options": [
+        "The table model pushes a handler record per `try` but stores it in a static table, making the push cheaper than SJLJ's linked-list insert.",
+        "SJLJ does its work only when an exception is thrown; the table model pays a constant cost on every function entry to register unwind data.",
+        "The two differ only in the section names used for unwind data, since both consult static tables when an exception propagates.",
+        "SJLJ pushes and pops a handler record at every `try` entry and exit; the table model does no runtime work to enter or leave a `try`."
+      ],
+      "correctIndex": 3,
+      "explanation": "SJLJ maintains a runtime linked list of handler records, so it costs time on every execution whether or not anything throws; the table model puts everything in static data consulted only when a throw happens, so the happy path is genuinely free. The option claiming SJLJ works only on throw reverses which model is lazy. SJLJ survives only in old MinGW and some embedded toolchains.",
+      "sourceAnchor": "107-zero-cost-exception-implementations",
+      "difficulty": "recall"
+    },
+    {
+      "id": "10-q21",
+      "prompt": "Under the table model, what are the real costs of exceptions on a build that never throws?",
+      "options": [
+        "None whatsoever, since `-fno-exceptions` and an exception-enabled build produce byte-identical code when nothing throws.",
+        "A per-call-site branch checking whether an exception is currently in flight, which the predictor learns and effectively hides.",
+        "Roughly 10-20% larger binaries from unwind tables, plus landing-pad basic blocks that constrain register allocation and inlining budgets.",
+        "A per-function prologue that registers the frame with the unwinder, plus a matching epilogue that deregisters it."
+      ],
+      "correctIndex": 2,
+      "explanation": "Zero-cost means zero on the happy *instruction stream*, not zero overall: `.eh_frame`, `.eh_frame_hdr`, and `.gcc_except_table` commonly add 10-20% binary size, and a call that may throw is a control-flow edge to a landing pad that constrains optimization and counts against inlining heuristics. The 'byte-identical' option is the overclaim the term 'zero-cost' invites. The prologue/epilogue registration describes SJLJ, not the table model.",
+      "sourceAnchor": "107-zero-cost-exception-implementations",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q22",
+      "prompt": "A TU is compiled with `-fno-exceptions` and calls into a TU that was not. The callee throws and the exception propagates outward. What happens?",
+      "options": [
+        "The behavior is undefined: the no-exceptions frame has no landing pads, its locals' destructors are skipped, and in practice you get `std::terminate`.",
+        "It compiles and links but the exception is caught by the nearest enclosing handler, since the flag is per-TU and unwinding is a runtime property.",
+        "The link fails, because mixing translation units built with and without exception support is ill-formed with no diagnostic required.",
+        "The exception propagates correctly, since `-fasynchronous-unwind-tables` is the default on x86-64 and supplies the needed CFI."
+      ],
+      "correctIndex": 0,
+      "explanation": "The flag is per-TU and mixing is legal, but a no-exceptions TU emits no landing pads, so an exception crossing its frames skips destructors and is undefined behavior. The fix is to wrap the boundary in an exception-enabled TU that catches everything. The CFI option is a real half-truth trap: asynchronous unwind tables give you the frame-restore information for backtraces, but not the LSDA cleanup actions that would run destructors.",
+      "sourceAnchor": "108-disabling-exceptions",
+      "difficulty": "trap"
+    },
+    {
+      "id": "10-q23",
+      "prompt": "With `-fno-exceptions`, what happens when `std::vector::at` is called with an out-of-range index on libstdc++?",
+      "options": [
+        "It compiles to a plain `operator[]`, so the access proceeds and reads whatever is at that offset in memory.",
+        "The call fails to compile, because `at` is defined in terms of `throw` and the header is ill-formed under the flag.",
+        "It sets `errno` to `ERANGE` and returns a reference to a static default-constructed element.",
+        "The process aborts, because libstdc++ replaces the internal throw helpers with calls to terminate rather than returning an error."
+      ],
+      "correctIndex": 3,
+      "explanation": "libstdc++ routes library throws through helpers like `__throw_out_of_range`, and under `-fno-exceptions` those call terminate/abort. That makes the flag a *behavior* change, not merely a compile-time restriction — the bounds check still runs, it just kills the process instead of throwing. The 'compiles to operator[]' option is wrong in a dangerous direction: the check is not removed. Standard headers remain usable under the flag, so nothing fails to compile.",
+      "sourceAnchor": "108-disabling-exceptions",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q24",
+      "prompt": "What is the relationship between `std::error_code` and `std::error_condition`?",
+      "options": [
+        "`error_condition` is the concrete platform error and `error_code` is the portable enumeration defined by `std::errc` for comparison.",
+        "`error_code` is a concrete platform error of `{value, category}`; `error_condition` is a portable abstraction that a category's `equivalent()` maps codes onto.",
+        "They are interchangeable typedefs for the same class, kept apart only so that overloads can distinguish the throwing and non-throwing APIs.",
+        "`error_code` carries a message string alongside the value, while `error_condition` is the stripped-down two-word form for hot paths."
+      ],
+      "correctIndex": 1,
+      "explanation": "The split is what lets `ec == std::errc::no_such_file_or_directory` work whether the code originated as POSIX `ENOENT` or Windows `ERROR_FILE_NOT_FOUND` — the category's `equivalent()` performs the mapping. The option that makes `error_condition` the concrete one simply reverses the two roles, which is the usual confusion. `error_code` is two words and allocation-free; the human-readable message comes from the category's `message()`, not from storage in the code.",
+      "sourceAnchor": "109-error-codes",
+      "difficulty": "recall"
+    },
+    {
+      "id": "10-q25",
+      "prompt": "A codebase bans exceptions entirely. Which design consequence follows most directly?",
+      "options": [
+        "RAII stops working, since destructors were only ever invoked as part of the unwinding machinery the ban removes.",
+        "Constructors can no longer report failure, so fallible construction moves to a static `create()` returning `expected` or to two-phase init.",
+        "Error codes become impossible to ignore, since the compiler requires every returned code to be inspected before the next statement.",
+        "Deep call stacks propagate errors automatically, because return codes bubble up through intermediate frames without explicit handling."
+      ],
+      "correctIndex": 1,
+      "explanation": "Constructors and overloaded operators have no return channel, so banning exceptions forces a factory returning `expected` or a two-phase init that reintroduces the invalid-object state RAII exists to eliminate. RAII is unaffected on normal returns — only the unwinding path is gone. Error codes are famously *ignorable*, which is why `[[nodiscard]]` exists, and manual propagation at every level is the honest ergonomic cost of the trade.",
+      "sourceAnchor": "109-error-codes",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q26",
+      "prompt": "`std::optional<int> o;` (empty). What is the difference between `*o` and `o.value()`?",
+      "options": [
+        "`*o` throws `std::bad_optional_access`; `o.value()` returns a value-initialized `int` as its documented empty-state result.",
+        "Both throw `std::bad_optional_access`, but `value()` additionally participates in the monadic chain via `or_else`.",
+        "`*o` returns a reference to the uninitialized storage and `o.value()` asserts, so both are diagnosable only in debug builds.",
+        "`*o` is undefined behavior with no check; `o.value()` is checked and throws `std::bad_optional_access`."
+      ],
+      "correctIndex": 3,
+      "explanation": "`operator*` has a precondition of engagement and performs no check, so dereferencing an empty optional is UB — the single most-asked detail about the type. `value()` is the checked accessor and throws, which also makes it unsuitable under `-fno-exceptions`. The 'both throw' option is the usual confusion; only one of the two accessors is checked.",
+      "sourceAnchor": "1010-optional-return-values",
+      "difficulty": "recall"
+    },
+    {
+      "id": "10-q27",
+      "prompt": "`std::optional<bool> ob = false;` then `if (ob) { ... }`. Does the branch execute, and why?",
+      "options": [
+        "Yes: `operator bool` reports engagement, and `ob` holds a value, so the contained `false` is never consulted.",
+        "No: the conversion forwards to the contained `bool`, so an engaged optional holding `false` tests as false.",
+        "No: `optional<bool>` is specialized to collapse the engaged flag and the value into a single tri-state boolean.",
+        "Yes, but only because `false` is not `std::nullopt`; assigning `std::nullopt` would leave `ob` engaged and still true."
+      ],
+      "correctIndex": 0,
+      "explanation": "`optional<bool>` is a three-state type and its contextual conversion tests engagement, never the contained value — so an engaged optional holding `false` is truthy. Writing `if (ob.value())` or `if (ob && *ob)` is what you meant. The 'forwards to the contained bool' option is precisely the bug this trap produces. There is no `optional<bool>` specialization, and assigning `std::nullopt` disengages the optional.",
+      "sourceAnchor": "1010-optional-return-values",
+      "difficulty": "trap"
+    },
+    {
+      "id": "10-q28",
+      "prompt": "Why is `sizeof(std::optional<T*>)` 16 rather than 8 on a 64-bit platform?",
+      "options": [
+        "`optional` heap-allocates the contained pointer and stores both the allocation address and the engaged flag inline.",
+        "`optional` reserves a second pointer-sized slot for the `bad_optional_access` exception object it may need to throw.",
+        "`optional` stores a separate `bool` engaged flag plus padding and performs no niche optimization using a pointer's null value.",
+        "`optional<T*>` is required to be trivially copyable, which forces alignment to a 16-byte boundary on the SysV ABI."
+      ],
+      "correctIndex": 2,
+      "explanation": "The layout is aligned storage for `T` followed by a `bool` and padding, and the standard provides no mechanism for a sentinel, so a null pointer is a perfectly valid engaged value and cannot double as the empty state — unlike Rust's niche optimization. If you need a compact optional you write your own with a domain sentinel. The `T` is stored inline with no allocation at all, which makes the heap option wrong.",
+      "sourceAnchor": "1010-optional-return-values",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q29",
+      "prompt": "Which choice of `E` keeps `std::expected<T, E>` cheap on a latency-sensitive path, and why?",
+      "options": [
+        "A `std::string`, because the union layout means the error side costs nothing unless the error is actually engaged.",
+        "A `std::variant` of every error category, because a union of unions collapses to the size of its largest single alternative.",
+        "A pointer to a heap-allocated error record, because indirection keeps `sizeof(expected)` at one word regardless of `T`.",
+        "A small trivially-copyable enum class, because a `std::string` error type makes the whole `expected` non-trivially-destructible and pushes it out of registers."
+      ],
+      "correctIndex": 3,
+      "explanation": "`expected<T,E>` is a union plus a discriminant, so it is only register-passable while both alternatives stay trivial; a `string` error type kills triviality and allocates on the error path. The 'union means it costs nothing' option is the seductive half-truth — the union bounds the *size*, but triviality is a property of the type regardless of which alternative is active. A variant error type is expressive but expands the size; prefer a flat enum and log rich context separately.",
+      "sourceAnchor": "1011-expected-return-values",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q30",
+      "prompt": "Which comparison between `std::expected` and exceptions is correct?",
+      "options": [
+        "`expected` propagates automatically through intermediate frames via its monadic operations, while exceptions require an explicit rethrow in each frame.",
+        "`expected` is visible in the signature and must be propagated by hand at every level; exceptions propagate automatically but are invisible in the signature.",
+        "Both are visible in the signature, since a function that can throw must declare the exception types it propagates.",
+        "`expected` can be ignored freely while an exception cannot, because `[[nodiscard]]` cannot be applied to a class template."
+      ],
+      "correctIndex": 1,
+      "explanation": "Manual propagation at every level is `expected`'s biggest ergonomic cost — C++ has no `?` operator — while its payoff is a self-documenting, `[[nodiscard]]` signature. Exceptions invert both properties. The monadic option overstates `and_then`: it composes within one function, it does not carry an error up through callers who never wrote a check. Dynamic exception specifications were removed, and the standard does mark `expected` `[[nodiscard]]`.",
+      "sourceAnchor": "1011-expected-return-values",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q31",
+      "prompt": "Which termination mechanism runs static destructors and `atexit` handlers but skips the destructors of automatic objects in the calling frame?",
+      "options": [
+        "`std::abort()`",
+        "`std::quick_exit(n)`",
+        "`std::exit(n)`",
+        "`std::_Exit(n)`"
+      ],
+      "correctIndex": 2,
+      "explanation": "`std::exit` runs static destructors and `atexit` handlers and flushes iostreams, but it never unwinds, so locals in the calling frame are simply abandoned. `quick_exit` runs only `at_quick_exit` handlers, `_Exit` runs nothing and does not flush, and `abort` raises SIGABRT for a core dump. The distinction matters in multithreaded programs, where `exit` can run static destructors while other threads are still using those objects — use `_Exit` or `quick_exit` on crash paths.",
+      "sourceAnchor": "1012-termination-and-abort",
+      "difficulty": "application"
+    },
+    {
+      "id": "10-q32",
+      "prompt": "Why can a `SIGSEGV` handler that calls `backtrace_symbols` deadlock?",
+      "options": [
+        "It allocates, and the crashed thread may already hold the malloc arena lock, which is not async-signal-safe to re-enter.",
+        "It blocks waiting for the unwinder's global `dl_iterate_phdr` mutex, which the kernel holds for the duration of signal delivery.",
+        "It re-raises `SIGSEGV` while the signal is still masked, so the handler recurses until the alternate stack is exhausted.",
+        "It writes to stderr, and `write(2)` blocks indefinitely when called from a handler on a non-blocking descriptor."
+      ],
+      "correctIndex": 0,
+      "explanation": "`backtrace_symbols` allocates, and if the signal interrupted the thread mid-`malloc` the arena lock is already held by that same thread, so the handler blocks on itself forever. The safe pattern is to preallocate, use `write(2)` directly, use `backtrace()` rather than `backtrace_symbols`, and re-raise with the default disposition to get a core. `write` is explicitly on the async-signal-safe list, so it is the recommended output call, not the hazard.",
+      "sourceAnchor": "1012-termination-and-abort",
+      "difficulty": "application"
+    }
+  ]
+}

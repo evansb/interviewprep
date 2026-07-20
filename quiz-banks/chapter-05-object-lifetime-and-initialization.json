@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-05-object-lifetime-and-initialization",
+  "questions": [
+    {
+      "id": "5-q01",
+      "prompt": "When does an object's lifetime formally begin?",
+      "options": [
+        "When storage of the proper size and alignment is obtained, regardless of any initialization.",
+        "When storage of the proper size and alignment is obtained AND its initialization is complete.",
+        "At the point of declaration, which is what makes the name visible to all the code that follows.",
+        "When the first member function is called on it, since that is the first observable use of it."
+      ],
+      "correctIndex": 1,
+      "explanation": "Both conditions are required: bytes plus completed initialization. The 'storage obtained' answer is the tempting one because it is exactly half the rule — and it is the half that makes people believe `operator new` alone gives them an object. Declaration is a compile-time notion and has nothing to do with lifetime.",
+      "sourceAnchor": "51-storage-and-object-lifetime",
+      "difficulty": "recall"
+    },
+    {
+      "id": "5-q02",
+      "prompt": "You have `S* p = static_cast<S*>(::operator new(sizeof(S)));` and have not yet constructed anything. Which operation is legal?",
+      "options": [
+        "Calling a non-virtual member function that touches no data members of the object at all.",
+        "Binding a `const S&` to `*p` so long as you never actually read through that reference.",
+        "Copying and comparing the pointer value, or reading the raw bytes through an `unsigned char*`.",
+        "Using `static_cast<Base*>(p)` to obtain a pointer to the base subobject of `S`."
+      ],
+      "correctIndex": 2,
+      "explanation": "Outside the lifetime you may handle the pointer value and inspect bytes through `unsigned char*`/`std::byte*`, and nothing more. The non-virtual member call is the classic misconception — there is no 'it works because it doesn't touch members' carve-out; any member call is UB. Reference binding and base casts are equally forbidden.",
+      "sourceAnchor": "51-storage-and-object-lifetime",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q03",
+      "prompt": "`struct C { const int id; }; C c{1}; c.~C(); new (&c) C{2}; int v = c.id;` What is the status of the read of `c.id`?",
+      "options": [
+        "Well-defined and yields 2, because the new object exactly overlays the old storage of the same type.",
+        "UB — destroying an automatic object and reconstructing it in place is never permitted at all.",
+        "Well-defined but unspecified, so it yields either 1 or 2 depending on the optimizer's choices.",
+        "UB — `C` has a const member, so the old pointer is not transparently replaceable and may still read 1."
+      ],
+      "correctIndex": 3,
+      "explanation": "Transparent replacement requires exact overlay, the same type, no const or reference non-static members, and not being a base subobject; the const `id` breaks it, so the compiler may have cached 1 and you need `std::launder(&c)->id`. The 'well-defined and yields 2' answer is the trap: the overlay and type conditions are met, but people forget the const-member condition, which is precisely why `optional::emplace` and `variant` launder internally.",
+      "sourceAnchor": "51-storage-and-object-lifetime",
+      "difficulty": "trap"
+    },
+    {
+      "id": "5-q04",
+      "prompt": "What does the standard's placement `operator new(std::size_t, void* p)` actually do?",
+      "options": [
+        "It allocates from a per-thread arena seeded by `p`, then constructs the object at the result.",
+        "Nothing but return `p` — it is a non-replaceable no-op, and all the work is the constructor call.",
+        "It zero-fills the region of `sizeof(T)` bytes at `p` and then returns `p` to the caller.",
+        "It checks that `p` is suitably aligned for `T` and throws `std::bad_alloc` when it is not."
+      ],
+      "correctIndex": 1,
+      "explanation": "The overload is defined by the standard, cannot be replaced, and simply returns its pointer argument; the observable effect of a placement-new expression comes entirely from running the constructor. The alignment-check answer is tempting because alignment really does matter here — but nothing checks it, which is why misalignment is silent UB rather than a thrown exception.",
+      "sourceAnchor": "52-placement-new",
+      "difficulty": "recall"
+    },
+    {
+      "id": "5-q05",
+      "prompt": "Why is C++20's `constexpr std::vector` implemented with `std::construct_at` rather than plain placement new?",
+      "options": [
+        "`construct_at` performs list-initialization, so it can aggregate-initialize elements that placement new cannot.",
+        "`construct_at` allocates the element storage itself, which placement new deliberately never does.",
+        "`construct_at` is the only form usable in a constant expression; plain placement new is not constexpr until C++26.",
+        "`construct_at` destroys any object already occupying the storage first, making the reuse well-defined."
+      ],
+      "correctIndex": 2,
+      "explanation": "Constant evaluation forbids plain placement new until C++26, and `construct_at` is the sanctioned constexpr-friendly wrapper. The list-initialization answer inverts the truth: `construct_at` always performs direct-*non-list*-initialization, which is a known wart precisely because it cannot do brace or aggregate forms.",
+      "sourceAnchor": "52-placement-new",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q06",
+      "prompt": "`Base* b = new D1; b->~Base(); new (b) D2; b->f();` Why is the call UB, and what fixes it?",
+      "options": [
+        "The compiler may have devirtualized based on the old vptr; `std::launder(b)->f()` discards that assumption.",
+        "The destructor call ended `b`'s storage as well as its lifetime; a fresh `operator new` is required.",
+        "`D1` and `D2` may differ in size, so the placement new overflowed; a larger buffer is what fixes it.",
+        "A strict-aliasing violation occurred by reusing a `Base*` for a `D2`; a `reinterpret_cast` fixes it."
+      ],
+      "correctIndex": 0,
+      "explanation": "The vptr and any devirtualization decision are among the things a compiler may cache across in-place replacement, so the old pointer cannot be used and `launder` refreshes it. The aliasing answer is the popular misconception: `launder` does not legalize `reinterpret_cast` or fix aliasing violations, and a destructor call never releases storage.",
+      "sourceAnchor": "53-stdlaunder-and-explicit-lifetime-apis",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q07",
+      "prompt": "Bytes for a `MsgHeader` have just arrived in a buffer via `read()`, and no object was ever constructed there. Which facility is designed for this?",
+      "options": [
+        "`std::launder(reinterpret_cast<MsgHeader*>(buf))`, which refreshes the pointer to the object there.",
+        "`std::construct_at(reinterpret_cast<MsgHeader*>(buf))`, which is the only zero-cost creation form.",
+        "`std::destroy_at(reinterpret_cast<MsgHeader*>(buf))`, which resets the region before you read it.",
+        "`std::start_lifetime_as<MsgHeader>(buf)`, which declares that the existing bytes are an object."
+      ],
+      "correctIndex": 3,
+      "explanation": "`start_lifetime_as` (C++23) *makes* an implicit-lifetime object exist over foreign bytes; `launder` is the near-miss because it assumes an object is already alive at that address and only refreshes your pointer — with nothing ever constructed, there is nothing to launder. `construct_at` would run a constructor and overwrite the received bytes.",
+      "sourceAnchor": "53-stdlaunder-and-explicit-lifetime-apis",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q08",
+      "prompt": "At block scope, `int x;` versus `int y{};` — what is the difference?",
+      "options": [
+        "Both are zero, since automatic storage is zero-filled on entry to the block by the platform ABI.",
+        "`x` is default-initialized and holds an indeterminate value; `y` is value-initialized and holds zero.",
+        "`x` is zero and `y` is indeterminate, because braces suppress the implicit zeroing of scalar types.",
+        "Both are indeterminate; empty braces only matter for class types that have a default constructor."
+      ],
+      "correctIndex": 1,
+      "explanation": "Default-initialization of a scalar in automatic or dynamic storage leaves it indeterminate; value-initialization zeroes it. The 'both are zero' answer confuses block scope with namespace/static scope, where `int x;` really is zero via static initialization — the same syntax with a different answer depending on storage duration.",
+      "sourceAnchor": "54-initialization-forms",
+      "difficulty": "recall"
+    },
+    {
+      "id": "5-q09",
+      "prompt": "Given `struct B { B() {} int x; };` and `struct C { C() = default; int x; };`, what do `B b{};` and `C c{};` leave in `x`?",
+      "options": [
+        "Both are zero, because empty braces always mean value-initialization and value-initialization zeroes.",
+        "`b.x` is zero and `c.x` is indeterminate, because a written constructor body zero-fills before running.",
+        "`b.x` is indeterminate and `c.x` is zero, because `= default` on the first declaration is not user-provided.",
+        "Both are indeterminate, because each type has a user-declared constructor that suppresses the zeroing."
+      ],
+      "correctIndex": 2,
+      "explanation": "Value-initialization zero-initializes first only when the default constructor is not user-provided; `B() {}` is user-provided and runs without touching `x`, while `C() = default;` on its first declaration is not. The 'both are zero' option is the natural but wrong generalization — 'value-init zeroes' holds for aggregates and scalars but not once a user-provided constructor intervenes. Moving the `= default` outside the class body flips `C` to indeterminate too.",
+      "sourceAnchor": "54-initialization-forms",
+      "difficulty": "trap"
+    },
+    {
+      "id": "5-q10",
+      "prompt": "What is the difference between `std::vector<int> v1(10, 5);` and `std::vector<int> v2{10, 5};`?",
+      "options": [
+        "`v1` has two elements, 10 and 5; `v2` has ten elements equal to 5, since braces select the sizing constructor.",
+        "Both have ten elements equal to 5; the brace form merely additionally forbids narrowing conversions.",
+        "`v1` has ten elements all equal to 5; `v2` fails to compile because the two overloads are ambiguous.",
+        "`v1` has ten elements all equal to 5; `v2` has two elements, 10 and 5, via the `initializer_list` constructor."
+      ],
+      "correctIndex": 3,
+      "explanation": "Brace-initialization prefers a viable `initializer_list` constructor over every other candidate, even a much better match, so `{10, 5}` is a two-element list. The 'both are ten fives' answer is what people expect from 'uniform' initialization — and it is exactly the reason containers with a size argument are the standing exception to the prefer-braces rule.",
+      "sourceAnchor": "54-initialization-forms",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q11",
+      "prompt": "On a hot path, `struct Buf { char data[65536]; }; Buf b{};` has what cost that `Buf b;` does not?",
+      "options": [
+        "A 64 KB `memset`, because value-initializing the aggregate zeroes every byte of the member array.",
+        "A heap allocation, because value-initialization of a large aggregate is routed through `operator new`.",
+        "A guard-variable check, because value-initialized large locals are lowered to function-local statics.",
+        "A `memcpy` from a `.rodata` template, which is the only way to materialize a large aggregate value."
+      ],
+      "correctIndex": 0,
+      "explanation": "Value-initializing a large aggregate emits a zero-fill, so the braces are a 64 KB `memset` that `Buf b;` skips entirely. The `.rodata` `memcpy` answer describes how a *non-zero* aggregate initializer is often lowered, which is why it sounds right — but zeroing needs no template. `Buf b;` is only safe if you genuinely write every field afterwards.",
+      "sourceAnchor": "54-initialization-forms",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q12",
+      "prompt": "Which of these initializations compiles cleanly?",
+      "options": [
+        "`int b{3.5};` — braces convert the double to 3 exactly as parentheses do, with no diagnostic.",
+        "`char c{300};` — the constant fits after the implementation-defined wrap to a `char` value.",
+        "`int a(3.5);` — parenthesized initialization permits the narrowing conversion and truncates to 3.",
+        "`uint32_t d{-1};` — the conversion is well-defined modular arithmetic, so it is not narrowing."
+      ],
+      "correctIndex": 2,
+      "explanation": "Only the parenthesized form allows the narrowing conversion; all three brace forms are ill-formed because narrowing is banned in list-initialization. The `uint32_t d{-1}` case is the most tempting: the conversion really is well-defined modular arithmetic at runtime, but 'well-defined' and 'non-narrowing' are different questions, and it is still an error.",
+      "sourceAnchor": "54-initialization-forms",
+      "difficulty": "trap"
+    },
+    {
+      "id": "5-q13",
+      "prompt": "In which standard did aggregates first become permitted to have base classes, and how is the base initialized?",
+      "options": [
+        "C++14, with the base initialized positionally like any other member: `Agg a{1, 2};` with no nesting.",
+        "C++17, with the base initialized by a nested brace group: `Agg a{{1}, 2};` for `struct Agg : Base`.",
+        "C++20, together with designated initializers, using `.Base = {1}` to name the base subobject.",
+        "C++11, provided the base is empty, in which case it contributes no initializer of its own at all."
+      ],
+      "correctIndex": 1,
+      "explanation": "C++17 allowed aggregates to derive, with the base written as a leading nested brace group. C++14 is the near-miss because that is when a different aggregate restriction was lifted — NSDMIs became allowed — and C++20 is when designated initializers and parenthesized aggregate init arrived, but neither of those is the base-class change.",
+      "sourceAnchor": "55-aggregate-initialization",
+      "difficulty": "recall"
+    },
+    {
+      "id": "5-q14",
+      "prompt": "For `struct Config { int port = 0; int backlog = 128; bool nodelay = false; };`, which C++20 designated initializer is valid?",
+      "options": [
+        "`Config c{.nodelay = true, .port = 9000};` — designators may appear in any order the caller prefers.",
+        "`Config c{.port = 9000, .backlog.high = 4};` — nested designators name a subobject of a member.",
+        "`Config c{[1] = 256};` — array-style designators index the members of the aggregate positionally.",
+        "`Config c{.port = 9000, .nodelay = true};` — designators in declaration order with a skipped member."
+      ],
+      "correctIndex": 3,
+      "explanation": "C++'s designated initializers are stricter than C's: initializers must appear in declaration order, though members may be skipped (they get their NSDMI or are value-initialized). The out-of-order form is the trap because it is perfectly legal C, as are nested and array designators — all three are C-only.",
+      "sourceAnchor": "55-aggregate-initialization",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q15",
+      "prompt": "What does `std::lock_guard<std::mutex>(m);` do on a line by itself inside a function?",
+      "options": [
+        "Creates an unnamed temporary guard that locks `m` and unlocks it at the end of the full-expression.",
+        "Declares a `lock_guard` named `m`, shadowing the mutex and providing no mutual exclusion at all.",
+        "Fails to compile, because `lock_guard` has no default constructor to satisfy such a declaration.",
+        "Locks `m` for the remainder of the enclosing scope, exactly as a named guard variable would do."
+      ],
+      "correctIndex": 1,
+      "explanation": "Anything parseable as a declaration is a declaration, so the parentheses around `m` are redundant declarator parentheses and this declares a default-constructed guard named `m`. The 'temporary released immediately' reading is the common half-right answer — it correctly senses that nothing is protected, but the real mechanism is worse: no mutex is ever locked, and the mutex name is now shadowed.",
+      "sourceAnchor": "56-most-vexing-parse",
+      "difficulty": "trap"
+    },
+    {
+      "id": "5-q16",
+      "prompt": "Which line actually declares and initializes an object rather than falling to the most vexing parse?",
+      "options": [
+        "`Widget w();` — the empty parentheses read as a default-construction request for a local object.",
+        "`Widget w(Gadget());` — the inner `Gadget()` names a value and so forces an object declaration.",
+        "`Timer t(std::chrono::seconds(1));` — the argument cannot be parsed as a parameter declaration.",
+        "`std::scoped_lock(m);` — CTAD removes the template argument and with it the declaration reading."
+      ],
+      "correctIndex": 2,
+      "explanation": "`std::chrono::seconds(1)` contains a value, `1`, that cannot be read as a parameter declaration, so the line really does declare and construct a `Timer`. The `scoped_lock` answer is the dangerous misconception: CTAD makes the trap *more* likely, not less, since dropping the template argument makes the accidental declaration shorter and more natural to write.",
+      "sourceAnchor": "56-most-vexing-parse",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q17",
+      "prompt": "`struct Holder { const std::string& s; Holder(const std::string& x) : s(x) {} }; Holder h{std::string(\"temp\")};` What happens?",
+      "options": [
+        "`h.s` is valid for `h`'s whole scope, because binding a temporary to a reference always extends its life.",
+        "`h.s` dangles: extension does not apply to reference members, so the temporary dies at the end of the full-expression.",
+        "`h.s` is valid until the constructor body ends, at which point the temporary is destroyed with the parameter.",
+        "The code fails to compile, because a temporary cannot bind to a reference member in a ctor-init-list."
+      ],
+      "correctIndex": 1,
+      "explanation": "Extension applies to a temporary bound directly to a local reference, not to a reference *member* initialized in a ctor-init-list, so the temporary dies at the end of the full-expression that created `h` — and `h` outlives it. The 'valid until the constructor ends' answer is the sophisticated near-miss: it correctly senses the extension fails, but even that shorter window is not guaranteed here.",
+      "sourceAnchor": "57-temporary-materialization-and-lifetime-extension",
+      "difficulty": "trap"
+    },
+    {
+      "id": "5-q18",
+      "prompt": "`for (char c : get_vector_of_strings()[0]) { ... }` — what changed about this loop in C++23?",
+      "options": [
+        "P2718 made the loop ill-formed, so the previously silent dangling is now a required compile-time error.",
+        "P2718 changed the range-initializer to be evaluated once per iteration, refreshing the temporary each pass.",
+        "P2718 extends all temporaries in the range-initializer to the loop's duration; before it, the vector died first.",
+        "P2718 requires the vector to be copied into the loop variable, which removes the reference into it entirely."
+      ],
+      "correctIndex": 2,
+      "explanation": "The `auto&&` range variable extended only the subscript result's referent, not the vector temporary itself, so the vector was destroyed before the body ran; P2718 extends every temporary in the range-initializer to the loop's duration. The 'now ill-formed' answer is plausible because compilers do warn via `-Wdangling-gsl`, but the committee fixed the semantics rather than banning the code.",
+      "sourceAnchor": "57-temporary-materialization-and-lifetime-extension",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q19",
+      "prompt": "A constructor acquires two raw resources in its body and the second acquisition throws. What happens?",
+      "options": [
+        "The destructor runs and releases both resources, since the object's storage was already obtained.",
+        "Nothing leaks: the runtime tracks resources acquired in a constructor body and releases them on unwinding.",
+        "The first resource leaks and the members leak too, since no destructors run for a failed construction.",
+        "The first resource leaks: the object's destructor never runs, though fully-constructed members and bases are destroyed."
+      ],
+      "correctIndex": 3,
+      "explanation": "A throwing constructor means the object's lifetime never began, so its destructor does not run — but every fully-constructed base and member subobject *is* destroyed in reverse order. That asymmetry is exactly why each resource should be its own RAII member rather than a raw handle acquired in the body; the 'the members leak too' answer gets the object right but wrongly extends the rule to members.",
+      "sourceAnchor": "58-raii",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q20",
+      "prompt": "The chapter names a non-obvious hot-path cost of RAII. Which is it?",
+      "options": [
+        "Destructors are registered with `__cxa_atexit`, adding a table entry for every scoped object.",
+        "Unwinding tables for each scope must be paged in, so every guarded scope costs an extra cache miss.",
+        "A non-trivial destructor forces memory-passing at ABI boundaries and disables tail-call optimization.",
+        "The destructor call is dispatched through the vtable, which the compiler is then unable to devirtualize."
+      ],
+      "correctIndex": 2,
+      "explanation": "The destructor body usually inlines to nothing, but its existence changes how the type crosses ABI boundaries and forces cleanup to run after a call returns, so a dispatch cannot become a `jmp`. The `__cxa_atexit` answer describes a real mechanism from a different section — it applies to namespace-scope statics, not automatic objects.",
+      "sourceAnchor": "58-raii",
+      "difficulty": "recall"
+    },
+    {
+      "id": "5-q21",
+      "prompt": "`struct S { int a; int b; S(int x) : b(x), a(b) {} };` What is wrong?",
+      "options": [
+        "Nothing is wrong: the member-initializer list runs left to right, so `b` is set before `a` reads it.",
+        "`a` is initialized first, from an uninitialized `b`, because members initialize in declaration order.",
+        "`b` is initialized twice — once from `x` and again during `a`'s initialization — which is itself UB.",
+        "Reading another member inside a member-initializer is ill-formed regardless of the ordering here."
+      ],
+      "correctIndex": 1,
+      "explanation": "Members are initialized in declaration order, so `a` runs first and reads a `b` that does not yet hold a value — `-Wreorder` exists for exactly this. The 'left to right' answer is the entire misconception the rule targets: the written order of the init-list is ignored, which is why writing it out of declaration order is a bug generator.",
+      "sourceAnchor": "59-construction-and-destruction-order",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q22",
+      "prompt": "A base-class constructor calls a virtual function that `Derived` overrides. Which override runs?",
+      "options": [
+        "The derived one, because the object being built is ultimately of the most-derived type.",
+        "It is unspecified which runs, since the vptr's value mid-construction is implementation-defined.",
+        "The base's, because the dynamic type during construction is the class currently being constructed.",
+        "The derived one, unless the function is pure virtual in the base, in which case the base's runs."
+      ],
+      "correctIndex": 2,
+      "explanation": "The vptr is set per construction stage, so a virtual call in a base constructor dispatches to the base's override; the rule exists because derived members do not exist yet. The 'the derived one, since the object is ultimately most-derived' answer is the intuition from finished objects and is the standard wrong answer. If the function is pure virtual in the base there is nothing to call — the program hits `__cxa_pure_virtual` and aborts.",
+      "sourceAnchor": "59-construction-and-destruction-order",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q23",
+      "prompt": "In what order are the parts of an object constructed?",
+      "options": [
+        "Direct bases in declaration order, then virtual bases, then members in initializer-list order, then the body.",
+        "Members in declaration order, then direct bases in declaration order, then virtual bases, then the body.",
+        "Virtual bases, then direct bases in reverse declaration order, then members in declaration order, then the body.",
+        "Virtual bases first, then direct bases in declaration order, then members in declaration order, then the body."
+      ],
+      "correctIndex": 3,
+      "explanation": "Virtual bases go first so they exist before any base that shares them, then direct bases and members each in declaration order, then the body; destruction is the exact reverse. The 'members in initializer-list order' answer is the most tempting because it embeds the widespread belief that the member-initializer list controls member order — it does not.",
+      "sourceAnchor": "59-construction-and-destruction-order",
+      "difficulty": "recall"
+    },
+    {
+      "id": "5-q24",
+      "prompt": "What does `constinit` guarantee for `constinit std::atomic<uint64_t> g_seq{0};`?",
+      "options": [
+        "It is constant-initialized in phase 1, so there is no dynamic initializer, no ordering hazard, no guard variable.",
+        "It is initialized on first use with thread-safe magic-static semantics, which removes any ordering hazard.",
+        "It is immutable after initialization, so the compiler may place it in `.rodata` and skip the dynamic phase.",
+        "It is initialized before every other global in the program, giving a deterministic cross-TU ordering."
+      ],
+      "correctIndex": 0,
+      "explanation": "`constinit` asserts constant initialization — a compile error if the initializer is not a constant expression — so the object never participates in the dynamic phase at all. The 'initialized on first use with magic-static semantics' answer describes the *other* fix, a function-local static, which does solve ordering but at the cost of a guard-variable check on every call; `constinit` says nothing about mutability, unlike `constexpr`.",
+      "sourceAnchor": "510-static-initialization-order-fiasco",
+      "difficulty": "recall"
+    },
+    {
+      "id": "5-q25",
+      "prompt": "A self-registering factory works when its .cpp is in the build, but registers nothing once the code moves into a static library. Why?",
+      "options": [
+        "Static libraries strip `.init_array` entries at archive creation time, so no dynamic initializers survive.",
+        "Archive members are initialized after `main` begins, so registration happens too late to be observed.",
+        "Static libraries force all their globals to be constant-initialized, which skips the registering constructor.",
+        "The object file is never referenced, so the linker never pulls it from the archive and its initializer never runs."
+      ],
+      "correctIndex": 3,
+      "explanation": "A linker takes an archive member only if something references a symbol in it, and a translation unit whose only purpose is a side-effecting static initializer is never pulled in. The fix is `--whole-archive` or an explicit reference from live code. The `.init_array` answer sounds mechanical and plausible, but that section is present and intact — it just never reaches the link.",
+      "sourceAnchor": "510-static-initialization-order-fiasco",
+      "difficulty": "trap"
+    },
+    {
+      "id": "5-q26",
+      "prompt": "Given `struct Empty {}; struct WithMember { Empty e; int i; }; struct WithBase : Empty { int i; };` what are the sizes on a typical ABI?",
+      "options": [
+        "Both are 4, because an empty class contributes nothing whether it appears as a member or as a base.",
+        "`WithMember` is 8 and `WithBase` is 4, because an empty base subobject may occupy zero bytes.",
+        "Both are 8, because every empty class needs a unique address and the alignment then forces padding.",
+        "`WithMember` is 4 and `WithBase` is 8, because a base subobject adds a vptr-sized table entry."
+      ],
+      "correctIndex": 1,
+      "explanation": "An empty *object* must have `sizeof >= 1` so distinct objects have distinct addresses, forcing a byte plus padding for the member; a base subobject carries no such requirement, so EBO makes it free. 'Both are 4' is the tempting answer for anyone who knows EBO exists but applies it to members too — that is precisely what `[[no_unique_address]]` was added in C++20 to enable.",
+      "sourceAnchor": "511-empty-base-optimization",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q27",
+      "prompt": "`struct S { [[no_unique_address]] Empty a, b; int i; };` — why is `sizeof(S)` 8 rather than 4?",
+      "options": [
+        "The attribute is a permission not a requirement, and compilers decline it when a class has several members.",
+        "The attribute applies only to the first declared member of a class, so `b` is laid out as an ordinary member.",
+        "`a` and `b` are distinct objects of the same type, so they need distinct addresses and cannot share offset 0.",
+        "The attribute never applies to members declared in a comma-separated list, so each needs its own declaration."
+      ],
+      "correctIndex": 2,
+      "explanation": "Two objects of the same type must be distinguishable by address, so only one of the pair can vanish — wrapping one in a distinct tag type restores the optimization. The 'the attribute is a permission not a requirement' answer is half-true and therefore tempting: the attribute genuinely is only a permission, but that is not why it fails here; this is a hard constraint, the same one EBO has.",
+      "sourceAnchor": "512-no_unique_address",
+      "difficulty": "trap"
+    },
+    {
+      "id": "5-q28",
+      "prompt": "`union U { int i; float f; }; U u; u.i = 1; float x = u.f;` What is the status of the read?",
+      "options": [
+        "Well-defined in C++, since the common initial sequence rule covers members of the same size.",
+        "Well-defined in C++, because assigning to `u.i` began the lifetime of every member at offset zero.",
+        "Ill-formed in C++, since reading a non-active union member is a required compile-time diagnostic.",
+        "UB in C++, though GCC and Clang document type punning through a union as a supported extension."
+      ],
+      "correctIndex": 3,
+      "explanation": "Only one member is active, and reading another is UB in C++ — the sole exception is the common initial sequence of standard-layout *structs* inside a union, which does not apply to two scalars. The 'the common initial sequence rule covers members of the same size' answer is the trap: people remember that a CIS rule exists and over-apply it. This read is legal in C, which is where the habit comes from.",
+      "sourceAnchor": "513-union-active-member-rules",
+      "difficulty": "trap"
+    },
+    {
+      "id": "5-q29",
+      "prompt": "`union V { std::string s; std::vector<int> v; V() : s() {} ~V() {} };` — how do you switch the active member from `s` to `v`?",
+      "options": [
+        "Assign `x.v = std::vector<int>{};` — assignment implicitly ends `s`'s lifetime and begins `v`'s, as for trivial members.",
+        "Call `x.s.~basic_string();` then `new (&x.v) std::vector<int>{};` — non-trivial members need explicit destroy and construct.",
+        "Call `x.~V();` then `new (&x) V{};` — the union's own destructor selects and destroys the active member for you.",
+        "Nothing special is needed — the compiler tracks the active member and inserts a destructor call at the assignment."
+      ],
+      "correctIndex": 1,
+      "explanation": "Implicit activation by assignment works only for members of trivial type; for non-trivial ones you must destroy the old member and placement-new the new one, tracking which is active yourself. The assignment answer is the trap because that rule is real — it just does not extend to non-trivial types. The user-provided `~V() {}` exists precisely because the union cannot know which member to destroy.",
+      "sourceAnchor": "513-union-active-member-rules",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q30",
+      "prompt": "`struct Base { ~Base(); }; struct Derived : Base { std::vector<int> v; }; Base* p = new Derived; delete p;` What actually goes wrong?",
+      "options": [
+        "UB, but harmless in practice: the derived destructor is skipped while the allocator still frees the block correctly.",
+        "Well-defined: the compiler emits a call to the correct destructor because the dynamic type is known at the `new` site.",
+        "A leak only: the standard still requires `operator delete` to receive the original pointer and the dynamic size.",
+        "UB: `Derived::~Derived` never runs so `v` leaks, and `operator delete` gets the base subobject's address and `sizeof(Base)`."
+      ],
+      "correctIndex": 3,
+      "explanation": "Without a virtual destructor there is no deleting-destructor vtable slot, so the derived destructor is skipped and deallocation is driven by the static type — under multiple inheritance the base subobject's address is genuinely a different pointer, which corrupts the allocator rather than merely leaking. The 'UB, but harmless in practice' answer is the widespread 'it's only a leak' folklore, and sized deallocation makes it worse, not better.",
+      "sourceAnchor": "514-destruction-through-base-pointers",
+      "difficulty": "application"
+    },
+    {
+      "id": "5-q31",
+      "prompt": "Why does `shared_ptr<Base> p = make_shared<Derived>()` destroy correctly without a virtual destructor, while `unique_ptr` does not?",
+      "options": [
+        "`shared_ptr` stores the dynamic type in the control block and performs a `dynamic_cast` before destroying.",
+        "`shared_ptr` always allocates the object and control block together, so it can free by size rather than by type.",
+        "`shared_ptr` type-erases the deleter into the control block at construction; `unique_ptr`'s deleter is part of its type.",
+        "`shared_ptr` synthesizes a virtual destructor for `Base` at instantiation, which `unique_ptr` is not allowed to do."
+      ],
+      "correctIndex": 2,
+      "explanation": "The control block captures a deleter matching the *constructing* type, so it destroys as `Derived` regardless of the pointer's static type; `unique_ptr<Base>`'s deleter is baked into its type and calls `~Base()`. The `dynamic_cast` answer is superficially plausible but would require `Base` to be polymorphic — the whole premise here is that it is not.",
+      "sourceAnchor": "514-destruction-through-base-pointers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "5-q32",
+      "prompt": "Why did the committee standardize sized deallocation in C++14?",
+      "options": [
+        "Size-class allocators otherwise look the size up from the pointer — a dependent load and likely cache miss per free.",
+        "Without the size, `operator delete` cannot know how many array elements it must destroy before releasing storage.",
+        "It lets `operator delete` verify the size against the allocation header and so diagnose heap corruption cheaply.",
+        "It was required to make over-aligned types work, since alignment can only be derived from the object's size."
+      ],
+      "correctIndex": 0,
+      "explanation": "tcmalloc, jemalloc, and pool allocators must map a pointer back to its size class, which is a radix-tree walk or span-header read on the free path; passing the compiler-known `sizeof(T)` turns that into arithmetic. The alignment answer confuses this with aligned allocation, a separate C++17 extension; element counts are the array cookie's job, not the deallocation function's.",
+      "sourceAnchor": "515-sized-aligned-and-destroying-delete",
+      "difficulty": "recall"
+    }
+  ]
+}

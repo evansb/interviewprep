@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-46-linux-network-stack",
+  "questions": [
+    {
+      "id": "46-q01",
+      "prompt": "What is the chapter's cost model for a packet travelling wire-to-application through the untuned kernel receive path on a 10/25 GbE colo host?",
+      "options": [
+        "Roughly 5–15 µs typical, with a p99.9 tail of 50–200 µs under interference.",
+        "Roughly 5–15 µs typical, and the tail is bounded near the same figure because the path is interrupt-driven.",
+        "Roughly 500 ns typical, with a p99.9 tail near 2 µs once the NIC is properly tuned.",
+        "Roughly 50–150 µs typical, dominated by the `copy_to_user` of the packet payload."
+      ],
+      "correctIndex": 0,
+      "explanation": "The median is acceptable and the tail is not — that asymmetry is the operational point of the chapter, and the tail comes from C-state exits, softirq starvation and the reader not being on CPU. The claim that an interrupt-driven path bounds its own tail is the tempting near-miss: interrupts are exactly what makes the tail unbounded, because every context boundary is a scheduling decision. The sub-microsecond figure belongs to kernel bypass, and `copy_to_user` is only 200–400 ns of the total.",
+      "sourceAnchor": "461-the-kernel-receive-path",
+      "difficulty": "recall"
+    },
+    {
+      "id": "46-q02",
+      "prompt": "Enabling `SO_BUSY_POLL` on a UDP feed socket cuts wire-to-application latency from about 11 µs to about 3 µs. Which stages did it actually remove?",
+      "options": [
+        "The MSI-X interrupt and ISR, and the reader wakeup with its context switch — everything from `napi->poll` through `copy_to_user` still runs.",
+        "The `sk_buff` allocation and the `copy_to_user`, leaving only the interrupt delivery and the reader wakeup in the path.",
+        "The protocol demux and socket enqueue, because busy polling delivers frames from the RX ring straight into the user buffer.",
+        "The softirq context entirely, because `napi->poll` is relocated into a per-queue kernel thread that the reader synchronises with."
+      ],
+      "correctIndex": 0,
+      "explanation": "Busy polling is precisely the deletion of the interrupt and the wakeup: `napi_busy_loop()` runs the same `napi->poll` from process context, so skb allocation, GRO, IP/UDP demux, socket enqueue and the copy all still happen — that residual 2–3 µs is what bypass exists to remove. The answer that keeps the interrupt and wakeup while deleting the allocation and copy inverts the picture exactly. Relocating polling into a kernel thread describes threaded NAPI, a different feature.",
+      "sourceAnchor": "461-the-kernel-receive-path",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q03",
+      "prompt": "On a DDIO-enabled Intel platform, what does the `copy_to_user` of a 1500-byte frame in `recvmsg` cost, and what is its side effect?",
+      "options": [
+        "About 60–100 ns because the DMA landed in L3, but it evicts roughly 24 cache lines of your working set per packet.",
+        "About 60–100 ns because the DMA landed in L3, and the working set is untouched since the copy never leaves cache.",
+        "About 1–2 µs, because even with DDIO the copy must pull the frame back out of DRAM before writing the user pages.",
+        "Effectively zero, because DDIO lets `recvmsg` map the L3-resident frame into the user address space without copying."
+      ],
+      "correctIndex": 0,
+      "explanation": "DDIO makes the copy cheap in isolation (L3→L1→L1) but not free in aggregate: 1500 bytes is about 24 cache lines of pressure applied to your order book and pools on every single packet. The 'untouched working set' option shares the correct premise and then draws the wrong conclusion — landing in cache is what causes the eviction, not what prevents it. DDIO changes where DMA lands; it does not turn a copy into a mapping.",
+      "sourceAnchor": "461-the-kernel-receive-path",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q04",
+      "prompt": "A candidate describes `send()` as \"a cheap push onto a queue that the kernel drains later\". What is wrong with that model?",
+      "options": [
+        "The socket lock, `copy_from_user`, header build, route lookup, qdisc pass, descriptor fill and the MMIO doorbell all run inline in the calling thread — about 1.5–4 µs.",
+        "The copy into the skb runs inline, but the route lookup, qdisc pass and doorbell write are deferred to the TX completion softirq on another core.",
+        "It is accurate for small writes; the path only becomes synchronous once the socket's send budget is exhausted and the call has to block.",
+        "It is accurate for the data path, but the doorbell is written by the qdisc watchdog timer, which is why transmit shows a millisecond-scale tail."
+      ],
+      "correctIndex": 0,
+      "explanation": "Transmit is mostly synchronous in the caller: everything down to and including the uncached PCIe doorbell write executes in your thread before `send()` returns. The 'only synchronous when the budget is exhausted' answer is the most seductive because blocking on a full send buffer is a real behaviour — but that is an extra cost on top of an already-inline path, not the point at which the path becomes inline. What genuinely happens later is the TX completion, which frees the skb.",
+      "sourceAnchor": "462-the-kernel-transmit-path",
+      "difficulty": "trap"
+    },
+    {
+      "id": "46-q05",
+      "prompt": "Why does the TX doorbell write cost a few hundred nanoseconds in the sending thread even though it is a posted write?",
+      "options": [
+        "It is an uncached store to a PCIe BAR: it does not wait for a round trip, but it must drain write-combining and cross the root complex, and it pipelines with nothing.",
+        "It is a blocking MMIO read of the doorbell register, so the thread stalls for the full PCIe round trip of roughly 0.5–2 µs before it can continue.",
+        "It is a cached write to a DMA-coherent ring page, so the cost is the coherence invalidation the NIC must perform before it is able to read it.",
+        "It is issued by the TX completion NAPI handler rather than by the sender, so the cost lands on whichever core the completion vector is affined to."
+      ],
+      "correctIndex": 0,
+      "explanation": "Posted means the store is not acknowledged end-to-end, but it is still an uncached transaction that must leave the core's buffers and traverse the root complex, and nothing overlaps it — which is why 100–300 ns of doorbell remains the irreducible floor even in DPDK. The blocking-read option describes the interrupt-cause register read of §46.4, a genuinely blocking MMIO read, which is why it is the easiest one to pick by mistake. The doorbell is written by the driver's `ndo_start_xmit` in the sender's context, not by completion processing.",
+      "sourceAnchor": "462-the-kernel-transmit-path",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q06",
+      "prompt": "`send()` starts returning `EAGAIN` on an idle wire. `ss -tim` shows a large `wmem_alloc`, an empty `Send-Q` and no congestion-window limitation. What is happening?",
+      "options": [
+        "Heavily coalesced TX completions are delaying skb frees, so the socket stays charged; set `ethtool -C eth0 tx-usecs 0 tx-frames 1`.",
+        "The root qdisc is a single-queue `pfifo_fast` and the transmitting cores are contending on `qdisc->q.lock`; switch the root qdisc to `mq`.",
+        "BQL has clamped in-flight bytes on that TX queue, and it is the clamp itself that inflates `sk_wmem_alloc` past the socket's budget.",
+        "The peer's advertised receive window has closed, so the sender is window-limited and stalls even though the local link carries no traffic."
+      ],
+      "correctIndex": 0,
+      "explanation": "The skb is freed by the TX completion path, not by `send()`, so `sk_wmem_alloc` only falls when completions are processed — delay them with aggressive TX coalescing and the socket looks full while the wire is empty. Qdisc lock contention is the tempting alternative because it is also a transmit-side pathology, but it manifests as `__qdisc_run` in `perf top` and a throughput plateau, not as inflated `wmem_alloc` with an empty `Send-Q`. A closed peer window or a BQL clamp would both leave data visibly queued in `Send-Q`.",
+      "sourceAnchor": "462-the-kernel-transmit-path",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q07",
+      "prompt": "What is the consequence of leaving a single-queue root qdisc in place on a multi-core sender?",
+      "options": [
+        "Every transmitting core contends on `qdisc->q.lock`, showing as `__qdisc_run`/`dev_queue_xmit` in `perf top` with throughput plateauing below line rate.",
+        "Each core still gets its own lock instance because qdiscs are per-CPU structures, so contention only appears later at the driver's TX ring.",
+        "The qdisc has been lockless since Byte Queue Limits was introduced, so the contention shows up on the socket lock instead of the qdisc.",
+        "Only the dequeue side is serialised, so enqueue from many cores scales freely and the throughput plateau must come from the NIC itself."
+      ],
+      "correctIndex": 0,
+      "explanation": "A single root qdisc is a global lock on the transmit path, and the cache-line bouncing on `qdisc->q.lock` caps throughput well below line rate; the standard fix is `mq`, which gives one qdisc per hardware TX queue. The 'lockless since BQL' answer is a plausible-sounding conflation — BQL bounds in-flight bytes in the TX ring and has nothing to do with qdisc locking. Enqueue is not exempt from the lock either, which is exactly why XPS matters: it determines which qdisc lock a thread takes.",
+      "sourceAnchor": "462-the-kernel-transmit-path",
+      "difficulty": "recall"
+    },
+    {
+      "id": "46-q08",
+      "prompt": "A colleague proposes `ethtool -G eth0 rx 4096` to \"stop dropping packets\". Why is this a poor move on a latency-critical 10 GbE feed host?",
+      "options": [
+        "A 4096-entry ring holds ~5 ms of line-rate traffic, so overload becomes staleness instead of loss, and the ring can outgrow the DDIO L3 allocation so descriptor reads hit DRAM.",
+        "A larger ring raises the per-packet DMA count from two transactions to three, because descriptors then straddle cache lines and must be written back twice.",
+        "A larger ring forces the driver to ring the doorbell once per descriptor rather than batching every 32, multiplying the MMIO cost on the refill path.",
+        "A larger ring scales the NAPI budget with it, so a single `poll()` call monopolises the softirq and starves the other queues sharing that core."
+      ],
+      "correctIndex": 0,
+      "explanation": "Both halves matter: a deep ring converts a loss you would detect and account for into staleness that silently poisons your prices, and DDIO's L3 allocation (2 ways by default) is small enough that a large ring pushes descriptor accesses back out to DRAM. The doorbell-batching answer is the most plausible distractor because doorbell amortisation is real, but batching is a driver policy tied to refill granularity, not to ring size. `netdev_budget` and per-NAPI `weight` are independent sysctls that do not scale with the ring.",
+      "sourceAnchor": "463-nic-dma-descriptor-rings",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q09",
+      "prompt": "A packet-rate host boots with `intel_iommu=on` in strict mode and per-packet latency rises by several hundred nanoseconds, with periodic worse spikes. What is the mechanism?",
+      "options": [
+        "Every `dma_map`/`dma_unmap` invalidates an IOTLB entry, adding hundreds of ns per packet and producing global invalidation storms at high rates.",
+        "The IOMMU translates descriptor addresses only, not frame buffers, so the cost is one translation per NAPI poll rather than one per received packet.",
+        "Strict mode disables DDIO, because translated addresses cannot be allocated into the reserved L3 ways, so every frame is forced out to DRAM.",
+        "The IOMMU is engaged only on transmit, where the driver maps user pages, so the cost appears solely in `sendmsg` and never on the receive side."
+      ],
+      "correctIndex": 0,
+      "explanation": "Strict mode means each unmap is followed by an IOTLB invalidation, so the cost is genuinely per-packet and degrades non-linearly with rate; latency-tuned hosts use `iommu.passthrough=1`/`iommu=pt` and state the device-DMA isolation trade-off explicitly. The DDIO answer is the most attractive because both features live near the PCIe path, but IOMMU translation and DDIO's L3 allocation are independent — passthrough removes translation cost without touching DDIO. Frame buffers are mapped for DMA in both directions, so receive is not exempt.",
+      "sourceAnchor": "463-nic-dma-descriptor-rings",
+      "difficulty": "trap"
+    },
+    {
+      "id": "46-q10",
+      "prompt": "What is receive livelock, in the Mogul & Ramakrishnan sense that motivated NAPI?",
+      "options": [
+        "At 14.88 Mpps a packet arrives every 67 ns while an interrupt costs 1–3 µs, so the CPU never returns to process context and throughput collapses toward zero as load rises.",
+        "The RX ring fills faster than the driver can refill it, so the NIC drops frames and throughput plateaus at whatever rate the driver is able to sustain.",
+        "The softirq re-raise count exceeds `MAX_SOFTIRQ_RESTART`, so all packet processing moves to `ksoftirqd` and the effective throughput roughly halves.",
+        "Interrupts are coalesced so aggressively that the ring overflows in the gaps between them, producing bursty loss that worsens as offered load rises."
+      ],
+      "correctIndex": 0,
+      "explanation": "The defining signature of livelock is that goodput falls toward zero as offered load increases, because interrupt servicing preempts the very process context that would consume the packets — not a plateau, a collapse. The ring-exhaustion answer is the closest miss: it describes ordinary overload with graceful degradation to a plateau, which is the outcome livelock is contrasted with. The `ksoftirqd` deferral is NAPI-era behaviour and is part of the mitigation, not the disease.",
+      "sourceAnchor": "464-interrupt-driven-packet-processing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "46-q11",
+      "prompt": "An overnight low-rate feed shows a bimodal latency histogram with a cluster near 50 µs, always on the first packet after a quiet period; the daytime load test is clean. What is the cause?",
+      "options": [
+        "The core drops into a deep C-state while idle and pays 30–60 µs of exit latency to take the interrupt; cap `max_cstate` or hold `/dev/cpu_dma_latency` open with 0 written.",
+        "`adaptive-rx` raises `rx-usecs` during idle periods, so the first packet of a burst waits out the enlarged coalescing timer before any interrupt fires.",
+        "GRO holds the first datagram in the per-NAPI list waiting for a second one to merge with, and on an idle feed that second datagram never arrives.",
+        "`ksoftirqd` is scheduled instead of the softirq running inline, because the scheduler prefers deferral whenever the local run queue is otherwise empty."
+      ],
+      "correctIndex": 0,
+      "explanation": "This is the canonical \"fine in the load test, terrible in production at 3am\" story: a busy load test keeps the core in C0, so the C6 exit penalty is invisible until traffic goes quiet, and the tell is that the penalty attaches specifically to the first packet after idle. The GRO answer is the strongest distractor because GRO does hold packets — but the list is flushed at `napi_complete_done`, i.e. at the end of the poll, so a lone packet is not held for tens of microseconds unless `gro_flush_timeout` is explicitly set. Busy-polling a core avoids this as a side effect by keeping it in C0.",
+      "sourceAnchor": "464-interrupt-driven-packet-processing",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q12",
+      "prompt": "How does NAPI arrange to give interrupt-like latency at low rates and polling efficiency at high rates?",
+      "options": [
+        "The ISR schedules NAPI and masks that queue's interrupt; the softirq polls up to `budget` packets and only `napi_complete_done` re-enables interrupts, when fewer than `budget` were available.",
+        "The ISR itself processes up to `budget` packets with interrupts left enabled, relying on the NIC's coalescing timers to bound the resulting interrupt rate.",
+        "Interrupts remain enabled throughout and NAPI simply batches the skb allocations, so the ISR executes progressively less code per packet as the rate climbs.",
+        "The driver masks the queue's interrupt permanently at `open()` and depends on `gro_flush_timeout` firing periodically to re-trigger the poll loop."
+      ],
+      "correctIndex": 0,
+      "explanation": "Interrupt to learn that work exists, then poll to do it: masking the queue's interrupt for the duration of the poll is what makes the transition to polling automatic under load and back to interrupts when the ring drains, with no tuning knob. The 'process in the ISR under a budget' answer keeps the budget but discards the masking, which is the half of the design that actually prevents livelock. Permanent masking plus a timer describes the deliberate `napi_defer_hard_irqs`/`gro_flush_timeout` busy-poll tuning, not baseline NAPI.",
+      "sourceAnchor": "465-napi-polling",
+      "difficulty": "recall"
+    },
+    {
+      "id": "46-q13",
+      "prompt": "Column 3 of `/proc/net/softnet_stat` is climbing on your handler CPU and `top` shows `ksoftirqd/6` accumulating time. What does this mean for latency?",
+      "options": [
+        "NAPI is exhausting its budget with work remaining, so processing is deferred to `ksoftirqd`, a `SCHED_OTHER` task competing on the run queue — tens to hundreds of µs added.",
+        "The per-CPU backlog queue is full and packets are being discarded outright; raise `net.core.netdev_max_backlog` to restore delivery on that core.",
+        "The driver failed to refill the RX ring in time, so the NIC dropped frames; this column is the software mirror of `rx_no_buffer_count` in `ethtool -S`.",
+        "The socket receive buffer overflowed while the handler was behind, so `nstat` will show a matching rise in `UdpRcvbufErrors` for that socket."
+      ],
+      "correctIndex": 0,
+      "explanation": "Column 3 is `time_squeeze`: not yet a drop, but the precursor, and the real damage is that packet processing lands in a normally-scheduled kernel thread instead of running promptly in softirq context. The backlog-drop answer is the classic confusion — that is column 2, which counts drops when a per-CPU backlog (the RPS path) fills, a different counter with a different fix. Ring-refill failures show as `rx_no_buffer_count`, and socket overflow shows in `nstat`; neither is what column 3 reports.",
+      "sourceAnchor": "465-napi-polling",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q14",
+      "prompt": "Your application busy-polls the socket, but the driver's own softirq keeps racing it for the same ring. Which configuration is the canonical low-latency resolution?",
+      "options": [
+        "`napi_defer_hard_irqs=2` and `gro_flush_timeout=200000` with `SO_PREFER_BUSY_POLL`, so interrupts essentially never fire while traffic flows and the timer is a safety net.",
+        "`net.core.netdev_budget=0` together with `SO_BUSY_POLL`, so the softirq can never make progress and only the application's loop drives the ring.",
+        "`/sys/class/net/eth0/threaded=1` together with `adaptive-rx on`, so the NAPI thread scales its own interrupt rate to the observed traffic pattern.",
+        "`rps_cpus` set to the handler core plus `SO_BUSY_POLL`, so the busy loop and the steered softirq both execute on one CPU and therefore cannot race."
+      ],
+      "correctIndex": 0,
+      "explanation": "`SO_PREFER_BUSY_POLL` makes `napi_complete_done` honour the hard-IRQ deferral, so the application's loop stays the driver of the ring, while `gro_flush_timeout` re-triggers NAPI if the app stalls — that combination is what 5.11+ added specifically for this race. The RPS answer is the tempting one because co-locating work on one core sounds like it removes the contention, but RPS adds an IPI and a cross-core skb migration per packet and does not stop the softirq from polling. Zeroing `netdev_budget` is not a supported way to disable softirq processing.",
+      "sourceAnchor": "465-napi-polling",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q15",
+      "prompt": "Why is `echo 1 > /sys/class/net/eth0/threaded` attractive on a kernel-path (non-bypass) trading host?",
+      "options": [
+        "NAPI polling moves into per-queue kernel threads that can be pinned and given `SCHED_FIFO`, taking packet processing out of shared softirq context and out of `ksoftirqd`'s class.",
+        "The driver's hardware interrupt handler itself moves into a thread, so the hardware interrupt is removed from the receive path altogether.",
+        "Each RX queue is given its own softirq vector, so `NET_RX_SOFTIRQ` no longer serialises the queues against one another on a shared core.",
+        "The packet budget is replaced by a purely time-based budget, so a poll can no longer be squeezed and `time_squeeze` stops incrementing entirely."
+      ],
+      "correctIndex": 0,
+      "explanation": "The value is that packet processing becomes a schedulable, priority-controllable entity: you can pin it and raise its priority, which is the standard answer to making kernel-path processing preemption-resistant without bypass. The 'ISR moves into a thread' answer is the closest miss — the hardware interrupt still fires and still schedules NAPI; only the poll is relocated. Softirq vectors and the budget mechanism are unchanged by the `threaded` flag.",
+      "sourceAnchor": "465-napi-polling",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q16",
+      "prompt": "Why is `adaptive-rx` — on by default in most drivers — singled out as actively harmful for a trading host?",
+      "options": [
+        "It varies the interrupt delay with observed traffic, so your latency distribution becomes a function of other people's flows and goes multi-modal.",
+        "It pins `rx-usecs` at 50 whenever the packet rate exceeds 100 kpps, so every packet above that rate carries a fixed 50 µs of added delay.",
+        "It overrides NAPI's budget mechanism, so a burst is drained one interrupt at a time regardless of how much work the RX ring actually holds.",
+        "It applies only to TX completions, so its cost shows up as delayed skb frees and a stalled `send()` rather than as any delay on the receive side."
+      ],
+      "correctIndex": 0,
+      "explanation": "The objection is not the magnitude but the variance: an adaptive algorithm makes your latency an unpredictable function of traffic you do not control, and its signature is an inexplicably multi-modal histogram — hence `adaptive-rx off adaptive-tx off rx-usecs 0 rx-frames 1`. The fixed-threshold answer is tempting because 50 µs is a real figure from the coalescing table, but that is the static `rx-usecs 50` setting; the adaptive variant is precisely the one with no fixed value. Delayed completions stalling `send()` is the separate TX coalescing axis.",
+      "sourceAnchor": "466-interrupt-coalescing-trade-offs",
+      "difficulty": "trap"
+    },
+    {
+      "id": "46-q17",
+      "prompt": "Why does the chapter argue that interrupt coalescing is \"exactly backwards\" for a bursty, mostly-idle market-data workload?",
+      "options": [
+        "It delays the first packet of a burst — the one carrying the price update — while NAPI already suppresses interrupts under sustained load, so it hurts at low rates and adds little at high ones.",
+        "It delays every packet of a burst equally, so the penalty accumulates linearly with burst length and a long burst is charged the full timer per packet.",
+        "It helps most at low rates where interrupt cost dominates and is harmless at high rates because NAPI is polling anyway, so the setting is merely redundant.",
+        "It delays only the last packet of a burst, because the coalescing timer restarts on each arrival and expires only once the burst has finally stopped."
+      ],
+      "correctIndex": 0,
+      "explanation": "The timer starts on the first packet, so the first packet of an idle-period burst eats the full `rx-usecs` — and that is the latency-critical one — while the interrupt-rate savings coalescing was invented for are already delivered by NAPI's masking under load. The 'helps at low rates, harmless at high rates' option shares the true observation that NAPI covers the high-rate case, then inverts the low-rate conclusion: low rate is where the added delay actually lands. A timer that restarted on each arrival would delay bursts indefinitely, which is not how coalescing works.",
+      "sourceAnchor": "466-interrupt-coalescing-trade-offs",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q18",
+      "prompt": "What does an `sk_buff`'s `truesize` measure, and why does it matter for `SO_RCVBUF` sizing?",
+      "options": [
+        "The charged memory including the skb, the data buffer and `skb_shared_info`; a 64-byte datagram can be charged 2048 bytes, so the buffer holds far less payload than expected.",
+        "The payload length plus the Ethernet, IP and UDP headers, so it exceeds `len` by a fixed 42 bytes and inflates the buffer's effective capacity slightly.",
+        "The size of the linear data area alone, which is why heavily fragmented skbs report a `truesize` noticeably smaller than their reported `len`.",
+        "The size charged against the sender's `sk_wmem_alloc`, so it governs when `send()` blocks and has no bearing at all on receive-buffer accounting."
+      ],
+      "correctIndex": 0,
+      "explanation": "`truesize` is accounting, not payload: some drivers allocate a full or half page per packet regardless of frame size, giving up to 32× inflation, and `SO_RCVBUF` is charged against that — the diagnostic is `ss -tim` showing `skmem` `r` far exceeding what you have actually read. The fixed-header answer is the intuitive guess and gets the direction right but the magnitude wrong by nearly two orders of magnitude, which is what makes the surprise a surprise. `truesize` is used on both directions of accounting, not only on transmit.",
+      "sourceAnchor": "467-sk_buff",
+      "difficulty": "recall"
+    },
+    {
+      "id": "46-q19",
+      "prompt": "You leave `tcpdump` running on the feed interface to \"passively\" measure latency, and the measured latency changes. Why?",
+      "options": [
+        "The AF_PACKET tap clones each skb, and a cloned skb cannot be modified in place, so downstream stages are forced into copies they would otherwise skip.",
+        "`tcpdump` copies each packet inside the NAPI poll loop, which adds a fixed 60–100 ns per packet to the receive path and nothing further beyond that.",
+        "`tcpdump` disables GRO for the duration of the capture, so the effect is confined to bulk TCP flows and leaves small-packet feed traffic untouched.",
+        "`tcpdump` runs as a separate process on another core, so its cost is entirely off the receive path and the change must come from something else."
+      ],
+      "correctIndex": 0,
+      "explanation": "`skb_clone` copies only the `sk_buff` and shares the data buffer, which is cheap in itself — the cost is the `cloned` flag, which forces any later stage that wants to modify the packet to copy it first. The \"separate process, therefore free\" answer is the belief that causes the mistake: the clone happens in the receive path itself, before any user-space process is involved. This is why real capture belongs on a mirror port or on hardware timestamps, not in-path.",
+      "sourceAnchor": "467-sk_buff",
+      "difficulty": "trap"
+    },
+    {
+      "id": "46-q20",
+      "prompt": "Your `recvmsg` calls are usually 300 ns but occasionally take several microseconds, with no drops and no change in traffic rate. What is the most likely kernel-side explanation?",
+      "options": [
+        "Packets that arrived while your thread held the socket lock went to `sk_backlog`, and `release_sock` makes your own thread process them before returning.",
+        "GRO occasionally merged several datagrams into one large skb, so the slow calls are the ones copying a 64 KB coalesced buffer out to user space.",
+        "`recvmsg` sometimes runs the NAPI poll itself, because busy polling is implicitly enabled on any socket whose reader blocks inside the syscall.",
+        "The socket lock is a sleeping mutex, so a contended `recvmsg` parks the thread until the next timer tick before it can retry the acquisition."
+      ],
+      "correctIndex": 0,
+      "explanation": "The backlog is the mechanism by which receive-path work migrates into your application thread: softirq cannot enqueue while you hold the socket lock, so it appends to `sk_backlog`, and you pay for those packets on `release_sock` — a genuine and easily missed source of `recv()` variance. The GRO answer is plausible for a bulk TCP reader but wrong for the described symptom, and GRO's delay is bounded by the poll's flush point rather than producing sporadic multi-microsecond syscalls. Busy polling requires `SO_BUSY_POLL` or the sysctl; it is never implicit.",
+      "sourceAnchor": "468-socket-receive-and-send-queues",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q21",
+      "prompt": "A TCP order-entry session shows a sudden multi-millisecond latency spike, then resumes normally. No error was returned and no NIC counter moved. What happened?",
+      "options": [
+        "A sequence gap stranded later segments in `out_of_order_queue`, so nothing was delivered until the retransmission arrived — visible as `TcpExtTCPOFOQueue` and `retrans` in `ss -ti`.",
+        "`recv()` returned a short read followed by `EAGAIN`, giving the application a chance to detect the gap and re-request the missing bytes itself.",
+        "The kernel delivered the out-of-order bytes immediately and posted a gap notification to `MSG_ERRQUEUE`, which the application never drains.",
+        "The connection was reset once `out_of_order_queue` grew past `sk_rcvbuf`, so the spike ended in an `ECONNRESET` that the framing layer silently retried."
+      ],
+      "correctIndex": 0,
+      "explanation": "TCP head-of-line blocking is silent by construction: the stream abstraction forbids delivering later bytes before earlier ones, so the application sees exactly one fast-retransmit or RTO worth of delay and no error at all. The short-read-plus-`EAGAIN` answer is appealing because it is what you would want the API to do, but exposing the gap would break in-order delivery — that is the whole reason the stall is invisible. `MSG_ERRQUEUE` carries TX timestamps and zerocopy completions, not sequence-gap notifications.",
+      "sourceAnchor": "468-socket-receive-and-send-queues",
+      "difficulty": "trap"
+    },
+    {
+      "id": "46-q22",
+      "prompt": "How do GRO and LRO differ, and why is only one of them safe on a forwarding or bridging host?",
+      "options": [
+        "LRO merges in NIC hardware and is irreversible, so it breaks forwarding correctness; GRO merges in software during the NAPI poll and is reversible because GSO metadata preserves the segmentation.",
+        "GRO merges in NIC hardware and LRO merges in software, and both are reversible, which is why only LRO can be safely re-segmented by a router.",
+        "Both merge in software during the NAPI poll; LRO differs only in that its merge criteria permit combining segments belonging to different flows.",
+        "LRO merges on the transmit side and GRO on the receive side, which is why LRO has to be disabled on any host that forwards or bridges traffic."
+      ],
+      "correctIndex": 0,
+      "explanation": "Reversibility is the whole distinction: GRO records enough GSO metadata that the merged skb can be re-segmented exactly, so a forwarded stream is unchanged, whereas LRO discards information in hardware and silently rewrites the stream — a violation of the end-to-end principle. The swapped-locations answer is the standard confusion and also gets the safety verdict backwards. Both add latency, which is why the feed baseline is `ethtool -K eth0 gro off lro off` regardless of forwarding.",
+      "sourceAnchor": "469-gro-and-lro",
+      "difficulty": "recall"
+    },
+    {
+      "id": "46-q23",
+      "prompt": "How long can GRO hold a received segment before it reaches the protocol stack, on a host with default settings?",
+      "options": [
+        "At most until the poll's flush point — `napi_complete_done`, `MAX_GRO_SKBS`, or a non-mergeable packet — typically a few microseconds; only a configured `gro_flush_timeout` extends that.",
+        "Always the full `gro_flush_timeout` interval, so the default cost is tens of microseconds of added delay on every single received segment.",
+        "Until `MAX_GRO_SKBS` (8) segments of that flow have accumulated, so a lone datagram on a quiet feed is effectively held indefinitely.",
+        "No time at all — GRO's only cost is the bookkeeping of evaluating the merge criteria, which is why it is safely left on for feed interfaces."
+      ],
+      "correctIndex": 0,
+      "explanation": "The crucial nuance is that the latency is bounded by the flush point, not by a timer: within one NAPI poll a segment waits for the rest of that poll, which is microseconds rather than the tens of microseconds people assume. The `MAX_GRO_SKBS` answer is the closest miss because that limit is real, but it is one of several flush triggers and never the only one — `napi_complete_done` flushes unconditionally at the end of the poll. The timer only becomes the bound once `gro_flush_timeout` is set, as in the busy-poll tuning.",
+      "sourceAnchor": "469-gro-and-lro",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q24",
+      "prompt": "Order entry shares a 10 GbE NIC with a bulk transfer that uses TSO. Your 80-byte order messages, which never trigger TSO themselves, occasionally see tens of microseconds of extra delay. Why?",
+      "options": [
+        "A 64 KB TSO super-frame ahead of your order takes ~52 µs to serialize at 10 GbE, head-of-line-blocking the small packet at the TX ring.",
+        "TSO segmentation happens in the qdisc, so your order is simply interleaved between the bulk flow's segments and the delay must come from elsewhere.",
+        "TSO can only affect the flow that uses it, because each TX queue's ring drains onto the wire independently of what any other queue is holding.",
+        "BQL breaks the bulk flow's super-frames up before they ever reach the ring, so head-of-line blocking at the TX ring cannot arise in the first place."
+      ],
+      "correctIndex": 0,
+      "explanation": "The NIC must DMA and serialize the whole super-frame before it can start the next descriptor, so a small packet queued behind one eats the full ~52 µs — one of the strongest arguments for a dedicated order-entry NIC. The independent-queues answer is the most tempting because rings really are per-queue, but the queues share one physical link, and serialization onto the wire is where the blocking occurs. BQL bounds in-flight bytes; it does not re-segment TSO frames.",
+      "sourceAnchor": "4610-gso-and-tso",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q25",
+      "prompt": "You run `ethtool -K eth0 sg off` on a test box and are surprised to find that `ethtool -k` now reports segmentation offload disabled too. What is the dependency?",
+      "options": [
+        "TSO requires scatter-gather, so turning SG off implicitly turns TSO off — and GSO with it — meaning one `ethtool -K` line silently disables three features.",
+        "Turning SG off forces GSO on in software, so the work moves from the NIC to the CPU but every offload feature remains reported as enabled.",
+        "Turning TSO off implicitly turns SG off, because scatter-gather exists solely to feed page fragments to the hardware segmentation engine.",
+        "SG and TSO are independent; the real coupling is with checksum offload, which has to be disabled before TSO can be turned off at all."
+      ],
+      "correctIndex": 0,
+      "explanation": "TSO builds its super-frame from page fragments, so scatter-gather is a hard prerequisite, and the kernel silently drops the dependent features rather than rejecting the command — which is why the `ethtool -k` inventory is worth reading after any change. The reversed-dependency answer is attractive because a dependency clearly exists; it simply runs the other way, and disabling TSO leaves SG perfectly usable. Nothing forces GSO on as compensation, and no offload has to be disabled in a particular order.",
+      "sourceAnchor": "4610-gso-and-tso",
+      "difficulty": "trap"
+    },
+    {
+      "id": "46-q26",
+      "prompt": "Which `skb->ip_summed` value does the chapter call the preferred receive-side outcome, and why?",
+      "options": [
+        "`CHECKSUM_COMPLETE` — the hardware computed a raw sum over the whole frame, so the stack folds in the pseudo-header cheaply and the sum survives header stripping.",
+        "`CHECKSUM_UNNECESSARY` — the hardware computed a raw sum that the stack still folds, which is what makes it usable for protocols the NIC cannot parse.",
+        "`CHECKSUM_PARTIAL` — set on receive when the NIC verified the L3 header only and left the L4 checksum for the software path to complete later.",
+        "`CHECKSUM_NONE` — the frame carried no checksum field at all, so the stack can skip verification entirely and no further work is required of it."
+      ],
+      "correctIndex": 0,
+      "explanation": "`CHECKSUM_COMPLETE` gives the stack a raw sum rather than a verdict, which is strictly more useful: it remains valid after headers are stripped and it works for protocols the NIC does not parse. The `CHECKSUM_UNNECESSARY` answer borrows `COMPLETE`'s description — `UNNECESSARY` is only a verdict, meaning hardware verified it and the stack skips verification, with nothing left to fold. `CHECKSUM_PARTIAL` is the transmit-side marker, and `CHECKSUM_NONE` means not checked, so software must do the work.",
+      "sourceAnchor": "4611-checksum-offload",
+      "difficulty": "recall"
+    },
+    {
+      "id": "46-q27",
+      "prompt": "A capture taken with `tcpdump` on the sending host shows \"incorrect checksum\" on every outbound TCP segment, yet the peer receives everything cleanly. What is going on?",
+      "options": [
+        "The capture tap runs before the NIC fills in the checksum: the stack wrote only the pseudo-header sum and marked the skb `CHECKSUM_PARTIAL`.",
+        "The tap runs after the NIC's DMA, so a wrong checksum there means the offload engine really is miscomputing and the peer is accepting it by luck.",
+        "libpcap does not know the pseudo-header, so it reports outbound checksums as bad regardless of whether any offload is configured on the interface.",
+        "The IPv6 rule that a zero checksum is illegal is applied to every capture, so any packet whose checksum field is still zero gets flagged as an error."
+      ],
+      "correctIndex": 0,
+      "explanation": "With transmit checksum offload the stack deliberately leaves the field incomplete and records `csum_start`/`csum_offset` for the NIC to finish during DMA, so the tap — which sits upstream of the NIC — legitimately sees a wrong value. The \"tap runs after DMA\" answer inverts the ordering that makes the whole thing benign, and would imply a genuine hardware fault. The IPv6 zero-checksum rule is real but concerns UDP on the wire, not how a capture is interpreted.",
+      "sourceAnchor": "4611-checksum-offload",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q28",
+      "prompt": "A multicast feed handler on an 8-queue NIC shows one core pegged at 100% softirq while the other seven idle. `ethtool -x` shows a fully populated indirection table. What is the fix?",
+      "options": [
+        "UDP is hashed on IP addresses only by default, so run `ethtool -N eth0 rx-flow-hash udp4 sdfn` to bring the source and destination ports into the hash.",
+        "The indirection table defaults to a single active entry until `ethtool -X eth0 equal 8` is run, so every packet is currently landing in queue 0.",
+        "UDP bypasses RSS entirely because the NIC parser cannot reach the ports behind a multicast destination, so only n-tuple rules can spread it.",
+        "The Toeplitz key defaults to all zeros on most drivers, so every packet hashes into the same bucket no matter which header fields are selected."
+      ],
+      "correctIndex": 0,
+      "explanation": "The IP-only default for UDP hashing is the most common severe RSS misconfiguration, and the described symptom — one core saturated, the rest idle, with a healthy indirection table — is its signature; `sdfn` selects source IP, destination IP, source port and destination port. The empty-indirection-table answer is ruled out by the question's own evidence that the table is populated. Note that if the feed really is one group, one port and one source, RSS cannot help at all and you need application-level partitioning.",
+      "sourceAnchor": "4612-receive-side-scaling",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q29",
+      "prompt": "What problem does a symmetric Toeplitz RSS key solve?",
+      "options": [
+        "With the default key, hash(A→B) differs from hash(B→A), so the two directions of a connection land on different cores; a symmetric key makes both hash to one queue.",
+        "The default key is already symmetric; a custom key is only needed to weight the indirection table unevenly via `ethtool -X eth0 weight`.",
+        "Symmetry is obtained by dropping the ports from the hash inputs, which is why symmetric configurations always hash on IP addresses alone.",
+        "A symmetric key doubles the indirection table so that each flow occupies two entries, one for each direction of the conversation."
+      ],
+      "correctIndex": 0,
+      "explanation": "Toeplitz over the 4-tuple is order-sensitive, so by default the inbound and outbound halves of one connection are steered to different cores — a symmetric key (the well-known repeating `0x6D5A` pattern) makes both directions hash identically, which matters for stateful middleboxes and for keeping send and receive processing on one core with warm state. The \"drop the ports\" answer conflates symmetry with the IP-only hashing default, which is a separate misconfiguration and is not symmetric either. Symmetry is a property of the key, not of the table's size.",
+      "sourceAnchor": "4612-receive-side-scaling",
+      "difficulty": "recall"
+    },
+    {
+      "id": "46-q30",
+      "prompt": "A single high-rate multicast group — one source, one destination port — saturates one core. What does RSS offer here?",
+      "options": [
+        "Nothing — one group, one port and one source is a single flow by definition, so spreading it needs application-level partitioning or steering on inner fields.",
+        "It spreads the feed correctly as soon as `sdfn` hashing is enabled, because the multicast group address then supplies sufficient hash entropy.",
+        "It replicates the multicast frames across every RX queue, so each core sees the full feed and the application filters out what it does not own.",
+        "It spreads the feed once RPS is enabled on that queue, which distributes the packets of the single flow across the configured CPUs round-robin."
+      ],
+      "correctIndex": 0,
+      "explanation": "RSS preserves flow affinity by design, and that guarantee is exactly what prevents it from splitting a single flow — the 4-tuple is constant, so every packet hashes to the same queue no matter which fields you select. The `sdfn` answer is the trap for someone who learned the UDP hashing fix without learning what it fixes: `sdfn` helps when many distinct 4-tuples are collapsing onto one queue, not when there is genuinely only one. RPS also hashes, so it inherits the same limitation while adding an IPI per packet.",
+      "sourceAnchor": "4612-receive-side-scaling",
+      "difficulty": "trap"
+    },
+    {
+      "id": "46-q31",
+      "prompt": "Which line correctly distinguishes RSS, RPS, RFS and XPS?",
+      "options": [
+        "RSS is hardware RX steering; RPS is software RX steering via an IPI; RFS steers to the CPU where the app last called `recvmsg`; XPS picks the TX queue per CPU.",
+        "RSS is hardware RX steering; RPS steers transmits per CPU; RFS is the NIC's flow-director rule table; XPS is the software receive-hash fallback path.",
+        "RPS is hardware RX steering; RSS is its software counterpart via an IPI; RFS and XPS are both transmit-side queue selectors, in hardware and software.",
+        "RSS and RFS both run inside the NIC; RPS and XPS are their software counterparts on the receive and the transmit sides respectively."
+      ],
+      "correctIndex": 0,
+      "explanation": "Two axes separate them: hardware versus software, and receive versus transmit — RSS (HW/RX), RPS (SW/RX), RFS (SW/RX but application-aware), XPS (SW/TX). The option putting RFS inside the NIC is the subtle miss: plain RFS is a software flow table, and it is only *accelerated* RFS that programs the NIC's steering table via `ndo_rx_flow_steer`. RPS is never a hardware feature; it exists precisely for NICs that lack hardware steering.",
+      "sourceAnchor": "4613-rps-rfs-and-xps",
+      "difficulty": "recall"
+    },
+    {
+      "id": "46-q32",
+      "prompt": "Someone enables RPS on a modern 8-queue NIC that already has RSS configured, expecting better distribution. What is the actual effect?",
+      "options": [
+        "It adds an IPI of roughly 1–2 µs plus a cross-core cache-line migration of the skb per packet, on a host whose hardware already steers correctly.",
+        "It duplicates the RSS hash in software, which is redundant but essentially free because the hash result is already cached in `skb->hash`.",
+        "It steers packets to the application's own CPU, so it subsumes RFS and removes any need for explicit flow-steering rules on that interface.",
+        "It offloads the protocol stack traversal to a dedicated kernel thread per CPU, reducing the softirq load on the queue's affined core."
+      ],
+      "correctIndex": 0,
+      "explanation": "RPS is \"RSS in software\": the receiving CPU hashes, enqueues onto another CPU's backlog and sends an IPI, so on a host that already has per-queue hardware steering it is pure added cost — its legitimate use is a single-queue virtual NIC. The \"free because `skb->hash` is cached\" answer is tempting because the hash really can be reused, but the hash was never the expensive part; the IPI and the cross-core skb migration are. Steering to where the application runs is RFS, not RPS — RPS is blind to the application.",
+      "sourceAnchor": "4613-rps-rfs-and-xps",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q33",
+      "prompt": "What does configuring XPS buy you on the transmit side?",
+      "options": [
+        "The same core builds the skb, takes that queue's qdisc lock and later reaps the completion, so transmit becomes fully core-local at no latency cost.",
+        "Received packets are steered to the CPU that will send the response, pairing both directions of a connection onto a single core's warm caches.",
+        "The qdisc layer is replaced by a per-CPU lockless ring, which is the mechanism by which it removes qdisc lock contention on multi-core senders.",
+        "An IPI is sent per transmit so that completion processing runs on the queue's affined core rather than on whichever core happened to call `send()`."
+      ],
+      "correctIndex": 0,
+      "explanation": "XPS maps CPUs to TX queues, so the thread transmits on a queue whose qdisc lock and completion interrupt belong to its own core — no shared cache lines, and unlike RPS it removes cost rather than adding any. The \"replaces the qdisc with a lockless ring\" answer gets the outcome roughly right and the mechanism wrong: the qdisc layer is still there, you simply stop sharing one instance across cores. Pairing receive with transmit on one core is what a symmetric RSS key does; XPS only chooses the TX queue.",
+      "sourceAnchor": "4613-rps-rfs-and-xps",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q34",
+      "prompt": "In the `ethtool -N` n-tuple interface, what does `action -1` do and why is it interesting?",
+      "options": [
+        "It drops the matching packet in the NIC, making it the cheapest possible filter because no PCIe transfer takes place at all.",
+        "It routes the matching packet to the default RSS queue, where an attached BPF program then decides whether to drop or to pass it.",
+        "It disables the rule while leaving it in the table, so it can be re-enabled later without consuming a fresh rule identifier slot.",
+        "It delivers a copy of the matching packet to every RX queue, which is how hardware multicast fan-out is configured on capable NICs."
+      ],
+      "correctIndex": 0,
+      "explanation": "A drop action is a hardware ACL: the frame never crosses PCIe, never consumes a descriptor and never allocates an skb, so it costs strictly less than any software filter including XDP. The \"send to the default queue for BPF to decide\" answer is plausible because that pipeline exists, but it describes a pass action followed by software work, which is the opposite of what `-1` saves. Non-negative values name the destination queue, which is how a feed is bound to a specific ring.",
+      "sourceAnchor": "4614-flow-steering",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q35",
+      "prompt": "A feed handler that was carefully steered to an isolated core \"got slower and nothing changed\" after an overnight link flap. What is the most likely cause?",
+      "options": [
+        "n-tuple rules are lost across link down/up and driver reloads, so the feed reverted to the default queue and the housekeeping core; re-apply them from a udev rule or startup script.",
+        "Rules persist in the NIC's NVRAM across resets, so the real risk is a stale rule surviving a reconfiguration rather than a live rule disappearing.",
+        "The kernel stores the rules and re-pushes them automatically on link up, so the only genuine hazard with n-tuple steering is table exhaustion.",
+        "Rules survive a driver reload but are flushed whenever `ethtool -L` changes the queue count, which is the only way that they can ever be lost."
+      ],
+      "correctIndex": 0,
+      "explanation": "Steering rules live in device state that does not survive a link flap or a driver reload, and their disappearance is silent — the traffic still arrives, just on the default queue and the housekeeping core, which is why the incident presents as an unexplained regression. The \"kernel re-pushes them automatically\" answer is the belief that causes the outage; the kernel does that for aRFS entries it owns, not for administrator-installed n-tuple rules. Table exhaustion and signature-mode hash collisions are additional failure modes, not the whole set.",
+      "sourceAnchor": "4614-flow-steering",
+      "difficulty": "trap"
+    },
+    {
+      "id": "46-q36",
+      "prompt": "A host is tuned with per-queue IRQ affinity, and a latency regression reliably appears a few minutes after every boot with no application change. What should you check first?",
+      "options": [
+        "`irqbalance` is running and has redistributed the queue's MSI-X vector to another core, possibly on the wrong NUMA node; disable it or ban the isolated CPUs.",
+        "`irqbalance` only rewrites affinity for vectors whose `smp_affinity` was never set explicitly, so an explicitly pinned vector is safe and the cause is elsewhere.",
+        "`irqbalance` migrates the application thread rather than the interrupt, so the correct remedy is `taskset` on the handler rather than touching the daemon.",
+        "`irqbalance` raises the NAPI budget on cores it considers busy, which appears as a rising `time_squeeze` on the handler core once the host warms up."
+      ],
+      "correctIndex": 0,
+      "explanation": "The daemon periodically rewrites `/proc/irq/N/smp_affinity` to spread load, which undoes your placement mid-session and can land the vector on the wrong socket — the delayed onset and the absence of any correlated application change are the giveaway. The \"only touches unpinned vectors\" answer is the dangerous misconception that leads people to leave the daemon running; it rebalances vectors regardless of what you wrote. `irqbalance` never moves threads and has no influence on the NAPI budget.",
+      "sourceAnchor": "4615-per-queue-interrupt-affinity",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q37",
+      "prompt": "`cat /sys/class/net/eth0/device/numa_node` prints `-1`. What does that mean?",
+      "options": [
+        "The BIOS did not report the PCIe device's node affinity, so the driver cannot honour `dev_to_node()` and ring buffers land arbitrarily — a few hundred ns per packet.",
+        "The device is attached equally to every node, so its DMA traffic is interleaved across the interconnect and no further NUMA tuning is warranted here.",
+        "The NIC has no DMA engine on this platform and is driven by programmed I/O, which is why NUMA placement of its rings is irrelevant to performance.",
+        "Automatic NUMA balancing has already migrated the ring pages to the optimal node, and `-1` is how the kernel reports that no further action is needed."
+      ],
+      "correctIndex": 0,
+      "explanation": "`-1` means \"unknown\", not \"anywhere is fine\": the driver loses the information it would use to allocate rings on the NIC's own socket, and the result is a consistent per-packet penalty that shows up as an unexplained latency difference between two supposedly identical handlers. The \"attached to every node\" reading is the intuitive one and is what makes people ignore the value — a PCIe device hangs off exactly one socket's root complex, so equal attachment is not physically possible. The fix is in the BIOS, verified with `lstopo`.",
+      "sourceAnchor": "4615-per-queue-interrupt-affinity",
+      "difficulty": "recall"
+    },
+    {
+      "id": "46-q38",
+      "prompt": "`ethtool -S eth0` shows `rx_missed_errors` climbing steadily. Where is the loss, and what should you investigate?",
+      "options": [
+        "The NIC's internal FIFO overflowed, so the PCIe/DMA path could not keep up; check link width with `lspci -vvv`, IOMMU mode, DDIO and competing devices on the root port.",
+        "The driver failed to refill the RX ring in time, which is softirq starvation; isolate the handler core, fix the IRQ affinity and turn on threaded NAPI.",
+        "The socket receive buffer overflowed while the handler was behind; raise `SO_RCVBUF` within reason, speed up the handler, or fan out with `SO_REUSEPORT`.",
+        "The per-CPU backlog filled on the RPS delivery path; disable RPS on that queue or raise `net.core.netdev_max_backlog` to absorb the arriving bursts."
+      ],
+      "correctIndex": 0,
+      "explanation": "`rx_missed_errors`/`rx_fifo_errors` are charged below the driver: the frame reached the NIC but could not be moved into host memory, so no amount of software tuning helps and blaming the application is a classic misdiagnosis. The softirq-starvation answer is the closest miss because it is also a NIC-adjacent drop, but that one is `rx_no_buffer_count`/`rx_ring_full` — the driver not refilling, which really is a software problem. Socket-buffer and backlog drops sit further up and appear in `nstat` and `softnet_stat` respectively.",
+      "sourceAnchor": "4616-nic-and-kernel-packet-drop-accounting",
+      "difficulty": "application"
+    },
+    {
+      "id": "46-q39",
+      "prompt": "Your feed shows sequence gaps, but `ethtool -S`, `/proc/net/softnet_stat`, `nstat` and `ss -tim` are all clean. What is the most likely explanation?",
+      "options": [
+        "A microburst overflowed the switch's egress buffer upstream; host counters are clean by construction and only sequence numbers or a passive tap reveal it.",
+        "The kernel discarded the datagrams inside `ip_rcv` without incrementing any counter, which is why even `perf trace -e skb:kfree_skb` cannot locate them.",
+        "GRO merged the missing datagrams into a neighbouring skb and then discarded the merged result, so no drop counter anywhere on the host increments.",
+        "The aggregate `dropped` column of `ip -s link` would have revealed it, since the per-stage counters do not cover multicast traffic at all."
+      ],
+      "correctIndex": 0,
+      "explanation": "Loss that happens before the packet reaches your NIC is invisible from the host — that is precisely why every market-data protocol carries a sequence number, and why the next step is switch counters or a passive tap with hardware timestamps. The \"silent kernel drop\" answer is tempting because unattributable drops did once exist, but since 5.17 `kfree_skb` carries a drop-reason enum and every software drop site is attributable. `ip -s link` is an aggregate of the same per-stage counters you already checked, so it cannot reveal anything they missed.",
+      "sourceAnchor": "4616-nic-and-kernel-packet-drop-accounting",
+      "difficulty": "trap"
+    },
+    {
+      "id": "46-q40",
+      "prompt": "Which tool gives the definitive answer to \"which kernel code path freed this packet\", and what did kernel 5.17 add to it?",
+      "options": [
+        "`perf trace -e skb:kfree_skb` or the equivalent bpftrace probe; 5.17 attached an `SKB_DROP_REASON_*` enum, so drops print as `NO_SOCKET`, `SOCKET_RCVBUFF` and so on.",
+        "`ip -s -s link show eth0`; 5.17 split its aggregate `dropped` column into per-stage sub-counters, so each layer's contribution can now be read off directly.",
+        "`ethtool -S eth0`; 5.17 standardised the vendor counter names so that software-stage drops such as socket overflow now appear alongside the hardware ones.",
+        "`nstat -az`; 5.17 added the freeing kernel function to each protocol counter, which is what finally made the older `dropwatch` tool redundant."
+      ],
+      "correctIndex": 0,
+      "explanation": "The `skb:kfree_skb` tracepoint fires at the actual free site, so a stack trace or the drop reason names the exact code path — this is what turned drop diagnosis from guesswork into a lookup. The `ethtool -S` answer is the most tempting because those counters really are the ground truth for *hardware* loss, but they are vendor-specific device counters and know nothing about socket-layer drops. `ip -s link` remains an aggregate that hides the stage, which is why the chapter warns against using it to localise loss.",
+      "sourceAnchor": "4616-nic-and-kernel-packet-drop-accounting",
+      "difficulty": "recall"
+    }
+  ]
+}

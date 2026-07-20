@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-44-build-and-analysis-tooling",
+  "questions": [
+    {
+      "id": "44-q01",
+      "prompt": "Which Compiler Explorer companion view gives a *static* per-cycle throughput and port-pressure estimate for a block of generated code?",
+      "options": [
+        "`llvm-mca`, which models issue ports and cycle counts for a block without executing it.",
+        "`cppinsights.io`, which measures the block's cycle count on the selected target CPU.",
+        "The opt-remarks pane, which reports the measured cycles spent in each basic block.",
+        "The preprocessor-output pane, which annotates every emitted instruction with its latency."
+      ],
+      "correctIndex": 0,
+      "explanation": "`llvm-mca` is the static machine-code analyser: it estimates throughput and port pressure from the instruction stream alone. The opt-remarks pane is the tempting near-miss — it does exist and is genuinely useful, but it reports which optimizations fired or failed, not measured cycles. cppinsights.io shows source-level transformations (implicit conversions, generated special members), and the preprocessor pane shows expanded source; neither measures anything.",
+      "sourceAnchor": "441-compiler-explorer",
+      "difficulty": "recall"
+    },
+    {
+      "id": "44-q02",
+      "prompt": "You paste a function into Compiler Explorer, call it with literal arguments from a wrapper, and the assembly pane shows almost nothing. What happened?",
+      "options": [
+        "The constant arguments were folded and the result dead-code-eliminated; pass values as parameters from a non-static, non-inline function.",
+        "Compiler Explorer elides bodies below a size threshold; raising the optimization level makes the full listing reappear.",
+        "The snippet was built with `-march=native`, which the site resolves to an empty baseline and suppresses codegen.",
+        "Assembly is emitted only for functions the linker retains; adding `-flto` keeps the body in the listing."
+      ],
+      "correctIndex": 0,
+      "explanation": "Constant inputs let the optimizer evaluate the whole call at compile time and then delete it, so you measure nothing. The fix is to make the inputs opaque (parameters, `volatile`, or an `extern` source) and to export the function so DCE cannot remove it. The `-march=native` answer is wrong on its own terms: Compiler Explorer has no fixed native target, so `-march=native` is not available at all and you must name the target explicitly.",
+      "sourceAnchor": "441-compiler-explorer",
+      "difficulty": "trap"
+    },
+    {
+      "id": "44-q03",
+      "prompt": "How does AddressSanitizer's shadow memory map application memory, and what does that mapping cost?",
+      "options": [
+        "One shadow byte per 8 application bytes, encoding addressability or a poison reason; the shadow costs 1/8 of the address space.",
+        "One shadow bit per application bit, encoding definedness; the shadow costs the same size as the application heap.",
+        "One shadow byte per application byte, encoding the owning allocation id; the shadow costs 1x the address space.",
+        "Four shadow records per 8 application bytes, holding recent accesses; the shadow costs 4x application memory."
+      ],
+      "correctIndex": 0,
+      "explanation": "ASan's 8:1 granularity is what makes the shadow affordable at 1/8 of the address space, and the byte encodes both how many of the 8 bytes are addressable and a negative poison code naming the reason. The per-bit definedness shadow described here belongs to MSan, and the four-recent-access-records-per-word shadow belongs to TSan; both are real designs, just not ASan's.",
+      "sourceAnchor": "442-addresssanitizer",
+      "difficulty": "recall"
+    },
+    {
+      "id": "44-q04",
+      "prompt": "Your engine allocates all hot objects from a custom arena carved out of one large `malloc`. You run the test suite under ASan and it reports nothing. What is the correct conclusion?",
+      "options": [
+        "The arena is one valid block to ASan, so intra-arena overflows are invisible until you call `__asan_poison_memory_region` on free.",
+        "The arena is one valid block to ASan, so overflows are reported against the enclosing block with an approximate offset.",
+        "ASan disables itself when it sees a replaced allocator, so the run silently produced no instrumentation at all.",
+        "ASan tracks arena sub-allocations through its allocator interceptors, so a clean run means the arena is genuinely clean."
+      ],
+      "correctIndex": 0,
+      "explanation": "ASan only knows about allocations made through the allocator it replaces; a bump-pointer arena is a single giant valid region, so writing past one sub-object into the next is an ordinary in-bounds store. Manually poisoning and unpoisoning sub-blocks with `__asan_poison_memory_region`/`__asan_unpoison_memory_region` restores detection. The answer claiming ASan follows sub-allocations through interceptors is the seductive one — interceptors exist, but they hook `malloc`/`free`, not your arena's internal bookkeeping.",
+      "sourceAnchor": "442-addresssanitizer",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q05",
+      "prompt": "A struct holds `char name[8];` immediately followed by `uint64_t seq;`. A loop writes 12 bytes into `name`. Does ASan report it?",
+      "options": [
+        "No — the fields are contiguous with no redzone between them, so the write lands in another member of the same object.",
+        "Yes — ASan places a redzone around every member of every aggregate, so member-to-member overflow is caught.",
+        "Yes, but only under `ASAN_OPTIONS=detect_stack_use_after_return=1`, which extends checking into aggregates.",
+        "No — ASan checks only heap allocations, so a struct member overflow is never visible to it anywhere."
+      ],
+      "correctIndex": 0,
+      "explanation": "Redzones surround allocations, not fields, and the layout of a struct is fixed by the ABI — there is nowhere to put poison between `name` and `seq`, so the 12-byte write is an in-bounds store as far as the shadow is concerned. The claim that ASan never sees struct overflow at all overshoots: if the struct is the last thing in its allocation, a write past its end does hit the redzone and is reported. `detect_stack_use_after_return` concerns frames outliving their function, not aggregate layout.",
+      "sourceAnchor": "442-addresssanitizer",
+      "difficulty": "trap"
+    },
+    {
+      "id": "44-q06",
+      "prompt": "A service crashes at startup depending on link order, and you suspect the static initialization order fiasco. Which ASan configuration surfaces it?",
+      "options": [
+        "`ASAN_OPTIONS=check_initialization_order=1:strict_init_order=1`, which flags reads of a global initialized in another TU too late.",
+        "`ASAN_OPTIONS=detect_stack_use_after_return=1`, which flags reads of a global whose initializer frame has already returned.",
+        "`ASAN_OPTIONS=strict_string_checks=1`, which flags reads of a global before its dynamic initializer has been recorded.",
+        "`ASAN_OPTIONS=quarantine_size_mb=0`, which flags reads of a global whose storage has not yet been released."
+      ],
+      "correctIndex": 0,
+      "explanation": "`check_initialization_order` plus `strict_init_order` is ASan's genuinely non-obvious feature for exactly this bug: it tracks which dynamic initializers have run and reports a cross-TU read of a not-yet-initialized global. `detect_stack_use_after_return` is the tempting one because it also sounds like a lifetime check, but it detects reuse of a *stack* frame after the function returns and has nothing to do with global initializer ordering.",
+      "sourceAnchor": "442-addresssanitizer",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q07",
+      "prompt": "What does `-fsanitize-trap=undefined` do that the default UBSan mode does not?",
+      "options": [
+        "It emits a bare trap instruction with no runtime library and near-zero code size, making UBSan checks shippable in production builds.",
+        "It links a smaller diagnostic runtime that prints one-line messages, halving the reporting overhead of the default mode.",
+        "It aborts on the first violation while still printing the full diagnostic, which is the standard configuration for CI gating.",
+        "It defers all diagnostics to process exit and prints a deduplicated summary, so a single run reports each site once."
+      ],
+      "correctIndex": 0,
+      "explanation": "Trap mode replaces the diagnostic call with a `ud2`/`brk`, so there is no runtime to link and essentially no size cost — you get an immediate crash and a core dump instead of silent UB, which is what makes it viable in shipping binaries. The abort-with-full-diagnostic description belongs to `-fno-sanitize-recover=undefined`, the correct CI setting; the small-runtime-with-short-messages description is `-fsanitize-minimal-runtime`.",
+      "sourceAnchor": "443-undefinedbehaviorsanitizer",
+      "difficulty": "recall"
+    },
+    {
+      "id": "44-q08",
+      "prompt": "You suspect code is calling a virtual function through a pointer to an already-destroyed polymorphic object. Which UBSan check targets that?",
+      "options": [
+        "`vptr`, which validates the dynamic type before a virtual call and needs RTTI and the C++ runtime.",
+        "`object-size`, which validates that the object's storage is still live before a virtual call is issued.",
+        "`null`, which validates that the vtable pointer is non-null before dispatching through it.",
+        "`function`, which validates that the object's destructor has not yet run before the call proceeds."
+      ],
+      "correctIndex": 0,
+      "explanation": "The `vptr` check inspects the vptr against the expected dynamic type, which catches both use-after-free of polymorphic objects and bad `static_cast` down-casts; it requires RTTI and the C++ runtime. The `function` check is the plausible decoy — it is real, but it catches calling a *function pointer* through the wrong type, not object lifetime. `object-size` covers accesses beyond a known object size and `null` covers null dereference.",
+      "sourceAnchor": "443-undefinedbehaviorsanitizer",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q09",
+      "prompt": "A reviewer says '`-fsanitize=undefined` is on in CI, so unsigned wraparound and strict-aliasing violations are covered.' What is wrong?",
+      "options": [
+        "Neither is in the `undefined` group: aliasing is not checked at all, and unsigned overflow is defined behavior with its own opt-in flag.",
+        "Both are checked, but only at `-O2` or higher, so a debug CI configuration silently skips them.",
+        "Aliasing is covered by the `pointer-overflow` check, but unsigned overflow needs `-fno-sanitize-recover` to be reported.",
+        "Both are checked, but reports are suppressed unless `UBSAN_OPTIONS=print_stacktrace=1` is exported in the environment."
+      ],
+      "correctIndex": 0,
+      "explanation": "Strict-aliasing violations, data races, uninitialized reads, and most lifetime issues are outside UBSan entirely, and unsigned overflow is well-defined, so it sits behind the separate, off-by-default `-fsanitize=unsigned-integer-overflow` (kept off because it fires on legitimate hashing code). The `print_stacktrace` answer is tempting because that option genuinely is off by default — but it degrades report quality, it does not gate whether a check exists.",
+      "sourceAnchor": "443-undefinedbehaviorsanitizer",
+      "difficulty": "trap"
+    },
+    {
+      "id": "44-q10",
+      "prompt": "On what basis does ThreadSanitizer decide two accesses constitute a data race?",
+      "options": [
+        "Vector clocks: two accesses to one location, at least one a write, unordered by happens-before in the observed execution.",
+        "Lock sets: two accesses to one location, at least one a write, made while no common mutex was held by both threads.",
+        "Interleaving exploration: the scheduler is perturbed until an ordering producing an incorrect result is found.",
+        "Shadow bit propagation: a value written by one thread is read by another before its shadow is marked clean."
+      ],
+      "correctIndex": 0,
+      "explanation": "TSan maintains a vector clock per thread, updated at intercepted synchronization points, and compares each access against per-word shadow records, so it *proves* the absence of ordering rather than guessing — hence essentially no false positives. Lock-set analysis is the plausible wrong answer: it is the classic alternative technique (used by Helgrind/DRD) and it is exactly what TSan does not do, which is why TSan does not report 'possible' races.",
+      "sourceAnchor": "444-threadsanitizer",
+      "difficulty": "recall"
+    },
+    {
+      "id": "44-q11",
+      "prompt": "TSan floods you with reports on a hand-rolled seqlock that uses inline-asm fences. What is the right response?",
+      "options": [
+        "Annotate the protocol with `__tsan_acquire`/`__tsan_release` so TSan can see the happens-before edges it cannot infer.",
+        "Raise `TSAN_OPTIONS=history_size` so the shadow keeps enough access records to order the seqlock's reads correctly.",
+        "Rebuild the seqlock's translation unit without instrumentation so TSan stops tracking those accesses entirely.",
+        "Switch the version counter to `std::atomic` with `memory_order_relaxed`, which restores the ordering TSan needs."
+      ],
+      "correctIndex": 0,
+      "explanation": "Custom synchronization built on inline asm or `volatile` is invisible to TSan's interception, so it genuinely cannot see the ordering and reports true-by-its-model false positives; the annotation API tells it where the edges are. The relaxed-atomic answer is the trap: relaxed operations deliberately carry no acquire/release ordering, so the reports would remain. Leaving the TU uninstrumented creates a blind spot and can produce further false positives elsewhere rather than fixing anything.",
+      "sourceAnchor": "444-threadsanitizer",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q12",
+      "prompt": "You want race detection and heap-overflow detection covering the same integration test. How should the build be set up?",
+      "options": [
+        "Two separate binaries — one `-fsanitize=thread`, one `-fsanitize=address` — because TSan cannot be combined with ASan.",
+        "One binary with `-fsanitize=thread,address`, which is supported and costs roughly the sum of the two slowdowns.",
+        "One binary with `-fsanitize=thread` plus `ASAN_OPTIONS=detect_leaks=1`, which enables ASan's checks inside TSan.",
+        "One binary with `-fsanitize=address` plus `TSAN_OPTIONS=halt_on_error=0`, which layers race detection on top."
+      ],
+      "correctIndex": 0,
+      "explanation": "TSan's shadow layout and runtime are incompatible with ASan's and with MSan's, so they cannot coexist in one binary and you build separate configurations. The combined-flags answer is tempting because ASan and UBSan genuinely do combine as `-fsanitize=address,undefined` — that compatibility does not extend to TSan. Setting environment options for a sanitizer that was never compiled in does nothing at all.",
+      "sourceAnchor": "444-threadsanitizer",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q13",
+      "prompt": "MemorySanitizer stays silent while your code `memcpy`s an uninitialized struct into a buffer, then reports at a later `if`. Why?",
+      "options": [
+        "Poison propagates through computation and is reported only when it reaches a branch, an address, or a syscall argument.",
+        "Poison is checked only at allocation boundaries, so a copy inside one block cannot trigger a report at all.",
+        "Poison is cleared by any `memcpy`, so the branch report must come from a second, independent uninitialized value.",
+        "Poison is reported lazily at process exit, so all diagnostics appear after the last branch has executed."
+      ],
+      "correctIndex": 0,
+      "explanation": "MSan keeps a bit-level shadow that flows through arithmetic and copies, and deliberately defers the diagnostic until the poisoned value influences observable behavior — that deferral is precisely what keeps its false-positive rate manageable. The claim that `memcpy` clears the poison inverts the design: the copy faithfully copies the shadow along with the bytes, which is why the later branch still knows the value is undefined.",
+      "sourceAnchor": "445-memorysanitizer",
+      "difficulty": "recall"
+    },
+    {
+      "id": "44-q14",
+      "prompt": "A first MSan run on your service produces thousands of reports pointing into standard-library internals. What is the most likely cause?",
+      "options": [
+        "The standard library and third-party dependencies were not built instrumented, so their writes still look poisoned to MSan.",
+        "Origin tracking was left off, so MSan cannot attribute values and defaults to blaming the nearest library frame.",
+        "The binary was linked without `-fno-omit-frame-pointer`, so MSan misattributes every report to the innermost library frame.",
+        "MSan's shadow is per-byte rather than per-bit, so partially initialized library structs are reported as fully poisoned."
+      ],
+      "correctIndex": 0,
+      "explanation": "MSan requires an instrumented world — including libc++ or libstdc++ and every dependency — because code it did not instrument writes memory whose shadow is never cleaned, and that shows up as a flood of false positives. This deployment cost is the reason MSan is far less used than ASan. Missing origin tracking is the plausible decoy: `-fsanitize-memory-track-origins=2` changes how *actionable* a report is, not how many spurious ones you get.",
+      "sourceAnchor": "445-memorysanitizer",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q15",
+      "prompt": "How does LeakSanitizer decide that a block has leaked, and what does that mechanism imply?",
+      "options": [
+        "A conservative stop-the-world scan from globals, stacks, TLS, and registers at exit; conservatism yields false negatives.",
+        "Reference counting maintained by allocator interceptors during the run; missed decrements yield false positives.",
+        "A precise type-aware trace of every allocation graph edge at exit; imprecise roots yield occasional false positives.",
+        "Shadow-memory bookkeeping updated on every store; unscanned regions yield both false positives and negatives."
+      ],
+      "correctIndex": 0,
+      "explanation": "LSan runs a mark-and-sweep from roots at exit (or on demand via `__lsan_do_leak_check()`), treating any word that looks like a pointer into a live block as a reference — so a stray integer can keep a genuinely leaked block alive and the leak goes unreported. That direction matters: conservative scanning produces false *negatives*, never false positives, so any answer promising false positives has the failure mode backwards.",
+      "sourceAnchor": "446-leaksanitizer",
+      "difficulty": "recall"
+    },
+    {
+      "id": "44-q16",
+      "prompt": "Your process RSS grows steadily over a trading session, but a clean LSan run reports zero leaks. Which explanations are consistent with that?",
+      "options": [
+        "A cache that never evicts, or a `shared_ptr` cycle — the memory is still reachable, so it is not a leak by LSan's definition.",
+        "A cache that never evicts, or leaked file descriptors — LSan scans only the heap and cannot reach either of them.",
+        "A `shared_ptr` cycle, or a double free — both leave the allocator's metadata in a state LSan declines to report.",
+        "Fragmentation of the arena, or a leak from a detached thread — LSan defers both to the next explicit leak check."
+      ],
+      "correctIndex": 0,
+      "explanation": "LSan defines a leak as memory with no remaining reference, so both an unbounded cache and a reference cycle fail its test — the cycle is reachable from itself. Growth of still-referenced memory is the more common production failure and needs Massif/heaptrack/RSS monitoring instead. Grouping the cache with file-descriptor leaks is the tempting mix: fd leaks are indeed invisible to LSan, but because they are not memory at all, not because of scan coverage.",
+      "sourceAnchor": "446-leaksanitizer",
+      "difficulty": "trap"
+    },
+    {
+      "id": "44-q17",
+      "prompt": "A crash is traced to a write past the end of a local `char buf[64]`. You have run the binary under `valgrind --leak-check=full` with no findings. Why?",
+      "options": [
+        "Stack memory is addressable, so Memcheck sees a legal store; ASan's poisoned stack redzones do catch it.",
+        "Memcheck reports stack errors only with `--track-origins=yes`, which was not enabled in that invocation.",
+        "Memcheck serializes threads, so a stack overflow in a non-main thread is never reached during the run.",
+        "Memcheck reports stack errors only as 'possibly lost' entries, which `--leak-check=full` filters out of the summary."
+      ],
+      "correctIndex": 0,
+      "explanation": "Memcheck's model is A bits and V bits over addressable memory; a local array's neighbours on the stack are perfectly addressable, so the overrun looks like an ordinary store and nothing is reported — the same blind spot applies to globals and to overflow from one heap block into an adjacent one. Thread serialization is real and does distort timing and hide races, but it does not explain a missed single-threaded stack overrun.",
+      "sourceAnchor": "447-valgrind-memcheck",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q18",
+      "prompt": "In a Memcheck leak report, what does the 'still reachable' category mean?",
+      "options": [
+        "A live pointer to the block exists at exit — usually a singleton, and usually not a bug.",
+        "Only an interior pointer to the block remains, which is common and usually benign for string-like types.",
+        "The block is reachable only from another block that itself has no remaining pointer to it.",
+        "No pointer to the block remains anywhere, making it the category that denotes a genuine leak."
+      ],
+      "correctIndex": 0,
+      "explanation": "'Still reachable' means something still points at the block when the process exits, which is the normal state of a singleton or a lazily-created global. The interior-pointer description is 'possibly lost', reachable-only-from-a-lost-block is 'indirectly lost', and no pointer at all is 'definitely lost' — the category you actually gate CI on with `--errors-for-leak-kinds=definite`.",
+      "sourceAnchor": "447-valgrind-memcheck",
+      "difficulty": "recall"
+    },
+    {
+      "id": "44-q19",
+      "prompt": "You want every access to a mutex-protected member checked for correct lock discipline, without a 5-15x slowdown or a lucky interleaving. What do you reach for?",
+      "options": [
+        "Clang thread-safety analysis: `GUARDED_BY`/`REQUIRES` annotations verified statically at compile time, at zero runtime cost.",
+        "Clang Static Analyzer via `scan-build`, whose path-sensitive symbolic execution proves lock discipline across translation units.",
+        "clang-tidy's `concurrency-mt-unsafe` check, which verifies that each member access is dominated by the matching lock acquisition.",
+        "Valgrind DRD, whose lock-set analysis verifies lock discipline on a release binary with no annotations or recompilation."
+      ],
+      "correctIndex": 0,
+      "explanation": "`-Wthread-safety` with `GUARDED_BY`/`REQUIRES`/`ACQUIRE`/`RELEASE` makes the compiler check statically that every annotated member is touched with the right lock held — near-zero false positives, no runtime cost, and it catches the class of bug TSan needs a heavy run and a lucky schedule to hit. `concurrency-mt-unsafe` is a genuine clang-tidy check, but it flags calls to thread-unsafe library functions; it does not verify per-member lock discipline.",
+      "sourceAnchor": "448-static-analysis",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q20",
+      "prompt": "Enabling clang-tidy across a mature codebase produces 5000 findings. Which rollout keeps the tool alive?",
+      "options": [
+        "Baseline the existing findings as accepted, gate only the diff against the merge base, and ratchet the baseline down over time.",
+        "Narrow the check list until the initial run is clean, then re-enable check families one at a time across the whole tree.",
+        "Apply `--fix` across the tree in one commit, then enforce a zero-warning policy on all files from that point forward.",
+        "Run the full check set nightly without gating, and file the findings as a backlog for the owning teams to burn down."
+      ],
+      "correctIndex": 0,
+      "explanation": "Baseline-plus-diff-gating is the pattern that works because it makes new code clean immediately while never blocking anyone on legacy debt; `clang-tidy-diff.py` against the merge base is the concrete mechanism, and every suppression should carry a written justification. Mass `--fix` is the plausible-sounding trap: many checks have no fix-it at all, and a tree-wide automated rewrite is unreviewable and risks semantic change.",
+      "sourceAnchor": "448-static-analysis",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q21",
+      "prompt": "Which statement about `-Wconversion` and `-Werror` matches the chapter's guidance?",
+      "options": [
+        "`-Wconversion` is the highest-value and noisiest flag, best introduced per-directory; `-Werror` belongs in CI with a pinned compiler.",
+        "`-Wconversion` is low-noise once `-Wall -Wextra` is on, so it can be enabled tree-wide alongside `-Werror` in developer builds.",
+        "`-Wconversion` is subsumed by `-Wsign-conversion`, so enabling the latter tree-wide with `-Werror` gives the same coverage.",
+        "`-Wconversion` is portable across GCC and Clang, so `-Werror` in developer builds carries no toolchain-upgrade risk."
+      ],
+      "correctIndex": 0,
+      "explanation": "Enabling `-Wconversion` on a mature codebase yields thousands of findings, mostly benign but some genuine — a `size_t`-to-`int` truncation in a length field is a remote-code-execution primitive — so it goes in directory by directory. `-Werror` in developer builds is the contentious one, since a new compiler version becomes a build break for the whole team; CI-only with a pinned compiler is the standard resolution. Warning sets are explicitly *not* portable between GCC and Clang.",
+      "sourceAnchor": "449-compiler-warnings",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q22",
+      "prompt": "Which warning flag flags deleting a derived object through a base pointer whose destructor is not virtual?",
+      "options": [
+        "`-Wnon-virtual-dtor`",
+        "`-Woverloaded-virtual`",
+        "`-Wsuggest-override`",
+        "`-Wuseless-cast`"
+      ],
+      "correctIndex": 0,
+      "explanation": "`-Wnon-virtual-dtor` is the flag for the polymorphic-deletion hazard, and it is one of the deliberate additions beyond `-Wall -Wextra` that interviewers expect you to name. `-Woverloaded-virtual` is the closest relative and also concerns virtual functions, but it fires when a derived function *hides* rather than overrides a base one; `-Wsuggest-override` flags a missing `override` keyword and `-Wuseless-cast` flags no-op casts.",
+      "sourceAnchor": "449-compiler-warnings",
+      "difficulty": "recall"
+    },
+    {
+      "id": "44-q23",
+      "prompt": "A CMake sanitizer build compiles fine but fails at link with undefined symbols such as `__asan_report_load8`. What is the fix?",
+      "options": [
+        "Add `-fsanitize=address` to `target_link_options` as well — it was only in `target_compile_options`.",
+        "Add `-fno-omit-frame-pointer` and `-g` to the target so the sanitizer runtime's symbols can be resolved.",
+        "Export `ASAN_OPTIONS=halt_on_error=0` before linking so the driver links the sanitizer runtime.",
+        "Set `CMAKE_EXPORT_COMPILE_COMMANDS=ON` so the link line inherits the target's sanitizer flags."
+      ],
+      "correctIndex": 0,
+      "explanation": "`-fsanitize=address` on the compile line inserts calls into the ASan runtime, and only the same flag on the *link* line makes the driver actually link that runtime — omitting the link side is described as the single most common CMake sanitizer mistake. `-fno-omit-frame-pointer` and `-g` are genuinely required for readable reports, which is what makes them the tempting answer, but they affect diagnostics quality, not symbol resolution.",
+      "sourceAnchor": "4410-the-cmake-target-model",
+      "difficulty": "trap"
+    },
+    {
+      "id": "44-q24",
+      "prompt": "Why should `target_link_libraries(core PUBLIC fmt::fmt)` be preferred over `target_link_libraries(core PUBLIC fmt)`?",
+      "options": [
+        "A missing namespaced target is a configure-time error, while a bare name silently degrades to a raw `-lfmt` at link time.",
+        "A namespaced target propagates usage requirements, while a bare name links the archive without any include directories.",
+        "A namespaced target is required for `PUBLIC` propagation, since bare names are treated as `PRIVATE` regardless of keyword.",
+        "A namespaced target resolves through `find_package`, while a bare name is only valid inside the directory that defined it."
+      ],
+      "correctIndex": 0,
+      "explanation": "CMake treats any name containing `::` as necessarily a target and errors immediately if it does not exist; a bare name that matches no target falls through to a plain `-lfmt`, converting a clear configure-time failure into a confusing link-time one. The propagation answer is the near-miss: if the bare name *does* resolve to a real target, usage requirements propagate exactly the same way — the difference is entirely in the failure mode.",
+      "sourceAnchor": "4410-the-cmake-target-model",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q25",
+      "prompt": "What does setting `CMAKE_EXPORT_COMPILE_COMMANDS=ON` produce, and who consumes it?",
+      "options": [
+        "`compile_commands.json`, the per-TU command database that clang-tidy, clangd, and IWYU require.",
+        "`CMakePresets.json`, the shareable configure/build/test invocation record that IDEs and CI consume.",
+        "`compile_commands.json`, a content-addressed cache index that ccache and sccache require for hits.",
+        "`MODULE.bazel.lock`, the pinned dependency manifest that hermetic build wrappers consume."
+      ],
+      "correctIndex": 0,
+      "explanation": "The compilation database records the exact flags for every translation unit, which is how a standalone tool reproduces the compiler's view of your code — clang-tidy needs `-p build/` pointing at it. Presets are a real and separate mechanism for making the configure/build invocation reproducible, but they are hand-authored in `CMakePresets.json`, not generated by this variable, and no analysis tool reads them for flags.",
+      "sourceAnchor": "4410-the-cmake-target-model",
+      "difficulty": "recall"
+    },
+    {
+      "id": "44-q26",
+      "prompt": "`core`'s public header includes `<fmt/core.h>`; its `book.cpp` includes `<zlib.h>` and nothing else does. What are the right keywords?",
+      "options": [
+        "`PUBLIC fmt::fmt` and `PRIVATE ZLIB::ZLIB`, because the test is whether the dependency appears in your headers.",
+        "`PRIVATE fmt::fmt` and `PRIVATE ZLIB::ZLIB`, because both are consumed by `core`'s own sources when it builds.",
+        "`PUBLIC fmt::fmt` and `PUBLIC ZLIB::ZLIB`, because both must be present on the link line of every consumer.",
+        "`INTERFACE fmt::fmt` and `PRIVATE ZLIB::ZLIB`, because `core` includes the header without needing to link it."
+      ],
+      "correctIndex": 0,
+      "explanation": "The decision rule is header versus implementation: fmt appears in `core`'s interface so consumers must get its include directories, while zlib is confined to a `.cpp` and stays `PRIVATE`. The all-`PUBLIC` answer is the common lazy choice and it is wrong for a reason worth stating — with static libraries CMake already propagates the *link* requirement of a `PRIVATE` dependency via `$<LINK_ONLY:...>`, so marking zlib `PUBLIC` buys nothing and injects its headers and types into every downstream TU and into your ABI surface.",
+      "sourceAnchor": "4411-public-private-and-interface-dependencies",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q27",
+      "prompt": "`core` is a static library with `target_link_libraries(core PRIVATE ZLIB::ZLIB)`. What reaches an executable that links `core`?",
+      "options": [
+        "The link requirement propagates via `$<LINK_ONLY:...>`, but zlib's include directories and definitions do not.",
+        "Nothing propagates, so the executable must repeat `ZLIB::ZLIB` itself or the link fails with undefined symbols.",
+        "Everything propagates, because a static archive cannot record which of its usage requirements were marked private.",
+        "The include directories propagate but the link requirement does not, so headers resolve and symbols do not."
+      ],
+      "correctIndex": 0,
+      "explanation": "A static archive does not resolve its own dependencies, so the zlib objects must still appear on the final link line; CMake handles that with `$<LINK_ONLY:...>` while correctly withholding the include directories and compile definitions. The 'nothing propagates' answer is the intuitive reading of PRIVATE and is exactly the trap — PRIVATE describes usage requirements, and the link requirement is the one part that must survive for static libraries to work at all.",
+      "sourceAnchor": "4411-public-private-and-interface-dependencies",
+      "difficulty": "trap"
+    },
+    {
+      "id": "44-q28",
+      "prompt": "Asked to find why a full build takes 40 minutes, what do you run first and how do you rank what you find?",
+      "options": [
+        "`clang -ftime-trace` aggregated by ClangBuildAnalyzer, ranking headers by parse cost times the number of TUs including them.",
+        "`ninja -t graph` on the whole project, ranking targets by the number of edges leading into them in the dependency graph.",
+        "`clang -H` on the slowest single file, ranking headers by their nesting depth in the include tree it prints.",
+        "`g++ -ftime-report -Q` on the slowest single file, ranking optimizer passes by their share of that file's wall time."
+      ],
+      "correctIndex": 0,
+      "explanation": "`-ftime-trace` emits per-TU Chrome-trace JSON with the exact cost of each header and template, and ClangBuildAnalyzer aggregates that into a project-wide ranking — which matters because the leverage is in removing an include from a *widely* included header, so cost must be weighted by how many TUs pay it. Profiling the single slowest file with `-ftime-report` is the tempting move and it misleads: a rarely-compiled expensive file matters far less than a cheap header included everywhere.",
+      "sourceAnchor": "4412-reducing-c-compile-times",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q29",
+      "prompt": "What does `-gsplit-dwarf` do for build times?",
+      "options": [
+        "It moves debug info into separate `.dwo` files so the linker never reads it, often the largest link-time win on a debug build.",
+        "It compresses debug info inside each object file, cutting the bytes the linker must relocate on a debug build.",
+        "It defers debug-info generation to a post-link pass, so parallel compilation is no longer serialized behind it.",
+        "It strips line tables from object files and rebuilds them from an index, cutting both parse and link time."
+      ],
+      "correctIndex": 0,
+      "explanation": "Split DWARF leaves the bulk of the debug information in side files that the linker simply never touches, which is why it is called out as often the biggest single link-time gain on debug builds. The compression answer is plausible because compressed debug sections do exist as a separate option, but compressed sections still have to be read and processed at link time, so they do not deliver the same win.",
+      "sourceAnchor": "4412-reducing-c-compile-times",
+      "difficulty": "recall"
+    },
+    {
+      "id": "44-q30",
+      "prompt": "After enabling `UNITY_BUILD ON`, a test starts passing that previously failed, with no source change. What is the most likely cause?",
+      "options": [
+        "A file-scope `using namespace` or a `#define` leaked forward into the next file in the batch, silently changing name lookup.",
+        "The batch was compiled as one TU, so the optimizer inlined across it and eliminated the undefined behavior the test relied on.",
+        "Unity builds parse each shared header once per batch, so a header guard that was previously re-evaluated now resolves differently.",
+        "The batch shares template instantiations, so a specialization declared in one file now applies retroactively in earlier files."
+      ],
+      "correctIndex": 0,
+      "explanation": "Concatenating TUs means a file-scope `using namespace`, a `#define`, or a `#undef` in one file is still in effect for the next, which changes overload resolution and macro expansion silently — the worst hazard precisely because it compiles and behaves differently rather than failing. Extra cross-file inlining is real (a batch is effectively LTO'd for free) but optimization does not 'eliminate' UB in a way that flips a deterministic test result the way leaked lookup state does.",
+      "sourceAnchor": "4413-precompiled-headers-and-unity-builds",
+      "difficulty": "trap"
+    },
+    {
+      "id": "44-q31",
+      "prompt": "A team adds `common/types.hpp` — edited several times a day — to `target_precompile_headers`. What is the consequence?",
+      "options": [
+        "Every edit invalidates the PCH and forces a full rebuild of every TU using it; only stable external headers belong in a PCH.",
+        "Every edit is absorbed incrementally because CMake regenerates only the changed portion of the serialized PCH image.",
+        "Every edit is ignored until the next clean build, so TUs silently compile against the stale snapshot in the PCH.",
+        "Every edit doubles compile time for that TU only, since the PCH copy and the header are both parsed on each build."
+      ],
+      "correctIndex": 0,
+      "explanation": "A PCH is a single serialized snapshot of parser state; touching anything inside it invalidates the whole thing and every consuming TU recompiles, so a frequently-modified project header turns each small edit into a full rebuild. The silently-stale answer describes a real-sounding failure but not this one — the build system does track the dependency; the problem is that it tracks it correctly and rebuilds everything.",
+      "sourceAnchor": "4413-precompiled-headers-and-unity-builds",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q32",
+      "prompt": "A PIMPL class declares `std::unique_ptr<Impl> p_;` and leaves the destructor implicit in the header. What happens?",
+      "options": [
+        "The destructor is instantiated where `Impl` is incomplete, so `unique_ptr`'s deleter fails on `sizeof` of an incomplete type.",
+        "The destructor compiles but leaks, because the default deleter declines to `delete` a pointer to an incomplete type.",
+        "The destructor compiles and works, because `unique_ptr`'s deleter only needs `Impl` complete where `Impl` is defined.",
+        "The destructor compiles but the move operations are deleted, because an implicit destructor suppresses their generation."
+      ],
+      "correctIndex": 0,
+      "explanation": "`std::unique_ptr`'s default deleter requires a complete type at the point the destructor is instantiated, and an implicit destructor is instantiated in the header where `Impl` is only forward-declared — hence the `static_assert` failure, or historically silent UB from deleting an incomplete type. The move-operations answer inverts the real rule: it is *declaring* a destructor that suppresses the implicit moves, which is why the PIMPL recipe declares those in the header too.",
+      "sourceAnchor": "4414-pimpl",
+      "difficulty": "trap"
+    },
+    {
+      "id": "44-q33",
+      "prompt": "Someone proposes PIMPL for the order-book node type allocated millions of times per session, citing faster compiles. What is the objection?",
+      "options": [
+        "It adds a pointer indirection on every member access and a heap allocation per object — the costs a hot path exists to avoid.",
+        "It forces every member function to become virtual, so each access pays a vtable lookup on top of the indirection.",
+        "It makes the type non-movable, so each node must be copied through a hand-written copy constructor on every insert.",
+        "It requires the impl to be allocated from the same arena as the owner, which serializes allocation across threads."
+      ],
+      "correctIndex": 0,
+      "explanation": "PIMPL belongs at library boundaries and on cold classes — configuration objects, session managers — because the indirection is a likely cache miss and the per-object allocation is exactly what hot-path work eliminates. The non-movable claim is the tempting distortion of a real fact: PIMPL types are move-only by default and need a hand-written *copy* constructor, but they move perfectly well once the move operations are declared and defined.",
+      "sourceAnchor": "4414-pimpl",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q34",
+      "prompt": "Two builds of the same commit produce different binaries. Which pairing of cause and fix is correct?",
+      "options": [
+        "Absolute build paths embedded in debug info — fix with `-ffile-prefix-map`, which covers the debug and macro prefix maps.",
+        "Absolute build paths embedded in debug info — fix with `SOURCE_DATE_EPOCH`, which normalizes recorded path prefixes.",
+        "Archive member timestamps written by `ar` — fix with `-fdebug-prefix-map`, which rewrites the archive header fields.",
+        "Locale-dependent sort order in a generated file — fix with `ar D`, which forces deterministic ordering of inputs."
+      ],
+      "correctIndex": 0,
+      "explanation": "`-ffile-prefix-map` rewrites the build directory out of both debug info and `__FILE__`, subsuming `-fdebug-prefix-map` and `-fmacro-prefix-map`. The other pairings swap real fixes onto the wrong causes: `SOURCE_DATE_EPOCH` handles embedded dates where one is unavoidable, `ar D` handles archive timestamps and ordering, and locale nondeterminism is fixed by pinning `LC_ALL=C` and `TZ=UTC`.",
+      "sourceAnchor": "4415-reproducible-and-hermetic-builds",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q35",
+      "prompt": "How do 'reproducible' and 'hermetic' differ as build properties?",
+      "options": [
+        "Reproducible means bit-identical output from the same inputs; hermetic means the build depends only on declared inputs.",
+        "Reproducible means the build depends only on declared inputs; hermetic means it runs in a sandbox with no network access.",
+        "Reproducible means any machine can rebuild the source; hermetic means the output is bit-identical across machines.",
+        "Reproducible means the toolchain is pinned by digest; hermetic means the dependency graph is fully version-locked."
+      ],
+      "correctIndex": 0,
+      "explanation": "The two are distinct properties, and hermeticity is what makes reproducibility achievable — a build that reads the host's installed packages, environment, clock, or network cannot be expected to produce identical bytes elsewhere. Sandboxing and network isolation are the *mechanisms* Bazel, Buck2, and Nix use to enforce hermeticity, not the definition of reproducibility, which is precisely the bit-identical-output claim.",
+      "sourceAnchor": "4415-reproducible-and-hermetic-builds",
+      "difficulty": "recall"
+    },
+    {
+      "id": "44-q36",
+      "prompt": "Your CMake `FetchContent` block sets `GIT_TAG v1.4.2` and CI uses `ubuntu:22.04`. What is the specific weakness?",
+      "options": [
+        "Both identities are movable — pin the dependency to a full commit SHA and the image to an `ubuntu@sha256:` digest.",
+        "Both identities are slow to resolve — cache the tag lookup locally and mirror the image so CI stops hitting the network.",
+        "Both identities lack checksums — add a `sha256` to the container reference and a lockfile entry beside the git tag.",
+        "Both identities are unversioned — record the resolved tag and image name in the SBOM emitted after each build."
+      ],
+      "correctIndex": 0,
+      "explanation": "A git tag can be moved or re-pointed and a container tag like `22.04` is republished continuously, so neither identifies a fixed set of bytes; the pinned forms are a full commit SHA and an immutable image digest. Recording what you resolved in an SBOM is genuinely valuable for provenance and CVE queries, but it documents the drift after the fact rather than preventing two builds of the same commit from consuming different inputs.",
+      "sourceAnchor": "4416-dependency-pinning-and-build-provenance",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q37",
+      "prompt": "Which change to a class in a shipped shared library is source-compatible but ABI-breaking?",
+      "options": [
+        "Adding a non-static data member, because `sizeof` and every subsequent member offset change.",
+        "Adding a non-virtual member function, because the class gains a new mangled symbol consumers lack.",
+        "Adding a default argument to an existing member function, because the call signature changes.",
+        "Renaming a private member, because the mangled names of the accessors that touch it change."
+      ],
+      "correctIndex": 0,
+      "explanation": "A new data member changes the object's size and shifts every member declared after it, so already-compiled consumers allocate the wrong amount and read the wrong offsets — the canonical silent ABI break. Adding a non-virtual member function is ABI-safe (it is just a new symbol nobody was calling), and a default argument is substituted at the call site, so old callers keep passing what they always did.",
+      "sourceAnchor": "4417-abi-compatibility-and-symbol-versioning",
+      "difficulty": "recall"
+    },
+    {
+      "id": "44-q38",
+      "prompt": "You fix a bug by changing the body of an `inline` function in a shipped library's public header. Is that ABI-safe?",
+      "options": [
+        "No — old callers keep the body already inlined into them, so one process ends up running two different behaviors.",
+        "Yes — the mangled name is unchanged, so the dynamic linker binds every caller to the library's new definition.",
+        "No — changing an inline body alters the function's mangled name, so old callers fail with an undefined symbol.",
+        "Yes — the linker deduplicates the emitted copies and keeps the newest one, so all callers converge on the fix."
+      ],
+      "correctIndex": 0,
+      "explanation": "Inline function bodies, and template definitions likewise, live in the *consumer's* object code, so a rebuilt library cannot retroactively change what was already inlined; mixing old and new callers gives two behaviors in one process, a silent ODR violation. The 'mangled name is unchanged so the linker binds the new one' answer has a true premise with a broken inference — an unchanged name is exactly why nothing fails loudly, which makes this worse, not safer.",
+      "sourceAnchor": "4417-abi-compatibility-and-symbol-versioning",
+      "difficulty": "trap"
+    },
+    {
+      "id": "44-q39",
+      "prompt": "How does ELF symbol versioning let one `libfeed.so` serve callers of an old and a new incompatible `feed_open`?",
+      "options": [
+        "Both definitions are exported with `.symver` tags plus a version script; `@@` marks the default for new links and `@` keeps the old.",
+        "The old definition is exported as a weak symbol and the new one as strong, so the loader binds old binaries to the weak one.",
+        "The loader compares the soname recorded in each caller and dispatches through a per-version PLT stub generated at load time.",
+        "Both definitions are kept in separate sections and `dlopen` selects the section matching the caller's recorded build ID."
+      ],
+      "correctIndex": 0,
+      "explanation": "`.symver feed_open_v1, feed_open@LIBFEED_1.0` and `.symver feed_open_v2, feed_open@@LIBFEED_2.0`, combined with `-Wl,--version-script=`, put multiple versioned definitions of one name in one object; already-linked binaries recorded the old version and keep resolving to it. Weak-versus-strong binding is the plausible confusion: that mechanism selects between definitions in *different* objects at link time and gives no way to keep both live.",
+      "sourceAnchor": "4417-abi-compatibility-and-symbol-versioning",
+      "difficulty": "application"
+    },
+    {
+      "id": "44-q40",
+      "prompt": "Beyond ABI hygiene, what does adding `local: *;` to a version script (or building with `-fvisibility=hidden`) buy you?",
+      "options": [
+        "Faster dynamic linking — fewer relocations and PLT entries, no interposition on internal calls — and a smaller binary.",
+        "Faster dynamic linking, because hidden symbols are resolved eagerly at load rather than lazily on first call.",
+        "A smaller binary, because hidden symbols are stripped of their debug info along with their dynamic symbol entries.",
+        "Stronger optimization, because hidden symbols become implicitly `inline` and are duplicated into every caller."
+      ],
+      "correctIndex": 0,
+      "explanation": "Hiding everything not explicitly exported shrinks the dynamic symbol table, so there are fewer relocations to process and fewer PLT entries, and internal calls can no longer be interposed — which also lets the compiler bind them directly. The eager-resolution answer confuses this with `-z now`/`BIND_NOW`; and hidden visibility does not touch debug info, nor does it make anything `inline`.",
+      "sourceAnchor": "4417-abi-compatibility-and-symbol-versioning",
+      "difficulty": "application"
+    }
+  ]
+}

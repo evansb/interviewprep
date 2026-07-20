@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-28-caches",
+  "questions": [
+    {
+      "id": "28-q01",
+      "prompt": "On a modern x86-64 server, what are the L1d and local-DRAM access latencies, and what is the ratio between them?",
+      "options": [
+        "L1d hits in 4–5 cycles (~1.3 ns) and local DRAM takes ~70–100 ns, a ratio of roughly 50–70×.",
+        "L1d hits in 4–5 cycles (~1.3 ns) and local DRAM takes ~25–30 ns, a ratio of roughly 10–15×.",
+        "L1d hits in ~14 cycles (~4.5 ns) and local DRAM takes ~70–100 ns, a ratio of roughly 15–20×.",
+        "L1d hits in 4–5 cycles (~1.3 ns) and local DRAM takes ~300–400 ns, a ratio of roughly 250×."
+      ],
+      "correctIndex": 0,
+      "explanation": "The chapter's figures are L1d 4–5 cycles, L2 ~14 cycles, L3 ~40–60 cycles, local DRAM ~70–100 ns, giving the ~50–70× L1-to-DRAM gap that makes one unhidden miss cost more than 200 dependent ALU ops. The variant quoting ~14 cycles for L1 has borrowed the L2 number, which is the most common slip; the ~25–30 ns figure is closer to a large ARM system-level cache than to DRAM, and ~300–400 ns is well past even remote-NUMA territory.",
+      "sourceAnchor": "281-cache-hierarchy",
+      "difficulty": "recall"
+    },
+    {
+      "id": "28-q02",
+      "prompt": "On an AMD Zen 4 part, `perf` reports a high `LLC-load-misses` count for your thread. What may you conclude from that alone?",
+      "options": [
+        "Not that DRAM was reached: the L3 is a per-CCX victim cache, so a miss may still be served by another CCX at ~100+ ns.",
+        "That every one of those misses reached DRAM, since a miss in the last-level cache by definition leaves the cache hierarchy.",
+        "That the L3 is inclusive of L2, so each miss also back-invalidated the matching L2 line in the core that owned it.",
+        "That another core in the same CCX held the line dirty, since an AMD L3 miss is only counted on a HITM snoop response."
+      ],
+      "correctIndex": 0,
+      "explanation": "AMD's L3 is an exclusive victim cache private to a CCX, so a line living in a sibling CCX shows up as an L3 miss yet is serviced over Infinity Fabric rather than from DRAM. The tempting reading is that a last-level miss must mean DRAM — it does on an Intel non-inclusive LLC, but the inference breaks on AMD precisely because the L3 is not socket-wide. Inclusivity and back-invalidation describe Intel pre-Skylake-SP, the opposite of AMD's policy.",
+      "sourceAnchor": "281-cache-hierarchy",
+      "difficulty": "trap"
+    },
+    {
+      "id": "28-q03",
+      "prompt": "Why is `std::hardware_destructive_interference_size` 128 in libstdc++ on x86-64 when the cache line is 64 bytes?",
+      "options": [
+        "Intel's L2 adjacent-line prefetcher pulls in the 128 B-aligned partner line, so effective sharing granularity is 128 bytes.",
+        "The x86-64 coherence unit is genuinely 128 bytes; the 64-byte figure describes only the L1 sector within that unit.",
+        "MESI state bits are maintained one set per 128-byte block, so two 64-byte lines always change state together.",
+        "The standard requires the constant to be twice the line size so that padded structures stay correct on Apple Silicon."
+      ],
+      "correctIndex": 0,
+      "explanation": "The line is 64 bytes, but a miss also drags in the paired line via the L2 spatial prefetcher, so two variables 64 bytes apart can still bounce — hence padding to 128 in HFT codebases. Claiming the coherence unit itself is 128 bytes on x86-64 is the plausible-sounding error: the transfer and coherence granularity really is 64, and only the prefetcher widens the practical effect. Apple Silicon does use a 128-byte line, but that is a separate fact, not what the libstdc++ value encodes.",
+      "sourceAnchor": "282-cache-line-organization",
+      "difficulty": "recall"
+    },
+    {
+      "id": "28-q04",
+      "prompt": "A hash probe reads one 8-byte value from a randomly located slot in a multi-gigabyte array. What fraction of the DRAM bandwidth that access consumes is actually useful?",
+      "options": [
+        "One eighth: the fill moves a whole 64-byte line, so 87.5% of the bytes transferred are never read.",
+        "All of it: critical-word-first delivery means the controller returns only the requested 8-byte word.",
+        "One half: the line is delivered as two 32-byte bursts and the unrequested burst is discarded on arrival.",
+        "One sixteenth: DRAM always transfers a fixed 128-byte burst regardless of the cache line size in use."
+      ],
+      "correctIndex": 0,
+      "explanation": "The cache line is the atomic unit of transfer, so touching one byte costs a full 64-byte fill and a random 8-byte read wastes 87.5% of the bandwidth it consumes. Critical-word-first is the seductive distractor because it is a real mechanism — but it only reorders delivery so the dependent instruction can restart early; the whole line still crosses the bus. That is exactly why a miss's latency and its bandwidth occupancy are different numbers.",
+      "sourceAnchor": "282-cache-line-organization",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q05",
+      "prompt": "For a 32 KB 8-way L1d with 64-byte lines, which address bits form the set index, and what does that imply about collisions?",
+      "options": [
+        "Bits [11:6] — 64 sets, so two addresses share a set exactly when they are congruent modulo 4096.",
+        "Bits [12:6] — 128 sets, so two addresses share a set exactly when they are congruent modulo 8192.",
+        "Bits [10:6] — 32 sets, so two addresses share a set exactly when they are congruent modulo 2048.",
+        "Bits [14:6] — 512 sets, so two addresses share a set exactly when they are congruent modulo 32768."
+      ],
+      "correctIndex": 0,
+      "explanation": "sets = 32768 / (64 × 8) = 64, so 6 index bits sit directly above the 6 offset bits, giving [11:6] and a collision modulus of 4096 — the page size, which is what makes VIPT lookup possible. The 128-set variant is what you get if you forget to divide by the 8 ways, and the 32-set variant if you divide by ways twice. Getting the modulus right is the whole reason the power-of-two-stride pathology is predictable.",
+      "sourceAnchor": "283-cache-associativity-and-address-decomposition",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q06",
+      "prompt": "Why did x86-64 L1d sizes stall around 32–48 KB instead of growing with the transistor budget?",
+      "options": [
+        "Staying VIPT needs size ≤ page_size × ways, so 64 KB with 4 KB pages would demand an expensive 16-way design.",
+        "Larger SRAM arrays cannot be accessed in 4–5 cycles at all, so the limit is purely an array access-time wall.",
+        "The tag would no longer fit above the 12-bit page offset, making physical tagging impossible at any associativity.",
+        "A larger L1 would exceed the L2's inclusion capacity, forcing a back-invalidation on every single L2 eviction."
+      ],
+      "correctIndex": 0,
+      "explanation": "Index plus offset must stay within the 12-bit page offset so the set lookup can start from the virtual address in parallel with TLB translation; that constrains capacity to page_size × ways, which is why Ice Lake bought 48 KB by going 12-way. Pure access time is the tempting answer — it is a real pressure, and it is why nobody just goes 16-way — but it is not the structural limit, since AMD and ARM get past 32 KB with way prediction and higher associativity rather than faster SRAM. Tags live above the index and are unaffected.",
+      "sourceAnchor": "283-cache-associativity-and-address-decomposition",
+      "difficulty": "trap"
+    },
+    {
+      "id": "28-q07",
+      "prompt": "`double m[1024][1024]; for (int i = 0; i < 1024; ++i) sum += m[i][0];` — what does L1d do, and what is the one-line fix?",
+      "options": [
+        "Row stride 8192 is congruent to 0 mod 4096, so all 1024 addresses hit one set and thrash past 8 ways; pad to `m[1024][1024+8]`.",
+        "The stride is constant, so the L2 streamer covers the walk and no fix is needed beyond backing the array with huge pages.",
+        "The 8 KB of touched data fits in L1, so the misses are purely compulsory; issue a software prefetch about 25 iterations ahead.",
+        "Each 8-byte element straddles a line boundary at this stride, so the fix is to align the array's base to 64 bytes."
+      ],
+      "correctIndex": 0,
+      "explanation": "Every element is 8192 bytes apart and 8192 mod 4096 = 0, so all 1024 column entries map to L1 set 0; with 8 ways you get 8 useful lines and then a 100% miss rate on a working set that would trivially fit. Padding the leading dimension breaks the congruence and is the classic whiteboard fix. The prefetcher answer is the trap: the stride genuinely is constant and the streamer genuinely tracks it, but prefetching into a set that can only hold 8 of the 1024 lines does not help — the problem is set mapping, not prediction.",
+      "sourceAnchor": "283-cache-associativity-and-address-decomposition",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q08",
+      "prompt": "Is Intel's last-level cache managed with LRU replacement?",
+      "options": [
+        "No — it is an adaptive RRIP-family policy with set dueling, chosen so a streaming scan does not evict the working set.",
+        "Yes — true LRU costs about 45 bits of age state per 16-way set, which is affordable at last-level cache sizes.",
+        "No — it is strictly pseudo-random replacement, the only policy that avoids pathological conflict-miss patterns.",
+        "Yes — but only for clean lines; dirty lines are chosen by a separate rule that prefers writing back the oldest one."
+      ],
+      "correctIndex": 0,
+      "explanation": "New lines are inserted with a distant re-reference prediction so data that is never reused becomes the first victim, which is what makes the LLC scan-resistant, and set dueling picks the insertion policy adaptively. The 45-bits-per-set answer inverts the real argument: that number is exactly why true LRU is *not* implemented for 16 ways. This is also why cachegrind, which models LRU, is only approximate for LLC figures.",
+      "sourceAnchor": "284-cache-replacement-policies",
+      "difficulty": "recall"
+    },
+    {
+      "id": "28-q09",
+      "prompt": "`cachegrind` reports an LLC miss rate that disagrees with `perf` on the same streaming workload. What is the likeliest reason?",
+      "options": [
+        "cachegrind simulates LRU, while the real LLC uses a scan-resistant RRIP variant that keeps the working set through the stream.",
+        "cachegrind observes only L1 demand accesses and derives its LLC numbers arithmetically rather than simulating that level.",
+        "perf's LLC counters exclude misses generated by hardware prefetch, which cachegrind attributes as ordinary demand misses.",
+        "cachegrind models the LLC as fully associative, so it never reports the conflict misses that the real indexed cache suffers."
+      ],
+      "correctIndex": 0,
+      "explanation": "Under LRU a single pass over data larger than the cache evicts everything and hits nothing, so cachegrind predicts the classic streaming pathology; real hardware inserts streamed lines with distant re-reference prediction and preserves the resident set, so measured misses differ. The fully-associative claim is the plausible near-miss — cachegrind does simulate exact set mapping, which is precisely what makes it useful for diagnosing conflict misses; it is the replacement model, not the indexing model, that is idealized.",
+      "sourceAnchor": "284-cache-replacement-policies",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q10",
+      "prompt": "In a store-heavy workload, the latency of unrelated loads rises even though those loads hit in cache. What explains it?",
+      "options": [
+        "The writeback buffer is saturating: dirty lines are created faster than they drain, so the workload is writeback-bandwidth-bound.",
+        "The caches have switched to write-through behaviour under pressure, so each store now propagates synchronously to the next level.",
+        "Each dirty-line eviction stalls its fill until the victim has reached DRAM, which roughly doubles the latency of every miss.",
+        "Every store sets a dirty bit, and checking that bit adds an extra cycle to each subsequent load that indexes the same set."
+      ],
+      "correctIndex": 0,
+      "explanation": "Dirty evictions are decoupled — the victim goes to a writeback buffer and drains asynchronously — but that buffer is finite, and once the workload dirties lines faster than they reach DRAM the backpressure shows up as rising read latency. The serialized-eviction answer is tempting because it would explain the symptom, but it describes the design that was specifically avoided: if a fill waited on its victim's writeback, read latency would double in every store-heavy loop, which is not what hardware does.",
+      "sourceAnchor": "285-write-back-and-write-through-caches",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q11",
+      "prompt": "Why does `memset(buf, 0, 1<<30)` move roughly 2 GiB of DRAM traffic on a write-back, write-allocate machine?",
+      "options": [
+        "Each store miss first issues an RFO that reads the line in, and the resulting dirty line is later written back.",
+        "The write-combining buffers duplicate each line, sending one copy to DRAM and one to the LLC for coherence.",
+        "The library writes the region twice, once to fault the pages in and once to store the value into them.",
+        "Write-through caching sends each store to DRAM, and the eventual eviction then sends the whole line again."
+      ],
+      "correctIndex": 0,
+      "explanation": "Write-allocate means a store to a cold line fetches the line before overwriting it, so 1 GiB of stores costs 1 GiB of RFO reads plus 1 GiB of writebacks — the usual reason a memset benchmark lands at half the DIMMs' peak. The write-through explanation reaches the same 2 GiB total by a mechanism that is not in play: mainstream x86-64 and ARM data caches are write-back, and a write-through cache would not additionally write back on eviction.",
+      "sourceAnchor": "286-write-allocation-policies",
+      "difficulty": "recall"
+    },
+    {
+      "id": "28-q12",
+      "prompt": "Which mechanism eliminates the RFO for a large sequential overwrite without any explicit intrinsic in the source?",
+      "options": [
+        "Full-line write combining behind `rep stosb` (ERMSB/FSRM), which the core recognizes as a complete 64-byte line write.",
+        "The L2 adjacent-line prefetcher, which supplies the paired line so that only half of the required RFOs reach memory.",
+        "MESI's Exclusive state, which lets the first store to a line that no other core holds skip the read-for-ownership.",
+        "Marking the destination write-combining through the PAT, which the compiler arranges automatically for large buffers."
+      ],
+      "correctIndex": 0,
+      "explanation": "Modern cores detect consecutive stores covering a whole 64-byte line and skip the fetch; Intel's ERMSB/FSRM path is why `rep movsb` went from historically slow to the fastest small-to-medium memcpy, and glibc dispatches to it. The E-state answer is the sharpest distractor: E→M really is silent, but that only applies once the line is already resident — on a cold line you still pay the fill, which is the very traffic in question. Memory types are set by the kernel via MTRR/PAT, never by the compiler.",
+      "sourceAnchor": "286-write-allocation-policies",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q13",
+      "prompt": "What does MESI's Exclusive state buy that a protocol with only M, S and I would lack?",
+      "options": [
+        "A load of a line no one else holds enters E, so the following store upgrades E→M silently with no bus traffic.",
+        "A line in E can be held dirty by several caches at once, removing the need to write back before sharing it.",
+        "E marks the one designated sharer that answers snoops, stopping several caches from responding to one request.",
+        "E lets a store retire without passing through the store buffer, since no other core can observe the intermediate value."
+      ],
+      "correctIndex": 0,
+      "explanation": "Without E, the first store to privately-held clean data would have to broadcast an invalidate even though nobody else has a copy; E makes read-then-write on private data cheap. The designated-responder description is genuinely a real state, but it is MESIF's F state, not E — F is a shared, clean, forwarding copy, whereas E is by definition the only copy. Dirty-and-shared is MOESI's O state, a third distinct thing.",
+      "sourceAnchor": "287-cache-coherence-protocols",
+      "difficulty": "recall"
+    },
+    {
+      "id": "28-q14",
+      "prompt": "A producer-consumer pair on AMD hammers a line the producer holds dirty. What does MOESI's Owned state change relative to plain MESI?",
+      "options": [
+        "The owner supplies the line cache-to-cache while keeping its dirty copy, so no write-back to memory is needed to share it.",
+        "The owner retains the sole copy and other cores must re-read from memory, which removes snoop traffic from the fabric.",
+        "The line is forced clean on its first snoop, so the owner's next store needs no invalidation round trip to proceed.",
+        "Ownership migrates on every read, so the consumer's core becomes responsible for eventually writing the line back."
+      ],
+      "correctIndex": 0,
+      "explanation": "Without O, a dirty line requested by another core must first be written back to memory before it can be shared; O lets the dirty holder keep its copy and hand the data over directly, which makes producer-consumer sharing cheaper in principle. The forced-clean-on-snoop description sounds close but has the consequence backwards: downgrading to a clean shared copy is exactly what MESI does, and it means the owner's *next* store then needs an invalidate, not that it avoids one.",
+      "sourceAnchor": "287-cache-coherence-protocols",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q15",
+      "prompt": "Same socket: core B loads a line that core A holds dirty in its L1. What does that cost, and which counter names the event?",
+      "options": [
+        "~70–110 cycles (~25–35 ns) for the HITM cache-to-cache transfer; `mem_load_l3_hit_retired.xsnp_hitm` counts it.",
+        "~40–60 cycles, the ordinary uncontended L3 hit latency, since the line is located through the shared L3 either way.",
+        "~150–300 ns, because a snoop that hits a modified line must be resolved through the memory controller before sharing.",
+        "~14 cycles, the L2 hit latency, because the snoop filter forwards the line straight between the two cores' private L2s."
+      ],
+      "correctIndex": 0,
+      "explanation": "A snoop that hits a modified line in another core makes A supply the data cache-to-cache and downgrade M→S or O, and that costs roughly double an uncontended L3 hit. Quoting the plain ~40–60 cycle L3 latency is the natural mistake — the lookup does go through the L3, but the dirty copy has to be extracted from another core's private cache, and that extra hop is the whole point of the HITM counter. The 150–300 ns figure belongs to the cross-socket case.",
+      "sourceAnchor": "287-cache-coherence-protocols",
+      "difficulty": "trap"
+    },
+    {
+      "id": "28-q16",
+      "prompt": "An SPSC ring buffer places the producer index and the consumer index in the same 64-byte line. What is the consequence?",
+      "options": [
+        "Each index write invalidates the peer core's copy, so the line bounces continuously and the wait-free queue becomes a contention point.",
+        "Nothing measurable, since each index has exactly one writer and a single-writer line never has to leave the Modified state.",
+        "The queue loses its wait-free guarantee, because two writers to one line must serialize through a hardware lock on that line.",
+        "Peer-index reads begin missing in L1 only once the buffer wraps, so the cost appears in bursts at each wrap boundary."
+      ],
+      "correctIndex": 0,
+      "explanation": "Coherence granularity is the line, not the variable, so the producer's write to its own index invalidates the consumer's copy of the shared line and vice versa — the classic bug that turns a wait-free SPSC queue into a bouncing disaster; put the indices on separate lines (128 bytes on Intel). The single-writer argument is the exact half-truth being tested: each *variable* has one writer, but the *line* has two, and the line is what MESI tracks. Wait-freedom as an algorithmic property survives; only throughput collapses.",
+      "sourceAnchor": "288-true-sharing-and-cache-line-bouncing",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q17",
+      "prompt": "`perf c2c` shows heavy HITM traffic on one line, with the contending threads touching the *same* offset inside it. What does that mean for the fix?",
+      "options": [
+        "It is true sharing, so padding cannot help; the algorithm must change — partition, batch, or make the sharing one-directional.",
+        "It is false sharing at 128-byte granularity, so widening the padding from 64 bytes to 128 bytes will make the contention go away.",
+        "It is false sharing, so applying `alignas(64)` to each contended variable will move them onto separate lines and resolve it.",
+        "It is a snoop-filter eviction artifact, so the remedy is to reduce the number of runnable threads on the socket."
+      ],
+      "correctIndex": 0,
+      "explanation": "Same offset means the threads genuinely contend for one variable — a queue head, a sequence number, a lock word — and no amount of padding separates a variable from itself; the signature of false sharing is *different* offsets in the same line. The 128-byte padding answer is the trap for anyone who learned the adjacent-line rule and reaches for it reflexively: it is the right correction for false sharing on Intel and completely inert here. A useful confirmation is that padding changes nothing under true sharing.",
+      "sourceAnchor": "288-true-sharing-and-cache-line-bouncing",
+      "difficulty": "trap"
+    },
+    {
+      "id": "28-q18",
+      "prompt": "Thirty-two cores each run `fetch_add(1)` on one shared `std::atomic<uint64_t>`. What aggregate throughput should you expect, and why?",
+      "options": [
+        "Under 10 million ops/sec in total — worse than a single thread — because the line is stolen again before any core makes progress.",
+        "Roughly 32× a single core's rate, because once the line reaches M state on a core the `lock xadd` completes entirely locally.",
+        "About 50 million ops/sec, set by the ~20-cycle cost of an uncontended read-modify-write on a line already held in M state.",
+        "Roughly the single-thread rate, because the hardware serializes the operations but each one still costs only about 20 cycles."
+      ],
+      "correctIndex": 0,
+      "explanation": "Throughput collapses to about one operation per line-transfer latency, and it gets *worse* as cores are added because each core loses the line before completing useful work — which is why per-core counters aggregated on read are the standard answer for metrics. The single-thread-rate estimate is the most defensible wrong answer: serialization is real, but it assumes each serialized op costs the uncontended ~20 cycles, when in fact each one pays a 70–110 cycle HITM transfer.",
+      "sourceAnchor": "288-true-sharing-and-cache-line-bouncing",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q19",
+      "prompt": "Adding 64 bytes of padding to a struct changes a single-threaded loop's runtime by 2×. Which miss class is responsible?",
+      "options": [
+        "Conflict: only conflict misses are hypersensitive to stride and base address, and padding changes nothing except which sets are used.",
+        "Capacity: the padding pushed the working set past the cache size, and the knee at that size is what produced the sudden jump.",
+        "Compulsory: padding altered the count of unique lines touched, and compulsory misses scale with unique bytes divided by 64.",
+        "Coherence: padding moved the hot field onto its own line, and that can only ever be a false-sharing effect between two cores."
+      ],
+      "correctIndex": 0,
+      "explanation": "The classification is operational, and address sensitivity is the discriminating test: capacity misses track working-set size and show a knee at the cache size, while conflict misses respond violently to a 64-byte shift that barely changes the footprint. The capacity answer is the tempting one because padding does technically enlarge the data — but by a fraction far too small to explain a 2× cliff. Coherence is excluded outright here since the loop is single-threaded.",
+      "sourceAnchor": "289-compulsory-capacity-and-conflict-misses",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q20",
+      "prompt": "Which pairing of a miss class with its distinct fix is correct?",
+      "options": [
+        "Capacity misses: shrink the working set, using blocking or tiling, smaller data types, SoA layout, or compression.",
+        "Conflict misses: prefetch earlier so that each line has already arrived by the time the demand access is issued.",
+        "Compulsory misses: pad the array's leading dimension so that the hot addresses spread evenly across the sets.",
+        "Coherence misses: raise the associativity so that more of the competing lines can coexist within a single set."
+      ],
+      "correctIndex": 0,
+      "explanation": "The 3 Cs taxonomy exists precisely because the remedy differs: compulsory misses want prefetch and better spatial layout, capacity misses want a smaller working set, conflict misses want different addresses, and coherence misses want padding or an algorithm change. Each of the rejected pairings takes a real fix and attaches it to the wrong class — prefetching a conflict miss just refetches into the same over-subscribed set, and padding a leading dimension does nothing for first-ever references.",
+      "sourceAnchor": "289-compulsory-capacity-and-conflict-misses",
+      "difficulty": "recall"
+    },
+    {
+      "id": "28-q21",
+      "prompt": "A pinned, isolated hot path shows a p99.9 regression whenever a backup job runs on other cores of the same socket. What is happening, and what fixes it?",
+      "options": [
+        "The neighbour is streaming through the shared LLC and evicting your hot lines; Intel CAT can reserve exclusive LLC ways for the hot path.",
+        "The neighbour is consuming L1 and L2 capacity on your pinned core, so adding its cores to `isolcpus` is what removes the interference.",
+        "The neighbour is invalidating your hot lines through coherence traffic, so padding the hot structures out to 128 bytes removes the bouncing.",
+        "The neighbour is retraining the hardware prefetchers on your core, so disabling the prefetchers through MSR 0x1A4 restores the latency."
+      ],
+      "correctIndex": 0,
+      "explanation": "L1 and L2 are private, but the LLC and the memory controller are shared, so a streaming co-tenant degrades your latency with no change to your code — the single most common cause of unexplained p99.9 regressions on shared hardware. The private-cache answer is the trap for people who assume pinning implies isolation: pinning protects L1/L2 occupancy and buys nothing at the LLC. Padding addresses sharing of *your* lines, which is not what a backup job does to them.",
+      "sourceAnchor": "2810-cache-thrashing",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q22",
+      "prompt": "A warm-up routine runs the real hot path on synthetic ticks and returns early instead of calling `send`. Why can this make production latency worse?",
+      "options": [
+        "The warm-up executes a different code shape, so the branch predictor is trained toward the discard path and the real message mispredicts.",
+        "The early return skips the encode stage, so only the parse stage's data lines get warmed while the rest of the path stays entirely cold.",
+        "Returning early leaves the NIC transmit descriptor unarmed, and the descriptor ring is the only part of the path where warming matters.",
+        "The synthetic ticks populate the order book with data that must first be evicted before a real message can be processed correctly."
+      ],
+      "correctIndex": 0,
+      "explanation": "Synthetic warming works because it warms I-cache, D-cache, TLBs, the DSB and the branch predictors together, and that last part is exactly what an extra discard branch corrupts — the standard remedy is to keep the send present but pointed at a dead socket so the executed code is byte-identical. The skipped-encode-stage explanation is plausible but describes a milder, obvious problem you would fix by moving the discard later; the subtle damage is predictor state on a path whose shape you changed.",
+      "sourceAnchor": "2811-cache-warming",
+      "difficulty": "trap"
+    },
+    {
+      "id": "28-q23",
+      "prompt": "A critical path executes a few thousand times a second while the machine does millions of other things. Which state is cold at each execution?",
+      "options": [
+        "L1d and L1i, the DSB, the branch predictor and BTB, and the dTLB/iTLB entries — which is why touching the data is not enough.",
+        "L1d and the dTLB only; the instruction-side structures stay warm because the surrounding non-critical work keeps fetching through them.",
+        "Only the shared LLC, since L1 and L2 are per-core and an isolated core's private caches retain their contents indefinitely.",
+        "Only the TLBs, because `mlockall` called at startup has already pinned every hot data line resident in L2 for the process lifetime."
+      ],
+      "correctIndex": 0,
+      "explanation": "Cold means every predictive and caching structure on the path, and branch-predictor and BTB state are often the larger effect on a branchy parsing path — which is the reason synthetic execution beats simply touching arrays. The `mlockall` answer conflates two layers: locking pages prevents swapping and faults, which is about physical residency, and says nothing about which lines are in L1 or L2.",
+      "sourceAnchor": "2811-cache-warming",
+      "difficulty": "recall"
+    },
+    {
+      "id": "28-q24",
+      "prompt": "Which statement about Intel's hardware prefetchers is accurate?",
+      "options": [
+        "They stop at 4 KB page boundaries, so a sequential stream retrains at every page — one reason 2 MB pages help beyond TLB coverage.",
+        "They follow pointer chains once the `next` field sits at a constant offset, which is why intrusive linked lists prefetch well on x86.",
+        "The L2 streamer runs up to 20 lines ahead and continues straight across page boundaries by issuing its own TLB translations.",
+        "They track an effectively unbounded number of concurrent streams, so a loop over many arrays never loses prefetch coverage."
+      ],
+      "correctIndex": 0,
+      "explanation": "Crossing a page would require translating an address that may not be mapped, so the prefetchers stop at the boundary; 2 MB pages let a stream run 512× further before retraining, which is a real benefit distinct from TLB reach. The pointer-chasing claim is the most seductive because constant field offsets feel like constant strides — but node *addresses* are what matter and they are unpredictable, so linked lists, trees and pointer-keyed maps get nothing (ARM's Neoverse V2 is the narrow exception). Stream tracking is limited to roughly 16–32 on Intel L2.",
+      "sourceAnchor": "2812-hardware-prefetchers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "28-q25",
+      "prompt": "Which of these access patterns is genuinely covered by the hardware prefetcher, making a software prefetch pure overhead?",
+      "options": [
+        "A `std::vector<Tick>` scanned in order at a constant 24-byte stride, forward or backward through the array.",
+        "A `std::map<Key, Tick*>` traversal, whose node addresses the L2 region prefetcher learns after the first few nodes.",
+        "A gather `data[index[i]]` where the index array is itself sequential, since the IP-stride unit learns the indirection.",
+        "A binary search over a sorted array, because the successive probe addresses form a shrinking power-of-two stride."
+      ],
+      "correctIndex": 0,
+      "explanation": "Constant-stride sequential scans in either direction are exactly what the DCU and L2 streamer are built for, so adding a software prefetch there buys nothing and costs a µop and an L1 lookup slot. The gather case is the sharpest distractor: the *index* stream is perfectly predictable and will be prefetched, but the resulting `data[...]` addresses are not, and that dependent load is precisely where software prefetch wins big. Binary search probes are data-dependent, not a learnable stride — which is why Eytzinger layout exists.",
+      "sourceAnchor": "2812-hardware-prefetchers",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q26",
+      "prompt": "DRAM latency is about 250 cycles and your loop body takes about 10 cycles per iteration. What prefetch distance do you use?",
+      "options": [
+        "About 25 iterations ahead as a starting point, then sweep roughly 4 to 64 and take the empirical optimum.",
+        "About 250 iterations ahead, since the distance in iterations is simply the memory latency expressed in cycles.",
+        "About 2500 iterations ahead, since the latency must be multiplied by the cycles each loop iteration consumes.",
+        "Exactly 25 iterations, a figure the formula pins down precisely once the loop body's cycle count is known."
+      ],
+      "correctIndex": 0,
+      "explanation": "distance = memory_latency / cycles_per_iteration gives 250/10 = 25, but that is only the starting point: too close and the line has not arrived, too far and it is evicted or it displaces data you still need, so a sweep is mandatory. Treating 25 as exact is the trap — it uses the right arithmetic and draws the wrong conclusion, since the real latency varies with queueing, the loop's cycle count varies with the data, and a blog-post constant is the classic way to get this wrong.",
+      "sourceAnchor": "2813-software-prefetching-and-prefetch-distance",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q27",
+      "prompt": "A histogram loop does `++hist[bucket]` with unpredictable bucket values. Which prefetch is the right one to issue ahead of the update?",
+      "options": [
+        "`__builtin_prefetch(&hist[b], 1)` — it emits `prefetchw`, pulling the line in already owned and eliminating a later RFO.",
+        "`__builtin_prefetch(&hist[b], 0)` — a read prefetch acquires ownership anyway on x86, so the write hint adds nothing.",
+        "`_mm_prefetch(&hist[b], _MM_HINT_NTA)` — non-temporal is right here because each bucket is written only once.",
+        "No prefetch at all — the L1 IP-stride prefetcher learns the bucket sequence as soon as the histogram fits inside L1."
+      ],
+      "correctIndex": 0,
+      "explanation": "`prefetchw` fetches the line into M/E state, so the read-modify-write does not stall on a separate ownership round trip later — one of the genuinely underused instructions, and read-modify-write on scattered buckets is its textbook case. The plain read prefetch is the tempting choice: it does bring the line in, but in S or E rather than owned, so a contended line still needs its RFO. NTA is wrong twice over, since histogram buckets are re-read constantly rather than streamed.",
+      "sourceAnchor": "2813-software-prefetching-and-prefetch-distance",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q28",
+      "prompt": "A producer NT-stores a buffer and then sets `ready = true` with an ordinary store. The consumer occasionally reads stale buffer contents. Why?",
+      "options": [
+        "NT stores are weakly ordered even on x86 — the documented exception to TSO — so an `sfence` is required before the flag store.",
+        "The ordinary store to `ready` joined the NT stores in the same write-combining buffer, and that buffer flushed its contents out of order.",
+        "The consumer's load of the buffer was speculatively hoisted above its load of `ready`, which only an acquire fence on the reader prevents.",
+        "The NT stores allocated in the LLC on their way out, so the consumer's snoop was answered from a stale copy sitting in its own L1."
+      ],
+      "correctIndex": 0,
+      "explanation": "NT stores drain through write-combining buffers outside the TSO guarantees that make ordinary x86 stores safe to publish behind a flag, so the flag can become visible while buffer data is still in flight — hence the mandatory `sfence` between them. The reader-side reordering answer is the most credible alternative and is wrong on this architecture: x86 does not reorder loads with other loads, so the consumer needs no acquire fence; the defect is entirely on the writer's side.",
+      "sourceAnchor": "2814-non-temporal-stores",
+      "difficulty": "trap"
+    },
+    {
+      "id": "28-q29",
+      "prompt": "Which use of non-temporal stores actually delivers the ~1.5–2× bandwidth improvement they promise?",
+      "options": [
+        "Writing one large journal buffer sequentially in full 64-byte lines, for data that will not be read back before it is flushed.",
+        "Interleaving eight NT store streams across eight destination arrays so the memory controller sees the maximum parallelism.",
+        "Scattering individual 8-byte NT stores across a hash table, so that each dirty line avoids its read-for-ownership traffic.",
+        "Storing a 128-byte header non-temporally immediately before the hot path reads it back to compute a checksum over it."
+      ],
+      "correctIndex": 0,
+      "explanation": "The gain comes from filling a write-combining buffer completely so it flushes as one 64-byte burst with no line read and no cache allocation — large, sequential, write-once data such as log buffers is the ideal case. The eight-stream variant is the trap: parallel streams sound like more bandwidth, but a core has only ~4–10 WC buffers, so extra streams force premature partial flushes and destroy the benefit. Scattered 8-byte stores are partial-line writes, and anything read back immediately wants to be cached.",
+      "sourceAnchor": "2814-non-temporal-stores",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q30",
+      "prompt": "You run one latency-critical process on a shared host with a 16-way LLC. What does Intel CAT let you do, and what is the counterintuitive result?",
+      "options": [
+        "Give the hot core a CLOS holding an exclusive subset of ways; fewer exclusive ways often beats more shared ways for p99.9.",
+        "Give the hot core a guaranteed fraction of memory bandwidth; reserving cache capacity is what the separate MBA feature does.",
+        "Partition the LLC by sets rather than by ways, which is exactly why the allocation masks must be contiguous on most parts.",
+        "Place physical pages so the process spreads evenly across LLC sets, which is page colouring implemented directly in hardware."
+      ],
+      "correctIndex": 0,
+      "explanation": "CAT defines Classes of Service with way bitmasks and assigns cores or processes to them, and reserving a smaller exclusive slice usually beats sharing the whole cache because determinism, not capacity, drives tail latency — measure p99.9, not the mean. Swapping CAT and MBA is the natural confusion: CAT partitions capacity and MBA throttles bandwidth, which is why a neighbour under CAT can still saturate the memory controller. Page colouring is a software page-allocation policy, and Linux does not implement it.",
+      "sourceAnchor": "2815-cache-coloring-and-way-partitioning",
+      "difficulty": "application"
+    },
+    {
+      "id": "28-q31",
+      "prompt": "A trading binary has a hot `.text` footprint of several megabytes. Why can that footprint not be iTLB-resident with 4 KB pages?",
+      "options": [
+        "The 256-entry L1 iTLB at 4 KB per entry covers only 1 MB, far less than the hot instruction footprint.",
+        "The L1 iTLB holds 32 entries of 4 KB, covering 128 KB, and the L2 STLB caches only data-side translations.",
+        "Instruction translations are never cached below the L1 iTLB, so any fetch to an unseen page walks the tables.",
+        "The iTLB is flushed on every context switch even when PCID is enabled, so its entries never survive to be reused."
+      ],
+      "correctIndex": 0,
+      "explanation": "256 entries × 4 KB is 1 MB of coverage against a multi-megabyte hot path, so the walks are structural rather than tunable — the symptom is high `itlb_misses.walk_active` and a benchmark that looks much faster than production for identical code. The PCID answer inverts the mechanism: PCID tags entries with their address space specifically so a context switch does *not* flush them, which is why Meltdown mitigation was merely expensive rather than catastrophic on modern parts.",
+      "sourceAnchor": "2816-instruction-tlb-behavior",
+      "difficulty": "recall"
+    },
+    {
+      "id": "28-q32",
+      "prompt": "You back a large `.text` section with 2 MB pages. How much iTLB coverage does that buy, and what gain is typically reported?",
+      "options": [
+        "32 entries × 2 MB = 64 MB of coverage, with reported gains of 5–15% on large server binaries.",
+        "256 entries × 2 MB = 512 MB of coverage, with reported gains of 30–40% on large server binaries.",
+        "32 entries × 2 MB = 64 MB of coverage, but the benefit stops at the STLB and measures under 1%.",
+        "2048 entries × 2 MB = 4 GB of coverage from the L1 iTLB, with gains comparable to static linking."
+      ],
+      "correctIndex": 0,
+      "explanation": "The 2 MB iTLB array has 32 entries, so huge text pages cover 64 MB — an entire large binary — and the reported 5–15% is comparable to BOLT and stacks with it. The 512 MB figure reuses the 4 KB array's 256 entries, which is the most common arithmetic slip since the two arrays are separate and differently sized. The 2048-entry number belongs to the shared L2 STLB, not the L1 iTLB.",
+      "sourceAnchor": "2816-instruction-tlb-behavior",
+      "difficulty": "application"
+    }
+  ]
+}

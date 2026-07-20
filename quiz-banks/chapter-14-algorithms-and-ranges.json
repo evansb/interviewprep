@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-14-algorithms-and-ranges",
+  "questions": [
+    {
+      "id": "14-q01",
+      "prompt": "What complexity does C++11 onward require of `std::sort`, and what implementation technique satisfies it?",
+      "options": [
+        "Worst-case O(n log n) comparisons, met by introsort: quicksort that switches a subrange to heapsort once recursion depth exceeds roughly 2·log₂n.",
+        "Average-case O(n log n) comparisons, met by a median-of-three quicksort whose adversarial worst case is still permitted to be O(n²).",
+        "Worst-case O(n log n) comparisons, met by a bottom-up merge sort that relinks or copies elements through an O(n) scratch buffer.",
+        "Worst-case O(n log n) comparisons and guaranteed stability, met by a timsort-style adaptive run detector over the input array."
+      ],
+      "correctIndex": 0,
+      "explanation": "C++11 tightened the requirement from average to worst case, and the depth-limited heapsort fallback is exactly what makes the bound unconditional. The average-case option describes the C++98 rule, under which the 'quicksort killer' input was conforming — a real DoS vector. Merge sort would satisfy the bound but is what `stable_sort` does, and `std::sort` is explicitly not stable.",
+      "sourceAnchor": "141-sorting-algorithms-in-the-standard-library",
+      "difficulty": "recall"
+    },
+    {
+      "id": "14-q02",
+      "prompt": "A candidate passes `[](const T& a, const T& b){ return a.x <= b.x; }` to `std::sort`. What is the consequence?",
+      "options": [
+        "A merely incorrect ordering: equivalent elements come out in an arbitrary order, but the range is still fully sorted and memory is untouched.",
+        "Undefined behavior: `<=` is not irreflexive, so equal elements compare 'less' both ways and libstdc++'s partition loop can run past the end of the array.",
+        "A compile error, because the standard requires comparators to be irreflexive and the library static_asserts on that property.",
+        "Correct but slower sorting, since the extra equality case forces introsort to abandon quicksort and finish with heapsort."
+      ],
+      "correctIndex": 1,
+      "explanation": "Strict weak ordering is a precondition, and violating a precondition is UB — the failure mode is real memory corruption during partitioning, not a cosmetic ordering bug. The 'merely wrong order' answer is the tempting one because it sounds proportionate to the mistake, but nothing in the library keeps the partition pointers in bounds once `comp(a,a)` is true. Irreflexivity is a semantic requirement no `static_assert` can check.",
+      "sourceAnchor": "141-sorting-algorithms-in-the-standard-library",
+      "difficulty": "trap"
+    },
+    {
+      "id": "14-q03",
+      "prompt": "Why does `std::list` provide a member `sort` rather than relying on `std::sort`?",
+      "options": [
+        "`std::sort` requires contiguous iterators for its `memmove` fast path, and `list` nodes are scattered, so the member version copies values into a scratch vector first.",
+        "`std::sort` would work but allocate, and `list::sort` exists purely to offer an allocation-free alternative with the same O(n log n) bound.",
+        "`std::sort` requires random-access iterators and `list` supplies only bidirectional ones; `list::sort` is a merge sort that relinks nodes instead of moving values.",
+        "`std::sort` cannot be stable, and containers whose iterators stay valid across the operation are required by the standard to sort stably."
+      ],
+      "correctIndex": 2,
+      "explanation": "The requirement is the iterator category: introsort indexes into partitions, which needs `+n` and iterator subtraction. The 'contiguous' answer overshoots — `std::deque` is random-access but not contiguous and sorts fine with `std::sort`, so contiguity is not the bar. `std::sort` itself does not allocate beyond O(log n) stack, so the allocation framing is wrong too.",
+      "sourceAnchor": "141-sorting-algorithms-in-the-standard-library",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q04",
+      "prompt": "What does the `std::execution::unseq` policy permit that `seq` does not, and what does it forbid in your callable?",
+      "options": [
+        "It permits the algorithm to run on several threads without vectorising, and forbids data races while still allowing mutexes to be taken.",
+        "It permits both multithreading and interleaving, and forbids only allocation, since locks are made safe by the implementation's own serialisation.",
+        "It permits reordering of whole elements between threads, and forbids exceptions specifically, since escaping ones would cross a thread boundary.",
+        "It permits element operations to interleave within a single thread's instruction stream, and forbids locks, allocation, and any order dependence."
+      ],
+      "correctIndex": 3,
+      "explanation": "`unseq` is single-threaded but explicitly allows one thread to interleave the operations of different elements, which is why lock acquisition inside the callable is 'vectorization-unsafe' and can self-deadlock. The multithreaded-without-vectorising description belongs to `par`, which does allow locks. `par_unseq` is the one that combines both axes, and no policy makes locks safe by serialising for you.",
+      "sourceAnchor": "1412-parallel-algorithms-and-execution-policies",
+      "difficulty": "recall"
+    },
+    {
+      "id": "14-q05",
+      "prompt": "After `std::nth_element(v.begin(), v.begin()+k, v.end())` returns, what is guaranteed about `v`?",
+      "options": [
+        "`v[k]` holds the element that sorting would place there and the prefix `v[0..k)` is sorted ascending, while the suffix is left in unspecified order.",
+        "`v[k]` holds the element that sorting would place there, everything before it is <= it and everything after is >= it, and neither side is in sorted order.",
+        "The whole range is partitioned around `v[k]` and equivalent elements retain their original relative order on each side of the boundary.",
+        "`v[k]` holds the element that sorting would place there and `v[k-1]` holds the next smallest, since the partition is built by repeated selection."
+      ],
+      "correctIndex": 1,
+      "explanation": "The postcondition is stated purely as a partition around position k, which is what makes quickselect's linear average cost possible. The 'sorted prefix' answer describes `partial_sort`, not `nth_element`, and is the classic confusion between the two. `nth_element` is also not stable — it may reorder equivalent elements arbitrarily — and nothing implies `v[k-1]` is the second smallest.",
+      "sourceAnchor": "142-selection-and-partial-sorting-algorithms",
+      "difficulty": "trap"
+    },
+    {
+      "id": "14-q06",
+      "prompt": "You need the 100 largest of 10 million values, and they must come back in descending order. Which call and complexity is right?",
+      "options": [
+        "`nth_element` at position 100 with `greater`, O(n) average, because the prefix it leaves behind is the top 100 in descending order.",
+        "`std::sort` with `greater` followed by `resize(100)`, O(n log n), because no selection algorithm can produce an ordered result.",
+        "`partition` around the 100th largest value, O(n) swaps, because partitioning orders the satisfying side by construction.",
+        "`partial_sort` with `greater`, O(n log k), because it maintains a k-element heap and yields the top k already ordered."
+      ],
+      "correctIndex": 3,
+      "explanation": "Order is required, so `partial_sort` is the answer and its O(n log k) beats a full sort at k=100, n=10⁷. `nth_element` is cheaper asymptotically but its prefix is unordered, which fails the stated requirement — that is the trap in this question. Sort-then-truncate is the answer the chapter explicitly tells you not to give, and `partition` produces no ordering on either side.",
+      "sourceAnchor": "142-selection-and-partial-sorting-algorithms",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q07",
+      "prompt": "What is the headline complexity of `std::nth_element`, and how is it achieved?",
+      "options": [
+        "O(n log k) in the worst case, because it maintains a bounded max-heap of the k smallest elements seen so far as it scans.",
+        "Linear in the worst case unconditionally, because the standard mandates a median-of-medians pivot for every recursive step.",
+        "Linear on average, because quickselect recurses into only one partition, giving the n + n/2 + n/4 + … expected-comparison series.",
+        "O(n log n) on average, because it must fully sort each partition before it can decide which side contains position k."
+      ],
+      "correctIndex": 2,
+      "explanation": "Discarding one side each step halves the remaining work, so the expected comparisons telescope to about 2n. The heap description belongs to `partial_sort`, not `nth_element`. Median-of-medians is not mandated — the standard only requires linear *average*, and libstdc++ bounds the worst case with introselect's heapsort fallback rather than a guaranteed-linear pivot rule.",
+      "sourceAnchor": "142-selection-and-partial-sorting-algorithms",
+      "difficulty": "recall"
+    },
+    {
+      "id": "14-q08",
+      "prompt": "What precondition do `lower_bound`, `upper_bound`, and `partition_point` actually require of the input range?",
+      "options": [
+        "That the range be partitioned with respect to the relevant predicate — a weaker requirement than being fully sorted by the comparator.",
+        "That the range be fully sorted by the same comparator, since the midpoint test is meaningless unless every adjacent pair is ordered.",
+        "That the range be sorted and free of duplicates, since equivalent elements would make the returned position ambiguous.",
+        "That the range be sorted and offer random-access iterators, since the halving step requires computing a midpoint in O(1)."
+      ],
+      "correctIndex": 0,
+      "explanation": "Partitioning with respect to the predicate is the true and strictly weaker precondition — `partition_point` generalises the whole family precisely because sortedness is not what the algorithm needs. The 'fully sorted' answer is the widespread half-truth: sortedness implies partitioning for `x < v`, but not the reverse, so it over-constrains. Duplicates are fine (that is what `equal_range` is for), and forward iterators suffice for correctness.",
+      "sourceAnchor": "143-binary-search-algorithms",
+      "difficulty": "recall"
+    },
+    {
+      "id": "14-q09",
+      "prompt": "You call `std::lower_bound(s.begin(), s.end(), key)` on a `std::set` of one million elements. What is the actual cost?",
+      "options": [
+        "O(log n) overall, because the guarantee is stated in comparisons and `set`'s tree structure makes each iterator advance a single node hop.",
+        "O(log n) comparisons but O(log n) increments, because the library detects the associative container and dispatches to the member function.",
+        "A compile error, because `std::lower_bound` constrains its iterator parameter to the random-access category through a concept check.",
+        "O(n) overall: it performs O(log n) comparisons but O(n) iterator increments, because `set` iterators are bidirectional rather than random-access."
+      ],
+      "correctIndex": 3,
+      "explanation": "The complexity guarantee counts comparisons only; stepping a bidirectional iterator to the midpoint costs a linear walk, so the whole call degrades to O(n). The 'O(log n) overall' answer conflates the counted operation with wall cost — the standard's guarantee is genuine but says nothing about iterator movement. No dispatch to `set::lower_bound` happens, and the call compiles fine because forward iterators satisfy the requirement.",
+      "sourceAnchor": "143-binary-search-algorithms",
+      "difficulty": "trap"
+    },
+    {
+      "id": "14-q10",
+      "prompt": "Why is a textbook binary search over a sorted array often slower than its O(log n) suggests, and what fixes it?",
+      "options": [
+        "Each step recomputes the midpoint with a division, which dominates; replacing the divide with a shift removes most of the cost on modern cores.",
+        "Each step is an unpredictable branch and a fresh cache miss; branchless midpoint arithmetic, prefetching both candidate children, or an Eytzinger layout attack that.",
+        "Each step reloads the comparator through an indirect call; marking the comparator `inline` removes the call and restores the asymptotic behaviour.",
+        "Each step performs a redundant equality test after the ordering test; hoisting that test out of the loop halves the number of comparisons executed."
+      ],
+      "correctIndex": 1,
+      "explanation": "The cost model is memory and branch prediction, not comparison count: every probe lands in an unvisited cache line and the branch is ~50/50. Branchless arithmetic converts the mispredict into a data dependency, and Eytzinger's breadth-first layout puts the top levels on shared lines. The divide answer is wrong on its own terms — midpoint computation is already a shift — and no indirect call is involved when the comparator is a lambda or `std::less`.",
+      "sourceAnchor": "143-binary-search-algorithms",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q11",
+      "prompt": "A `par_unseq` `for_each` callable takes a `std::mutex` to protect a shared counter, and the program hangs on one thread. Why?",
+      "options": [
+        "The policy silently promotes the mutex to a recursive one, and the recursion count overflows once the vector width exceeds the lock's depth limit.",
+        "`par_unseq` requires all shared state to be atomic, so the mutex is stripped by the implementation and the counter race stalls the loop forever.",
+        "Interleaving lets one thread begin element i+1's lock acquisition before it has released the lock for element i, so the thread deadlocks against itself.",
+        "The thread pool runs every element on the same worker, so the mutex serialises the whole loop and the algorithm never reaches its join point."
+      ],
+      "correctIndex": 2,
+      "explanation": "Vectorisation-unsafe means exactly this: the unsequenced axis lets operations from different elements be woven together in one instruction stream, so a non-recursive mutex is re-entered by its own holder. Nothing promotes the mutex or strips it — the standard simply makes such a callable's behaviour undefined. Serialisation on one worker would be slow, not hung.",
+      "sourceAnchor": "1412-parallel-algorithms-and-execution-policies",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q12",
+      "prompt": "What does `std::remove(v.begin(), v.end(), value)` do to the vector?",
+      "options": [
+        "It move-assigns surviving elements forward and returns the new logical end, leaving the tail valid-but-unspecified and `v.size()` unchanged.",
+        "It move-assigns surviving elements forward and shrinks the container to the new logical end, so `v.size()` reflects the survivors.",
+        "It swaps matching elements to the back of the range and returns an iterator to the first of them, preserving the removed values intact.",
+        "It destroys the matching elements in place and returns the new logical end, leaving the tail as raw uninitialised storage."
+      ],
+      "correctIndex": 0,
+      "explanation": "Algorithms operate on iterators and cannot resize a container, so `remove` only compacts and reports where the survivors end — hence the erase-remove idiom and C++20's `std::erase`/`erase_if`. The 'shrinks the container' answer is the single most common standard-library misconception; C++20 added `[[nodiscard]]` on `remove` precisely to catch it. The tail elements are moved-from, not destroyed and not preserved.",
+      "sourceAnchor": "144-partitioning-algorithms",
+      "difficulty": "recall"
+    },
+    {
+      "id": "14-q13",
+      "prompt": "In a hot compaction loop over an object pool where surviving order does not matter, why prefer `std::partition` to `std::remove_if`?",
+      "options": [
+        "`partition` runs in O(log n) because it can binary-search the boundary, while `remove_if` must inspect every element to compact the survivors.",
+        "`partition` is unstable and does at most n/2 swaps, while `remove` preserves order and pays O(n) move-assignments, so partitioning moves strictly less data.",
+        "`partition` needs only forward iterators while `remove_if` needs bidirectional ones, so only `partition` compiles against a pool exposing a forward range.",
+        "`partition` returns an iterator you can pass straight to `erase`, whereas `remove_if` returns void and forces a second pass to locate the new end."
+      ],
+      "correctIndex": 1,
+      "explanation": "Order preservation is what costs you: `remove` must slide every survivor down, while `partition` may swap ends and gets away with n/2 swaps. The O(log n) claim confuses `partition` with `partition_point`, which is logarithmic only on an already-partitioned range. Both algorithms need only forward iterators, and both return the boundary iterator.",
+      "sourceAnchor": "144-partitioning-algorithms",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q14",
+      "prompt": "You need `std::stable_partition` inside a code path that must never allocate. What is the problem?",
+      "options": [
+        "It always allocates an O(n) buffer and throws `std::bad_alloc` on failure, so an allocation-free path cannot use it under any circumstances.",
+        "It allocates only when the predicate is true for more than half the range, so pre-filtering the input to a minority-true predicate makes it allocation-free.",
+        "It does not allocate at all; the allocating members of that family are `stable_sort` and `inplace_merge`, so it is safe on such a path.",
+        "It tries to obtain a temporary buffer and, if it cannot, silently falls back to an in-place divide-and-conquer costing O(n log n) swaps."
+      ],
+      "correctIndex": 3,
+      "explanation": "`stable_partition` is one of the three algorithms — with `stable_sort` and `inplace_merge` — that attempt an allocation and degrade to a worse complexity rather than fail. The 'always throws' option gets the hazard direction right but the mechanism wrong: graceful degradation is what makes the allocation invisible and therefore dangerous. The predicate's true/false balance has no bearing on whether a buffer is requested.",
+      "sourceAnchor": "144-partitioning-algorithms",
+      "difficulty": "trap"
+    },
+    {
+      "id": "14-q15",
+      "prompt": "What was wrong with `for (auto c : get_object().get_string()) { ... }` before C++23, and what fixed it?",
+      "options": [
+        "The loop copied each character out of a temporary string, so the body saw stale values; P2718 makes the range variable bind by reference instead of by value.",
+        "The range expression was evaluated once per iteration, calling `get_object()` repeatedly; P2718 hoists the expression out of the loop so it runs exactly once.",
+        "Only the final temporary in the range expression had its lifetime extended, so `get_object()`'s result died before the body ran; P2718 extends every temporary to the end of the loop.",
+        "The string's iterators were not `borrowed_range` iterators, so the loop was ill-formed; P2718 marked `std::string` as a borrowed range to permit it."
+      ],
+      "correctIndex": 2,
+      "explanation": "The expansion binds `auto&& __range = expr`, which extends only the lifetime of the outermost temporary; the intermediate `get_object()` result was destroyed at the end of the full expression, leaving the string dangling. P2718 extends all temporaries in the range expression through the loop. The range expression was already evaluated exactly once, and `std::string` is deliberately not a borrowed range — that is unchanged.",
+      "sourceAnchor": "1411-range-view-lifetimes",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q16",
+      "prompt": "Given `std::vector<double> d` holding {0.5, 0.5, 0.5}, what does `std::accumulate(d.begin(), d.end(), 0)` return?",
+      "options": [
+        "1.5, because the accumulator type is deduced from the iterator's value type and the literal `0` is simply converted to `0.0`.",
+        "0, because `init` deduces `int`, so the accumulator is `int` and every partial sum truncates the fractional part away.",
+        "1, because the accumulator is `int` and each addition rounds the running total to the nearest representable integer value.",
+        "0.0, because integer `init` disables the fold entirely and `accumulate` returns the unmodified initial value it was given."
+      ],
+      "correctIndex": 1,
+      "explanation": "`accumulate` deduces its accumulator from `init`, so the type is `int` and `0 + 0.5` converts back to 0 at every step — the fix is `0.0` or `T{}`. The 1.5 answer assumes deduction from the range, which is what `reduce`'s no-init overload does, not `accumulate`. Truncation toward zero, not rounding, is why the result is 0 rather than 1.",
+      "sourceAnchor": "145-transformation-and-accumulation-algorithms",
+      "difficulty": "trap"
+    },
+    {
+      "id": "14-q17",
+      "prompt": "What does `std::reduce` require of its binary operation that `std::accumulate` does not?",
+      "options": [
+        "Associativity and commutativity, because `reduce` may group and order the operations arbitrarily rather than folding strictly left to right.",
+        "Only associativity, because `reduce` may regroup the operations but is still required to visit the elements in their original left-to-right order.",
+        "That it be free of side effects, because `reduce` is required by the standard to execute in parallel whenever a policy overload is selected.",
+        "That its result type match the range's value type, because `reduce` deduces the accumulator from the range and cannot widen it."
+      ],
+      "correctIndex": 0,
+      "explanation": "`reduce` leaves both the grouping and the order unspecified, so commutativity is required alongside associativity — which is exactly why floating-point `reduce` is non-deterministic across runs and core counts. The associativity-only answer is the near miss: it correctly names half the requirement but wrongly asserts a preserved visit order. `reduce` also has an overload taking an explicit `init` of a different type.",
+      "sourceAnchor": "145-transformation-and-accumulation-algorithms",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q18",
+      "prompt": "You need an offset table where `out[i]` is the sum of all inputs strictly before index i, for a radix-sort bucketing pass. Which algorithm is the direct fit?",
+      "options": [
+        "`std::inclusive_scan`, which includes the current element in each output and is the standard offset-table primitive.",
+        "`std::partial_sum`, which omits the current element from each output but is a strict left fold with no policy overload.",
+        "`std::transform_reduce`, which fuses the mapping and the running total into a single pass over the input.",
+        "`std::exclusive_scan`, which omits the current element from each output and is order-relaxed and policy-accepting."
+      ],
+      "correctIndex": 3,
+      "explanation": "Excluding the current element is precisely the offset-table shape, and `exclusive_scan` is the C++17 order-relaxed version that accepts an execution policy. `inclusive_scan` and `partial_sum` both include the current element, so their outputs are shifted by one bucket — the `partial_sum` option also misstates its semantics. `transform_reduce` collapses to a single value and produces no per-element output at all.",
+      "sourceAnchor": "145-transformation-and-accumulation-algorithms",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q19",
+      "prompt": "A trivial `std::transform(in.begin(), in.end(), out.begin(), f)` over two `vector<float>`s fails to vectorise cleanly. What is the likely cause?",
+      "options": [
+        "`std::transform` is specified to apply `f` in strict order, which forbids the compiler from executing any two applications simultaneously.",
+        "The lambda `f` is passed by value as a template argument and is therefore called indirectly once per element, which blocks the vectoriser.",
+        "The compiler cannot prove the input and output do not overlap, so it emits a runtime overlap check plus a scalar fallback alongside the vector body.",
+        "`std::transform` writes through an output iterator, whose single-pass contract prevents the compiler from unrolling the write loop at all."
+      ],
+      "correctIndex": 2,
+      "explanation": "Aliasing is the classic blocker: two `float*`s of the same type may overlap as far as the compiler knows, so it duplicates the loop behind a runtime check — `__restrict` or distinct types removes it. The ordering answer is wrong because the specification's sequencing does not prevent vectorisation of independent element operations. A lambda passed as a template parameter inlines fully; there is no indirect call.",
+      "sourceAnchor": "145-transformation-and-accumulation-algorithms",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q20",
+      "prompt": "Why is \"amortized O(1) `push_back`\" the wrong statistic on a latency-percentile-sensitive path?",
+      "options": [
+        "Because any single call may reallocate and be O(n); the amortized average hides that the P99.9 is exactly that reallocation, which `reserve` moves to startup.",
+        "Because the amortization argument assumes geometric growth, and implementations may grow by a constant factor of one, making every call O(n) in the worst case.",
+        "Because amortized bounds count assignments rather than time, so the guarantee says nothing about any call, including the ones that do not reallocate.",
+        "Because amortization holds only over the lifetime of a single vector, so alternating `push_back` and `pop_back` calls each cost O(n) individually."
+      ],
+      "correctIndex": 0,
+      "explanation": "Amortized bounds describe a total over a sequence, so they average away exactly the outlier a tail-latency budget cares about — the reallocate-and-move call. The constant-growth answer misstates reality: implementations do grow geometrically, which is what makes the amortization valid in the first place. The alternating push/pop claim is also false, since capacity is not released by `pop_back`.",
+      "sourceAnchor": "146-algorithm-complexity-guarantees",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q21",
+      "prompt": "Which set of standard algorithms attempts an allocation and silently degrades to a worse complexity if it fails?",
+      "options": [
+        "`sort`, `nth_element`, and `partial_sort`, each of which requests a buffer to hold the pivot partitions and reverts to heapsort otherwise.",
+        "`rotate`, `unique`, and `remove_if`, each of which stages the surviving elements in a temporary buffer before writing them back.",
+        "`transform`, `partial_sum`, and `inclusive_scan`, each of which buffers the intermediate results so input and output may safely overlap.",
+        "`stable_sort`, `stable_partition`, and `inplace_merge`, each of which falls back to an O(n log n) in-place path without a buffer."
+      ],
+      "correctIndex": 3,
+      "explanation": "These three are the standard's 'with sufficient additional memory' family, and their quiet degradation is what disqualifies them from allocation-free hot paths. The `sort`/`nth_element`/`partial_sort` option is the tempting one, but those selection algorithms are all in-place and use only O(log n) stack — they never request a pivot buffer. `rotate`, `unique`, and `remove_if` are in-place compaction algorithms with no buffer, and `transform` explicitly permits in-place operation without one.",
+      "sourceAnchor": "146-algorithm-complexity-guarantees",
+      "difficulty": "recall"
+    },
+    {
+      "id": "14-q22",
+      "prompt": "An element access inside `std::for_each(std::execution::par, ...)` throws an exception that is not caught in the callable. What happens?",
+      "options": [
+        "The exception is captured and rethrown on the calling thread once all elements finish, so an ordinary try/catch around the call handles it.",
+        "`std::terminate` is called; parallel algorithms do not propagate an escaping exception back to the caller, so errors must be handled inside the callable.",
+        "The exception is repackaged into a `std::exception_list` alongside any others thrown concurrently, and that aggregate is thrown at the join point.",
+        "The algorithm silently falls back to sequential execution and rethrows from the element that failed, leaving later elements unprocessed."
+      ],
+      "correctIndex": 1,
+      "explanation": "The standard's parallel overloads specify `terminate` for an escaping exception, which is why error handling has to live inside the callable rather than around the call. The rethrow-on-the-caller answer is what people expect from `std::async`/futures, and the `exception_list` answer describes an aggregate type that appeared in the Parallelism TS but was never adopted into C++17. Sequential fallback is a resource-shortage behaviour, not an exception one.",
+      "sourceAnchor": "1412-parallel-algorithms-and-execution-policies",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q23",
+      "prompt": "What distinguishes a contiguous iterator from a random-access iterator, and which container illustrates the gap?",
+      "options": [
+        "Contiguous additionally guarantees O(1) `advance` and iterator subtraction, which random access does not provide; `list` is the container that lacks it.",
+        "Contiguous additionally guarantees the iterator is a raw pointer type rather than a class, which random access permits; `vector` is the container that lacks it.",
+        "Contiguous additionally guarantees the elements are adjacent in memory, unlocking `memmove` and `data()`; `deque` is random-access but not contiguous.",
+        "Contiguous additionally guarantees references stay valid across insertion, which random access does not; `vector` is the container that lacks it."
+      ],
+      "correctIndex": 2,
+      "explanation": "Adjacency in memory is the added guarantee — carved out in C++17 and given a real tag in C++20 — and `deque` is the standard counterexample, indexable in O(1) yet stored in chunks. O(1) `advance` and subtraction are already random-access properties, so that option adds nothing new. Contiguous iterators need only satisfy `std::to_address`; they are not required to be raw pointers, and reference stability is unrelated.",
+      "sourceAnchor": "147-iterator-categories",
+      "difficulty": "recall"
+    },
+    {
+      "id": "14-q24",
+      "prompt": "Which statement about C++20 ranges iterators is correct?",
+      "options": [
+        "The sentinel may be a distinct type from the iterator, so a null-terminated string is a valid range with no precomputed end and no `strlen` pre-pass.",
+        "`std::input_iterator` still requires copyability, which is why `views::istream` must buffer each element rather than move it through the pipeline.",
+        "`iterator_concept` replaced `iterator_traits::iterator_category` outright, so legacy tag-dispatching algorithms no longer compile against ranges iterators.",
+        "`std::ranges::forward_iterator` dropped the equality-preserving dereference requirement, which is what lets `transform_view` model a forward range."
+      ],
+      "correctIndex": 0,
+      "explanation": "The separate sentinel type is the headline change: `begin` and `end` need not agree, which eliminates the classic double pass over a C string. Ranges input iterators explicitly no longer require copyability — that relaxation is what makes move-only and generator-backed iterators work. `iterator_concept` supplements rather than replaces the old tag, and `forward_iterator` *added* the equality-preserving dereference requirement, which is why a by-value `transform_view` is only an input range.",
+      "sourceAnchor": "147-iterator-categories",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q25",
+      "prompt": "In `std::ranges::sort(v, std::greater{}, &Order::price)`, what role does `&Order::price` play?",
+      "options": [
+        "It is a comparator adaptor that tells `greater` which member to dereference, replacing the two-argument lambda entirely.",
+        "It is a key extractor evaluated once per element into a temporary key array, which `ranges::sort` then sorts and gathers from.",
+        "It is a member-pointer overload selector that binds `ranges::sort` to a member `sort` on `Order` if one exists.",
+        "It is a projection applied via `std::invoke` to each element before the comparator sees it, so `greater` orders the projected prices."
+      ],
+      "correctIndex": 3,
+      "explanation": "A projection answers 'which part do I look at' and is invoked through `std::invoke`, which is exactly why a pointer-to-member works where a plain call would not. The 'evaluated once into a key array' answer is the important misconception: projections are re-applied on every comparison, so an expensive one costs O(n log n) evaluations and wants a manual Schwartzian transform. The comparator remains an independent two-argument callable.",
+      "sourceAnchor": "148-custom-comparators-and-projections",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q26",
+      "prompt": "A team stores its sort comparator as `std::function<bool(const Order&, const Order&)>`. What is the measured consequence?",
+      "options": [
+        "A one-time type-erasure cost at construction, after which the call is devirtualised by the compiler and performance matches a lambda.",
+        "Correctness risk only: `std::function` may throw `bad_function_call` mid-sort, but when populated the generated code is identical to a lambda's.",
+        "Roughly n log n indirect calls that cannot be inlined or well predicted, typically a 3–10× sort slowdown versus an equivalent lambda.",
+        "Extra storage in every `std::set` node holding the comparator, roughly 32 bytes per element, with no effect on comparison speed itself."
+      ],
+      "correctIndex": 2,
+      "explanation": "Type erasure puts an indirect call on the innermost operation of the sort, defeating inlining and branch prediction once per comparison. Devirtualisation is not available in general because the stored target is only known at run time. The storage answer is wrong on two counts: a comparator lives once in the container, not per node, and the real cost here is speed, not size.",
+      "sourceAnchor": "148-custom-comparators-and-projections",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q27",
+      "prompt": "Which property must a type satisfy to model `std::ranges::view`, and why does it matter for `|` chaining?",
+      "options": [
+        "Ownership of its elements with O(1) move but O(n) copy, so each adaptor stage transfers the underlying storage forward exactly once.",
+        "O(1) copy, move, and destroy with reference-like semantics, so an adaptor can freely copy the wrapped range into the next stage of the pipeline.",
+        "A `size()` member returning in O(1), so each adaptor stage can preallocate the storage the next stage in the chain will need.",
+        "Iterators and sentinels of the same type, so each adaptor stage can forward the pair to legacy iterator-pair algorithms unchanged."
+      ],
+      "correctIndex": 1,
+      "explanation": "Cheap copy plus reference semantics is the `view` requirement, and it is what makes stacking adaptors free — each one holds the previous by value. The ownership answer describes a container, whose O(n) copy is precisely what views avoid. `sized_range` and `common_range` are orthogonal axes, not prerequisites: `views::filter` is neither, yet it is unquestionably a view.",
+      "sourceAnchor": "149-range-concepts",
+      "difficulty": "recall"
+    },
+    {
+      "id": "14-q28",
+      "prompt": "What does `std::ranges::find(std::vector{1,2,3}, 2)` return, and what is the design intent?",
+      "options": [
+        "A valid iterator into an `owning_view` of the vector, since C++20 rescues rvalue containers by moving them into the algorithm's own storage.",
+        "An iterator that is immediately invalid; the standard chose not to diagnose it, which is why `enable_borrowed_range` exists as an opt-out.",
+        "`std::nullopt` wrapped in an `std::optional<iterator>`, which forces the caller to check before dereferencing the returned position.",
+        "`std::ranges::dangling`, a member-less type, so any attempt to use the result is a compile error rather than runtime UB on a dead iterator."
+      ],
+      "correctIndex": 3,
+      "explanation": "Returning `dangling` converts a whole class of dangling-iterator UB into a type error at the use site — the point is that the failure is loud and at compile time. The `owning_view` answer confuses algorithms with adaptors: `owning_view` rescues rvalue containers piped into a *view pipeline*, not iterators returned from an algorithm. `enable_borrowed_range` is the opt-*out* of this protection, used by `span`, `string_view`, and `subrange`.",
+      "sourceAnchor": "149-range-concepts",
+      "difficulty": "trap"
+    },
+    {
+      "id": "14-q29",
+      "prompt": "Given `auto r = orders | views::filter(is_buy) | views::transform(&Order::price) | views::take(10);`, what has happened when this line finishes?",
+      "options": [
+        "Nothing has been computed or allocated; the predicate runs per element only as the consuming loop advances, and stops after ten survivors.",
+        "The filter has been evaluated eagerly into a temporary, and the transform and take stay lazy until the range is iterated.",
+        "All three stages have run, producing one intermediate container per stage, which is why deep pipelines are criticised for allocation churn.",
+        "The filter's `begin()` has scanned the whole range to count survivors, since `take` needs a size before it can bound the pipeline."
+      ],
+      "correctIndex": 0,
+      "explanation": "View adaptors do their work on dereference and increment, so composition itself is free — that laziness is what removes intermediate containers and gives `take(10)` its short-circuit. The eager-filter answer is the common half-understanding; `filter_view::begin()` does scan, but only far enough to find the *first* satisfying element, and only when iteration starts. `take` needs no size and works over unsized and infinite ranges.",
+      "sourceAnchor": "1410-lazy-range-views",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q30",
+      "prompt": "Why can't you pass a `const std::ranges::filter_view&` to an algorithm that needs to iterate it?",
+      "options": [
+        "`filter_view` stores its predicate by const reference, so a const view cannot invoke a predicate that may itself be mutable.",
+        "`filter_view` is not a `borrowed_range`, and const-qualifying a view strips its iterators' validity beyond the enclosing expression.",
+        "`begin()` caches the first satisfying position to stay amortized O(1), so it is a non-const member and const iteration is unavailable.",
+        "`filter_view` models only `input_range`, and all input ranges are non-const-iterable because their iterators are single-pass."
+      ],
+      "correctIndex": 2,
+      "explanation": "The cache is the whole reason: finding the first match is O(n), so it is memoised, and memoisation makes `begin()` mutating and therefore non-const. That same cache also means `filter_view` is not a `sized_range`. The input-range answer is false in both directions — filtering a forward range yields a forward range, and input-ness is not what governs const iteration.",
+      "sourceAnchor": "1410-lazy-range-views",
+      "difficulty": "trap"
+    },
+    {
+      "id": "14-q31",
+      "prompt": "A profile shows a range pipeline running far slower than the equivalent hand-written loop in a release build. Which explanation matches the chapter?",
+      "options": [
+        "Each adaptor layer adds a virtual dispatch per element, since view composition is implemented through a type-erased range interface.",
+        "Views allocate a small control block per stage on first iteration, so a three-stage pipeline pays three allocations per traversal.",
+        "The `|` operator forces each stage to be evaluated into a `subrange` before the next stage begins, serialising the pipeline stage by stage.",
+        "The filter's per-increment predicate check produces a loop structure the vectoriser cannot handle, so the pipeline stays scalar where the raw loop vectorises."
+      ],
+      "correctIndex": 3,
+      "explanation": "Vectorisation failure is the real and documented cost: the conditional advance inside `filter` breaks the countable-trip-count loop shape the vectoriser needs, which is why the chapter says to check the assembly before putting a pipeline on a hot path. Views are templates composed by value — there is no type erasure, no virtual dispatch, and no allocation. The 10–50× figure people quote comes from `-O0` builds, not release ones.",
+      "sourceAnchor": "1410-lazy-range-views",
+      "difficulty": "application"
+    },
+    {
+      "id": "14-q32",
+      "prompt": "Which lifetime claim about range pipelines is correct under C++20 as amended?",
+      "options": [
+        "An rvalue *view* piped into an adaptor is safe because views are `borrowed_range`s, but an rvalue *container* dangles because containers own their elements.",
+        "An rvalue *container* piped into an adaptor is safe because `owning_view` moves it into the pipeline, but an rvalue *view* over other storage owns nothing and can still dangle.",
+        "Both rvalue containers and rvalue views are safe, because `viewable_range` rejects every expression that could produce a dangling pipeline at compile time.",
+        "Neither is safe, because the pipe operator always stores a reference to its left operand and never extends any temporary's lifetime."
+      ],
+      "correctIndex": 1,
+      "explanation": "P2415 added `owning_view` precisely so a temporary container is moved into the pipeline and kept alive; a view, by contrast, owns nothing, so a temporary view over a dead container still dangles. The claim that an rvalue *view* is safe while an rvalue *container* dangles inverts the rule exactly — it is ownership, not the `borrowed_range` label, that decides. `viewable_range` narrows the hazard but the protection is admittedly incomplete, so the blanket-safety claim is wrong too.",
+      "sourceAnchor": "1411-range-view-lifetimes",
+      "difficulty": "trap"
+    }
+  ]
+}

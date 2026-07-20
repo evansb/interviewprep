@@ -6,6 +6,10 @@ const root = process.cwd();
 const chaptersDir = path.join(root, 'src/content/docs/chapters');
 const quizzesDir = path.join(root, 'src/data/quizzes');
 const generatedDir = path.join(root, 'src/generated');
+const bankDir = path.join(root, 'quiz-banks');
+
+const DIFFICULTIES = ['recall', 'application', 'trap'];
+const MIN_EXPLANATION = 80;
 
 const STOP_WORDS = new Set(
   'a an and are as at be but by can do does for from has have how i if in into is it its of on or that the their this to vs what when where which why will with you your'.split(' '),
@@ -222,6 +226,78 @@ function makeQuiz(chapter, markdown) {
   };
 }
 
+async function loadAuthoredBank(slug) {
+  try {
+    return JSON.parse(await readFile(path.join(bankDir, `${slug}.json`), 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw new Error(`Could not parse quiz-banks/${slug}.json: ${error.message}`);
+  }
+}
+
+function validateBank(bank, chapter, sections) {
+  const where = `quiz-banks/${chapter.slug}.json`;
+  const fail = (message, id) => {
+    throw new Error(`${where}${id ? ` [${id}]` : ''}: ${message}`);
+  };
+
+  if (bank.slug !== chapter.slug) fail(`slug is "${bank.slug}", expected "${chapter.slug}"`);
+  if (!Array.isArray(bank.questions)) fail('questions must be an array');
+  const count = bank.questions.length;
+  if (count < 20 || count > 50) fail(`has ${count} questions, expected between 20 and 50`);
+
+  const anchors = new Set(sections.map((section) => section.anchor));
+  const ids = new Set();
+  for (const question of bank.questions) {
+    const id = question.id;
+    if (!id || typeof id !== 'string') fail('question is missing a string id');
+    if (ids.has(id)) fail('duplicate question id', id);
+    ids.add(id);
+    if (!question.prompt || question.prompt.length < 12) fail('prompt is missing or too short', id);
+    if (!Array.isArray(question.options) || question.options.length !== 4) fail('must have exactly 4 options', id);
+    if (new Set(question.options).size !== 4) fail('options must be distinct', id);
+    if (question.options.some((option) => !option || typeof option !== 'string')) fail('options must be non-empty strings', id);
+    if (!Number.isInteger(question.correctIndex) || question.correctIndex < 0 || question.correctIndex > 3) {
+      fail(`correctIndex must be an integer 0-3, got ${question.correctIndex}`, id);
+    }
+    if (!question.explanation || question.explanation.length < MIN_EXPLANATION) {
+      fail(`explanation must be at least ${MIN_EXPLANATION} characters, got ${question.explanation?.length ?? 0}`, id);
+    }
+    if (!DIFFICULTIES.includes(question.difficulty)) {
+      fail(`difficulty must be one of ${DIFFICULTIES.join(', ')}, got "${question.difficulty}"`, id);
+    }
+    if (!anchors.has(question.sourceAnchor)) {
+      fail(`sourceAnchor "${question.sourceAnchor}" does not match any heading in ${chapter.slug}.md`, id);
+    }
+  }
+  return bank;
+}
+
+// Authors write correctIndex naturally; rotate the correct option into slot i % 4
+// so answer positions stay balanced across the bank without authors tracking it.
+function normalizeBank(bank) {
+  return bank.questions.map((question, index) => {
+    const target = index % 4;
+    const options = [...question.options];
+    const correct = options[question.correctIndex];
+    options[question.correctIndex] = options[target];
+    options[target] = correct;
+    return { ...question, options, correctIndex: target };
+  });
+}
+
+function buildAuthoredQuiz(chapter, bank, sections) {
+  validateBank(bank, chapter, sections);
+  const questions = normalizeBank(bank);
+  return {
+    chapter: chapter.number,
+    slug: chapter.slug,
+    title: chapter.title,
+    targetCount: questions.length,
+    questions,
+  };
+}
+
 function parseInventory(markdown) {
   const groups = [];
   let current = null;
@@ -255,6 +331,7 @@ async function main() {
 
   const chapterByNumber = new Map();
   const meta = [];
+  let authoredCount = 0;
 
   for (const file of files) {
     const source = await readFile(path.join(root, file), 'utf8');
@@ -290,7 +367,9 @@ async function main() {
     ].join('\n');
     await writeFile(path.join(chaptersDir, file), `${frontmatter}${body}`, 'utf8');
 
-    const quiz = makeQuiz(chapter, source);
+    const bank = await loadAuthoredBank(slug);
+    const quiz = bank ? buildAuthoredQuiz(chapter, bank, splitSections(source)) : makeQuiz(chapter, source);
+    if (bank) authoredCount += 1;
     await writeFile(path.join(quizzesDir, `${slug}.json`), `${JSON.stringify(quiz, null, 2)}\n`, 'utf8');
     meta.push({ ...chapter, questionCount: quiz.questions.length, wordCount: source.split(/\s+/).filter(Boolean).length });
   }
@@ -313,7 +392,9 @@ async function main() {
   await writeFile(path.join(generatedDir, 'book-meta.json'), `${JSON.stringify({ groups, chapters: meta }, null, 2)}\n`, 'utf8');
 
   const totalQuestions = meta.reduce((sum, chapter) => sum + chapter.questionCount, 0);
-  process.stdout.write(`Generated ${meta.length} chapters and ${totalQuestions} quiz questions.\n`);
+  process.stdout.write(
+    `Generated ${meta.length} chapters (${authoredCount} authored, ${meta.length - authoredCount} fallback) and ${totalQuestions} quiz questions.\n`,
+  );
 }
 
 await main();

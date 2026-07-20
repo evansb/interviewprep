@@ -1,0 +1,565 @@
+{
+  "slug": "chapter-22-algorithmic-techniques",
+  "questions": [
+    {
+      "id": "22-q01",
+      "prompt": "What precondition makes the converging (opposite-ends) two-pointer technique valid?",
+      "options": [
+        "The range must be monotone — usually sorted — so that advancing a pointer provably discards candidates that cannot be the answer.",
+        "The range must hold distinct values, since duplicates let the discard step eliminate a pair that was actually the answer.",
+        "The range must have even length, so that the two indices meet exactly instead of crossing past one another.",
+        "The range must be contiguous in memory, since the elimination argument depends on O(1) random access."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each step discards a whole row of candidates in O(1), and that discard is sound only because the values are ordered: when a[lo]+a[hi] is below target, monotonicity is what proves a[lo] can pair with nothing large enough. The distinct-values claim is the tempting near-miss — duplicates are harmless, because the argument needs ordering, not strictness. Contiguity helps the prefetcher but is not a correctness requirement.",
+      "sourceAnchor": "221-two-pointers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "22-q02",
+      "prompt": "You must decide whether a singly linked list contains a cycle using O(1) extra space, and locate the cycle's entry node. Which procedure does this?",
+      "options": [
+        "Advance one pointer by one node and another by two; when they meet, restart one at the head and advance both singly until they meet again.",
+        "Advance both pointers one node per step from positions one apart; the fixed gap closes inside the loop and they meet at the cycle entry.",
+        "Insert each visited node's address into a hash set and stop at the first repeat, which needs only constant extra space.",
+        "Compare every visited node's address against the head; a match proves a cycle and no match proves the list is acyclic."
+      ],
+      "correctIndex": 0,
+      "explanation": "Floyd's tortoise and hare meet within O(λ+μ) steps, and the head-restart phase then lands on the cycle entry — all in two pointers' worth of space. The hash-set answer is the tempting one because it genuinely detects cycles, but it costs O(n) memory, which is exactly what the constraint forbids. Two pointers moving at the same speed never converge, and comparing only against the head misses any cycle whose entry is not the head itself.",
+      "sourceAnchor": "221-two-pointers",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q03",
+      "prompt": "An array may contain negative values and you need the smallest subarray with sum >= S. Why does the classic expand-then-shrink sliding window break?",
+      "options": [
+        "Shrinking from the left can lower the sum further, so the predicate is not monotone in the window and lo can no longer advance monotonically.",
+        "The running sum stops being invertible, so removing a[lo] cannot restore the earlier value and a monotonic deque becomes necessary.",
+        "The window stays valid but degrades to O(n log n), because lo must occasionally move backward by a logarithmic amount.",
+        "Mixed signs make the accumulator overflow-prone, so the window is correct only once a wider integer type is used."
+      ],
+      "correctIndex": 0,
+      "explanation": "The amortized O(n) bound comes from lo never moving backward, and that in turn comes from the predicate being monotone in the window. Negatives destroy monotonicity: a shorter window can have a smaller sum, so shrinking is no longer a safe move. The invertibility answer is the tempting one — but sums form a group and subtraction still restores the previous value exactly; invertibility is what breaks for max/min, not for sums.",
+      "sourceAnchor": "222-sliding-windows",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q04",
+      "prompt": "A fixed-size window needs its maximum after every slide. A colleague maintains a running max and \"removes\" the outgoing element from it. What is wrong?",
+      "options": [
+        "Max has no inverse, so dropping the outgoing element cannot recover the previous maximum; a monotonic deque or a multiset is required.",
+        "The approach is sound but costs O(log k) rather than O(1) per slide, because of the comparison chain it walks.",
+        "The running max is correct but overflows on long windows, so widening the accumulator type repairs the update.",
+        "Max works only when the window size is a power of two, because otherwise the expiry index is computed incorrectly."
+      ],
+      "correctIndex": 0,
+      "explanation": "Sums form a group with an inverse; maxima form only a semigroup, so once the current maximum leaves the window there is no arithmetic that recovers the runner-up. The O(log k) answer is tempting because a multiset really does cost O(log k) — but that is a different data structure, not the running-scalar scheme described, which is simply wrong rather than slow. Max never overflows and window size has nothing to do with it.",
+      "sourceAnchor": "222-sliding-windows",
+      "difficulty": "trap"
+    },
+    {
+      "id": "22-q05",
+      "prompt": "In the partition-point form `while (lo < hi) { mid = lo + (hi-lo)/2; pred(a[mid]) ? hi = mid : lo = mid + 1; }`, what guarantees termination?",
+      "options": [
+        "hi minus lo strictly decreases every iteration, because mid is always below hi and mid + 1 is always above lo.",
+        "The loop condition lo <= hi forces one final iteration in which the two indices are made equal.",
+        "The update hi = mid - 1 keeps the interval shrinking even in the case where mid happens to equal lo.",
+        "Recomputing mid as the arithmetic mean makes the bounds converge geometrically whatever the updates do."
+      ],
+      "correctIndex": 0,
+      "explanation": "With integer division mid < hi always holds and mid + 1 > lo always holds, so each branch shrinks the interval by at least one and the loop must reach lo == hi. The hi = mid - 1 answer is the tempting one because that update appears in the other common convention — but mixing it with `lo < hi` and `hi = mid` is exactly the off-by-one that skips the answer; the loop condition here is strict, not `lo <= hi`.",
+      "sourceAnchor": "223-binary-search",
+      "difficulty": "recall"
+    },
+    {
+      "id": "22-q06",
+      "prompt": "What does calling `std::lower_bound` on a `std::list` actually cost?",
+      "options": [
+        "O(log n) comparisons but O(n) iterator advances, so the call as a whole is O(n) and the binary search buys nothing.",
+        "It fails to compile, because `std::lower_bound` is constrained to require a RandomAccessIterator.",
+        "O(log n) overall, since the algorithm caches previously visited iterators and never re-walks the list.",
+        "O(n log n), because every probe has to advance from `begin()` again to reach its midpoint."
+      ],
+      "correctIndex": 0,
+      "explanation": "The algorithm only needs ForwardIterator, so it compiles and is correct — but reaching each midpoint costs a linear walk, and the total advance work is O(n), which swamps the O(log n) comparisons. The compile-failure answer is the near-miss: people remember that binary search \"needs random access\" and conclude the interface forbids it, when the standard deliberately allows it and merely loses the complexity benefit.",
+      "sourceAnchor": "223-binary-search",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q07",
+      "prompt": "A hot path binary-searches a sorted array of about 32 int keys. Replacing it with a straight linear SIMD scan makes it measurably faster. Why?",
+      "options": [
+        "The scan is branchless, sequential and prefetch-friendly, whereas binary search pays near-50% mispredicts plus a serialized dependent-load chain.",
+        "`std::lower_bound` falls back to a linear scan below an internal cutoff, so both versions end up executing identical instructions.",
+        "Binary search re-validates that the range is sorted on entry, and that O(n) check is what dominates at this size.",
+        "The linear scan has the better asymptotic complexity once n drops below roughly one cache line's worth of keys."
+      ],
+      "correctIndex": 0,
+      "explanation": "Binary search's branch is ~50/50 by construction and each iteration's address depends on the previous comparison, so it is both mispredict-bound and serialized; at 32 elements the whole array is a couple of cache lines and a branchless scan wins outright. The asymptotics answer is the tempting one — O(n) never beats O(log n) asymptotically; the crossover is a constant-factor effect, not a complexity one, which is precisely the point.",
+      "sourceAnchor": "223-binary-search",
+      "difficulty": "trap"
+    },
+    {
+      "id": "22-q08",
+      "prompt": "Packages must ship in the given order within D days; find the minimum daily capacity. Which technique applies, and at what cost?",
+      "options": [
+        "Binary search on capacity, since \"D days suffice at capacity c\" is monotone in c; O(n log range) with an O(n) greedy feasibility check.",
+        "Greedy by weight: sort the packages in descending order and pack the heaviest into the earliest days, for O(n log n).",
+        "0/1 knapsack DP over (package index, remaining capacity), which gives O(n·C) time with an O(C) rolling array.",
+        "Prefix sums plus one scan: the answer is the D-th largest gap between consecutive prefix sums, in O(n)."
+      ],
+      "correctIndex": 0,
+      "explanation": "This is the canonical \"smallest capacity such that X is achievable\" phrasing, which signals binary search on the answer: more capacity never makes delivery infeasible, so the predicate is monotone and one O(n) simulation decides each candidate. The knapsack answer is the tempting one because a capacity appears in the statement, but nothing here is a selection problem — the package order is fixed and every package must ship.",
+      "sourceAnchor": "224-binary-search-on-the-answer",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q09",
+      "prompt": "Binary searching a real-valued answer with `while (lo < hi)` never terminates. What is the correct fix?",
+      "options": [
+        "Run a fixed number of halvings — around 100 — which deterministically exhausts a double's precision with no epsilon to tune.",
+        "Loop while hi - lo > 1e-9, which is an exact and safe stopping rule for doubles at any magnitude.",
+        "Widen both bounds to long double, so that the strict inequality eventually compares the two as equal.",
+        "Change the condition to lo <= hi, which stops the search as soon as the two bounds cross over."
+      ],
+      "correctIndex": 0,
+      "explanation": "A fixed trip count is deterministic and needs no tolerance: 100 halvings shrink any starting interval below a double's representable resolution, and ~60 is already exact. The absolute-epsilon answer is the tempting one, and it is the classic bug — for bounds around 1e18 the gap 1e-9 is far below one ULP, so the condition can never be satisfied and the loop spins forever. Loosening or widening the comparison does not change that.",
+      "sourceAnchor": "224-binary-search-on-the-answer",
+      "difficulty": "trap"
+    },
+    {
+      "id": "22-q10",
+      "prompt": "What does `std::sort` guarantee about stability and worst-case complexity?",
+      "options": [
+        "Not stable, but O(n log n) worst case since C++11, because introsort falls back to heapsort past depth 2·log n.",
+        "Stable and O(n log n) worst case, because the standard library implements it as a bottom-up mergesort.",
+        "Not stable and O(n²) worst case, which is why adversarial pivot inputs remain a denial-of-service vector.",
+        "Stable whenever the comparator is a strict weak ordering, and O(n log n) worst case in every case."
+      ],
+      "correctIndex": 0,
+      "explanation": "Introsort is quicksort with an insertion-sort base case and a heapsort escape hatch at depth 2·log n, which buys a hard worst-case bound while giving up stability. The O(n²) answer is the tempting one because it correctly remembers quicksort's adversarial blow-up — but that is exactly what the depth-triggered heapsort fallback closes off, and it has been a standard requirement since C++11. Stability requires `std::stable_sort`.",
+      "sourceAnchor": "225-sorting-properties-and-tradeoffs",
+      "difficulty": "recall"
+    },
+    {
+      "id": "22-q11",
+      "prompt": "You must sort a million uniformly random `uint32_t` keys as fast as possible. What is the strongest choice, and why is the comparison lower bound not violated?",
+      "options": [
+        "An LSD radix sort in four 8-bit passes: the bound constrains comparison sorts only, and radix exploits the key's bit structure instead.",
+        "`std::sort`, because the Ω(n log n) bound applies to every sorting algorithm and radix sort merely hides the log factor in its passes.",
+        "`std::stable_sort`, because its O(n) scratch buffer is precisely what lets it escape the comparison lower bound.",
+        "Heapsort, because a guaranteed O(n log n) worst case makes it the fastest option on uniformly random integer keys."
+      ],
+      "correctIndex": 0,
+      "explanation": "The Ω(n log n) bound comes from a decision tree with n! leaves, so it constrains only algorithms whose sole primitive is comparison; radix sort reads digits and typically beats `std::sort` by 2-4x on a million 32-bit keys. The \"bound applies to everything\" answer is the standard misconception. Extra scratch space does not escape the bound either — `std::stable_sort` is still a comparison sort, and heapsort's guarantee comes with the worst cache behaviour of the set.",
+      "sourceAnchor": "225-sorting-properties-and-tradeoffs",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q12",
+      "prompt": "What algorithm is `std::nth_element`, and what does it cost?",
+      "options": [
+        "Introselect — quickselect with a guaranteed-linear fallback — running in O(n) on average and positioning only the k-th element correctly.",
+        "A partial heapsort running in O(n log k), which leaves the first k elements of the range in fully sorted order.",
+        "An introsort that is halted early, running in O(n log n) but touching only the prefix of the range up to k.",
+        "Median of medians as its primary path, giving deterministic O(n) with a small and competitive constant factor."
+      ],
+      "correctIndex": 0,
+      "explanation": "Quickselect recurses into only the side containing k, so its expected cost is n + n/2 + n/4 + … = 2n, and a median-of-medians or heapselect fallback protects the worst case. The O(n log k) answer describes `std::partial_sort`, which is the neighbouring algorithm and the easiest confusion. Median of medians is used only as a fallback precisely because its constant is roughly 10-20x quickselect's, never as the primary path.",
+      "sourceAnchor": "226-selection-and-partial-sorting",
+      "difficulty": "recall"
+    },
+    {
+      "id": "22-q13",
+      "prompt": "Each worker thread computes the p99 of its own latency samples, and the service reports the mean of those per-thread p99s. What is wrong with that?",
+      "options": [
+        "Quantiles do not average — a quantile of quantiles is not a quantile; the per-thread histograms must be merged and the p99 taken from the merge.",
+        "Nothing is wrong statistically; the mean simply needs weighting by each thread's sample count to become exact.",
+        "The per-thread p99s should be summed rather than averaged, because latency contributions across threads compose additively.",
+        "The only real problem is the cost of sorting samples per thread; taking the median of the per-thread p99s is correct."
+      ],
+      "correctIndex": 0,
+      "explanation": "A p99 is a rank statistic over a distribution, and ranks are not linear, so no combination of per-thread p99s reconstructs the global one — a thread with ten samples and one with ten million contribute incomparable quantiles. The sample-count weighting answer is the most tempting because weighting genuinely fixes averaging *means*; it does nothing for quantiles. Mergeable fixed-bucket histograms are the production answer, at O(1) per sample.",
+      "sourceAnchor": "226-selection-and-partial-sorting",
+      "difficulty": "trap"
+    },
+    {
+      "id": "22-q14",
+      "prompt": "In the swap / recurse / swap-back permutation generator, what does the trailing swap — the \"backtrack\" — actually buy?",
+      "options": [
+        "It restores the shared array on the way out, so working state is O(depth) instead of a fresh copy at every node of the search tree.",
+        "It guarantees that permutations are emitted in lexicographic order, which the forward swap on its own would not produce.",
+        "It stops the recursion from revisiting a node, which is what turns the exponential enumeration into polynomial time.",
+        "It lets the compiler apply tail-call optimization, since no live state remains once the recursive call has returned."
+      ],
+      "correctIndex": 0,
+      "explanation": "Backtracking mutates one shared structure in place and restores it on exit, so the resident working set is proportional to depth rather than to the number of nodes visited. The pruning answer is the tempting one because pruning is what controls node count in backtracking generally — but the undo is bookkeeping, not pruning; it changes memory, not the number of nodes, and permutation enumeration stays factorial either way.",
+      "sourceAnchor": "227-recursion-and-backtracking",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q15",
+      "prompt": "A recursive-descent parser handles untrusted nested input. A reviewer says it is fine because the recursive call sits in tail position and the compiler will elide the frame. Why is that wrong?",
+      "options": [
+        "C++ guarantees no tail-call optimization, and one local with a destructor suppresses it; the real fix is an explicit depth limit.",
+        "Tail calls are elided reliably at -O2, but the resulting SIGSEGV is catchable as an exception, so the parser can recover.",
+        "The call cannot be in tail position by definition, because a function that returns a value is never able to make a tail call.",
+        "Tail-call optimization applies but only shrinks each frame, so a nesting depth of 10^7 still overflows an 8 MB stack."
+      ],
+      "correctIndex": 0,
+      "explanation": "GCC and Clang do perform the transform at -O2, but nothing in the language requires it, and a single local `std::string` whose destructor must run after the call silently disables it — so correctness must never depend on it. The \"catchable as an exception\" answer is the dangerous misconception: stack overflow hits the guard page and raises SIGSEGV with no unwinding, no destructors, and no exception to catch.",
+      "sourceAnchor": "227-recursion-and-backtracking",
+      "difficulty": "trap"
+    },
+    {
+      "id": "22-q16",
+      "prompt": "Mergesort satisfies T(n) = 2·T(n/2) + O(n). Which Master Theorem case applies, and what does that mean intuitively?",
+      "options": [
+        "Case 2: f(n) matches n^(log_b a) = n, so work is spread evenly across the levels and T(n) = Θ(n log n).",
+        "Case 1: the leaves dominate, because f(n) is polynomially smaller than n^(log_b a), which gives T(n) = Θ(n).",
+        "Case 3: the root's combine step dominates, because f(n) grows faster than n^(log_b a), which gives T(n) = Θ(n).",
+        "No case applies, because the Master Theorem requires the subproblem count to exceed the branching factor b."
+      ],
+      "correctIndex": 0,
+      "explanation": "With a = 2 and b = 2, n^(log_b a) = n, which is exactly the merge cost, so every level does Θ(n) work across log n levels. The leaves-dominate answer is the tempting one because mergesort really does bottom out in n leaves — but case 1 requires f(n) to be polynomially *smaller* than n^(log_b a), and here they are equal, which is what introduces the log factor rather than eliminating it.",
+      "sourceAnchor": "228-divide-and-conquer",
+      "difficulty": "recall"
+    },
+    {
+      "id": "22-q17",
+      "prompt": "A recursion splits a problem into smaller instances of itself. Which single question decides whether it is divide and conquer or dynamic programming?",
+      "options": [
+        "Whether the subproblems share sub-subproblems: overlap makes naive recursion exponential and is what memoization repairs.",
+        "Whether the split is balanced: unbalanced splits indicate dynamic programming, while even halves indicate divide and conquer.",
+        "Whether the combine step costs O(n) or less: an O(n) combine is the defining signature of dynamic programming.",
+        "Whether the recursion depth is O(log n): logarithmic depth means divide and conquer, linear depth means dynamic programming."
+      ],
+      "correctIndex": 0,
+      "explanation": "Both paradigms decompose into subproblems; the distinguishing property is whether those subproblems reach the same sub-subproblems along multiple paths, which is exactly what turns naive Fibonacci from Θ(n) into Θ(φⁿ). The balanced-split answer is tempting because unbalanced splits are indeed a divide-and-conquer failure mode — but an unbalanced split is still divide and conquer, just a slow one; it never becomes DP.",
+      "sourceAnchor": "228-divide-and-conquer",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q18",
+      "prompt": "Which two properties must a problem have before dynamic programming applies?",
+      "options": [
+        "Optimal substructure and overlapping subproblems — the second is what memoization is actually buying you.",
+        "Optimal substructure and a monotone objective, which together allow the table to be filled in any order at all.",
+        "Overlapping subproblems and a polynomial state space, which together bound the table's memory footprint.",
+        "Optimal substructure and the greedy-choice property, which is what makes the recurrence well-founded."
+      ],
+      "correctIndex": 0,
+      "explanation": "Optimal substructure lets an optimal answer be assembled from optimal sub-answers, and overlap is what makes storing them worthwhile — without overlap the same recursion is plain divide and conquer and a cache saves nothing. The greedy-choice pairing is the tempting one: that property is precisely what makes a problem greedy rather than DP, which is why fractional knapsack is greedy and 0/1 knapsack is not.",
+      "sourceAnchor": "229-dynamic-programming",
+      "difficulty": "recall"
+    },
+    {
+      "id": "22-q19",
+      "prompt": "The 0/1 knapsack rolling array runs `for (int c = W; c >= w; --c) dp[c] = max(dp[c], dp[c-w] + v);`. What changes if the inner loop runs upward instead?",
+      "options": [
+        "dp[c-w] would already include the current item, so that item could be taken repeatedly — the result becomes unbounded knapsack.",
+        "Nothing changes in the result; the upward loop is merely worse for locality because it works against the hardware prefetcher.",
+        "The result becomes the fractional knapsack optimum, because partially reusing an item is then effectively permitted.",
+        "dp[c-w] would still hold the previous row's value, so the answer is identical but the loop no longer vectorizes."
+      ],
+      "correctIndex": 0,
+      "explanation": "The rolling array overwrites the previous row in place, so downward iteration guarantees dp[c-w] is still the pre-item value; going upward means dp[c-w] may already have this item folded in, which is exactly the unbounded-knapsack recurrence. The \"nothing changes\" answer is the tempting one because the direction genuinely looks like an arbitrary style choice — interviewers ask precisely because it is not.",
+      "sourceAnchor": "229-dynamic-programming",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q20",
+      "prompt": "You are selecting the maximum number of mutually non-overlapping activities from a set with given start and finish times. Which greedy key is correct?",
+      "options": [
+        "Earliest finish time — an exchange argument shows the earliest-finishing activity leaves the most room and never makes the answer worse.",
+        "Shortest duration first — a short activity blocks the least of the timeline, so swapping it in can never reduce the final count.",
+        "Earliest start time — starting as early as possible frees the tail of the timeline for all of the remaining activities.",
+        "Fewest conflicts first — taking the least-constrained activity at each step keeps the largest number of options open."
+      ],
+      "correctIndex": 0,
+      "explanation": "Earliest-finish is the only key with an exchange argument: swapping the earliest-finishing activity into any optimal solution never reduces its size, because it releases the resource no later than whatever it replaced. Shortest-duration is the most seductive alternative and has a small counterexample — one brief activity straddling the boundary between two long ones kills a size-two solution. Earliest-start fails on a single very long first activity.",
+      "sourceAnchor": "2210-greedy-algorithms",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q21",
+      "prompt": "\"Always take the largest coin\" works for US and euro denominations. What is the standard rebuttal to \"greedy always works for coin change\"?",
+      "options": [
+        "The system {1,3,4} making 6: greedy takes 4+1+1 for three coins while 3+3 uses two, so greedy holds only for canonical systems.",
+        "It fails whenever the coin set omits a unit coin, so adding a 1-unit denomination always restores greedy optimality.",
+        "It fails whenever there are more than four denominations, because the exchange argument holds only for small sets.",
+        "It fails whenever some coin is not a multiple of the smallest coin, as with the two-denomination system {2,5}."
+      ],
+      "correctIndex": 0,
+      "explanation": "{1,3,4} making 6 is the minimal counterexample and the one to have ready: greedy commits to the 4 and cannot recover. The \"just add a unit coin\" answer is the most tempting, since a unit coin does guarantee that *some* representation exists — but {1,3,4} already contains a 1 and greedy still loses, so existence and optimality are different claims. Optimality depends on the system being canonical, not on its size or divisibility.",
+      "sourceAnchor": "2210-greedy-algorithms",
+      "difficulty": "trap"
+    },
+    {
+      "id": "22-q22",
+      "prompt": "What does `x & (x - 1)` compute, and which classic technique is built on it?",
+      "options": [
+        "It clears the lowest set bit, which is the basis of Kernighan's popcount looping once per set bit rather than once per bit.",
+        "It isolates the lowest set bit, which is the basis of extracting the least significant flag out of a packed mask.",
+        "It sets the lowest clear bit, which is the basis of claiming the first free slot from an allocator's availability bitmap.",
+        "It masks off everything above the lowest set bit, which is the basis of rounding a value down to a power of two."
+      ],
+      "correctIndex": 0,
+      "explanation": "Subtracting one flips the lowest set bit to zero and turns every bit below it to one, so the AND clears exactly that bit — iterate while x is nonzero and you get O(popcount) iterations, which is Kernighan's trick and still the right answer for sparse masks without hardware POPCNT. Isolating the lowest set bit is the neighbouring identity `x & (-x)`, which is the easiest of these to swap by mistake.",
+      "sourceAnchor": "2211-bit-manipulation-techniques",
+      "difficulty": "recall"
+    },
+    {
+      "id": "22-q23",
+      "prompt": "A codebase rotates a `uint32_t` with `(x << k) | (x >> (32 - k))`. What is the defect?",
+      "options": [
+        "At k == 0 the right shift is by 32, a shift of at least the operand width, which is undefined behaviour — use `std::rotl`.",
+        "It is safe for `uint32_t`; the undefined behaviour appears only for signed types, where the right shift is implementation-defined.",
+        "The OR should be an XOR, because bits overlapping between the two shifted halves would otherwise be counted twice.",
+        "At k == 16 the two halves alias each other, so the upper half is lost, and `std::rotl` special-cases exactly this width."
+      ],
+      "correctIndex": 0,
+      "explanation": "Shifting by an amount greater than or equal to the operand width is undefined regardless of signedness, and k == 0 walks straight into it — compilers really do miscompile the idiom, which is why C++20 added `std::rotl`. The signedness answer is tempting because signed shifts have their own separate hazards, but they are not what breaks here: the bug is present in the fully unsigned form.",
+      "sourceAnchor": "2211-bit-manipulation-techniques",
+      "difficulty": "trap"
+    },
+    {
+      "id": "22-q24",
+      "prompt": "You need the maximum of every length-k window over an array in O(n) total time. Which structure delivers that bound?",
+      "options": [
+        "A deque of indices held in decreasing value order: expire the front when it leaves the window, pop dominated elements off the back.",
+        "A max-heap of the window's values, popping the root whenever the element it refers to has fallen outside the window bounds.",
+        "A running scalar max, updated by comparing against the incoming element and subtracting off the outgoing one.",
+        "A prefix-max array over the whole input, answering each window as the difference between two prefix maxima."
+      ],
+      "correctIndex": 0,
+      "explanation": "An element that is both older and smaller than the arrival can never again be the window maximum, so back-popping is free amortized work and every index is pushed and popped at most once — O(n). The heap answer is the acceptable second-best in an interview but does not meet the stated bound: a binary heap cannot delete an arbitrary expired element, so it needs lazy deletion and lands at O(n log n).",
+      "sourceAnchor": "2212-monotonic-stacks-and-queues",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q25",
+      "prompt": "A monotonic-stack loop contains an inner `while` that pops. Why is the whole traversal still O(n)?",
+      "options": [
+        "Every index is pushed exactly once and popped at most once, so the total number of pops is bounded by the n pushes.",
+        "The inner while runs at most log n times per element, because the values held on the stack remain sorted throughout.",
+        "The inner while runs O(1) times per element in the worst case, since at most one violator can ever sit on top.",
+        "The stack never exceeds a constant size, because dominated elements are discarded before they are ever pushed."
+      ],
+      "correctIndex": 0,
+      "explanation": "This is an amortization argument, not a per-iteration one: a single arrival can pop many elements, but that work is charged to the pushes that put them there, and there are only n pushes in total. The \"at most one violator\" answer is the tempting misreading — a large arrival can legitimately clear the entire stack in one step, which is why the bound has to be argued globally rather than per element.",
+      "sourceAnchor": "2212-monotonic-stacks-and-queues",
+      "difficulty": "recall"
+    },
+    {
+      "id": "22-q26",
+      "prompt": "You must apply N range-increment operations to an array of size n and then read the whole array once. Which structure is the right fit?",
+      "options": [
+        "A difference array: d[l] += v and d[r] -= v per update in O(1), then one prefix scan to materialize, for O(N + n) overall.",
+        "A prefix-sum array rebuilt after every update, giving O(N·n) but with perfectly sequential memory traffic throughout.",
+        "A Fenwick tree, which is required here because point updates and range queries cannot otherwise be mixed at all.",
+        "A segment tree with lazy propagation, the only structure that supports O(1) range addition over a flat array."
+      ],
+      "correctIndex": 0,
+      "explanation": "The access pattern is all-updates-then-one-read, which is precisely the difference array's shape: each update is two O(1) writes and a single final scan reconstructs everything. The segment tree answer is the tempting one because lazy propagation genuinely handles range addition — but at O(log n) per update, not O(1), and it is not needed at all when no queries are interleaved with the updates.",
+      "sourceAnchor": "2213-prefix-sums",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q27",
+      "prompt": "A range sum over a day's PnL, computed as P[r] - P[l] from a `double` prefix-sum array, does not tie out against a direct loop. What is the numerical failure?",
+      "options": [
+        "Catastrophic cancellation: two large and nearly equal prefixes subtract to a small range sum with few or no correct digits left.",
+        "Denormal flush-to-zero inside the accumulator, which silently drops the smallest contributions from the running total.",
+        "The subtraction itself is inexact, because IEEE-754 floating-point subtraction is not a correctly rounded operation.",
+        "Signed integer overflow of the accumulator, which wraps around and makes the difference of the two prefixes negative."
+      ],
+      "correctIndex": 0,
+      "explanation": "Both prefixes carry the rounding error of everything summed before them, and subtracting two huge nearly equal values leaves a result whose magnitude is far smaller than that accumulated error — the correct digits cancel away. The \"subtraction is inexact\" answer is the near-miss: IEEE-754 subtraction is in fact correctly rounded and exact for nearby operands; the error was already present in the two prefixes before the subtraction ran.",
+      "sourceAnchor": "2213-prefix-sums",
+      "difficulty": "trap"
+    },
+    {
+      "id": "22-q28",
+      "prompt": "You compute minimum meeting rooms by sweeping +1/-1 events over half-open intervals [s, e). How must ties at an equal coordinate be broken?",
+      "options": [
+        "Ends before starts, achieved by sorting on (x, delta) with -1 ordering before +1, so touching intervals never count as overlapping.",
+        "Starts before ends, so that a meeting beginning exactly when another finishes is correctly counted as a genuine overlap.",
+        "Either order works, because the running counter reaches the same value once both events at that coordinate have been applied.",
+        "Ends before starts, but only for closed intervals [s, e]; the half-open convention instead requires starts to come first."
+      ],
+      "correctIndex": 0,
+      "explanation": "Under [s, e) a meeting ending at time t does not occupy t, so its -1 must land before any +1 at t, and sorting by (x, delta) achieves that since -1 < +1. The \"either order works\" answer has a true premise and a broken inference: the counter does land on the same value after both events, but the maximum is sampled *between* them, so start-first records a phantom overlap of one extra room.",
+      "sourceAnchor": "2214-sweep-line-algorithms",
+      "difficulty": "trap"
+    },
+    {
+      "id": "22-q29",
+      "prompt": "Every event in a sweep is known before the sweep begins. Why prefer a presorted `std::vector` over a `std::priority_queue`?",
+      "options": [
+        "The vector is one sequential, perfectly prefetched pass after the sort, while the heap performs O(n log n) random-access sift operations.",
+        "The heap would produce a wrong answer, because it cannot preserve the required tie-break order among events at equal coordinates.",
+        "The heap raises the asymptotic cost to O(n²), since each push has to scan the backing array for the correct insertion point.",
+        "The vector permits new events to be inserted mid-sweep, which a priority queue by construction is unable to support."
+      ],
+      "correctIndex": 0,
+      "explanation": "Both approaches are O(n log n) asymptotically; the difference is entirely locality — the sorted vector streams, and the heap's sift-up/sift-down touch scattered indices with poor prefetch behaviour. The insertion answer is exactly backwards, and that reversal is the point: mid-sweep event generation is the one case that *forces* a heap, which is why Bentley-Ottmann needs a priority queue rather than a presorted vector.",
+      "sourceAnchor": "2214-sweep-line-algorithms",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q30",
+      "prompt": "Two half-open intervals [a1, a2) and [b1, b2) overlap under which test?",
+      "options": [
+        "a1 < b2 && b1 < a2 — the direct form, obtained by negating the disjointness test a2 <= b1 || b2 <= a1.",
+        "a1 <= b2 && b1 <= a2 — the closed-interval form, which is also correct for half-open ranges as written.",
+        "a1 < b1 && b1 < a2 — it is enough to check that b's start point falls strictly inside interval a.",
+        "a1 <= b1 && b2 <= a2 — overlapping means one interval's whole span is contained inside the other's."
+      ],
+      "correctIndex": 0,
+      "explanation": "Overlap is the negation of disjointness, and under the half-open convention disjoint means one interval ends at or before the other begins, which negates to the two strict inequalities. The closed-interval form with `<=` is the tempting near-miss: it reports adjacent intervals such as [0,5) and [5,9) as overlapping, which is exactly the ambiguity half-open notation exists to remove. Containment is a strictly stronger relation than overlap.",
+      "sourceAnchor": "2215-interval-algorithms",
+      "difficulty": "recall"
+    },
+    {
+      "id": "22-q31",
+      "prompt": "Merging overlapping intervals sorts by start, but selecting the maximum non-overlapping subset sorts by end. Why do the keys differ?",
+      "options": [
+        "Merging needs positional adjacency to fuse neighbours in a single scan; the selection greedy needs earliest finish for its exchange argument.",
+        "Both problems accept either key; sorting by start for selection merely costs one extra pass afterwards to repair the result.",
+        "Selection sorts by end only to break ties deterministically, and the count it produces is identical under a start-order sort.",
+        "Merging sorts by start because end values are not known until the merge completes, so no end-based order can be formed."
+      ],
+      "correctIndex": 0,
+      "explanation": "The two algorithms rest on different arguments: merging is a scan that needs candidates to arrive in positional order so an overlap can only be with the current run, while selection's optimality comes from an exchange argument that specifically requires the earliest-finishing choice. The \"same count either way\" answer is the tempting one and is false — one long early-starting interval can swallow two short later ones and cut the count.",
+      "sourceAnchor": "2215-interval-algorithms",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q32",
+      "prompt": "A BFS implementation sets `dist[v]` when v is dequeued rather than when it is enqueued. What is the consequence?",
+      "options": [
+        "A node can be enqueued many times before its first dequeue, inflating the work toward O(E) duplicates and blowing up queue memory.",
+        "Distances all come out one too large, because the source ends up recorded at depth one instead of at depth zero.",
+        "The traversal silently degenerates into a DFS, since repeated enqueues push descendants ahead of same-level siblings.",
+        "Nothing changes on connected graphs; only vertices in disconnected components are then wrongly reported unreachable."
+      ],
+      "correctIndex": 0,
+      "explanation": "Between a node's first enqueue and its dequeue it carries no mark, so every other neighbour that scans it enqueues it again — on a dense graph the queue can hold a copy per in-edge. The DFS answer is the tempting one because the queue contents genuinely do become disordered, but the frontier is still FIFO and the first dequeue still happens at the correct distance, so the computed distances stay right; what breaks is work and memory.",
+      "sourceAnchor": "2216-breadth-first-and-depth-first-search",
+      "difficulty": "trap"
+    },
+    {
+      "id": "22-q33",
+      "prompt": "All edges in a graph have weight 0 or 1 and you need single-source shortest paths. What is the best algorithm?",
+      "options": [
+        "0-1 BFS with a deque: `push_front` on weight-0 edges and `push_back` on weight-1 edges, for O(V+E) with no heap at all.",
+        "Dijkstra with a binary heap, which is asymptotically optimal here at O((V+E) log V) because the edge weights vary.",
+        "Plain BFS on a FIFO queue, which is already correct because the frontier orders every node by its hop count.",
+        "Bellman-Ford for V-1 relaxation rounds, needed because zero-weight edges invalidate Dijkstra's settled-set argument."
+      ],
+      "correctIndex": 0,
+      "explanation": "A deque keeps the frontier sorted by distance with only two distinct weights, so the log factor disappears entirely and the traversal is O(V+E). The Dijkstra answer is the tempting one because Dijkstra is correct here — but its optimality claim is false, since 0-1 BFS solves the same problem strictly faster. Plain BFS counts hops and would treat a zero-weight edge as costing one, and zero weights are non-negative, so Dijkstra needs no rescuing.",
+      "sourceAnchor": "2216-breadth-first-and-depth-first-search",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q34",
+      "prompt": "Why does Dijkstra's algorithm require non-negative edge weights?",
+      "options": [
+        "Correctness rests on a popped minimum being final; a negative edge could later reduce it, and the result is then silently wrong.",
+        "Negative weights make the priority queue's ordering ill-defined, so the heap's comparator stops being a strict weak ordering.",
+        "Negative weights cause the distance array to overflow, because relaxation can then decrease distances without any bound.",
+        "Negative weights make the algorithm loop forever, re-relaxing the same edges until the heap exhausts available memory."
+      ],
+      "correctIndex": 0,
+      "explanation": "The settled-set argument says a node popped with minimum tentative distance can never be improved, which holds only when every remaining path can only add non-negative length. The infinite-loop answer is the tempting one because negative *cycles* really do cause unbounded improvement in other algorithms — but Dijkstra never revisits a settled node, so it terminates normally and just reports wrong distances, which is far worse than crashing.",
+      "sourceAnchor": "2217-shortest-paths",
+      "difficulty": "recall"
+    },
+    {
+      "id": "22-q35",
+      "prompt": "A relaxation loop tests `if (d + w < dist[v])` with `dist` initialised to `INT64_MAX`. What goes wrong?",
+      "options": [
+        "d + w overflows for a node still sitting at INF and wraps negative, which then looks like an improvement; use INT64_MAX/2 or guard the add.",
+        "The comparison is fine, but `dist` has to be unsigned so that the wraparound saturates upward instead of going negative.",
+        "INT64_MAX cannot be represented exactly as a double, so the comparison silently promotes and loses low-order precision.",
+        "Nothing goes wrong: signed overflow saturates at INT64_MAX on every mainstream compiler, so the test simply fails as intended."
+      ],
+      "correctIndex": 0,
+      "explanation": "Adding any positive weight to INT64_MAX is signed overflow, and the wrapped value compares as less than everything, so unreached nodes get bogus finite distances that then propagate. The \"saturates in practice\" answer is the dangerous one: signed overflow is undefined behaviour, not saturation, and optimizers actively assume it cannot happen — so the observed behaviour can change with flags. Reserving headroom in the sentinel is the standard fix.",
+      "sourceAnchor": "2217-shortest-paths",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q36",
+      "prompt": "How does Kahn's algorithm detect a cycle at no extra cost?",
+      "options": [
+        "If fewer than V nodes are emitted, the remaining ones never reached indegree zero and therefore lie on or behind cycles.",
+        "If some node is emitted twice, that duplicate emission marks the point at which the traversal re-entered a cycle.",
+        "If the ready queue empties before any node at all is emitted, there is a cycle; otherwise the graph must be acyclic.",
+        "If a node's indegree goes negative during the decrements, that node closes a cycle back to an already-emitted node."
+      ],
+      "correctIndex": 0,
+      "explanation": "Nodes on a cycle mutually keep each other's indegree above zero, so they can never enter the ready queue and the emitted count falls short of V — the count is already being maintained, so the check costs nothing. The \"empty queue with nothing emitted\" answer is the tempting partial truth: it catches a graph that is entirely cyclic, but misses the usual case where a large acyclic portion is emitted first and only a small cycle stalls.",
+      "sourceAnchor": "2218-topological-sorting",
+      "difficulty": "recall"
+    },
+    {
+      "id": "22-q37",
+      "prompt": "You need the longest path in a DAG whose edge weights may be negative. What is the right approach?",
+      "options": [
+        "Process the vertices in topological order and relax forward; every dependency is already final, so the whole thing is O(V+E).",
+        "Negate all the weights and run Dijkstra, which handles the transformed graph in O((V+E) log V) with a lazy-deletion heap.",
+        "It is NP-hard even on a DAG, so only exponential search or an approximation algorithm is actually available here.",
+        "Run Floyd-Warshall across the DAG in O(V³), which is the only method that tolerates negative edge weights at all."
+      ],
+      "correctIndex": 0,
+      "explanation": "DP over a topological order is the general form of \"DP on DAGs\": when a vertex is processed all its predecessors are final, so shortest *and* longest paths both fall out in linear time with no restriction on edge signs. The NP-hardness answer is the most tempting because longest path genuinely is NP-hard on general graphs — acyclicity is exactly what removes the hardness. Negating weights makes them negative, which is precisely what Dijkstra cannot handle.",
+      "sourceAnchor": "2218-topological-sorting",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q38",
+      "prompt": "For an order-lifecycle state machine, why is a `constexpr` 2-D transition table the strong answer over a `switch` on the state enum?",
+      "options": [
+        "The machine becomes data: exhaustively checkable, enumerable in tests, `.rodata`-resident, and one cache line for a 7x7 byte table.",
+        "The table removes indirect branching entirely, so the CPU cannot mispredict on any transition no matter what the input stream does.",
+        "A `switch` has no way to express an illegal transition, so a table is the only construct that can reject an unexpected event.",
+        "The table makes each transition O(1), whereas a `switch` is O(states) because the compiler emits a linear comparison chain."
+      ],
+      "correctIndex": 0,
+      "explanation": "Turning transitions into data means every (state, event) pair has an explicit cell, so illegal pairs are marked rather than silently falling through, and the table can be asserted over exhaustively at build time. The O(states) claim is the tempting one — compilers routinely lower a dense `switch` on a small enum to a jump table, so the `switch` is not linear; the real advantage is checkability, not raw dispatch cost.",
+      "sourceAnchor": "2219-finite-state-machines",
+      "difficulty": "application"
+    },
+    {
+      "id": "22-q39",
+      "prompt": "A parser indexes a 256-entry classification table as `table[c]` where `c` is a plain `char` on x86-64. What is the bug?",
+      "options": [
+        "`char` is signed there, so any byte above 0x7F indexes negatively and reads out of bounds; cast through `uint8_t` first.",
+        "`char` may be wider than one byte under some ABIs, so the index can exceed 255 and run off the end of the table.",
+        "`char` is unsigned on x86-64, so the index is safe, but the table must hold 512 entries to cover the sign bit.",
+        "The lookup is fine; the real hazard is that the table is not `constexpr` and so gets initialised at program startup."
+      ],
+      "correctIndex": 0,
+      "explanation": "On x86-64 Linux plain `char` is signed, so byte 0xFF converts to -1 and `table[-1]` reads memory before the array — a genuine out-of-bounds read on any non-ASCII or adversarial input. The signedness answer stated backwards is the trap: `char` signedness is implementation-defined and is unsigned on ARM, which is exactly why the `uint8_t` cast has to be written explicitly rather than assumed.",
+      "sourceAnchor": "2220-table-driven-parsing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "22-q40",
+      "prompt": "When does a table-driven classifier actually lose to a plain chain of `if` comparisons?",
+      "options": [
+        "When one branch is taken nearly always, so the predictor is essentially free, or when the table has grown past what L1 can hold.",
+        "When the input alphabet is small, because a table smaller than one cache line cannot be indexed efficiently by the hardware.",
+        "When the table is `constexpr`, because `.rodata` pages are shared between processes and therefore slower to load from.",
+        "When optimizations are enabled, because the compiler converts a constant table back into an equivalent branch chain."
+      ],
+      "correctIndex": 0,
+      "explanation": "The table trades a data-dependent branch for a fixed-latency L1 load, which wins on high-entropy input and loses when the predictor already gets the branch right nearly every time or when the table stops fitting in cache — a 100-state by 256-symbol table of `uint32_t` is 100 KB and misses constantly. The small-alphabet answer is the tempting inversion: a compact table is the best case, since a single resident line is what makes the lookup cheap.",
+      "sourceAnchor": "2220-table-driven-parsing",
+      "difficulty": "application"
+    }
+  ]
+}

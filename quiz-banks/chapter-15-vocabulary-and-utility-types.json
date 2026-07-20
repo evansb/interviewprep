@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-15-vocabulary-and-utility-types",
+  "questions": [
+    {
+      "id": "15-q01",
+      "prompt": "How are the elements of a `std::tuple` laid out in memory?",
+      "options": [
+        "In declaration order with exactly the padding of the equivalent struct, making the two layout-compatible.",
+        "Sorted by decreasing alignment to minimise padding, which is what makes memcpy to a wire format safe.",
+        "In implementation-defined order — libstdc++ and MSVC store them reversed via recursive inheritance.",
+        "In declaration order as mandated by the standard, though padding may differ, so `offsetof` is well-defined."
+      ],
+      "correctIndex": 2,
+      "explanation": "Element order is unspecified, and the two most common implementations reverse it through a recursive-inheritance chain, so `get<0>` sits at the highest address. The tempting answer is the declaration-order one, because `std::pair` really is a plain struct in declaration order — but that guarantee does not extend to `tuple`. The practical consequence is that a tuple is not layout-compatible with a struct of the same members and must never be memcpy'd into a wire format.",
+      "sourceAnchor": "151-pair-and-tuple",
+      "difficulty": "recall"
+    },
+    {
+      "id": "15-q02",
+      "prompt": "`struct A {}; struct B {}; struct C {};` are all stateless. What is `sizeof(std::tuple<A, B, C>)`?",
+      "options": [
+        "1, because empty-base optimization gives the stateless members no storage while the object still needs a nonzero size.",
+        "3, because each empty member is padded to its own distinct one-byte address just as in a struct.",
+        "0, because a tuple whose elements are all empty is itself an empty type occupying no storage.",
+        "24, because each base subobject in the recursive chain still reserves one pointer-sized slot."
+      ],
+      "correctIndex": 0,
+      "explanation": "Tuple stores its elements as base subobjects, so EBO collapses empty ones to nothing; a complete object can never be zero-sized, so the answer is 1. The '3' option is the near-miss: three empty *members* of a struct really would each need a distinct address, but base subobjects are exactly the case EBO applies to. This is why a tuple of stateless functors, comparators, or allocators is free.",
+      "sourceAnchor": "151-pair-and-tuple",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q03",
+      "prompt": "With `int x = 0; auto rw = std::ref(x);`, how do `std::make_pair(rw, 1)` and `std::pair p{rw, 1}` differ?",
+      "options": [
+        "Both unwrap the wrapper and yield `pair<int&, int>`, so the two spellings are exactly equivalent.",
+        "CTAD unwraps the wrapper while `make_pair` preserves it, which is why `make_pair` is safer for storage.",
+        "Neither unwraps it, but `make_pair` additionally decays it by copying the referent into a plain `int`.",
+        "`make_pair` unwraps it to give `pair<int&, int>`, while CTAD keeps it as `pair<reference_wrapper<int>, int>`."
+      ],
+      "correctIndex": 3,
+      "explanation": "`make_pair` decays its arguments and deliberately unwraps `reference_wrapper` into a real reference; class template argument deduction does no such thing and deduces the wrapper type verbatim. The 'exactly equivalent' option is the trap — CTAD is usually the modern advice, which makes people assume it is a drop-in replacement. The reversed option gets the direction backwards; `make_pair` is the one that unwraps.",
+      "sourceAnchor": "151-pair-and-tuple",
+      "difficulty": "trap"
+    },
+    {
+      "id": "15-q04",
+      "prompt": "What does `std::apply(f, t)` do, and how is it implemented?",
+      "options": [
+        "It calls `f` with the tuple's elements as separate arguments, expanding `std::get<Is>(t)...` over an `index_sequence`.",
+        "It calls `f` once per tuple element in order and collects the results into a new tuple of the same arity.",
+        "It calls `f` with the tuple itself as one argument, after converting the tuple to a parameter pack at run time.",
+        "It constructs an object from the tuple's elements, which is why `make_from_tuple` is defined as an alias for it."
+      ],
+      "correctIndex": 0,
+      "explanation": "`apply` is the unpack operation: `std::invoke(f, std::get<Is>(std::forward<Tuple>(t))...)` with the indices supplied by an `index_sequence`, which is the canonical pack-expansion idiom. The 'once per element' option describes a transform/for_each, not apply. `make_from_tuple` is a sibling built on the same machinery but constructs a `T` rather than invoking a callable, so it is not an alias.",
+      "sourceAnchor": "152-stdapply-and-stdtie",
+      "difficulty": "recall"
+    },
+    {
+      "id": "15-q05",
+      "prompt": "A class stores `auto args = std::forward_as_tuple(compute(), name);` as a member and calls `std::apply` on it later. What is wrong?",
+      "options": [
+        "The tuple copies its arguments but strips const, so the later call observes a mutated copy instead of the originals.",
+        "The tuple holds references, including one to the temporary from `compute()`, so it dangles once the full expression ends.",
+        "Nothing: `forward_as_tuple` materializes its arguments into storage, which is precisely why it exists for deferred calls.",
+        "`std::apply` cannot be invoked on a tuple of rvalue references, so the member call is ill-formed rather than unsafe."
+      ],
+      "correctIndex": 1,
+      "explanation": "`forward_as_tuple` builds a tuple of references that preserve value category, so the result must die with the full expression that created it; storing it leaves a reference to a destroyed temporary. The 'nothing is wrong' option is the tempting one because deferred invocation is genuinely what tuples of arguments are for — but that job belongs to `make_tuple`, which copies. `apply` on a tuple of rvalue references is perfectly well-formed, which is what makes the bug silent.",
+      "sourceAnchor": "152-stdapply-and-stdtie",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q06",
+      "prompt": "What is `sizeof(std::optional<int*>)` on a 64-bit platform, and why?",
+      "options": [
+        "8, because the disengaged state is represented by storing a null pointer value in the same word.",
+        "12, because the `bool` adds one byte and the object is padded only to a four-byte boundary.",
+        "8, because pointer-like contained types are specialized to reuse a spare bit of the pointer.",
+        "16, because the engaged flag is a separate `bool` and nothing folds it into the pointer's invalid values."
+      ],
+      "correctIndex": 3,
+      "explanation": "`optional` is specified as storage for `T` plus a distinct `bool`, padded to `alignof(T)`, and the standard permits no niche optimization — so a pointer plus a flag rounds to 16. The 8-byte answers come from Rust's `Option<&T>`, where the null representation genuinely is the niche; C++ made the opposite choice. This is exactly why hot data structures fall back to a domain sentinel instead.",
+      "sourceAnchor": "153-stdoptional",
+      "difficulty": "recall"
+    },
+    {
+      "id": "15-q07",
+      "prompt": "In `return opt.value_or(build_default());` where `build_default()` allocates, what happens when `opt` is engaged?",
+      "options": [
+        "`build_default()` still runs, since it is an ordinary function argument evaluated before the call is entered.",
+        "`build_default()` is skipped, because `value_or` takes its fallback lazily and evaluates it only when disengaged.",
+        "`build_default()` runs only when the contained type is not trivially copyable and must therefore be materialized.",
+        "The call is ill-formed unless the fallback is wrapped in a lambda, which is the form `value_or` requires."
+      ],
+      "correctIndex": 0,
+      "explanation": "`value_or` takes a value, not a callable, so its argument is evaluated unconditionally at the call site and a `T` is always constructed — the cost is paid even on the engaged path. The 'lazy' option is the intuition people import from other languages' `getOrElse`; in C++ the lazy spelling is C++23's `or_else`, which does take a callable. Triviality of `T` has no bearing on when an argument expression is evaluated.",
+      "sourceAnchor": "153-stdoptional",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q08",
+      "prompt": "Given `std::optional<int> o;` (disengaged), what does `int n = *o;` do?",
+      "options": [
+        "It throws `std::bad_optional_access`, since `operator*` and `value()` share the same engaged check.",
+        "It yields 0, because the aligned storage is value-initialized until the optional is engaged.",
+        "It is undefined behavior — `operator*` performs no check at all; only `value()` throws.",
+        "It fails to compile, because `operator*` is constrained to engaged optionals by a precondition."
+      ],
+      "correctIndex": 2,
+      "explanation": "`operator*` and `operator->` are unchecked by design so that the common engaged path costs nothing; reading through them while disengaged is UB, not a diagnosable error. The 'throws' option is the most common misconception because `value()` sits right next to them and does throw. Nothing is value-initialized either — the storage is uninitialized bytes until a `T` is constructed there.",
+      "sourceAnchor": "153-stdoptional",
+      "difficulty": "trap"
+    },
+    {
+      "id": "15-q09",
+      "prompt": "A lambda takes an `Order` and returns `std::optional<Price>`. Which `optional` member applies it without producing `optional<optional<Price>>`?",
+      "options": [
+        "`transform`, which unwraps a nested optional result back down to a single level of wrapping.",
+        "`or_else`, which invokes the callable on the engaged case and returns the optional it produced.",
+        "`value_or`, which accepts a callable and returns its optional result whenever the source is engaged.",
+        "`and_then`, which is flatMap and expects the callable to have returned an optional already."
+      ],
+      "correctIndex": 3,
+      "explanation": "`and_then` is the flatMap of the C++23 monadic set: the callable already returns an optional, so no extra wrapping occurs. `transform` is the tempting neighbour — it is map, and it wraps whatever the callable returns, which with an optional-returning lambda gives exactly the nested type you wanted to avoid. `or_else` fires on the *disengaged* case, and `value_or` takes a plain value rather than a callable.",
+      "sourceAnchor": "153-stdoptional",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q10",
+      "prompt": "Which statement about C++26's `std::optional<T&>` (P2988) is correct?",
+      "options": [
+        "It is pointer-sized, and assigning to an engaged one rebinds the reference rather than assigning through it.",
+        "It is pointer-sized, and assigning to an engaged one assigns through the reference into the referent.",
+        "It stores a pointer plus a separate `bool`, matching the layout of every other `optional` specialization.",
+        "It has been available since C++17, which is why a raw pointer was never the idiomatic optional reference."
+      ],
+      "correctIndex": 0,
+      "explanation": "The reference specialization is a pointer internally and so is finally pointer-sized, and its assignment rebinds — that rebinding choice is precisely the controversy that kept the feature out of the standard for a decade. The assign-through option is the alternative semantics that was rejected, and it is what most people guess by analogy with `T&` itself. Before C++26 there was no such specialization at all, which is why `T*` remains the idiomatic optional reference in older code.",
+      "sourceAnchor": "153-stdoptional",
+      "difficulty": "trap"
+    },
+    {
+      "id": "15-q11",
+      "prompt": "What does a `std::variant<Ts...>` object physically contain?",
+      "options": [
+        "The sum of the sizes of every alternative plus an index, so each alternative keeps its own dedicated slot.",
+        "A pointer to heap storage for the active alternative plus an index, which is why alternatives may be incomplete.",
+        "Storage for the largest alternative only; the active type is recovered through RTTI rather than a stored tag.",
+        "Storage for the largest alternative, aligned to the strictest one, plus a discriminant index — and never a heap block."
+      ],
+      "correctIndex": 3,
+      "explanation": "A variant is a tagged union: one block sized to the largest alternative and aligned to the strictest, plus an index that implementations often shrink to a single byte when there are few alternatives. It never allocates, which is the whole point of choosing it over a `unique_ptr<Base>` hierarchy. The heap-pointer option is tempting because it would also explain type safety, but it would forfeit the contiguity that motivates variant in the first place, and it is `any`, not `variant`, that may allocate.",
+      "sourceAnchor": "154-stdvariant-and-visitation",
+      "difficulty": "recall"
+    },
+    {
+      "id": "15-q12",
+      "prompt": "How do you guarantee that a `std::variant` never enters the `valueless_by_exception` state?",
+      "options": [
+        "Make every alternative nothrow-move-constructible, so implementations never need to enter the state at all.",
+        "Give every alternative a nothrow default constructor, letting the variant fall back to a default-constructed one.",
+        "Add `std::monostate` as the first alternative, which implementations use as the fallback when a move throws.",
+        "Assign only through `emplace`, which is specified never to leave the variant in the valueless state."
+      ],
+      "correctIndex": 0,
+      "explanation": "The state exists only because assignment may have to destroy the old alternative before constructing the new one; when every alternative is nothrow-move-constructible, implementations use a move into place and the state becomes unreachable — and `visit` then skips the valueless branch entirely, which is a measurable win in dispatch-heavy code. The `monostate` option is the most tempting: monostate does make a variant default-constructible, but implementations are not permitted to silently substitute it on a throw. `emplace` can leave a variant valueless too, since it destroys the current alternative first.",
+      "sourceAnchor": "154-stdvariant-and-visitation",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q13",
+      "prompt": "What does `std::visit` over a single variant compile to, and why does it resist inlining?",
+      "options": [
+        "A chain of `if constexpr` type tests that the compiler unrolls but refuses to inline past the third alternative.",
+        "A table of function pointers indexed by `index()`, so the call is indirect and its target is unknown at the call site.",
+        "A virtual call through a vtable synthesized for the variant, so devirtualization is blocked by the extra indirection.",
+        "A `switch` over `index()` that the compiler always lowers to a jump table it can inline each arm into."
+      ],
+      "correctIndex": 1,
+      "explanation": "`visit` builds an array of function pointers, one per alternative, and calls through it after checking for valueless — an indirect call the optimizer cannot see through, and one exposed to indirect-branch misprediction of roughly 15-20 cycles. The `switch` option is the tempting one because that is what a hand-rolled tagged union gives you, and it is exactly why the hand-rolled version often beats `visit` on a hot path: the compiler can inline into a switch arm but not through a function pointer. No vtable is involved; variant has no polymorphic base.",
+      "sourceAnchor": "154-stdvariant-and-visitation",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q14",
+      "prompt": "You call `std::visit` on three variants at once, each with five alternatives. What does the compiler generate?",
+      "options": [
+        "A 15-entry dispatch table, one entry per alternative summed across the three variants being visited.",
+        "Three chained 5-entry tables, so the cost of adding another variant is additive rather than multiplicative.",
+        "A 125-entry dispatch table, one entry per combination, inflating both code size and compile time.",
+        "Nothing — multi-visit is ill-formed beyond two variants, so the call fails to compile."
+      ],
+      "correctIndex": 2,
+      "explanation": "Multi-visit instantiates an N-dimensional table of size equal to the product of the alternative counts, so 5x5x5 is 125 distinct visitor instantiations. The 'additive' option is the intuitive guess but is wrong about the mechanism: the table is indexed by the tuple of indices in one step, not by a sequence of independent dispatches. Multi-visit is legal at any arity; the problem is that it explodes, not that it is rejected.",
+      "sourceAnchor": "154-stdvariant-and-visitation",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q15",
+      "prompt": "Framed as the expression problem, how do `std::variant` and a virtual base hierarchy compare?",
+      "options": [
+        "`variant` makes adding an operation cheap and adding a type expensive; the virtual hierarchy is the reverse.",
+        "`variant` makes adding a type cheap and adding an operation expensive; the virtual hierarchy is the reverse.",
+        "Both make adding a type cheap, and they differ only in whether the dispatch mechanism allocates.",
+        "Both make adding an operation cheap, and they differ only in whether exhaustiveness is compiler-checked."
+      ],
+      "correctIndex": 0,
+      "explanation": "Adding a visitor to a variant touches no alternative, while adding an alternative breaks every visitor — and the compiler reports it, which is the exhaustiveness guarantee. Inheritance inverts both: a new derived class needs no edits elsewhere, but a new operation means editing every class in the hierarchy. The reversed option is the single most common way candidates garble this, usually by conflating 'open type set' with 'cheap to extend with types' in the wrong direction for variant.",
+      "sourceAnchor": "154-stdvariant-and-visitation",
+      "difficulty": "trap"
+    },
+    {
+      "id": "15-q16",
+      "prompt": "Which pair of facts about `std::any` is accurate?",
+      "options": [
+        "It needs RTTI only for `type()`; `any_cast` compares stored size and alignment, so `-fno-rtti` builds still work.",
+        "It never allocates, since the standard mandates a buffer large enough for any copy-constructible type.",
+        "It needs RTTI for `type()` and `any_cast`, and it allocates above an implementation-defined small-object threshold.",
+        "It always allocates, because the standard forbids a small-object buffer in order to keep `sizeof(any)` fixed."
+      ],
+      "correctIndex": 2,
+      "explanation": "`any_cast` is a runtime `type_info` comparison, so the whole type is unusable under `-fno-rtti`, and small-object optimization is permitted but not required — libstdc++ and libc++ inline roughly 16 bytes of nothrow-movable type and heap-allocate anything larger. The 'never allocates' option confuses `any` with `variant`, which genuinely never allocates because its type set is closed and its size is known at compile time. Nothing about `any_cast` can be done with size and alignment; two unrelated types can share both.",
+      "sourceAnchor": "155-stdany",
+      "difficulty": "recall"
+    },
+    {
+      "id": "15-q17",
+      "prompt": "A plugin `.so` puts a `Config` into a `std::any`; the host's `any_cast<Config>` throws `bad_any_cast` even though both sides include the same header. Most likely cause?",
+      "options": [
+        "The two `type_info` objects for `Config` were never merged, so the identity comparison failed under hidden visibility.",
+        "The plugin's `Config` exceeded the small-object threshold, so it was heap-allocated and cannot cross a module boundary.",
+        "`any_cast` by value copies, and therefore requires the contained type to be trivially copyable across modules.",
+        "`std::any` stores a hash of the mangled name, and the two modules seeded their hash function differently."
+      ],
+      "correctIndex": 0,
+      "explanation": "`any_cast` compares `type_info`, and implementations may compare the addresses of the type_info objects rather than their names; when the symbols are not merged across the shared-library boundary the same type appears distinct. The fix is symbol visibility — `-fvisibility=default` for the type, or `RTLD_GLOBAL` on the load. The heap-allocation option is tempting because SOO is real and threshold-dependent, but where the bytes live has no bearing on the type check; a large type crosses module boundaries just as well as a small one.",
+      "sourceAnchor": "155-stdany",
+      "difficulty": "trap"
+    },
+    {
+      "id": "15-q18",
+      "prompt": "`std::bitset<64> b; b.set(3); auto x = b[3]; b.reset(3);` — what does `x` hold at the end?",
+      "options": [
+        "`true`, because `x` is a `bool` copied at the point of the assignment and is unaffected by the later reset.",
+        "It does not compile, because `x` deduces to `bool&` bound to a packed bit, which cannot be formed.",
+        "`false`, because `x` is a proxy reference into `b` and re-reads the underlying bit when converted to `bool`.",
+        "It is undefined behavior, because reading a proxy after any modification of the owning bitset invalidates it."
+      ],
+      "correctIndex": 2,
+      "explanation": "The non-const `operator[]` returns `bitset<N>::reference`, a proxy holding a word pointer and a bit position, and `auto` deduces that proxy rather than `bool` — so `x` tracks `b` and reads false after the reset. The `true` option is the whole trap: it is what you get from `bool x = b[3];`, and the difference between the two spellings is invisible at a glance. Nothing is undefined here as long as `b` is alive; the danger is a proxy that outlives its bitset.",
+      "sourceAnchor": "156-stdbitset",
+      "difficulty": "trap"
+    },
+    {
+      "id": "15-q19",
+      "prompt": "On an LP64 platform, what is `sizeof(std::bitset<65>)`?",
+      "options": [
+        "9 — one byte per group of eight bits, rounded up, with no further padding applied to the object.",
+        "16 — the bits live in `ceil(N/64)` words of `unsigned long`, so 65 bits need two of them.",
+        "72 — one byte is spent per bit so that `operator[]` can hand back a genuine `bool` reference.",
+        "8 — the words are tightly packed and the 65th bit is kept in a separate side allocation."
+      ],
+      "correctIndex": 1,
+      "explanation": "`bitset` is backed by an array of `unsigned long`, so its size is `ceil(N/64)*8` on LP64: `bitset<1>` is 8 bytes and `bitset<65>` is 16. The 9-byte answer assumes byte-granular packing, which would break the word-at-a-time shifts, `count()`, and `any()` that make bitset fast. There is never a side allocation — being entirely inline is bitset's advantage over `vector<bool>`.",
+      "sourceAnchor": "156-stdbitset",
+      "difficulty": "recall"
+    },
+    {
+      "id": "15-q20",
+      "prompt": "Compilers already shipped `__builtin_popcount` and friends. What does `<bit>` add that they lacked?",
+      "options": [
+        "Defined behavior at the edges: `countr_zero(0)` is the operand width and `rotl` is fine at `n == 0` or `n >= width`.",
+        "The same instructions but without `constexpr` evaluation, which the intrinsic forms had always supported.",
+        "A guarantee that `POPCNT` and `TZCNT` are emitted regardless of the target's instruction-set feature flags.",
+        "The same undefined zero cases as `__builtin_ctz(0)`, standardizing only the spelling across compilers."
+      ],
+      "correctIndex": 0,
+      "explanation": "The zero and width cases are the entire reason the header exists: `__builtin_ctz(0)` is UB, `BSF` leaves its destination unmodified for a zero input, and the hand-rolled `(x<<n)|(x>>(64-n))` rotate is UB at `n == 0`. `<bit>` nails all of them down and is `constexpr` throughout — so the option claiming it gave up `constexpr` has the direction backwards. No library function can conjure an instruction the target does not have; without `-mpopcnt` you get a SWAR fallback of about twelve operations.",
+      "sourceAnchor": "157-standard-bit-manipulation-utilities",
+      "difficulty": "recall"
+    },
+    {
+      "id": "15-q21",
+      "prompt": "Which loop visits the index of every set bit in a `uint64_t m` correctly and without a branch per empty slot?",
+      "options": [
+        "`for (int i = 0; i < 64; ++i) if (m >> i & 1) use(i);` — sixty-four fixed iterations that the compiler always vectorizes away.",
+        "`while (m) { int i = std::countl_zero(m); use(i); m &= m + 1; }` — one leading-zero count and one clear-lowest-set-bit per bit.",
+        "`while (m) { int i = std::popcount(m); use(i); m >>= 1; }` — `popcount` yields the next set index as the mask shifts down.",
+        "`while (m) { int i = std::countr_zero(m); use(i); m &= m - 1; }` — one trailing-zero count and one clear-lowest-set-bit per bit."
+      ],
+      "correctIndex": 3,
+      "explanation": "`countr_zero` gives the index of the lowest set bit and `m &= m - 1` clears it, so the loop runs exactly once per set bit — one `TZCNT` and one `BLSR`, with no iteration wasted on zeros. The fixed 64-iteration scan is the tempting fallback, and it does produce the right indices, but it pays for every empty slot and no compiler turns it into the two-instruction form. `m &= m + 1` does not clear the lowest set bit, and `popcount` returns a count, never an index.",
+      "sourceAnchor": "157-standard-bit-manipulation-utilities",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q22",
+      "prompt": "What is `std::bit_ceil(x)` for a `uint32_t x` equal to `0x8000'0001`?",
+      "options": [
+        "Undefined behavior, because the next power of two is not representable in the operand's type.",
+        "`0`, since the computation wraps modulo 2^32 like any other unsigned arithmetic in the language.",
+        "`0x8000'0000`, because `bit_ceil` saturates downward to the largest representable power of two.",
+        "It throws `std::overflow_error`, mirroring how `bitset::to_ulong` reports a non-representable value."
+      ],
+      "correctIndex": 0,
+      "explanation": "`bit_ceil` is UB when the result would not fit in the return type, and 0x80000001 needs 2^32 — a real trap, since every other `<bit>` function was designed to eliminate exactly this kind of edge case. The wrap-to-zero option is the most plausible guess because unsigned arithmetic really does wrap, but `bit_ceil` is specified with a precondition rather than as modular arithmetic, so nothing constrains what the implementation emits. `<bit>` functions never throw.",
+      "sourceAnchor": "157-standard-bit-manipulation-utilities",
+      "difficulty": "trap"
+    },
+    {
+      "id": "15-q23",
+      "prompt": "What argument types do `std::popcount`, `std::countr_zero`, and `std::rotl` accept?",
+      "options": [
+        "Any integral type; signed values are converted to the corresponding unsigned type before the operation.",
+        "Signed types included, with the sign bit treated as an ordinary bit, so `std::popcount(-1)` is the operand width.",
+        "Unsigned integer types only — passing a signed value is ill-formed, and deliberately so.",
+        "Any arithmetic type including `float`, since a `bit_cast` to the same-width unsigned type is applied implicitly."
+      ],
+      "correctIndex": 2,
+      "explanation": "The `<bit>` functions are constrained to unsigned integer types, from `unsigned char` through `unsigned long long` plus extended types; a signed argument is a compile error rather than a silent conversion. That is intentional: shifts and bit counts on signed representations are precisely where the undefined behavior lives, so the library refuses the input instead of guessing. The implicit-conversion option is the tempting one because integral promotion behaves that way almost everywhere else in C++.",
+      "sourceAnchor": "157-standard-bit-manipulation-utilities",
+      "difficulty": "recall"
+    },
+    {
+      "id": "15-q24",
+      "prompt": "What does `std::simd` buy you that auto-vectorization does not?",
+      "options": [
+        "A guarantee that surrounding scalar loops vectorize too, because the compiler can now prove absence of aliasing.",
+        "A guarantee expressed in the type system: width is part of the type, so lost vectorization is a compile error.",
+        "A single fixed 512-bit width on every target, so identical instructions are emitted on all supported ISAs.",
+        "Automatic handling of the tail elements that do not fill a full vector, which intrinsic code must do by hand."
+      ],
+      "correctIndex": 1,
+      "explanation": "Auto-vectorization is a best-effort optimization that silently vanishes under aliasing, non-unit stride, float-reduction reassociation, or an unknown trip count — `-fopt-info-vec-missed` exists because the failures are invisible. `std::simd` makes the width part of the type, so a regression surfaces as a diagnostic rather than a 4x slowdown. The tail-handling option is the trap: tail handling is explicitly *your* problem with `std::simd`, via masked loads or a scalar remainder loop, and the ABI tag `native` means width is target-dependent, not fixed.",
+      "sourceAnchor": "158-stdsimd",
+      "difficulty": "recall"
+    },
+    {
+      "id": "15-q25",
+      "prompt": "For `std::simd<float> a, b;` you write `auto m = a < b;`. What is `m`, and how do you branch on it?",
+      "options": [
+        "A `std::simd_mask<float>` of per-lane predicates; reduce it with `any_of`/`all_of`/`none_of` before branching.",
+        "A `bool` that is true only when the comparison holds in every lane, so it is directly usable in an `if`.",
+        "A `std::simd<int>` whose lanes are 0 or -1, converting to `bool` by testing the value of the first lane.",
+        "A `std::bitset` with one bit per lane, so writing `if (m)` tests whether at least one lane compared true."
+      ],
+      "correctIndex": 0,
+      "explanation": "Comparison yields a `simd_mask`, one predicate per lane, and it has no conversion to `bool` — you must collapse it with `any_of`, `all_of`, or `none_of` first, or better, avoid the branch entirely with `simd_select`. The 'bool that means all lanes' option is the most seductive because that is what an `all_of` reduction gives, but making the conversion implicit would hide exactly the lane-vs-scalar distinction the type system is there to enforce. Nothing about `simd_mask` is a `bitset`, and it is not a `simd<int>` of 0/-1 either.",
+      "sourceAnchor": "158-stdsimd",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q26",
+      "prompt": "Why is `std::mt19937` a poor engine choice on a latency-sensitive path?",
+      "options": [
+        "Its 32-bit state is too small to avoid short cycles, so the sequence repeats within a few million draws.",
+        "It consults `std::random_device` internally on each draw, which becomes a syscall on Linux.",
+        "It is specified to be thread-safe, so every draw costs an atomic read-modify-write on shared state.",
+        "Its ~2.5 KB of state is cache-hostile, and it is refilled in a 312-word batch that produces a periodic spike."
+      ],
+      "correctIndex": 3,
+      "explanation": "Mersenne Twister carries 624 words of state, which will not sit in L1 alongside your working set, and its output is generated in batches — so one draw in every 312 pays for regenerating the whole block, a recurring latency outlier. A 16-32 byte PCG or xoshiro engine is both faster and cache-friendly, and C++26 adds `philox_engine`. The 'short period' option inverts the truth: mt19937's period of 2^19937-1 is enormous, and it is the *size* of that state, not any shortage of it, that hurts.",
+      "sourceAnchor": "159-random-engines-and-distributions",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q27",
+      "prompt": "A simulation must replay identically on libstdc++ and MSVC given the same seed. What does `<random>` guarantee?",
+      "options": [
+        "Engines are fully specified and reproduce everywhere; distributions are not, since only the shape is specified.",
+        "Distributions are fully specified and reproduce everywhere; engines may differ in their transition function.",
+        "Both are fully specified, so a fixed seed yields identical values on libstdc++, libc++, and MSVC alike.",
+        "Neither is specified, so reproducibility requires pinning the standard library version as well as the seed."
+      ],
+      "correctIndex": 0,
+      "explanation": "The standard defines each engine's transition and output functions exactly, but for distributions it specifies only the resulting distribution, leaving the algorithm free — so `uniform_int_distribution` legitimately yields different values per implementation from the same engine and seed. The reversed option is the common assumption, since the distribution is the part with a mathematical definition and so feels more pinned down. For cross-platform replay you keep the standard engine and implement the distribution yourself.",
+      "sourceAnchor": "159-random-engines-and-distributions",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q28",
+      "prompt": "Latency samples are bucketed with `duration_cast<std::chrono::milliseconds>`. What does that do to the histogram?",
+      "options": [
+        "It rounds to nearest, so boundary samples alternate between buckets and the histogram develops a comb pattern.",
+        "It performs a runtime division that dominates the measurement, perturbing the very samples it records.",
+        "It refuses to compile for a lossy conversion, so the histogram silently retains the raw nanosecond counts.",
+        "It truncates toward zero, so every sample lands in the bucket below its true value and the histogram skews low."
+      ],
+      "correctIndex": 3,
+      "explanation": "`duration_cast` is the explicit, truncating conversion, so a 1.9 ms sample is recorded as 1 ms and every bucket is systematically biased downward — use `round`, `floor`, or `ceil` (C++17) when you want a stated rounding policy. The 'refuses to compile' option confuses `duration_cast` with implicit conversion: it is the *implicit* direction that is restricted to exact conversions, which is exactly why the lossy direction requires the cast you just wrote. The conversion is compile-time ratio arithmetic folded into a shift or a magic multiply, so it costs essentially nothing at run time.",
+      "sourceAnchor": "1510-stdchrono-durations-and-time-points",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q29",
+      "prompt": "With `std::chrono::nanoseconds a = 5ns; std::chrono::microseconds b = 3us;`, what is `auto sum = a + b;`?",
+      "options": [
+        "`microseconds` holding 3 — the common type is the coarser period, and the 5 ns is truncated away.",
+        "`nanoseconds` holding 3005 — the common type is the finer period, and both conversions are exact.",
+        "Ill-formed — mixed-period arithmetic requires an explicit `duration_cast` on one of the operands.",
+        "`duration<double, std::nano>` holding 3005.0 — mixing periods promotes the representation to floating point."
+      ],
+      "correctIndex": 1,
+      "explanation": "The common type of two durations uses the greatest common divisor of the periods, which here is nanoseconds, and converting microseconds to nanoseconds is exact — so the addition is implicit and lossless. The 'coarser period' option gets the direction backwards and would silently lose data, which is precisely the outcome the design forbids: implicit conversion is permitted only when exact, and `ms = ns` is the direction that needs `duration_cast`. Nothing promotes the representation to floating point.",
+      "sourceAnchor": "1510-stdchrono-durations-and-time-points",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q30",
+      "prompt": "Why is `std::chrono::high_resolution_clock` the wrong clock for timing a code section?",
+      "options": [
+        "It is required to alias `steady_clock`, so it is safe but entirely redundant with spelling out `steady_clock`.",
+        "It has a coarser tick period than `steady_clock`, so intervals shorter than a millisecond round down to zero.",
+        "It is monotonic but reads through a syscall rather than the vDSO, making each call microseconds long.",
+        "The standard permits it to alias `system_clock`, which is adjustable, so an NTP step can make the interval negative."
+      ],
+      "correctIndex": 3,
+      "explanation": "The name promises precision but the standard guarantees nothing about monotonicity; it happens to alias `steady_clock` on libstdc++, libc++, and modern MSVC, yet an implementation may point it at `system_clock`, where an NTP step or a `settimeofday` moves time backwards mid-measurement. The 'required to alias steady_clock' option is the trap because it describes what the major implementations actually do — but that is a coincidence of practice, not a guarantee you may rely on. The correct answer to 'how do you time a code section' is always `steady_clock`.",
+      "sourceAnchor": "1511-standard-clocks",
+      "difficulty": "trap"
+    },
+    {
+      "id": "15-q31",
+      "prompt": "A hot loop calling `steady_clock::now()` runs fine on bare metal but collapses on a VM whose clocksource is `hpet`. Why?",
+      "options": [
+        "The call stops being served from the vDSO and becomes a real syscall, moving from ~20-30 ns to hundreds of ns or more.",
+        "The call keeps its vDSO fast path but loses monotonicity under load, so the computed intervals come back negative.",
+        "The call falls back to a raw `RDTSC`, which is faster but uncalibrated, so the readings are reported in wrong units.",
+        "The call starts reading a value refreshed by a timer tick, so repeated calls return the same reading for milliseconds."
+      ],
+      "correctIndex": 0,
+      "explanation": "With a TSC clocksource the kernel exports the conversion through the vDSO and `clock_gettime` is a userspace read of about 20-30 ns; with `hpet` or `acpi_pm` there is no userspace path, so every call becomes a genuine syscall with the mode switch that implies. Monotonicity is unaffected — `steady_clock` stays monotonic regardless of clocksource, which is what makes the 'loses monotonicity under load' answer wrong despite sounding like a plausible virtualization symptom. Check `/sys/devices/system/clocksource/*/current_clocksource`, and use `RDTSC` explicitly if you need sub-20-ns timestamps.",
+      "sourceAnchor": "1511-standard-clocks",
+      "difficulty": "application"
+    },
+    {
+      "id": "15-q32",
+      "prompt": "How does C++20 `<chrono>` turn the classic UTC-versus-local-time mix-up into a compile error?",
+      "options": [
+        "`local_time` is a distinct type but converts implicitly to `sys_time` using the process's `TZ` environment variable.",
+        "Both are `system_clock` time points, and the mismatch is caught by a runtime check inside `zoned_time`'s constructor.",
+        "`sys_time` and `local_time` are distinct types, and a `local_time` carries no epoch meaning until paired with a zone.",
+        "`local_time` carries a `time_zone` pointer beside its duration, so it is mixing two different zones that gets rejected."
+      ],
+      "correctIndex": 2,
+      "explanation": "`sys_time<D>` and `local_time<D>` are separate types, so passing one where the other is expected simply does not compile; `local_time` is deliberately an uninterpreted wall-clock reading, and pairing it with a `time_zone` to make a `zoned_time` is the only way to give it meaning. The implicit-`TZ` option describes what `<ctime>` and `struct tm` did, and that silent global-state conversion is exactly the behavior the new types were designed to eliminate. Genuinely ambiguous conversions are surfaced too: a DST gap throws `nonexistent_local_time` and an overlap throws `ambiguous_local_time`.",
+      "sourceAnchor": "1512-calendar-and-timezone-library",
+      "difficulty": "application"
+    }
+  ]
+}

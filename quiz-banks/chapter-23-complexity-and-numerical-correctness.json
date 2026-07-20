@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-23-complexity-and-numerical-correctness",
+  "questions": [
+    {
+      "id": "23-q01",
+      "prompt": "Which statement is the definition of f = o(g)?",
+      "options": [
+        "For every c > 0 there is an n₀ with f(n) < c·g(n) for all n ≥ n₀ — equivalently f/g tends to 0.",
+        "There exist a c and an n₀ with f(n) ≤ c·g(n) for all n ≥ n₀, and no tighter bound is available.",
+        "There exist a c and an n₀ with f(n) ≥ c·g(n) for all n ≥ n₀ — equivalently g/f tends to 0.",
+        "Both f = O(g) and f = Ω(g) hold, so g describes f's growth from above and below at once."
+      ],
+      "correctIndex": 0,
+      "explanation": "Little-o is the ∀c form: the bound must hold for every constant, which forces the ratio to zero and makes g strictly larger. The tempting near-miss is the ∃c,n₀ upper-bound form — that is exactly big-O, and the ∀/∃ quantifier swap is the whole difference between the two. The two-sided version describes Θ, and the ≥ version describes Ω.",
+      "sourceAnchor": "231-asymptotic-notation",
+      "difficulty": "recall"
+    },
+    {
+      "id": "23-q02",
+      "prompt": "A candidate says \"quicksort is O(n log n)\". What is the correct critique?",
+      "options": [
+        "It is ambiguous: O says nothing about which input case, and quicksort is Θ(n log n) expected but Θ(n²) worst.",
+        "It is wrong, because O always names the worst case and quicksort's worst case is Θ(n²) on adversarial pivots.",
+        "It is wrong, because O(n log n) forbids any input from costing more, so only mergesort can carry that bound.",
+        "It is fine and means the same as Θ(n log n), since O and Θ coincide for comparison-based sorting algorithms."
+      ],
+      "correctIndex": 0,
+      "explanation": "Complexity class (O/Ω/Θ) and case analysis (best/average/worst) are orthogonal axes, so the statement under-specifies rather than being false — \"O(n²) worst case, Θ(n log n) expected\" is the precise version. The seductive distractor is the claim that O denotes the worst case; that conflates the two axes, which is the single most common asymptotics error. O and Θ are also not interchangeable: O(n²) is a true statement about a linear algorithm.",
+      "sourceAnchor": "231-asymptotic-notation",
+      "difficulty": "trap"
+    },
+    {
+      "id": "23-q03",
+      "prompt": "A lookup in `std::map` is Θ(log n) and a linear scan of `std::vector` is Θ(n), yet the vector wins up to roughly 100 elements. Why?",
+      "options": [
+        "The scan is a prefetched sequential stream while the tree walk is a chain of dependent cache misses, and asymptotics hide those constants.",
+        "Below about 100 elements log₂ n exceeds n, so the tree genuinely performs more key comparisons than the scan does.",
+        "`std::map` lookup is actually Θ(n) at small sizes, because the red-black tree does not rebalance until it is deeper.",
+        "The linear scan is itself Θ(log n) at small n, because the branch predictor collapses the loop to a logarithmic cost."
+      ],
+      "correctIndex": 0,
+      "explanation": "The asymptotics are correct and irrelevant at that size: the hidden constant is a memory-hierarchy constant, one node per cache miss with no memory-level parallelism versus 16 int32_t per miss on a prefetched stream. The comparison-count argument is the tempting one, but log₂ 100 is about 7 and n is 100, so the tree really does do far fewer comparisons — it loses anyway, which is precisely the point. Neither the tree's balance nor branch prediction changes anyone's complexity class.",
+      "sourceAnchor": "231-asymptotic-notation",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q04",
+      "prompt": "Which operation is paired with the correct kind of complexity guarantee?",
+      "options": [
+        "`unordered_map::find` is expected O(1) and worst-case O(n), and that worst case is reachable by an adversary.",
+        "`vector::push_back` is expected O(1), because the cost depends on where a reallocation randomly happens to land.",
+        "Quickselect is amortized O(n), because its expensive partitions are paid for by the cheap ones before them.",
+        "`std::map::find` is amortized O(log n), a bound that only holds across a long sequence of lookup operations."
+      ],
+      "correctIndex": 0,
+      "explanation": "Expected averages over randomness (here, hash distribution), and because an attacker can choose colliding keys the worst case is reachable — this is why hash flooding exists and why production maps use a per-process seed. The `push_back` distractor is the classic conflation: reallocation is deterministic, not random, so the bound is amortized, a guarantee with no probability in it. Quickselect is the reverse mistake (expected, not amortized), and `map::find` is a plain per-operation worst-case bound.",
+      "sourceAnchor": "232-best-average-and-worst-case-complexity",
+      "difficulty": "recall"
+    },
+    {
+      "id": "23-q05",
+      "prompt": "Why might a latency-critical hot path prefer heapsort or mergesort to a quicksort that is faster on average?",
+      "options": [
+        "They are input-oblivious, so best and worst case coincide and p99 equals p50 — on a hot path the tail is the metric.",
+        "They have a strictly smaller Θ than quicksort, so their asymptotic advantage widens as the input size grows.",
+        "They avoid recursion entirely, so they cannot suffer the stack-depth spikes that produce quicksort's latency tail.",
+        "They are randomized internally, so no adversary can construct an input that drives them into their worst case."
+      ],
+      "correctIndex": 0,
+      "explanation": "Mergesort, heapsort, radix sort and sorting networks do the same work regardless of input, which collapses the distribution: a worse mean with no tail often beats a better mean with a bad tail. The randomization claim is the plausible trap — randomized pivots do defend quicksort against an adversary, but they convert a worst case into an expected case rather than eliminating it, so the tail remains. All three algorithms are Θ(n log n), and mergesort is normally recursive.",
+      "sourceAnchor": "232-best-average-and-worst-case-complexity",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q06",
+      "prompt": "In the aggregate argument that `vector::push_back` with doubling is amortized O(1), what does the geometric series establish?",
+      "options": [
+        "Total elements copied across all reallocations is 1+2+4+… < 2n, so n pushes cost O(n) in total.",
+        "Each individual reallocation copies at most log₂ n elements, so n pushes cost O(n log n) overall.",
+        "Copies average two per push only when elements are appended without any intervening `pop_back` calls.",
+        "Memory use stays below 2n bytes, and the time bound follows because element copying itself is free."
+      ],
+      "correctIndex": 0,
+      "explanation": "The whole proof is that a geometric series with ratio 2 sums to less than twice its largest term, so the total copy work over n pushes is linear and the per-push amortized cost is constant. The log₂ n distractor is the appealing confusion: the *number* of reallocations is logarithmic, but their *sizes* are not — the last one alone copies n/2 elements. Amortized bounds are worst-case guarantees over the sequence and need no assumption about the operation mix.",
+      "sourceAnchor": "233-amortized-analysis",
+      "difficulty": "recall"
+    },
+    {
+      "id": "23-q07",
+      "prompt": "A buffer grows by a fixed 1024 elements each time it fills. What is the amortized cost per push?",
+      "options": [
+        "Θ(n) amortized — the copy sizes form an arithmetic series summing to Θ(n²) over n pushes.",
+        "Θ(1) amortized — any policy that copies at most n elements per reallocation amortizes to constant cost.",
+        "Θ(log n) amortized — the number of reallocations stays logarithmic in n for any fixed increment.",
+        "Θ(1) amortized, but with roughly 1024 copies per element rather than the 2 that doubling gives."
+      ],
+      "correctIndex": 0,
+      "explanation": "Constant growth gives n/1024 reallocations copying 1024, 2048, 3072, … elements; that arithmetic series is Θ(n²) total, so the per-push amortized cost is Θ(n) and the amortization is destroyed. The \"Θ(1) with a bigger constant\" answer is the tempting one — it correctly senses that 1024 is a large constant, but the constant is the *increment*, not the copies per element, and any growth factor of exactly 1 loses the geometric argument. Only a growth factor k > 1 gives O(1), at k/(k−1) copies per element.",
+      "sourceAnchor": "233-amortized-analysis",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q08",
+      "prompt": "A feed handler inserts into an `unordered_map` on the hot path, relying on its amortized O(1) insert. What is the real hazard?",
+      "options": [
+        "A rehash is a single Θ(n) event with reallocation and full re-probing; call `reserve(expected)` before the hot path starts.",
+        "Rehashing is amortized away completely, so the only remaining hazard is a poor-quality hash function on the key type.",
+        "The amortized bound already covers the spike, so the only available fix is to switch to a node-based ordered map.",
+        "Every insert invalidates all references into the map, so values must be stored in a stable side array instead."
+      ],
+      "correctIndex": 0,
+      "explanation": "An amortized bound is a statement about a sequence total, not a per-operation guarantee, so the Θ(n) rehash still lands on one unlucky message and shows up directly in p99. The \"already covered by the bound\" answer is the trap: the mathematics is right and the operational conclusion is wrong — reserving, fixed-capacity containers, or pool allocators are what convert amortized into worst-case. Rehash also does not invalidate references to elements, only iterators.",
+      "sourceAnchor": "233-amortized-analysis",
+      "difficulty": "trap"
+    },
+    {
+      "id": "23-q09",
+      "prompt": "Replacing a 4 MB precomputed lookup table with a recomputation costing one multiply and one add makes the code faster. Why?",
+      "options": [
+        "A 4 MB table falls out of L2, so a lookup risks a ~200–300 cycle DRAM access while the arithmetic costs a handful of cycles.",
+        "Recomputing removes a data dependency, so the compiler can hoist the entire computation out of the surrounding loop.",
+        "Lookup tables live in read-only memory, which is designed with higher access latency than the L1 data cache.",
+        "The table lookup compiles to an indirect branch, and no predictor can track a target set as large as 4 MB."
+      ],
+      "correctIndex": 0,
+      "explanation": "The modern inversion: a DRAM access is roughly 200–300 cycles and an FP multiply is about 4, so a table wins only while it is L1/L2-resident and replaces more than 10–20 cycles of work. The data-dependency answer is the plausible one — a table load genuinely does introduce a dependency — but the compiler cannot hoist a value that varies per iteration, so that is not where the win comes from. A table read is an indexed load, not an indirect branch.",
+      "sourceAnchor": "234-space-time-tradeoffs",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q10",
+      "prompt": "What is the chapter's rule of thumb for when a precomputed lookup table is actually worth it?",
+      "options": [
+        "It stays resident in L1 or L2 and replaces more than roughly 10–20 cycles of computation.",
+        "It fits inside the shared 32 MB L3, since anything L3-resident avoids DRAM for every core on the socket.",
+        "It replaces at least one integer division, since nothing cheaper than a division can ever justify a table.",
+        "It is smaller than a 4 KB page, so that a single TLB entry covers every possible lookup into it."
+      ],
+      "correctIndex": 0,
+      "explanation": "Residency plus a meaningful amount of replaced work is the test — a 4 KB table is fine, a 4 MB table is a cache-eviction machine. The L3 answer is the strongest distractor because its premise is true (an L3 hit does avoid DRAM at roughly 40–50 cycles) but the conclusion does not follow: a large L3-resident table evicts the working sets of every co-resident thread, a shared cost that a single-threaded microbenchmark systematically fails to measure.",
+      "sourceAnchor": "234-space-time-tradeoffs",
+      "difficulty": "recall"
+    },
+    {
+      "id": "23-q11",
+      "prompt": "In the external-memory (cache-aware) model of Aggarwal and Vitter, what is counted and what parameterises it?",
+      "options": [
+        "Memory transfers between cache and memory, parameterised by cache size M and block (cache-line) size B.",
+        "Instructions executed, parameterised by cache size M and the associativity W of each cache level.",
+        "Cycles of memory latency, parameterised by the number of cache levels and whether they are inclusive.",
+        "Memory transfers, parameterised by the core count and the available DRAM bandwidth per socket."
+      ],
+      "correctIndex": 0,
+      "explanation": "The model replaces the RAM model's uniform O(1) access with two parameters, M and B, and counts cache misses instead of instructions — which is what makes it predict real runtime above L2 far better. The bandwidth-and-cores variant is the tempting one because it names transfers correctly, but M and B are the only parameters; parallelism and bandwidth belong to different models. Associativity is deliberately excluded, which is why conflict misses fall outside the model entirely.",
+      "sourceAnchor": "235-cache-complexity",
+      "difficulty": "recall"
+    },
+    {
+      "id": "23-q12",
+      "prompt": "Tiling a naive n³ matrix multiply changes what, precisely?",
+      "options": [
+        "Instructions stay Θ(n³) while transfers fall from Θ(n³/B + n²) to Θ(n³/(B·√M)) — the cost model changed, not the complexity.",
+        "Arithmetic drops to Θ(n^2.807) by reusing partial products across tiles, which is where the wall-clock speedup comes from.",
+        "Transfers are unchanged, but the prefetcher can now follow the stride and overlap the misses it was previously serialising.",
+        "Both instructions and transfers fall by a factor of √M, because each tile is computed once instead of n separate times."
+      ],
+      "correctIndex": 0,
+      "explanation": "This is the headline result of the cache model: identical asymptotic instruction count, √M fewer memory transfers, and 5–10× wall clock in practice. The Θ(n^2.807) option is the trap for anyone who half-remembers matrix multiplication — that exponent is Strassen's, achieved by an algebraic identity that reduces multiplications, whereas tiling changes only the memory access order and performs exactly the same arithmetic.",
+      "sourceAnchor": "235-cache-complexity",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q13",
+      "prompt": "Traversing a million `int32_t` values in a `std::vector` beats the same values in a `std::list` by 10–50×. Which explanation is correct?",
+      "options": [
+        "The scan gets 16 values per 64-byte line and prefetches ahead, while each node costs a miss whose address is unknown until the previous load returns.",
+        "The list traversal is Θ(n log n), because reaching each node requires consulting the allocator's free-list metadata structure.",
+        "Both are Θ(n/B) transfers, but the list's per-transfer constant factor is about 16× larger due to node header overhead.",
+        "Most allocators place list nodes contiguously anyway, so the entire difference comes from the extra pointer arithmetic per step."
+      ],
+      "correctIndex": 0,
+      "explanation": "Two effects compound: the scan amortises one miss over 16 elements (Θ(n/B) transfers) while the list pays one per node (Θ(n)), and the list's misses are *serialised* because the next address is the result of the current load, destroying memory-level parallelism. The Θ(n/B)-with-a-worse-constant answer is the near miss — it correctly identifies that transfers dominate, but pointer chasing is a different complexity class in this model, not a worse constant within the same one.",
+      "sourceAnchor": "235-cache-complexity",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q14",
+      "prompt": "What makes an algorithm cache-oblivious?",
+      "options": [
+        "It attains asymptotically optimal cache complexity without referring to M or B, usually by recursive subdivision, so it is optimal at every level at once.",
+        "It measures the cache hierarchy at program startup and selects its tile sizes automatically, removing the need for any manual retuning.",
+        "It bypasses the cache using non-temporal loads and stores, so that its transfer count no longer depends on either M or B.",
+        "It is optimal only at the one cache level whose parameters it was compiled against, but a recompilation retunes it for free."
+      ],
+      "correctIndex": 0,
+      "explanation": "The mechanism is recursion: keep halving, and at some depth the subproblem fits whatever cache you name, from which point the whole subtree runs miss-free — without ever naming the level. Runtime measurement is the strongest distractor because that is real and useful, but it is *autotuning* (what FFTW's planner adds on top); a cache-oblivious algorithm needs no measurement at all. Non-temporal access avoids pollution, not transfers.",
+      "sourceAnchor": "236-cache-oblivious-algorithms",
+      "difficulty": "recall"
+    },
+    {
+      "id": "23-q15",
+      "prompt": "Cache-oblivious analysis assumes an ideal cache. Where does that assumption visibly break on real hardware?",
+      "options": [
+        "Real caches are 8–16-way set-associative, so power-of-two strides map to one set and generate conflict misses the model predicts as absent.",
+        "Real caches are write-back rather than write-through, so every store costs two transfers instead of the one that the model charges for it.",
+        "Real caches have a finite line size B, whereas the ideal-cache model assumes cache lines of effectively unbounded width.",
+        "Real caches are inclusive, so any L1 miss must also evict a line from L3, which doubles the transfer count the model predicts."
+      ],
+      "correctIndex": 0,
+      "explanation": "The ideal-cache model assumes full associativity with optimal replacement; real pseudo-LRU set-associative caches produce conflict misses, most visibly at power-of-two strides, and the standard fix — padding rows to a non-power-of-two stride — is something the model cannot predict at all. The finite-B option is the trap: B is an explicit parameter of the model, so that is what it already assumes rather than a place it fails.",
+      "sourceAnchor": "236-cache-oblivious-algorithms",
+      "difficulty": "trap"
+    },
+    {
+      "id": "23-q16",
+      "prompt": "How do conditioning and stability differ?",
+      "options": [
+        "Conditioning is the problem's sensitivity to input perturbation; stability is a property of the algorithm, and no algorithm rescues an ill-conditioned problem.",
+        "Conditioning describes how an algorithm's rounding errors accumulate; stability describes how sensitive the underlying problem is to its own inputs.",
+        "Conditioning applies to floating-point formats and stability to fixed-point ones; both name the same sensitivity measured in different representations.",
+        "Both are properties of the algorithm: conditioning bounds its forward error and stability bounds its backward error on the same input."
+      ],
+      "correctIndex": 0,
+      "explanation": "Problem versus algorithm is the whole distinction, and it drives the practical rule error ≈ condition_number × algorithm_error: with a condition number of 10¹⁶, double's 16 digits buy nothing no matter how good the algorithm is. The swapped-definition option is the tempting one because both halves sound familiar; the give-away is that conditioning cannot mention rounding at all, since it is defined before any algorithm is chosen.",
+      "sourceAnchor": "237-numerical-stability",
+      "difficulty": "recall"
+    },
+    {
+      "id": "23-q17",
+      "prompt": "Given `double a = 1.0000000001, b = 1.0; double d = a - b;`, what does catastrophic cancellation actually do here?",
+      "options": [
+        "The subtraction is exact; it exposes a's pre-existing representation error, which is now a large fraction of the tiny result.",
+        "The subtraction rounds badly and introduces a fresh error roughly equal in magnitude to the larger of the two operands.",
+        "The result underflows into the subnormal range, and the low-order bits of the difference are lost to gradual underflow.",
+        "The result is exact and completely error-free, since both operands are themselves exactly representable as doubles."
+      ],
+      "correctIndex": 0,
+      "explanation": "By Sterbenz-style reasoning the difference of two nearby doubles is representable exactly, so the subtraction adds nothing — it *reveals* the error already sitting in a, which was never exactly 1.0000000001, and that error is now 100% of a result near 1e-10. The \"introduces a new error\" answer is the standard misconception and gets the mechanism exactly backwards. The result, near 1e-10, is nowhere near the subnormal range (~1e-308).",
+      "sourceAnchor": "237-numerical-stability",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q18",
+      "prompt": "A rolling volatility computes variance as E[x²] − E[x]² on prices near 50,000 with true variance near 0.01. What fails, and what is the fix?",
+      "options": [
+        "The two large near-equal terms cancel away every significant digit and can even yield a negative variance; use Welford, updating the mean before accumulating M2.",
+        "The squared prices overflow the exponent range of `double` at that magnitude, so accumulate the sums in `long double` instead.",
+        "The estimator divides by n rather than n−1, so it is biased low; applying Bessel's correction restores the correct sample variance.",
+        "Floating-point addition is not commutative, so the sum of squares depends on order; sort the prices descending before summing them."
+      ],
+      "correctIndex": 0,
+      "explanation": "Both terms are around 2.5×10⁹ and their difference is 0.01, so roughly 11 leading digits cancel out of the 16 that double carries — the regime where the naive formula loses everything and can go negative. The Bessel option is the plausible distractor because n-versus-n−1 is a real variance issue, but that is a small systematic bias of order 1/n, not a loss of all precision, and it does not produce negative results. Floating-point addition *is* commutative; it is associativity that fails.",
+      "sourceAnchor": "237-numerical-stability",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q19",
+      "prompt": "You must compare two doubles that may be near zero on one call and around 10⁶ on the next. Which comparison strategy is correct?",
+      "options": [
+        "Combined: accept when |a−b| ≤ abs_eps, and otherwise require |a−b| ≤ rel · max(|a|, |b|).",
+        "Pure relative epsilon, since scaling by max(|a|, |b|) adapts to any magnitude including values arbitrarily close to zero.",
+        "Pure absolute epsilon, since a single fixed tolerance is scale-free and therefore stays valid at every magnitude.",
+        "Bitwise equality of the two doubles, since equal values always share a bit pattern and this avoids tolerance tuning entirely."
+      ],
+      "correctIndex": 0,
+      "explanation": "The absolute test handles the near-zero regime where relative error is meaningless, and the relative test handles large magnitudes where a fixed epsilon is far below one ULP — each covers the other's failure region, which is why the combined form is the practical default. Pure relative is the strongest distractor: it genuinely does adapt across magnitudes, but it collapses near zero, where max(|a|,|b|) shrinks toward zero along with the tolerance. Bitwise comparison also fails outright, since −0.0 and 0.0 compare equal with different bits.",
+      "sourceAnchor": "238-floating-point-comparison",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q20",
+      "prompt": "A comparator passed to `std::sort` can receive NaN values. What is the consequence?",
+      "options": [
+        "NaN compares false against everything, so strict weak ordering is violated and the sort is UB — libstdc++ runs off the end of the array and segfaults.",
+        "NaN sorts deterministically to the end of the range, so the outcome is a surprising order rather than an actual correctness bug.",
+        "`std::sort` detects the inconsistent ordering and throws `std::invalid_argument`, though only when the library is built in debug mode.",
+        "NaN compares greater than every other value under IEEE-754, which is a consistent rule and therefore safe for sorting purposes."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because `x < NaN` and `NaN < x` are both false, NaN appears \"equivalent\" to every value while those values are not equivalent to each other — the ordering axioms break, and libstdc++'s unguarded partition loop then walks past the array bounds. The \"sorts to the end\" answer is the trap: that is what people observe with some inputs, which makes the bug look benign right up until a different input pattern crashes the process. Ordered containers keyed on doubles corrupt their invariants the same way.",
+      "sourceAnchor": "238-floating-point-comparison",
+      "difficulty": "trap"
+    },
+    {
+      "id": "23-q21",
+      "prompt": "ULP-distance comparison reinterprets a double's bits as an integer. What makes that valid, and what breaks it?",
+      "options": [
+        "Bit patterns of positive doubles increase monotonically with value, but IEEE uses sign-magnitude, so negatives order backwards and need a special case.",
+        "Bit patterns are monotone across the entire range including negatives, because IEEE stores the exponent field in two's-complement form.",
+        "Monotonicity holds only within a single binade, so the technique is valid only for pairs of values within a factor of two of each other.",
+        "The reinterpretation is well defined for `float` but undefined for `double`, since `bit_cast` requires matching alignment on 64-bit types."
+      ],
+      "correctIndex": 0,
+      "explanation": "Consecutive representable positive doubles are consecutive integers, which is what turns \"how many representable steps apart\" into a subtraction; the sign bit is a magnitude flag rather than part of a two's-complement number, so the negatives run in the opposite direction and need explicit handling (and ±0.0 must compare equal). The two's-complement claim is the tempting one because the biased exponent really is chosen to make positive values sort correctly — but that trick stops at the sign bit.",
+      "sourceAnchor": "238-floating-point-comparison",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q22",
+      "prompt": "A team ships Kahan summation and measures no accuracy improvement at all over the naive loop. What is the most likely cause?",
+      "options": [
+        "The translation unit was built with `-ffast-math`, so the compiler assumed associativity and simplified `c = (t - sum) - y` to zero.",
+        "The compensation variable must be `long double`; held in a `double` it cannot represent the low-order bits that were lost.",
+        "Kahan only helps on inputs sorted ascending by magnitude, so an unsorted array yields exactly naive-summation accuracy.",
+        "The loop was auto-vectorized, and a SIMD reduction discards the compensation lane because it has no horizontal counterpart."
+      ],
+      "correctIndex": 0,
+      "explanation": "Algebraically (t − sum) − y is zero, and `-fassociative-math` licenses the compiler to say so — the entire compensation is deleted and you are left with naive summation plus dead instructions. The `long double` answer is the appealing one: it sounds like a precision problem, but the whole insight of Kahan is that the lost bits *are* exactly representable in the same `double`, which is why the technique works without any wider type. Verify by checking whether the compensation instructions survive in the assembly.",
+      "sourceAnchor": "239-kahan-summation",
+      "difficulty": "trap"
+    },
+    {
+      "id": "23-q23",
+      "prompt": "What is the recommended default method for summing a large array of doubles, and why?",
+      "options": [
+        "Pairwise summation: O(ε log n) error at essentially naive cost, and a multi-accumulator SIMD reduction already performs it implicitly.",
+        "Kahan summation: O(ε) error at the same cost as the naive loop, since its extra flops hide under the array's load latency.",
+        "Sort ascending by magnitude, then sum naively: this reaches O(ε) error and the sorting cost amortizes over repeated summations.",
+        "A `long double` accumulator: it produces exact results for any n and costs only one extra register on the x86-64 SysV ABI."
+      ],
+      "correctIndex": 0,
+      "explanation": "Pairwise gets nearly Kahan's accuracy for free, and the pleasing consequence is that vectorizing a reduction with 4 or 8 partial accumulators improves accuracy as well as speed. The Kahan option is the tempting one because its error bound is genuinely better — but it costs 4 flops per element instead of 1, and it is the variant that `-ffast-math` silently deletes. A wider accumulator buys digits without fixing an unstable formulation, and is never exact.",
+      "sourceAnchor": "239-kahan-summation",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q24",
+      "prompt": "A PnL accumulator held in a `double` has reached 2⁵³. What happens when 1.0 is added to it?",
+      "options": [
+        "Nothing changes — the spacing at that magnitude exceeds 1.0, so the sum stalls permanently; accumulate in `int64_t` minor units instead.",
+        "The value increases by 1.0 correctly, and precision loss only begins once the accumulator passes 2⁶⁴ and the exponent saturates.",
+        "The inexact flag is raised and the value rounds upward to the next representable double, which is 2⁵³ + 2 at that magnitude.",
+        "The accumulator becomes infinity, because 2⁵³ is the largest integer a `double` is able to represent without overflowing."
+      ],
+      "correctIndex": 0,
+      "explanation": "Above 2⁵³ the representable doubles are spaced 2 apart, so 2⁵³ + 1 sits exactly halfway between neighbours and round-to-nearest-even sends it back to 2⁵³ — every subsequent unit addition does the same and the accumulator freezes. The \"rounds up to 2⁵³+2\" option is the strongest distractor: the operand really is a tie, but the IEEE default breaks ties to even, not upward. This is the concrete reason money is accumulated in integers.",
+      "sourceAnchor": "239-kahan-summation",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q25",
+      "prompt": "What is true of storing the price 100.10 in a `double`?",
+      "options": [
+        "It is held as 100.09999999999999432, because 0.1 has no finite exact binary expansion.",
+        "It is held exactly, since 100.10 needs only five significant digits and `double` provides fifteen to sixteen.",
+        "It is held exactly, because the decimal exponent of the literal is folded into the binary exponent field.",
+        "It is held as exactly 100.1, but comparisons still misbehave because x87 evaluates in 80-bit registers."
+      ],
+      "correctIndex": 0,
+      "explanation": "Representability is about the *binary* expansion, not the digit count: one tenth is a repeating fraction in base two, so the nearest double is slightly off no matter how many bits are available. The digit-count answer is the most common misconception — 15–16 digits is the precision available for values that are representable at all, and it says nothing about whether a given decimal falls on the binary grid. This is the first reason prices are held as scaled integers.",
+      "sourceAnchor": "2310-fixed-point-price-arithmetic",
+      "difficulty": "recall"
+    },
+    {
+      "id": "23-q26",
+      "prompt": "`Price` is `Fixed<8>`, so `raw` is the price times 10⁸. Computing notional = price × quantity in integers requires what?",
+      "options": [
+        "Widening the product to `__int128`, then dividing by 10⁸ with an explicit rounding rule; on x86-64 the 64×64→128 multiply is one instruction.",
+        "Nothing special: whenever the true notional fits in an `int64_t`, the raw product of the two operands cannot overflow either.",
+        "Converting both operands to `double` first, since a 53-bit mantissa comfortably exceeds the precision the product actually needs.",
+        "Dividing each operand by 10⁴ before multiplying, which keeps the intermediate in range and preserves the result exactly."
+      ],
+      "correctIndex": 0,
+      "explanation": "Multiplying two scale-8 values produces a scale-16 intermediate, which overflows `int64_t` routinely even when the final notional is small — the wide intermediate is mandatory, and on x86-64 it costs essentially nothing since `MUL` already delivers 128 bits in RDX:RAX. The \"fits in the result so it cannot overflow\" answer is the trap: it reasons about the final value while the hazard lives in the doubled scale of the intermediate. Pre-dividing by 10⁴ discards low digits and is not exact.",
+      "sourceAnchor": "2310-fixed-point-price-arithmetic",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q27",
+      "prompt": "Under half-to-even (banker's) rounding, what do −2.5 and 1.5 round to, and why is it the IEEE default?",
+      "options": [
+        "−2 and 2: ties go to the even neighbour, which removes the systematic upward bias that half-away-from-zero accumulates.",
+        "−3 and 2: ties always move away from zero, which is symmetric about zero and therefore statistically unbiased.",
+        "−2 and 1: ties truncate toward zero, which matches C++ integer division and keeps the two rules consistent.",
+        "−3 and 1: ties move toward negative infinity, which is the conservative direction for both sides of the book."
+      ],
+      "correctIndex": 0,
+      "explanation": "Both −2.5 and 1.5 have an even neighbour at −2 and 2 respectively, so ties land there; across many roundings half the ties go up and half go down and the bias cancels. The half-away-from-zero option is the strong distractor because it *is* symmetric about zero — but symmetry is not the same as unbiasedness: for a stream of same-signed amounts every tie moves the same direction, and summed over millions of roundings that drift is money.",
+      "sourceAnchor": "2311-scale-conversion-and-rounding",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q28",
+      "prompt": "A buy limit price must be snapped onto the exchange's tick grid. Which rule is correct?",
+      "options": [
+        "Round down, toward the passive side, so the snap can never make the order more aggressive than the trader intended.",
+        "Round to nearest, since that minimises the absolute price error and therefore minimises the expected slippage on the fill.",
+        "Round up, so that the order is more likely to fill promptly and the unhedged residual risk is cleared sooner.",
+        "Round half-to-even, since the exchange's tick-grid validation requires an unbiased rule to accept the price."
+      ],
+      "correctIndex": 0,
+      "explanation": "Rounding in a trading system is a risk decision, not a numerical one: a buy rounds down and a sell rounds up, so the adjustment always moves the order away from the market. Round-to-nearest is the tempting answer because it is the right default for general numerics and does minimise absolute error — but on a buy it can round *up*, crossing the spread and turning a passive order aggressive, which is a far larger cost than one tick of price error. Quantities round down to lot size for the same reason.",
+      "sourceAnchor": "2311-scale-conversion-and-rounding",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q29",
+      "prompt": "For signed `int64_t` values, `if (a + b < a) return error;` compiles to nothing at -O2. Why, and what is correct?",
+      "options": [
+        "Signed overflow is UB, so the compiler may assume a + b ≥ a and delete the test; use `__builtin_add_overflow` instead.",
+        "The compiler proves the branch cold and moves it out of line, so the check still runs and the code remains correct as written.",
+        "Comparison of signed values with differing signs is unspecified, so switch to unsigned types and keep the same `a + b < a` form.",
+        "The sum is evaluated in a wider register, so it cannot overflow before the comparison; enable `-ftrapv` to restore the check."
+      ],
+      "correctIndex": 0,
+      "explanation": "The check tests for a condition the standard says cannot happen, so the optimizer folds it to false and removes the branch — the classic \"my overflow check disappeared at -O2\" bug. The cold-branch answer is the plausible one because compilers really do sink unlikely branches, but sinking preserves semantics whereas this transformation eliminates them. The builtins read the hardware overflow flag, costing one perfectly-predicted `jo`, so the usual \"too slow for the hot path\" objection does not hold.",
+      "sourceAnchor": "2312-checked-and-saturating-arithmetic",
+      "difficulty": "trap"
+    },
+    {
+      "id": "23-q30",
+      "prompt": "Two 32-bit sequence numbers `a` and `b` come from a wrapping sequence space. Which comparison correctly decides whether a precedes b?",
+      "options": [
+        "`int32_t(a - b) < 0`, which keeps working across the point where the sequence space wraps around.",
+        "`a < b` on the raw `uint32_t` values, which is correct provided the in-flight window stays below 2³¹.",
+        "`(a - b) < 0x80000000u`, treating the unsigned difference directly as a signed magnitude comparison.",
+        "`std::cmp_less(a, b)`, which promotes both operands to a wider signed type and thereby handles the wrap."
+      ],
+      "correctIndex": 0,
+      "explanation": "The unsigned subtraction wraps in a defined way and reinterpreting the difference as signed recovers the correct relative order for any pair within half the sequence space — the idiom used by TCP, exchange sequence handling, and lock-free ring buffers. Direct `a < b` is the trap: it looks fine and works for almost every pair, then inverts precisely at the wrap point, where a fresh low sequence number follows a high one. `std::cmp_less` solves mixed-sign comparison, which is a different problem entirely.",
+      "sourceAnchor": "2312-checked-and-saturating-arithmetic",
+      "difficulty": "application"
+    },
+    {
+      "id": "23-q31",
+      "prompt": "Systems using −1 as a \"no price\" sentinel broke when WTI crude went negative in April 2020. What is the lesson and the fix?",
+      "options": [
+        "The sentinel sat inside the valid domain, since negative prices are legal; pick an unreachable value such as `INT64_MIN`, or use `optional` or a validity bitmap.",
+        "The sentinel was stored in too narrow a field; widening the price field to `int64_t` and continuing to use −1 makes the value unreachable.",
+        "The problem was the type rather than the value; once the price field is declared unsigned, any in-band sentinel becomes safe to use again.",
+        "The fix is to test for the sentinel at every use site rather than once at ingest, so that no downstream consumer can ever forget the check."
+      ],
+      "correctIndex": 0,
+      "explanation": "A sentinel must lie outside the *representable* domain, not merely outside the range observed so far — for a scale-8 `int64_t` price, `INT64_MIN` is unreachable by any real quote while −1 is just a price. The \"check everywhere\" option is the tempting one because more checking sounds safer, but it multiplies the places that can be forgotten; the discipline is to name the constant, check once at the boundary on ingest, and assert it never enters arithmetic.",
+      "sourceAnchor": "2313-sentinel-value-hazards",
+      "difficulty": "trap"
+    },
+    {
+      "id": "23-q32",
+      "prompt": "A feed handler parses prices with `strtod`. A linked library calls `setlocale` to a `de_DE` locale at startup. What is the effect?",
+      "options": [
+        "`strtod(\"1.5\")` returns 1, because that locale's decimal separator is a comma; `std::from_chars` is locale-free by specification.",
+        "`strtod` continues to use the C locale for numeric conversion, so only formatted output such as `printf` is affected by the change.",
+        "`strtod(\"1.5\")` returns 15, because the dot is treated as a thousands separator and the surrounding digits are concatenated.",
+        "`strtod` sets `errno` to `EINVAL` and returns 0, so the parse failure is at least detectable by the caller at runtime."
+      ],
+      "correctIndex": 0,
+      "explanation": "`strtod` stops at the first character it cannot use, and under a comma-decimal locale the dot is not part of a number, so it parses 1 and reports the rest as unconsumed — every price is silently corrupted, with no error raised. The \"only output is affected\" answer is the dangerous one: `LC_NUMERIC` governs both directions, which is exactly why a third-party library's `setlocale` call can poison a parser it never touches. `from_chars` is immune by design, which is the reason to use it unconditionally in a feed handler.",
+      "sourceAnchor": "2314-decimal-conversion-and-tick-precision",
+      "difficulty": "application"
+    }
+  ]
+}

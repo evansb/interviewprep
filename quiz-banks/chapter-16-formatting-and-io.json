@@ -1,0 +1,355 @@
+{
+  "slug": "chapter-16-formatting-and-io",
+  "questions": [
+    {
+      "id": "16-q01",
+      "prompt": "In the two-layer iostream design, which layer actually issues the write syscall?",
+      "options": [
+        "The `streambuf`, from its virtual `overflow()`/`sync()` once the put area fills or a flush is requested.",
+        "The `ostream`, from `operator<<` after the locale facet has produced the characters.",
+        "The `sentry` object, which is constructed and destroyed around every formatted insertion.",
+        "The `num_put` facet, which writes formatted digits straight to the file descriptor."
+      ],
+      "correctIndex": 0,
+      "explanation": "The stream handles formatting, flags, and state; the `streambuf` owns the character array and is the only thing that touches the OS, from `overflow`/`sync`. Naming `operator<<` is the tempting miss — it does the formatting and then hands bytes to the buffer, but it never calls `write` itself. The `sentry` only flushes tied streams and checks state, and `num_put` formats into a buffer.",
+      "sourceAnchor": "161-iostream-architecture-and-cost",
+      "difficulty": "recall"
+    },
+    {
+      "id": "16-q02",
+      "prompt": "A logging loop emits one million lines with `std::cout << msg << std::endl` to a redirected file. Replacing `std::endl` with `'\\n'` speeds it up enormously. Why?",
+      "options": [
+        "`endl` is a function pointer that defeats inlining of `operator<<`, adding an indirect call on every line.",
+        "`endl` writes a platform-dependent two-character sequence, doubling the bytes pushed through the buffer.",
+        "`endl` inserts the newline and then calls `flush()`, so the filebuf issues a `write(2)` per line instead of one per full buffer.",
+        "`endl` forces the stream to re-acquire its locale facets, so `num_put` is looked up again on each line."
+      ],
+      "correctIndex": 2,
+      "explanation": "The cost is entirely the mandated `flush()`: a syscall per line versus a syscall per buffer-full (typically 4-8 KiB). The 'indirect call' answer is plausible-sounding but wrong in magnitude and mechanism — manipulator dispatch is nanoseconds, while a `write` is 1-2 microseconds. `endl` always inserts exactly `'\\n'`, and it performs no locale work.",
+      "sourceAnchor": "161-iostream-architecture-and-cost",
+      "difficulty": "application"
+    },
+    {
+      "id": "16-q03",
+      "prompt": "What does `std::ios_base::sync_with_stdio(false)` actually change, and what do you give up?",
+      "options": [
+        "`cout` stops flushing on every newline and becomes fully buffered; you lose line-by-line output when writing to a terminal.",
+        "`cout` stops proxying C `stdout` and gets its own buffer; you lose the guarantee that `printf` and `cout` interleave correctly.",
+        "`cout` stops taking the per-`FILE` lock on each insertion; you lose thread safety when several threads write to `cout`.",
+        "`cout` stops consulting the global locale for numeric output; you lose thousands separators and locale-specific decimal points."
+      ],
+      "correctIndex": 1,
+      "explanation": "By default the standard requires C and C++ streams to interleave, which implementations achieve by making `cout` an essentially unbuffered wrapper over `stdout`; unsyncing gives it a real buffer, typically 2-10x throughput, at the cost of mixing `printf` with `cout`. The locking answer is the seductive one — per-`FILE` locking is a real stdio cost discussed in this chapter, but it is not what this flag governs. Buffering mode and locale behavior are likewise untouched.",
+      "sourceAnchor": "161-iostream-architecture-and-cost",
+      "difficulty": "recall"
+    },
+    {
+      "id": "16-q04",
+      "prompt": "Code reads `while (!in.eof()) { in >> x; use(x); }`. What is wrong with it?",
+      "options": [
+        "`eof()` returns true only at end of file, so a `badbit` transport error spins the loop forever without ever terminating.",
+        "`eof()` clears the stream state as a side effect, so the next extraction always starts from a freshly reset stream.",
+        "`operator>>` sets `eofbit` before consuming the final value, so the last valid item in the stream is silently skipped.",
+        "`eofbit` is only set by the read that fails, so the body runs one extra time on a value the failed extraction did not supply."
+      ],
+      "correctIndex": 3,
+      "explanation": "The flag is set *after* the failing read, so the loop enters once more and processes a value that was never read — since C++11 the target is zero-initialized on failure, which changes the symptom from 'stale duplicate' to 'spurious zero' but not the bug. The 'skips the last item' option is the mirror-image misconception: the defect is an extra iteration, not a missing one. Testing `while (in >> x)` uses `operator bool`, which is `!fail()`, and is correct.",
+      "sourceAnchor": "161-iostream-architecture-and-cost",
+      "difficulty": "trap"
+    },
+    {
+      "id": "16-q05",
+      "prompt": "What does `std::cout << std::hex << 255 << \" \" << 16 << std::setw(6) << 7 << 8;` print?",
+      "options": [
+        "`ff 16` then `     7` then `     8` — hex applies once, width persists for both numbers.",
+        "`ff 10` then `     7` then `     8` — both hex and width persist for every subsequent insertion.",
+        "`ff 10` then `     7` then `8` — hex persists for both numbers, width applies only to the 7.",
+        "`ff 16` then `     7` then `8` — both hex and width apply to exactly one insertion each."
+      ],
+      "correctIndex": 2,
+      "explanation": "Base is sticky, so 16 prints as `10`; width is the one manipulator that resets after each formatted insertion, so only the 7 is padded and the 8 is bare. The 'both persist' option is the most common half-knowledge answer — it correctly remembers stickiness but forgets that `setw` is carved out. Stickiness leaking across function boundaries is exactly what makes iostream formatting non-composable.",
+      "sourceAnchor": "161-iostream-architecture-and-cost",
+      "difficulty": "application"
+    },
+    {
+      "id": "16-q06",
+      "prompt": "A program reads with `std::cin >> x` in a loop and is unexpectedly slow even after `sync_with_stdio(false)`. What is the remaining fix from this chapter?",
+      "options": [
+        "`std::cin.exceptions(std::ios::badbit)`, because state-bit checking on each extraction is slower than the throwing path.",
+        "`std::cin.tie(nullptr)`, because the input `sentry` otherwise flushes the tied `cout` before every extraction.",
+        "`std::cin.rdbuf()->pubsetbuf(buf, n)`, because an unsynced `cin` is created with no buffer at all until one is supplied.",
+        "`std::cin.imbue(std::locale::classic())`, because an unsynced stream reverts to loading locale data from disk per read."
+      ],
+      "correctIndex": 1,
+      "explanation": "`cin` is tied to `cout` by default, and the `sentry` built for each extraction flushes the tied stream — a syscall per read that survives unsyncing. The `pubsetbuf` answer is the plausible-sounding trap: unsyncing does give `cin` its own buffer automatically, so there is nothing missing to supply. Enabling exceptions changes error reporting, not throughput, and locale data is never reloaded per read.",
+      "sourceAnchor": "161-iostream-architecture-and-cost",
+      "difficulty": "application"
+    },
+    {
+      "id": "16-q07",
+      "prompt": "A tool prints progress to `stdout` and errors to `stderr`. On a terminal the output interleaves sensibly; redirected to a file the errors appear far too early. Why?",
+      "options": [
+        "Redirected `stderr` becomes fully buffered instead of unbuffered, so its records are held back and merged out of order.",
+        "The kernel serializes writes to a pipe but not to a regular file, so ordering between the two descriptors is lost on files.",
+        "Both streams become fully buffered, and `stderr`'s smaller default buffer fills and flushes first.",
+        "Redirected `stdout` becomes fully buffered instead of line buffered, while `stderr` stays unbuffered and overtakes it."
+      ],
+      "correctIndex": 3,
+      "explanation": "`stdout` is line buffered only when it is a terminal; on a pipe or file it switches to fully buffered, so progress lines sit in a 4-8 KiB buffer while unbuffered `stderr` goes straight out. The 'stderr becomes buffered' option is the same story told backwards — `stderr` is unbuffered by default and stays that way. Fixes are an explicit `setvbuf(stdout, nullptr, _IOLBF, size)` or routing diagnostics to `stderr`.",
+      "sourceAnchor": "162-c-stdio",
+      "difficulty": "application"
+    },
+    {
+      "id": "16-q08",
+      "prompt": "A program opens a log file, writes a few lines, then calls `setvbuf` on it to enlarge the buffer. What is the status of that call?",
+      "options": [
+        "Undefined behavior — `setvbuf` must be called after opening but before any I/O has been performed on the stream.",
+        "Well defined — the existing buffer is flushed and replaced, and subsequent writes use the new one.",
+        "Well defined but a no-op — the buffering mode is fixed at `fopen` time and `setvbuf` can only change the buffer size.",
+        "Undefined behavior — `setvbuf` may only be called on the three standard streams, never on a stream from `fopen`."
+      ],
+      "correctIndex": 0,
+      "explanation": "The window for `setvbuf` is exactly between `fopen` and the first I/O operation; calling it afterwards is undefined, not merely ineffective. The 'flushes and replaces' answer is what most people assume by analogy with other configuration calls, and it is precisely the assumption the standard declines to guarantee. `setvbuf` applies to any stream, including ones from `fopen`.",
+      "sourceAnchor": "162-c-stdio",
+      "difficulty": "trap"
+    },
+    {
+      "id": "16-q09",
+      "prompt": "How do `flockfile` plus `putc_unlocked` speed up character-at-a-time stdio output?",
+      "options": [
+        "They bypass the `FILE` buffer entirely, turning each character into a direct unbuffered `write(2)`.",
+        "They switch the stream to fully buffered mode for the duration, eliminating per-newline flushes.",
+        "They hoist the per-`FILE` lock out of the loop, taking it once instead of on every character.",
+        "They skip the stream's error and EOF flag updates, removing a branch from each character write."
+      ],
+      "correctIndex": 2,
+      "explanation": "POSIX requires `FILE*` operations to be atomic with respect to one another, so every `putc` takes a recursive per-`FILE` lock; `flockfile` acquires it once around the whole loop and the `_unlocked` variants then skip it. The 'bypasses the buffer' answer inverts the win — going unbuffered would make it dramatically slower, since buffering is what amortizes the syscall. Note `fwrite_unlocked`/`fputs_unlocked` are GNU extensions rather than POSIX.",
+      "sourceAnchor": "162-c-stdio",
+      "difficulty": "recall"
+    },
+    {
+      "id": "16-q10",
+      "prompt": "What type checking does the language give `printf`, and how do compilers compensate?",
+      "options": [
+        "Full checking for the standard specifiers, since the conversions are part of the C library's declared interface.",
+        "Checking of argument count only; types are unchecked because default promotions erase the distinctions.",
+        "Checking for pointer-typed specifiers only, since those are the ones with a security-relevant failure mode.",
+        "None at all — it is variadic, so `-Wformat` driven by `__attribute__((format(printf, m, n)))` recovers checking as a diagnostic."
+      ],
+      "correctIndex": 3,
+      "explanation": "A C variadic function gets no language-level type checking whatsoever; GCC and Clang reconstruct it from the format attribute, which is why applying that attribute to your own logging wrappers is a practice signal. The 'argument count only' option misdescribes default promotions — those widen `float` to `double` and small integers to `int`, but they neither perform nor prevent checking. Passing a `std::string` to `%s` or a `size_t` to `%d` is UB caught only by `-Wformat`.",
+      "sourceAnchor": "162-c-stdio",
+      "difficulty": "recall"
+    },
+    {
+      "id": "16-q11",
+      "prompt": "Why is a `printf` format string built from user input a security vulnerability rather than merely a correctness bug?",
+      "options": [
+        "`%s` will keep reading until a null byte, so a long conversion always overflows the destination buffer.",
+        "`%n` writes a count back through a pointer argument, giving the attacker a memory-write primitive.",
+        "The runtime parser recurses on nested specifiers, so a crafted string exhausts the stack and crashes the process.",
+        "`printf` caches the parsed format, so a malicious string persists and corrupts every later call site."
+      ],
+      "correctIndex": 1,
+      "explanation": "`%n` stores the number of characters written so far into a pointer taken from the argument list, which under attacker-controlled specifiers becomes an arbitrary-write primitive — that is the escalation from information leak to code execution. The `%s` answer describes a real hazard class but a weaker one: over-reading leaks memory rather than writing it, and `printf` writes to a buffer it manages. There is no nested-specifier recursion and no format cache.",
+      "sourceAnchor": "162-c-stdio",
+      "difficulty": "application"
+    },
+    {
+      "id": "16-q12",
+      "prompt": "Beyond runtime cost, what does merely adding `#include <iostream>` to a translation unit bring with it?",
+      "options": [
+        "A mandatory call to `setlocale` at program start, which fixes the process locale before `main` runs.",
+        "A runtime dependency on the C stdio buffers that forces `sync_with_stdio` to remain true for that TU.",
+        "A static initializer, `std::ios_base::Init`, which constructs the standard streams and adds startup cost plus an initialization-order concern.",
+        "A per-TU copy of the `num_put` facet, which the linker cannot merge because facets have internal linkage."
+      ],
+      "correctIndex": 2,
+      "explanation": "The header declares an `ios_base::Init` object in every TU that includes it, so the standard streams get constructed before `main` — measurable startup cost, significant binary size from the template machinery, and a static-initialization-order hazard for globals that log. The `setlocale` answer is wrong in direction: the C++ runtime starts in the classic locale and does not call `setlocale` for you. `sync_with_stdio` is a runtime call, not a per-TU property.",
+      "sourceAnchor": "162-c-stdio",
+      "difficulty": "application"
+    },
+    {
+      "id": "16-q13",
+      "prompt": "What happens with `std::format(\"{:d}\", some_std_string)` in C++20 as amended by P2216?",
+      "options": [
+        "It fails to compile, because the format string is consteval-parsed against the argument types.",
+        "It throws `std::format_error` at runtime when the parser reaches the mismatched specifier.",
+        "It is undefined behavior, exactly as the equivalent `printf(\"%d\", str.c_str())` would be.",
+        "It compiles and prints the string's size, since `{:d}` falls back to the integral conversion."
+      ],
+      "correctIndex": 0,
+      "explanation": "With a literal format string the parameter is a `std::format_string<Args...>` whose consteval constructor parses the spec against the argument types, so a mismatch is a hard compile error — the strongest correctness argument over `printf`. The `format_error` answer is right only for the *runtime* string path via `vformat` or `std::runtime_format`, where compile-time checking is impossible by construction. `std::format` never has `printf`'s undefined behavior here.",
+      "sourceAnchor": "163-stdformat-and-stdprint",
+      "difficulty": "application"
+    },
+    {
+      "id": "16-q14",
+      "prompt": "Why does `std::format` not suffer the code bloat you would expect from a variadic template?",
+      "options": [
+        "The parsing and formatting code is `consteval`, so it runs entirely at compile time and emits no machine code at all.",
+        "The compiler merges the per-type instantiations at link time via COMDAT folding, leaving one copy of each conversion.",
+        "Formatting is dispatched through a virtual `formatter` base class, so all argument types share one vtable slot.",
+        "Arguments are type-erased into `std::format_args`, so each call site instantiates only small packing code and one non-template `vformat` does the work."
+      ],
+      "correctIndex": 3,
+      "explanation": "Small built-ins are stored inline in the arg array and user types as a `void*` plus a formatting thunk, so the heavy parser exists exactly once in the binary. The `consteval` answer confuses two things: format-string *checking* is compile time, but the actual formatting of runtime values obviously must emit code. COMDAT folding is a linker mitigation for bloat that already happened, not the design, and `std::formatter` is a template specialized per type, not a polymorphic base.",
+      "sourceAnchor": "163-stdformat-and-stdprint",
+      "difficulty": "application"
+    },
+    {
+      "id": "16-q15",
+      "prompt": "After `char buf[16]; auto r = std::format_to_n(buf, sizeof buf, \"{}\", 1234567890123L);` what does `r.size` hold?",
+      "options": [
+        "16 — the number of characters actually written, which equals the buffer capacity here.",
+        "13 — the number of characters that *would* have been written had there been room.",
+        "0 — the call detected that the output does not fit and wrote nothing at all.",
+        "3 — the number of characters that were dropped because the buffer was too small."
+      ],
+      "correctIndex": 1,
+      "explanation": "`format_to_n` truncates safely and reports the *untruncated* length in `size`, which is what makes it the right primitive for a fixed-size log record: you write what fits and still learn you were clipped. The '16' answer conflates `size` with `out`, which is the one-past-last-written iterator and is what you subtract from `buf` to get the bytes actually present. The call always writes as much as fits rather than failing wholesale.",
+      "sourceAnchor": "163-stdformat-and-stdprint",
+      "difficulty": "application"
+    },
+    {
+      "id": "16-q16",
+      "prompt": "Which formatting facility is C++23 rather than C++20?",
+      "options": [
+        "`std::format_to` and `std::formatted_size`, the output-iterator and sizing forms.",
+        "`std::vformat` with `std::make_format_args`, the type-erased runtime entry point.",
+        "`std::print`/`std::println`, and formatting of ranges, tuples, and pairs.",
+        "Compile-time checked format strings via the `std::format_string` wrapper."
+      ],
+      "correctIndex": 2,
+      "explanation": "C++20 shipped `format`, `format_to`, `formatted_size`, and `vformat`, with compile-time checking folded in retroactively by P2216; C++23 added `<print>` and range/tuple formatting, and C++26 adds `std::runtime_format`. Naming `vformat` is the tempting error because it pairs with the C++26 `runtime_format` in discussions of runtime strings, but `vformat` itself was there from the start.",
+      "sourceAnchor": "163-stdformat-and-stdprint",
+      "difficulty": "recall"
+    },
+    {
+      "id": "16-q17",
+      "prompt": "How does `std::print` compare against `printf` and `ostringstream` on the performance ladder in this chapter?",
+      "options": [
+        "Faster than `std::to_chars` for numbers, since it writes digits directly into the stream buffer with no intermediate.",
+        "Slower than `printf` for integers, because type erasure adds an indirect call that the runtime parser avoids.",
+        "Roughly equal to `ostringstream`, since both must materialize a `std::string` before any bytes are emitted.",
+        "Comparable to or faster than `printf`, 2-10x faster than `ostringstream`, but still slower than `std::to_chars`."
+      ],
+      "correctIndex": 3,
+      "explanation": "Shortest-round-trip float formatting via `to_chars` and the absence of locale lookups make it beat `printf` on floats and match it on integers, while `ostringstream`'s allocation and facet dispatch put it 2-10x behind. `to_chars` remains the floor for pure number-to-text, so the option claiming `std::print` beats it inverts the ordering. `std::print` writes to the `FILE*` without building a `std::string` at all.",
+      "sourceAnchor": "163-stdformat-and-stdprint",
+      "difficulty": "recall"
+    },
+    {
+      "id": "16-q18",
+      "prompt": "You write `template <> struct std::formatter<Price>` with a `constexpr parse` and a non-const `format` member. What goes wrong under C++23?",
+      "options": [
+        "It fails to compile at the call site, because C++23 requires the `format` member to be const-qualified.",
+        "It compiles but silently ignores any width or alignment spec, because `parse` must be non-constexpr to store them.",
+        "It compiles but defeats compile-time checking of specs for `Price`, because only `format` participates in consteval parsing.",
+        "It fails to compile in the specialization itself, because `parse` may not be `constexpr` when `format` is not."
+      ],
+      "correctIndex": 0,
+      "explanation": "C++23 calls `format` on a const `formatter` object, so a non-const member does not satisfy the requirement and the use fails. The 'defeats compile-time checking' option gets the participation backwards: it is `parse` that runs during consteval format-string checking, which is exactly why a `constexpr parse` gives your own type compile-time spec validation. Width and alignment are inheritable cheaply by deriving from `std::formatter<std::string_view>` and delegating.",
+      "sourceAnchor": "163-stdformat-and-stdprint",
+      "difficulty": "trap"
+    },
+    {
+      "id": "16-q19",
+      "prompt": "On a host with `LC_NUMERIC` set to a European locale, what do `printf(\"%f\", 3.14)` and `strtod(\"3.14\", nullptr)` do?",
+      "options": [
+        "Print `3.140000`, and parse `3.14`, because both functions are defined to use the C locale for doubles.",
+        "Print `3,140000`, and parse `3.14`, because output honors the locale while input always accepts `.`.",
+        "Print `3,140000`, and parse only `3.0` because the `.` terminates the number early.",
+        "Print `3.140000`, and parse `3.0`, because only the parsing side consults `LC_NUMERIC`."
+      ],
+      "correctIndex": 2,
+      "explanation": "Both directions are locale sensitive and both break together: the writer emits a comma and the reader stops at the unexpected `.`, silently truncating rather than failing loudly — which is what makes it a data-corruption bug rather than a crash. The 'output only' option is the intuitive half-answer; input is if anything the more dangerous side because it fails quietly. `from_chars`/`to_chars` are immune and are the correct protocol-parsing tools.",
+      "sourceAnchor": "164-locale-costs",
+      "difficulty": "trap"
+    },
+    {
+      "id": "16-q20",
+      "prompt": "Why does this chapter tell you to replace `std::isdigit` from `<cctype>` with an explicit range check inside a parser?",
+      "options": [
+        "It takes an `int` rather than a `char`, so every call sign-extends and the compiler inserts a conversion branch.",
+        "It consults the global C locale, so it is an uninlinable call plus a table load with locale-dependent semantics.",
+        "It is required to set `errno` on non-ASCII input, so the parser pays a thread-local store on each character.",
+        "It is a macro on most implementations, so its argument is evaluated twice inside the classification loop."
+      ],
+      "correctIndex": 1,
+      "explanation": "The locale dependence is the whole problem: the compiler cannot fold the result, cannot inline across the call, and the semantics can vary by ambient locale, so the parser is neither fast nor deterministic. The `int` parameter observation is genuinely true of the signature — passing a negative `char` really is UB — but that is a correctness footnote about the argument, not the reason the chapter rejects it on performance grounds. A 256-entry table is the other suggested replacement.",
+      "sourceAnchor": "164-locale-costs",
+      "difficulty": "application"
+    },
+    {
+      "id": "16-q21",
+      "prompt": "What does `std::format(\"{}\", 1234567)` produce on a process whose global locale is `en_US.UTF-8`?",
+      "options": [
+        "`1,234,567` — the global locale applies unless you explicitly request the classic locale.",
+        "`1234567` — grouping requires passing a `std::locale` as the first argument, which `{:L}` alone cannot do.",
+        "`1,234,567` — integral formatting is always locale aware, and only floats need `{:L}`.",
+        "`1234567` — grouping is opt-in per specifier via `{:L}`, regardless of the global locale."
+      ],
+      "correctIndex": 3,
+      "explanation": "`std::format` is locale-independent by default and `{:L}` is the per-specifier opt-in — the deliberate inversion of the iostream and `printf` default, and worth naming explicitly in an interview. The option claiming `{:L}` cannot use the global locale is wrong: `{:L}` alone uses the global locale, and passing a `std::locale` argument merely overrides which one. Assuming `{}` groups digits is listed among the chapter's traps.",
+      "sourceAnchor": "164-locale-costs",
+      "difficulty": "application"
+    },
+    {
+      "id": "16-q22",
+      "prompt": "A dependency calls `setlocale` from a worker thread while another thread formats numbers. What is the concern?",
+      "options": [
+        "`setlocale` mutates process-global state and is not thread safe, so this is a data race that can flip your decimal separator.",
+        "`setlocale` only affects the calling thread, so the formatting thread keeps stale settings and output diverges between threads.",
+        "`setlocale` bumps an atomic refcount on the shared locale, so the cost is contention on that counter rather than a race.",
+        "`setlocale` throws if another thread holds a locale reference, so the dependency's call will fail unpredictably."
+      ],
+      "correctIndex": 0,
+      "explanation": "The C locale is process-global and `setlocale` is not thread safe in general, so a concurrent format is a genuine race whose visible effect can be a changed decimal separator mid-run; `LC_ALL=C` at startup is the defensive practice. The 'per-thread' answer describes POSIX `uselocale`/`newlocale`, which is the fix rather than the default behavior. Refcounting applies to copying `std::locale` objects, not to `setlocale`, and `setlocale` is a C function that reports failure by returning null.",
+      "sourceAnchor": "164-locale-costs",
+      "difficulty": "application"
+    },
+    {
+      "id": "16-q23",
+      "prompt": "In a NanoLog-style async logger, what does the producing thread do with its arguments?",
+      "options": [
+        "Formats them into a text line and copies the finished bytes into the ring, so the consumer only issues the write.",
+        "Copies the raw argument bytes plus a format-site id into a ring slot, leaving all text conversion to the consumer.",
+        "Stores pointers to the arguments in the ring and lets the consumer dereference them when it formats.",
+        "Formats them into a thread-local `std::string` and hands the consumer ownership of that string."
+      ],
+      "correctIndex": 1,
+      "explanation": "The whole design principle is format at consumption, not at production: a timestamp plus a memcpy of raw bytes reaches 10-30 ns, while an offline dictionary decodes the format-site id later. The 'formats then copies' option is what `spdlog`'s async mode actually does, which is why it is tempting — it is a real design, just an order of magnitude slower on the producer. Storing pointers is the classic dangling-argument bug unless the target is a string literal.",
+      "sourceAnchor": "165-asynchronous-logging",
+      "difficulty": "application"
+    },
+    {
+      "id": "16-q24",
+      "prompt": "The log ring is full and a hot thread wants to emit a record. What is the standard trading-system policy?",
+      "options": [
+        "Block until the consumer drains a slot, so no record is ever lost and the log stays complete.",
+        "Overwrite the oldest unread slot, which preserves recency without needing any drop accounting.",
+        "Grow the ring by allocating a new segment, deferring the loss until memory is genuinely exhausted.",
+        "Drop the record and increment a counter, so logging can never couple trading latency to disk latency."
+      ],
+      "correctIndex": 3,
+      "explanation": "Blocking is the option that couples the hot path to disk latency, which is unacceptable when a stalled write can pause trading; dropping with a counter keeps the path bounded while still accounting for what was lost. Overwriting is a real alternative but the chapter's objection stands regardless — you still lose records, so you still need the counter, and you lose the *oldest* ones, usually the context for whatever came next. Allocating on the hot path defeats the purpose entirely.",
+      "sourceAnchor": "165-asynchronous-logging",
+      "difficulty": "recall"
+    },
+    {
+      "id": "16-q25",
+      "prompt": "Why does a modern logging library still expose `LOG_DEBUG` as a macro rather than a function template?",
+      "options": [
+        "Only a macro can capture `__FILE__` and `__LINE__`, which a function template cannot obtain at the call site.",
+        "Only a macro can force the format string to be a literal, which a function template would decay to a pointer.",
+        "Only a macro can suppress evaluation of the arguments when the level is disabled.",
+        "Only a macro can be compiled out entirely, since a function template always emits a symbol even when unused."
+      ],
+      "correctIndex": 2,
+      "explanation": "A call like `LOG_DEBUG(\"{}\", expensive())` must not invoke `expensive()` at a disabled level, and function arguments are always evaluated before the call — the macro is what lets the level check guard the whole expression. The `__FILE__`/`__LINE__` option is the best distractor but is false since C++20: `std::source_location::current()` as a default argument captures the call site from a function. Format-string literalness is preserved by `std::format_string`, and an uninstantiated template emits nothing.",
+      "sourceAnchor": "165-asynchronous-logging",
+      "difficulty": "application"
+    }
+  ]
+}

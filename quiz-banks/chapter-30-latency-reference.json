@@ -1,0 +1,355 @@
+{
+  "slug": "chapter-30-latency-reference",
+  "questions": [
+    {
+      "id": "30-q01",
+      "prompt": "You measure the same routine on a 3 GHz box and on a 4.5 GHz box. Which of its component costs is expected to stay roughly constant in *nanoseconds* rather than in cycles?",
+      "options": [
+        "Branch mispredict — the pipeline flush is charged as a fixed wall-clock interval by the front end.",
+        "Local DRAM read — its latency is set by DIMM timings and the memory controller, not by the core clock.",
+        "L1d hit — the load-to-use path is timed by the memory channel rather than by the core pipeline.",
+        "Register-to-register add — ALU results travel a forwarding bus with a fixed propagation delay."
+      ],
+      "correctIndex": 1,
+      "explanation": "Off-core costs are set by hardware outside the clock domain, so raising the frequency raises the *cycle* cost of a DRAM access without changing its nanosecond cost. The branch-mispredict answer is the tempting one because a flush feels like a fixed physical event, but its penalty tracks pipeline depth and is therefore nearly frequency-invariant in cycles, not in nanoseconds. The same is true of the L1 hit and the ALU op, which are both in-core.",
+      "sourceAnchor": "conventions-used-throughout",
+      "difficulty": "application"
+    },
+    {
+      "id": "30-q02",
+      "prompt": "The chapter says \"an L3 miss costs 200 cycles\" and \"an L3 miss costs 70 ns\" are both correct. What conversion reconciles them at the chapter's baseline clock?",
+      "options": [
+        "About 1 cycle per nanosecond, so 1 cycle is about 1 ns at the chapter's 3 GHz baseline.",
+        "About 10 cycles per nanosecond, so 1 cycle is about 0.1 ns at the chapter's 3 GHz baseline.",
+        "About 3 cycles per nanosecond, so 1 cycle is about 0.33 ns at the chapter's 3 GHz baseline.",
+        "About 0.3 cycles per nanosecond, so 1 cycle is about 3 ns at the chapter's 3 GHz baseline."
+      ],
+      "correctIndex": 2,
+      "explanation": "At 3 GHz a cycle is 1/3 ns, so 200 cycles is about 67 ns — the two quotes describe one event in two units. The \"1 cycle is about 1 ns\" answer is the common shortcut and corresponds to a 1 GHz machine, which would make the same miss 200 ns; the chapter calls this conversion the single most useful thing to have memorized precisely because vendors quote cycles and budgets are quoted in nanoseconds.",
+      "sourceAnchor": "conventions-used-throughout",
+      "difficulty": "recall"
+    },
+    {
+      "id": "30-q03",
+      "prompt": "A core has about 12 line-fill buffers and sees 80 ns DRAM latency. Applying Little's Law, what streaming bandwidth can that single core sustain from DRAM?",
+      "options": [
+        "About 9.6 GB/s — 12 line fills of 64 B each per 80 ns, a concurrency limit rather than a bandwidth limit.",
+        "About 96 GB/s — 12 line fills of 64 B each per 8 ns, since fills pipeline against L2 rather than DRAM latency.",
+        "About 0.8 GB/s — one 64 B line per 80 ns, because fills from DRAM cannot be overlapped by a single core.",
+        "About 204 GB/s — a core inherits the socket's full DDR4-3200 eight-channel peak whenever it streams."
+      ],
+      "correctIndex": 0,
+      "explanation": "Outstanding bytes equals bandwidth times latency, so 12 × 64 B ÷ 80 ns lands near 9.6 GB/s no matter how much bandwidth the socket has spare. The socket-peak answer is the classic error — 204 GB/s is a per-socket aggregate that needs many cores' worth of concurrency to reach. The serial-miss answer under-counts the other way: a core genuinely does keep 10–16 fills in flight, which is why hardware prefetch helps by raising concurrency.",
+      "sourceAnchor": "301-cpu-and-memory-latency-numbers",
+      "difficulty": "application"
+    },
+    {
+      "id": "30-q04",
+      "prompt": "Binary search over 1 M `int64` values (an 8 MB array) is quoted at roughly 175 ns. Which decomposition produces that figure?",
+      "options": [
+        "About 20 dependent misses at roughly 9 ns each, one for every level of the binary search.",
+        "About 7 misses issued in parallel, so the cost is one 25 ns miss plus loop and compare overhead.",
+        "About 175 sequential element touches at roughly 1 ns each, bandwidth-bound across the 8 MB array.",
+        "About 7 dependent misses at roughly 25 ns each, since each probe's address depends on the prior compare."
+      ],
+      "correctIndex": 3,
+      "explanation": "Only the last handful of probes miss — the early levels touch a small, repeatedly-visited set of elements that stays cached — so roughly 7 misses at L3-ish latency give ~175 ns. The \"20 misses, one per level\" answer is the tempting one because log2(1 M) is 20 and the arithmetic happens to land near the same total, but it wrongly assumes every level misses. The parallel-issue answer contradicts the structure: each probe's address depends on the previous comparison, so the misses cannot overlap.",
+      "sourceAnchor": "301-cpu-and-memory-latency-numbers",
+      "difficulty": "application"
+    },
+    {
+      "id": "30-q05",
+      "prompt": "A 100 M-node linked-list traversal costs 150–300 ns per node while a sequential array scan costs 0.2–1 ns per element, though both stream from DRAM. What explains the gap?",
+      "options": [
+        "The array scan is served entirely from L3, so unlike the list traversal it never reaches DRAM at all.",
+        "Dependent loads collapse memory-level parallelism to 1, so miss latencies add instead of overlapping.",
+        "A linked-list node miss is intrinsically far more expensive than an array line miss on the same DRAM.",
+        "Every list node crosses a page boundary, so each hop pays a page walk with its PTEs sitting in DRAM."
+      ],
+      "correctIndex": 1,
+      "explanation": "The per-miss cost is the same in both cases; what differs is how many misses are in flight at once. Pointer chasing serializes them because the next address is the previous load's result, so latency adds, while the array scan keeps a dozen fills outstanding and becomes bandwidth-bound. The \"a node miss is intrinsically more expensive\" answer is the intuitive trap — it attributes to the miss what is really a property of the access dependency graph.",
+      "sourceAnchor": "301-cpu-and-memory-latency-numbers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "30-q06",
+      "prompt": "In the chapter's derivation of 70–90 ns local DRAM latency, what does the DRAM device itself contribute on a row-buffer hit versus a row miss?",
+      "options": [
+        "About 42 ns (tRP + tRCD + tCL) on a hit, versus about 14 ns (tCL alone) on a row miss.",
+        "About 5 ns on a hit, versus about 20 ns on a row miss, the rest being memory-controller queueing.",
+        "About 14 ns (tCL alone) on a hit, versus about 42 ns (tRP + tRCD + tCL) on a row miss.",
+        "About 14 ns on a hit, versus about 80 ns on a row miss, which also repeats the full mesh traversal."
+      ],
+      "correctIndex": 2,
+      "explanation": "A row-buffer hit needs only the column access, so at DDR4-3200 CL22 that is 13.75 ns; a row miss must precharge and activate first, stacking tRP + tRCD + tCL into roughly 42 ns. The reversed-figures answer is easy to pick under time pressure, but precharge and activate are pure additions to the hit case, never a substitute for it. Adding the ~20 ns cache-lookup chain and ~15–25 ns of mesh traversal is what brings the total to 70–90 ns.",
+      "sourceAnchor": "301-cpu-and-memory-latency-numbers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "30-q07",
+      "prompt": "A producer writes a cache line that a consumer then reads. Moving the consumer from the same socket to the other socket changes the cost of that dirty-line transfer from what to what?",
+      "options": [
+        "From 15–25 ns to 40–75 ns, since a cross-socket read simply adds one extra L3 lookup on the way.",
+        "From 40–75 ns to 180–300 ns, because the modified line must now cross the UPI/xGMI interconnect.",
+        "From 70–90 ns to 110–150 ns, the same 1.4–2.0× penalty that an ordinary remote DRAM read pays.",
+        "It stays roughly the same, because the home agent resolves coherence identically in both placements."
+      ],
+      "correctIndex": 1,
+      "explanation": "Same-socket HITM is 120–220 cycles (40–75 ns); cross-socket HITM is 550–900 cycles (180–300 ns), a 4× step caused by the interconnect hop. The 1.4–2.0× answer quotes the remote-*DRAM* penalty, which is the tempting substitution — contended lines degrade far worse than plain remote reads, which is exactly why the chapter warns against treating remote NUMA as \"a bit slower\".",
+      "sourceAnchor": "301-cpu-and-memory-latency-numbers",
+      "difficulty": "application"
+    },
+    {
+      "id": "30-q08",
+      "prompt": "The chapter offers two ratio chains that let you reconstruct most of its tables from memory. What are they?",
+      "options": [
+        "L1 : L2 : L3 : DRAM about 1 : 4 : 20 : 100, and miss : syscall : switch : disk about 1 : 10 : 100 : 10000.",
+        "L1 : L2 : L3 : DRAM about 1 : 2 : 8 : 30, and miss : syscall : switch : disk about 1 : 3 : 30 : 1000.",
+        "L1 : L2 : L3 : DRAM about 1 : 3 : 15 : 60, and miss : syscall : switch : disk about 1 : 30 : 300 : 3000.",
+        "L1 : L2 : L3 : DRAM about 1 : 3 : 15 : 60, and miss : syscall : switch : disk about 1 : 3 : 30 : 1000."
+      ],
+      "correctIndex": 3,
+      "explanation": "Anchoring L1 at 1.3 ns, the 1 : 3 : 15 : 60 chain gives roughly 4 ns, 20 ns and 80 ns, matching the tables; anchoring a miss at ~80 ns, the 1 : 3 : 30 : 1000 chain gives ~250 ns of syscall, a few microseconds of switch, and milliseconds of disk. The variant with the correct cache chain but 1 : 30 : 300 : 3000 for the system chain is the closest miss — it would put a syscall at 2.4 µs, an order of magnitude above the 200–350 ns the chapter measures.",
+      "sourceAnchor": "301-cpu-and-memory-latency-numbers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "30-q09",
+      "prompt": "Random access into a 10 GB working set with 4 KB pages is quoted at 150–250 ns, not the 80–120 ns of the DRAM access alone. What accounts for the difference?",
+      "options": [
+        "A likely TLB miss whose page walk finds its PTEs in DRAM, adding a further 100–200 ns of latency.",
+        "Memory-controller queueing delay, which roughly doubles access latency even on an unloaded socket.",
+        "The remote-NUMA penalty, which applies to any working set larger than a single node's L3 capacity.",
+        "A branch mispredict on each lookup, whose 15–20 cycle pipeline flush is added to every access."
+      ],
+      "correctIndex": 0,
+      "explanation": "10 GB of 4 KB pages needs 2.6 M translations, far beyond any TLB's reach, so most accesses pay a page walk whose PTEs are themselves not cached — up to four dependent DRAM reads, 100–200 ns. The queueing answer is a real effect but only under load, and the chapter's figure is an unloaded one. The mispredict answer is arithmetically hopeless anyway: 15–20 cycles is 5–7 ns, nowhere near the ~100 ns being explained.",
+      "sourceAnchor": "301-cpu-and-memory-latency-numbers",
+      "difficulty": "application"
+    },
+    {
+      "id": "30-q10",
+      "prompt": "A profile shows one hot branch costing 30–60 cycles per mispredict instead of the usual 15–20. Where will a top-down profiler charge the extra cycles?",
+      "options": [
+        "To `bad_speculation` — by definition every cycle following a mispredicted branch is speculation cost.",
+        "To `retiring` — the extra µops on the correct path retire normally once fetch has been redirected.",
+        "To `backend_bound` — the refill stalls on the load ports while the correct path's data is fetched.",
+        "To `frontend_bound` — the flush is ~16 cycles and the rest is refetching a path absent from L1i."
+      ],
+      "correctIndex": 3,
+      "explanation": "The flush itself is bounded by pipeline depth at roughly 16 cycles; anything beyond that is the front end failing to deliver the correct path because it is in neither the µop cache nor L1i. The `bad_speculation` answer is the trap — it is where you would look first, and it will under-report, sending you to optimize prediction when the real fix is code layout and I-cache footprint.",
+      "sourceAnchor": "301-cpu-and-memory-latency-numbers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "30-q11",
+      "prompt": "What does the chapter identify as the single most important number in its atomics table?",
+      "options": [
+        "An uncontended RMW on a line already Modified in your L1 is ~20 cycles; contention makes it 10–100× worse.",
+        "An uncontended RMW costs ~20 cycles and contention adds at most another 20 cycles within one socket.",
+        "A relaxed atomic load costs ~20 cycles, which is why atomic loads must be hoisted out of hot loops.",
+        "An uncontended RMW costs ~200 cycles, so lock-free code is inherently slower than a mutex fast path."
+      ],
+      "correctIndex": 0,
+      "explanation": "The point is the spread, not the base cost: 18–25 cycles uncontended, 100–250 when another core owns the line, 500–2000 under eight-thread contention, and 1500–4000 cross-socket. That is the whole argument for per-core sharded counters. The claim that contention adds only about 20 more cycles is the dangerous near-miss — it would make sharing free and sharding pointless. Note also that a relaxed atomic load on x86 is a plain `mov` at 4 cycles, not 20.",
+      "sourceAnchor": "302-synchronization-and-syscall-latency-numbers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "30-q12",
+      "prompt": "An ordinary uncontended `lock cmpxchg` costs 6–9 ns, yet one that straddles a cache-line boundary is quoted at 1000–5000 ns. What produces that jump?",
+      "options": [
+        "The store buffer must drain twice, and each `mfence`-equivalent drain costs hundreds of nanoseconds.",
+        "The line-fill buffers are exhausted, so the core waits out a full DRAM round trip for each half.",
+        "Cache-line locking cannot span two lines, so the CPU asserts a bus lock that stalls every core.",
+        "The access splits into two independent RMWs, each of which must take the contended cross-socket path."
+      ],
+      "correctIndex": 2,
+      "explanation": "Atomicity is normally implemented by holding one line in Modified state; when the operand spans two lines that mechanism is unavailable, so the CPU falls back to a global bus lock. The cost is therefore paid by the whole machine, not just the issuing core — which is what makes it microseconds rather than the tens of nanoseconds any two-line-transfer explanation would predict. The \"two separate RMWs\" answer is the plausible-sounding one, but splitting the operation would break atomicity outright.",
+      "sourceAnchor": "302-synchronization-and-syscall-latency-numbers",
+      "difficulty": "application"
+    },
+    {
+      "id": "30-q13",
+      "prompt": "A `std::mutex` that parks on a futex costs 2–8 µs, while an uncontended lock/unlock pair costs 15–25 ns. Roughly how many uncontended acquisitions fit inside one parked one?",
+      "options": [
+        "Roughly 10–40 — parking costs about one order of magnitude more than the uncontended fast path.",
+        "Roughly 100–400 — two syscalls plus a context switch, against two atomics with no kernel entry.",
+        "Roughly 1,000–4,000 — parking costs about three orders of magnitude more than the fast path.",
+        "Roughly 3–8 — the glibc futex fast path keeps parking within a small multiple of the fast path."
+      ],
+      "correctIndex": 1,
+      "explanation": "Dividing 2–8 µs by 15–25 ns gives roughly 100–400×, and that cliff is why \"make contention rarer\" (sharding, per-thread state, single-writer designs) beats \"make the critical section shorter\". The one-order-of-magnitude answer is the usual underestimate; it would put parking near 200 ns, which is barely more than a single syscall entry and leaves no room for the context switch that dominates.",
+      "sourceAnchor": "302-synchronization-and-syscall-latency-numbers",
+      "difficulty": "application"
+    },
+    {
+      "id": "30-q14",
+      "prompt": "A busy-polling hot path takes one involuntary preemption. The direct switch cost is 1–3 µs, yet the observed outlier is about 50 µs. What accounts for the rest?",
+      "options": [
+        "The scheduler's run-queue walk, whose cost scales with the number of runnable threads on the box.",
+        "The futex wake path being traversed twice, once to park the thread and once to make it runnable.",
+        "A C6 exit on the core, whose fixed exit latency of 50–150 µs is charged on every preemption.",
+        "Cache and TLB recovery: the resumed thread finds L1/L2 evicted and its TLB entries gone, 10–100 µs."
+      ],
+      "correctIndex": 3,
+      "explanation": "The direct cost — saving registers, switching `CR3`, running the scheduler — is the small part; the indirect cost of re-warming L1, L2 and the TLB is 10–100 µs and dominates. That is the entire justification for core isolation, since no amount of code optimization removes it. The C6 answer is the tempting one because the magnitude fits, but C6 exit is paid on waking an *idle* core, and a busy-polling thread never let its core idle.",
+      "sourceAnchor": "302-synchronization-and-syscall-latency-numbers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "30-q15",
+      "prompt": "A hot loop issues one `read()` on a ready socket a million times per second. Roughly what does that cost, and what is the standard architectural response?",
+      "options": [
+        "About 0.1 of a core — negligible, so kernel bypass is aimed at jitter rather than at CPU overhead.",
+        "About 10 full cores — which is why any syscall at all is impossible at message rates near 1 M/s.",
+        "1–3 full cores of overhead — the arithmetic behind kernel bypass, `io_uring` and the vDSO.",
+        "About 0.2 of a core — the vDSO already removes the mode switch from `read()` on modern kernels."
+      ],
+      "correctIndex": 2,
+      "explanation": "At 1–3 µs per `read()` including stack traversal, a million calls per second is 1–3 seconds of CPU per second — one to three saturated cores spent on overhead alone. The vDSO answer is the tempting one because vDSO really does eliminate the mode switch, but only for pure-read timekeeping calls like `clock_gettime`; `read()` must enter the kernel and traverse the network stack.",
+      "sourceAnchor": "302-synchronization-and-syscall-latency-numbers",
+      "difficulty": "application"
+    },
+    {
+      "id": "30-q16",
+      "prompt": "On a box with KPTI and IBRS enabled, `getpid()` costs 200–350 ns but `clock_gettime()` costs 15–25 ns. Why is the timekeeping call unaffected by the mitigations?",
+      "options": [
+        "It is served from the vDSO — kernel timekeeping data mapped into user space, read with no mode switch.",
+        "It is a cached syscall: the kernel returns the previous result until the next timer tick advances it.",
+        "It is exempted from KPTI, so its mode switch skips the two `CR3` writes the mitigation would add.",
+        "It runs on the timer interrupt's already-mapped stack, so no page-table swap is needed on entry."
+      ],
+      "correctIndex": 0,
+      "explanation": "The vDSO maps the kernel's timekeeping page into the process and the routine reads the TSC directly in user mode, so there is no ring transition for KPTI or IBRS to tax — which is why the same call forced through the real syscall path costs 300–500 ns on that box. The \"exempted from KPTI\" answer is the closest miss: it still assumes a mode switch happens, and the mitigation cost is precisely the mode switch.",
+      "sourceAnchor": "302-synchronization-and-syscall-latency-numbers",
+      "difficulty": "application"
+    },
+    {
+      "id": "30-q17",
+      "prompt": "A 1500 B frame crosses four store-and-forward switches on a 10 GbE path. Roughly how much serialization delay do those hops add in total?",
+      "options": [
+        "About 1.22 µs — serialization is paid once at the sender and the switches merely forward the bits.",
+        "About 490 ns — each hop adds a tenth of the frame time while pipelining the remainder onward.",
+        "About 12.2 µs — each hop pays the frame time at the 1 GbE rate of the switch's internal fabric.",
+        "About 4.9 µs — each hop must clock in the entire 1.22 µs frame before it can forward anything."
+      ],
+      "correctIndex": 3,
+      "explanation": "Store-and-forward means the switch buffers the whole frame before transmitting, so each hop costs a full frame time: 4 × 1.22 µs ≈ 4.9 µs. The \"paid once at the sender\" answer is exactly right for a *cut-through* switch, which starts forwarding after the header, and confusing the two is the standard error — it is also why cut-through silicon exists in trading networks.",
+      "sourceAnchor": "303-network-latency-and-serialization-numbers",
+      "difficulty": "application"
+    },
+    {
+      "id": "30-q18",
+      "prompt": "Someone proposes 9000 B jumbo frames on a 10 GbE market-data path to cut per-packet CPU cost. What happens to latency?",
+      "options": [
+        "Latency is unchanged, because serialization delay is a function of link rate rather than frame size.",
+        "Serialization rises from 1.22 µs to 7.25 µs per frame — a throughput win and a per-hop latency loss.",
+        "Latency improves, since fewer frames mean fewer interframe gaps and fewer per-frame switch lookups.",
+        "Serialization rises from 1.22 µs to 2.9 µs per frame, matching the 25 GbE figure for the same payload."
+      ],
+      "correctIndex": 1,
+      "explanation": "Serialization is frame bits divided by link rate, so a 6× larger frame takes 6× longer to clock onto the wire — and every store-and-forward hop pays it again. Jumbo frames are a throughput and CPU optimization and a latency pessimization, which is the trap the chapter calls out by name. The \"2.9 µs\" figure is the 9000 B time at 25 GbE, not at 10 GbE.",
+      "sourceAnchor": "303-network-latency-and-serialization-numbers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "30-q19",
+      "prompt": "Chicago–New York is ~6.5 ms one-way by fiber and ~4.0 ms by microwave, against a 3.97 ms straight-line vacuum path over ~1,190 km. What is microwave actually beating?",
+      "options": [
+        "The speed of light in vacuum, since microwaves propagate through air faster than light does in vacuum.",
+        "Serialization delay, since microwave links clock frames onto the medium far faster than long-haul fiber.",
+        "The refractive index and the routing — fiber runs ~1,300 km at 1.47× slower propagation than free space.",
+        "Switching latency, since a microwave path traverses no intermediate hops between the two endpoints."
+      ],
+      "correctIndex": 2,
+      "explanation": "Microwave wins on two counts, both of which are engineering rather than physics: free space has essentially no refractive penalty (3.34 µs/km versus fiber's 4.9 µs/km) and the tower path is straighter than the fiber right-of-way. The vacuum-speed answer is the one to reject outright — 3.97 ms is the floor and 4.0 ms sits just above it, which is the whole point. Microwave links are also relay chains, so they are not hop-free.",
+      "sourceAnchor": "303-network-latency-and-serialization-numbers",
+      "difficulty": "application"
+    },
+    {
+      "id": "30-q20",
+      "prompt": "A same-rack request/response path runs at 3–6 µs RTT with cut-through switching and kernel bypass. What happens to the per-direction stack cost if it is moved back onto the kernel UDP path?",
+      "options": [
+        "It roughly triples, from the 1.2–2 µs of a bypass receive to the 3–6 µs of a kernel UDP receive.",
+        "It roughly doubles, from the 3–6 µs of a bypass receive to the 8–12 µs of a kernel UDP receive.",
+        "It falls, because the kernel amortizes interrupt handling across batches of received packets.",
+        "It barely moves, since the switch hop and cable propagation already dominate at 3–6 µs each way."
+      ],
+      "correctIndex": 0,
+      "explanation": "Kernel UDP receive is 3–6 µs wire-to-`recvfrom` against 1.2–2 µs for OpenOnload/VMA-class bypass, so the receive side alone roughly triples and the whole rack RTT budget is blown. The \"switch and propagation dominate\" answer is the tempting one, but a cut-through switch hop is 40–130 ns and in-hall cable is 100–500 ns — two orders of magnitude below the stack cost, which is why the stack is where the optimization lives.",
+      "sourceAnchor": "303-network-latency-and-serialization-numbers",
+      "difficulty": "application"
+    },
+    {
+      "id": "30-q21",
+      "prompt": "What are the chapter's total one-way tick-to-trade budgets for a bypass software stack and for an FPGA?",
+      "options": [
+        "3–6 µs for software with kernel bypass, versus 700 ns – 1.5 µs for an FPGA implementation.",
+        "700 ns – 1.5 µs for software with kernel bypass, versus 30–50 ns for an FPGA implementation.",
+        "1.2–3 µs for software with kernel bypass, versus 400–700 ns for an FPGA implementation.",
+        "1.2–3 µs for software with kernel bypass, versus 70–150 ns for an FPGA implementation."
+      ],
+      "correctIndex": 3,
+      "explanation": "Summing the five stages gives 1.2–3 µs in software (400–700 ns of NIC receive, 200–800 ns of decode, 100–500 ns of decision, 100–300 ns of encode, 400–700 ns of transmit) against 70–150 ns on an FPGA — roughly a 20× gap. The 700 ns – 1.5 µs figure is the *wire-to-wire* cost of ef_vi or DPDK alone, with no decode, strategy or encode work in it, which makes it the most tempting substitution.",
+      "sourceAnchor": "303-network-latency-and-serialization-numbers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "30-q22",
+      "prompt": "You compute the serialization time of a minimum-size Ethernet frame at 10 GbE as 51.2 ns, but the chapter says 67.2 ns. What did you leave out?",
+      "options": [
+        "The 8b/10b line coding of 10 GbE, which inflates the wire time of every frame by exactly 25 percent.",
+        "The 8 B preamble/SFD and the 12 B interframe gap, so a 64 B frame occupies 84 B of wire time.",
+        "The switch's fixed cut-through forwarding latency, which the chapter folds into its frame-time column.",
+        "The 14 B Ethernet header and the 4 B frame check sequence, which sit outside the 64 B payload figure."
+      ],
+      "correctIndex": 1,
+      "explanation": "Every frame carries 8 B of preamble/SFD ahead of it and 12 B of interframe gap behind it, so the wire is occupied for 84 B: 84 × 8 ÷ 10 Gb/s = 67.2 ns. The header-and-FCS answer is the most tempting because those bytes are real, but they are already *inside* the 64 B minimum frame — counting them again double-counts. Forgetting the gap and preamble is listed among the chapter's common traps.",
+      "sourceAnchor": "303-network-latency-and-serialization-numbers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "30-q23",
+      "prompt": "Which mechanisms does the chapter list as dominating p99.9, as distinct from the neighbouring percentiles?",
+      "options": [
+        "L3 misses and occasional branch mispredicts — too rare to move the median but routine at p99.9.",
+        "Page faults, TLB misses, lock contention and allocator slow paths, which define the p99.9 tier.",
+        "C-state exit, NUMA migration and page-cache writeback, which are the p99.9 mechanisms specifically.",
+        "Context switches, IRQ handling, timer ticks and THP compaction — none of them visible in the median."
+      ],
+      "correctIndex": 3,
+      "explanation": "The chapter's ladder assigns L3 misses and mispredicts to p90, page faults and lock contention to p99, scheduler and interrupt events to p99.9, and C-state exit, NUMA migration and writeback to p99.99/max. Each wrong answer here is the correct list for an adjacent tier, which is exactly how the distinction gets muddled — the operational point is that p50 is a cache-behaviour story while p99.9 is an operating-system story.",
+      "sourceAnchor": "304-latency-numbers-as-estimates-not-constants",
+      "difficulty": "recall"
+    },
+    {
+      "id": "30-q24",
+      "prompt": "A change improves p50 by 20 ns and introduces a one-in-10⁵ chance of a 500 µs stall. Why does the chapter call this a loss?",
+      "options": [
+        "Because the median itself worsens — a 500 µs stall at that rate shifts the whole distribution rightwards.",
+        "Because the mean latency worsens, and the mean is the statistic by which such systems are judged.",
+        "Because low-latency systems are judged on p99.9 and max, where the new stall lands and the p50 gain does not.",
+        "Because coordinated omission makes the 20 ns gain an artifact of a generator that stopped sending."
+      ],
+      "correctIndex": 2,
+      "explanation": "A one-in-100,000 event is invisible in the median and contributes only about 5 ns to the mean, so both summary statistics say the change is good — and both are the wrong statistics. What matters is that a 500 µs excursion now exists in the max and near p99.99, where the system is actually evaluated. The \"the mean worsens\" answer is doubly wrong: the mean in fact improves slightly, and the mean is not the governing statistic in the first place.",
+      "sourceAnchor": "304-latency-numbers-as-estimates-not-constants",
+      "difficulty": "trap"
+    },
+    {
+      "id": "30-q25",
+      "prompt": "A capacity plan assumes DRAM latency will improve meaningfully with the next server generation. What does the Skylake-SP to Sapphire Rapids/Genoa comparison say about that?",
+      "options": [
+        "DRAM latency in nanoseconds is nearly unchanged while per-socket bandwidth roughly tripled.",
+        "DRAM latency fell by roughly half over that span while bandwidth stayed flat as channel counts held.",
+        "Both DRAM and L3 latency improved steadily, which is why L1 and L2 cycle counts also came down.",
+        "DRAM latency in cycles is nearly unchanged, so raising the clock reliably lowers it in nanoseconds."
+      ],
+      "correctIndex": 0,
+      "explanation": "Across six years L1/L2 latency in cycles barely moved (and L2 got *slower* in cycles as it grew), L3 worsened as meshes lengthened, and DRAM nanoseconds stood still while bandwidth tripled and core width went from 4-wide to 6-wide. The \"unchanged in cycles\" answer inverts the invariant: it is the nanosecond figure that is fixed by the DIMM, so a higher clock raises the cycle count rather than lowering the time. Any design betting on a latency improvement arriving is a design that will not improve.",
+      "sourceAnchor": "304-latency-numbers-as-estimates-not-constants",
+      "difficulty": "application"
+    }
+  ]
+}
