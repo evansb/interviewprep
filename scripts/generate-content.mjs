@@ -11,10 +11,6 @@ const bankDir = path.join(root, 'quiz-banks');
 const DIFFICULTIES = ['recall', 'application', 'trap'];
 const MIN_EXPLANATION = 80;
 
-const STOP_WORDS = new Set(
-  'a an and are as at be but by can do does for from has have how i if in into is it its of on or that the their this to vs what when where which why will with you your'.split(' '),
-);
-
 function slugify(value) {
   return value
     .toLowerCase()
@@ -45,13 +41,6 @@ function yamlString(value) {
   return JSON.stringify(value);
 }
 
-function words(value) {
-  return cleanInline(value)
-    .toLowerCase()
-    .split(/[^\p{L}\p{N}_+]+/u)
-    .filter((word) => word.length > 2 && !STOP_WORDS.has(word));
-}
-
 function splitSections(markdown) {
   const matches = [...markdown.matchAll(/^##\s+(.+)$/gm)];
   return matches.map((match, index) => {
@@ -67,170 +56,12 @@ function splitSections(markdown) {
   });
 }
 
-function firstUsefulSentence(body) {
-  const plain = body
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/^\|.*$/gm, ' ')
-    .replace(/^[-*>#]+\s*/gm, '')
-    .replace(/\n+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  const candidates = plain.match(/[^.!?]+[.!?]+/g) || [plain];
-  return trimAnswer(candidates.find((item) => cleanInline(item).length >= 45) || candidates[0] || '', 280);
-}
-
-function bestSectionAnchor(text, sections) {
-  const query = new Set(words(text));
-  let best = null;
-  let bestScore = 0;
-  for (const section of sections.filter((item) => item.numbered)) {
-    const headingWords = words(section.title);
-    const bodyWords = new Set(words(section.body.slice(0, 1000)));
-    let score = headingWords.reduce((sum, word) => sum + (query.has(word) ? 6 : 0), 0);
-    for (const word of query) if (bodyWords.has(word)) score += 1;
-    if (score > bestScore) {
-      bestScore = score;
-      best = section.anchor;
-    }
-  }
-  return best || sections.find((item) => item.numbered)?.anchor || 'key-interview-questions';
-}
-
-function parseInterviewQuestions(section) {
-  if (!section) return [];
-  const output = [];
-  const pattern = /^\d+\.\s+\*\*(.+?\?)\*\*\s*[—–-]\s*(.+)$/gm;
-  for (const match of section.body.matchAll(pattern)) {
-    output.push({ prompt: cleanInline(match[1]), answer: trimAnswer(match[2]) });
-  }
-  return output;
-}
-
-function parseTraps(section) {
-  if (!section) return [];
-  return [...section.body.matchAll(/^-\s+(.+)$/gm)]
-    .map((match) => trimAnswer(match[1]))
-    .filter((item) => item.length >= 35);
-}
-
-function chooseDistractors(correct, pool, seed) {
-  const candidates = [...new Set(pool.filter((item) => item && item !== correct))];
-  const selected = [];
-  for (let offset = 0; offset < candidates.length && selected.length < 3; offset += 1) {
-    const candidate = candidates[(seed * 7 + offset * 11) % candidates.length];
-    if (candidate && !selected.includes(candidate)) selected.push(candidate);
-  }
-  const fallbacks = [
-    'It is purely an implementation detail with no observable effect on correctness or performance.',
-    'It is guaranteed by the C++ standard in every build mode and on every supported platform.',
-    'It applies only at compile time and cannot affect runtime behavior or generated machine code.',
-  ];
-  for (const fallback of fallbacks) if (selected.length < 3 && fallback !== correct) selected.push(fallback);
-  return selected.slice(0, 3);
-}
-
-function buildQuestion({ id, prompt, correct, explanation, sourceAnchor, difficulty }, pool, index) {
-  const correctIndex = index % 4;
-  const options = chooseDistractors(correct, pool, index);
-  options.splice(correctIndex, 0, correct);
-  return { id, prompt, options, correctIndex, explanation, sourceAnchor, difficulty };
-}
-
-function makeQuiz(chapter, markdown) {
-  const sections = splitSections(markdown);
-  const numbered = sections.filter((item) => item.numbered);
-  const interviewSection = sections.find((item) => item.title === 'Key Interview Questions');
-  const trapSection = sections.find((item) => item.title === 'Common Traps');
-  const interviews = parseInterviewQuestions(interviewSection);
-  const traps = parseTraps(trapSection);
-  const wordCount = markdown.split(/\s+/).filter(Boolean).length;
-  const target = Math.min(
-    50,
-    Math.max(20, 20 + Math.floor(Math.max(wordCount - 5000, 0) / 1000) + Math.max(numbered.length - 10, 0)),
-  );
-
-  const sectionFacts = numbered
-    .map((section) => ({ section, fact: firstUsefulSentence(section.body) }))
-    .filter(({ fact }) => fact.length >= 35);
-  const answerPool = [...interviews.map((item) => item.answer), ...traps, ...sectionFacts.map((item) => item.fact)];
-  const questions = [];
-
-  for (const item of interviews) {
-    const anchor = bestSectionAnchor(`${item.prompt} ${item.answer}`, sections);
-    questions.push(
-      buildQuestion(
-        {
-          id: `${chapter.number}-interview-${questions.length + 1}`,
-          prompt: item.prompt,
-          correct: item.answer,
-          explanation: item.answer,
-          sourceAnchor: anchor,
-          difficulty: questions.length % 3 === 0 ? 'application' : 'recall',
-        },
-        answerPool,
-        questions.length,
-      ),
-    );
-  }
-
-  for (const trap of traps) {
-    if (questions.length >= target) break;
-    const topic = trimAnswer(trap.split(/[—–:]/)[0], 110);
-    const anchor = bestSectionAnchor(trap, sections);
-    questions.push(
-      buildQuestion(
-        {
-          id: `${chapter.number}-trap-${questions.length + 1}`,
-          prompt: `Which statement best addresses this common trap: “${topic}”?`,
-          correct: trap,
-          explanation: trap,
-          sourceAnchor: anchor,
-          difficulty: 'trap',
-        },
-        answerPool,
-        questions.length,
-      ),
-    );
-  }
-
-  let sectionIndex = 0;
-  while (questions.length < target && sectionFacts.length) {
-    const { section, fact } = sectionFacts[sectionIndex % sectionFacts.length];
-    const pass = Math.floor(sectionIndex / sectionFacts.length) + 1;
-    const prompt = pass === 1
-      ? `Which description best matches “${section.title.replace(/^\d+\.\d+\s+/, '')}”?`
-      : `According to the chapter, what is an important consequence or property of “${section.title.replace(/^\d+\.\d+\s+/, '')}”?`;
-    questions.push(
-      buildQuestion(
-        {
-          id: `${chapter.number}-section-${questions.length + 1}`,
-          prompt,
-          correct: fact,
-          explanation: fact,
-          sourceAnchor: section.anchor,
-          difficulty: pass === 1 ? 'recall' : 'application',
-        },
-        answerPool,
-        questions.length,
-      ),
-    );
-    sectionIndex += 1;
-  }
-
-  return {
-    chapter: chapter.number,
-    slug: chapter.slug,
-    title: chapter.title,
-    targetCount: target,
-    questions: questions.slice(0, target),
-  };
-}
-
+// Every chapter must ship a hand-authored bank; there is no generated fallback.
 async function loadAuthoredBank(slug) {
   try {
     return JSON.parse(await readFile(path.join(bankDir, `${slug}.json`), 'utf8'));
   } catch (error) {
-    if (error.code === 'ENOENT') return null;
+    if (error.code === 'ENOENT') throw new Error(`Missing authored quiz bank quiz-banks/${slug}.json.`);
     throw new Error(`Could not parse quiz-banks/${slug}.json: ${error.message}`);
   }
 }
@@ -331,7 +162,6 @@ async function main() {
 
   const chapterByNumber = new Map();
   const meta = [];
-  let authoredCount = 0;
 
   for (const file of files) {
     const source = await readFile(path.join(root, file), 'utf8');
@@ -368,8 +198,7 @@ async function main() {
     await writeFile(path.join(chaptersDir, file), `${frontmatter}${body}`, 'utf8');
 
     const bank = await loadAuthoredBank(slug);
-    const quiz = bank ? buildAuthoredQuiz(chapter, bank, splitSections(source)) : makeQuiz(chapter, source);
-    if (bank) authoredCount += 1;
+    const quiz = buildAuthoredQuiz(chapter, bank, splitSections(source));
     await writeFile(path.join(quizzesDir, `${slug}.json`), `${JSON.stringify(quiz, null, 2)}\n`, 'utf8');
     meta.push({ ...chapter, questionCount: quiz.questions.length, wordCount: source.split(/\s+/).filter(Boolean).length });
   }
@@ -393,7 +222,7 @@ async function main() {
 
   const totalQuestions = meta.reduce((sum, chapter) => sum + chapter.questionCount, 0);
   process.stdout.write(
-    `Generated ${meta.length} chapters (${authoredCount} authored, ${meta.length - authoredCount} fallback) and ${totalQuestions} quiz questions.\n`,
+    `Generated ${meta.length} chapters and ${totalQuestions} authored quiz questions.\n`,
   );
 }
 

@@ -1,0 +1,481 @@
+{
+  "slug": "chapter-57-testing",
+  "questions": [
+    {
+      "id": "57-q01",
+      "prompt": "Which set of properties is the chapter's operational definition of a unit test?",
+      "options": [
+        "It touches no clock other than an injected one, opens no socket, file, or shared-memory segment, starts no thread it does not join, and is order-independent under shuffling.",
+        "It runs in under one millisecond, uses a framework fixture, and asserts on at least one public method of the class under test.",
+        "It replaces every dependency with a virtual-interface mock and never names a concrete type from another translation unit.",
+        "It exercises a single function, contains exactly one assertion, and is named after the behaviour it pins down."
+      ],
+      "correctIndex": 0,
+      "explanation": "The definition is mechanical rather than stylistic: injected clock, no I/O, no unjoined threads, order-independence. Every clause is enforceable, which is the point — an LD_PRELOAD or seccomp shim that aborts on socket() or clock_gettime in the unit target catches drift far better than convention.",
+      "sourceAnchor": "571-unit-testing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "57-q02",
+      "prompt": "You need a test seam for a clock used by a hot-path component. Which choice keeps runtime cost at zero while remaining practical to test?",
+      "options": [
+        "Make the component a template on the clock type and hold an instance, so the call inlines fully in release and a virtual clock substitutes in tests.",
+        "Introduce a virtual IClock interface, since an indirect call is a negligible cost compared with the value of a mockable seam.",
+        "Call the global steady_clock directly and override it in tests with a linker-level symbol interposition per test case.",
+        "Read the time once at construction into a member and pass the cached value everywhere the component needs a timestamp."
+      ],
+      "correctIndex": 0,
+      "explanation": "A template policy parameter costs nothing at runtime because the call is inlined, at the price of instantiating the system under test twice and longer compiles. A virtual interface adds an indirect call that defeats inlining on the hot path, which is exactly the cost the chapter warns testability should not impose.",
+      "sourceAnchor": "571-unit-testing",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q03",
+      "prompt": "A helper function shared by several GoogleTest cases checks preconditions with ASSERT_EQ. Why is this a trap?",
+      "options": [
+        "ASSERT returns from the helper, not from the test, so the test body continues running past a failed precondition and can appear to pass.",
+        "ASSERT is compiled out in release builds, so the precondition is silently unchecked whenever the suite is built with optimizations.",
+        "ASSERT inside a non-void function is undefined behaviour and will corrupt the fixture's state for subsequent test cases.",
+        "ASSERT requires a fixture, so a free helper function cannot report the failure to the enclosing test at all."
+      ],
+      "correctIndex": 0,
+      "explanation": "ASSERT_* macros expand to a return statement, and that return exits whatever function contains it. Placed in a helper, the failure is recorded but the test body carries on with a violated precondition — a classic source of tests that look green after something already went wrong. EXPECT_* continues by design.",
+      "sourceAnchor": "571-unit-testing",
+      "difficulty": "trap"
+    },
+    {
+      "id": "57-q04",
+      "prompt": "In property-based testing, what does shrinking contribute that random generation alone does not?",
+      "options": [
+        "It reduces a failing input to a minimal counterexample, turning a 400-event random sequence into a three-event bug report.",
+        "It reduces the number of generated cases needed to reach a target coverage percentage of the code under test.",
+        "It removes inputs that fail the precondition so the discard rate stays low and the suite finishes in bounded time.",
+        "It compresses the stored corpus so that regression inputs occupy less space in version control over time."
+      ],
+      "correctIndex": 0,
+      "explanation": "A large random failing input is nearly useless for diagnosis; the minimized one is a bug report. Shrinking requires a structured generator — frameworks shrink integers toward zero and containers toward empty while preserving constraints — which is why byte-consuming fuzz-style generators shrink poorly unless run through an explicit crash-minimization pass.",
+      "sourceAnchor": "572-property-based-testing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "57-q05",
+      "prompt": "A property test over an order book generates uniformly random BookEvent values and almost never finds bugs. What is the most likely cause?",
+      "options": [
+        "The generator is not state-aware, so cancels and modifies reference order ids that do not exist and the interesting code paths are never reached.",
+        "The property is checked after the whole sequence rather than after each event, so intermediate violations are masked by later events.",
+        "The framework's default case count is too low, and raising it by an order of magnitude is the standard remedy for weak coverage.",
+        "Uniform generators cannot express preconditions, so every generated case is silently counted as a pass by the framework."
+      ],
+      "correctIndex": 0,
+      "explanation": "Uniform random events almost never produce a cancel for an order that exists, so the run burns its budget on discards and trivially invalid input. The fix is a stateful generator that draws ids and prices from the current model state, which is precisely where property-based testing converges with model-based testing.",
+      "sourceAnchor": "572-property-based-testing",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q06",
+      "prompt": "A round-trip property asserts decode(encode(x)) == x for an SBE codec and passes consistently. Why might it still be worthless?",
+      "options": [
+        "If encode and decode share the same buggy field-offset table, the property is self-consistent and passes while both sides disagree with the venue's wire format.",
+        "Round-trip properties cannot shrink, so any failure they do find arrives as an unminimized input that nobody can act on.",
+        "Encoding is lossy by definition for fixed-point prices, so equality after a round trip can only ever be approximate.",
+        "The property holds vacuously whenever the generator produces messages shorter than the schema's header size."
+      ],
+      "correctIndex": 0,
+      "explanation": "A property that merely re-implements the code under test in its assertion proves internal consistency and nothing about conformance. This is the same failure mode as generating protocol vectors from your own encoder: only bytes captured from the venue, or its published conformance file, can settle what the wire format actually is.",
+      "sourceAnchor": "572-property-based-testing",
+      "difficulty": "trap"
+    },
+    {
+      "id": "57-q07",
+      "prompt": "What problem does differential testing solve that a conventional expected-value test does not?",
+      "options": [
+        "It sidesteps the oracle problem: you need not know the right answer, only that two implementations that should agree do agree on the same input.",
+        "It removes the need for input generation, because the reference implementation supplies the inputs the fast implementation is tested with.",
+        "It proves the fast implementation is optimal, since any divergence in output indicates the slower path took a different code route.",
+        "It eliminates flakiness, because both implementations observe the same clock and therefore produce identical timestamps."
+      ],
+      "correctIndex": 0,
+      "explanation": "Differential testing needs no oracle, only agreement, which is why it fits a hand-vectorized parser against a scalar reference, your book builder against the venue's published snapshot, or an optimized build against an unoptimized one. The hard part is defining equality precisely enough that innocent differences do not fire.",
+      "sourceAnchor": "573-differential-testing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "57-q08",
+      "prompt": "You build a fuzz harness that decodes each mutated buffer with both a SIMD parser and a scalar reference. How must the harness treat the accept/reject decision?",
+      "options": [
+        "Both rejecting the input is a pass, but one accepting while the other rejects must be a failure, because the accept boundary is where parser bugs live.",
+        "Any input either parser rejects should be discarded, since only successfully decoded messages have comparable structures to assert on.",
+        "Rejection by the scalar reference should be treated as authoritative and the fast parser's result ignored for that input entirely.",
+        "Disagreement on acceptance is expected for mutated input and should be counted rather than asserted, with the count reported at exit."
+      ],
+      "correctIndex": 0,
+      "explanation": "The boundary between accepted and rejected input is exactly where framing and validation defects hide, so asymmetric acceptance must fail the harness. Discarding rejected inputs throws away the most valuable signal, and coverage guidance plus automatic minimization make this combination the strongest technique available for parsers.",
+      "sourceAnchor": "573-differential-testing",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q09",
+      "prompt": "In model-based testing of an order book, what makes a nested std::map of price to order id to quantity a good model?",
+      "options": [
+        "It is obviously correct and hopelessly slow, which is exactly what an oracle needs to be, since performance is the real implementation's job.",
+        "It has the same asymptotic complexity as the production structure, so divergence in behaviour cannot be caused by differing algorithms.",
+        "It shares the production comparison and tie-breaking code, so any priority bug appears identically on both sides of the check.",
+        "It can be serialized to the same wire format as the real book, allowing byte-level comparison after every generated command."
+      ],
+      "correctIndex": 0,
+      "explanation": "The model's value comes from being transparently correct at any cost in speed; the production structure is an array of price levels with intrusive order lists chosen for latency. Sharing code between model and system under test would destroy the independence that makes the comparison meaningful.",
+      "sourceAnchor": "574-model-based-testing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "57-q10",
+      "prompt": "Comparing the full book against the model after every command is O(n) per step and caps sequence length. What is the usual compromise?",
+      "options": [
+        "Check only the touch after each command, the full book every k commands, and the complete state unconditionally at the end of the sequence.",
+        "Check the full book after each command but cap sequences at a few dozen commands so the total cost stays bounded.",
+        "Check nothing during the run and compare only the final state, relying on shrinking to locate which command introduced the divergence.",
+        "Check a hash of the book after each command, which is O(1) and detects any divergence with negligible probability of collision."
+      ],
+      "correctIndex": 0,
+      "explanation": "Cheap per-step checks keep sequences long enough to find genuine sequence bugs, while the periodic and final full comparisons catch defects buried deep in the structure — a leaked price level holding zero orders, a stale free-list entry — that a best-bid-only check can never observe.",
+      "sourceAnchor": "574-model-based-testing",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q11",
+      "prompt": "Why should a randomized test print its seed on every run rather than only when it fails?",
+      "options": [
+        "CI truncates output and passing runs frequently need re-examination later, so the seed must already be in the log when the question arises.",
+        "Printing the seed only on failure would require the failure handler to allocate, which is unsafe once an assertion has already fired.",
+        "The framework derives per-thread substreams from the printed value, so omitting the print changes the sequence of random draws.",
+        "A seed printed only on failure cannot be fed back into the same binary, because the generator has already consumed part of its state."
+      ],
+      "correctIndex": 0,
+      "explanation": "The discipline is one seed, sourced once, logged always. A run that passed today may need to be reproduced next week when a related bug surfaces, and CI log truncation means the value has to be there from the start. Established frameworks echo their random seed in the header line for the same reason.",
+      "sourceAnchor": "575-deterministic-random-seeds-and-reproducers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "57-q12",
+      "prompt": "A test fails about 1 run in 200. Roughly how many repeats per commit does a bisect step need for about 95% detection?",
+      "options": [
+        "About 600, since n repeats miss a per-run failure probability p with probability (1-p)^n and n of roughly 3/p gives about 95% detection.",
+        "About 200, because one expected failure per bisect step is sufficient to classify the commit with high confidence.",
+        "About 20, since the binary search over commits multiplies the detection probability across the roughly ten steps of the bisect.",
+        "About 5000, because the failure rate must be estimated to within one percent before the commit can be classified at all."
+      ],
+      "correctIndex": 0,
+      "explanation": "With p of 1/200, n repeats miss the bug with probability (1-p)^n, and n of about 3/p leaves roughly a 5% miss rate — so around 600 runs per step. Wrapping the bisect command in a loop of that size is the standard technique, and getting the arithmetic right is a strong interview signal.",
+      "sourceAnchor": "575-deterministic-random-seeds-and-reproducers",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q13",
+      "prompt": "After shrinking a property-test failure to four commands, why is recording only the seed insufficient?",
+      "options": [
+        "A seed reproduces only against that build of that generator, so any refactor of the generator silently stops reproducing the bug.",
+        "Seeds are drawn from a hardware entropy source and therefore cannot be replayed on a machine with a different CPU model.",
+        "The framework rehashes the seed with the process id, so the same value produces a different sequence on each invocation.",
+        "Shrinking mutates the seed as it minimizes, so the reported value corresponds to the minimized case rather than the original failure."
+      ],
+      "correctIndex": 0,
+      "explanation": "Shrink, then pin: serialize the minimal input into the repository as a regression corpus entry — a byte file for a fuzz target, a literal command list for a model-based test. The committed artifact survives generator changes; a seed does not, and its value quietly evaporates at the next refactor.",
+      "sourceAnchor": "575-deterministic-random-seeds-and-reproducers",
+      "difficulty": "trap"
+    },
+    {
+      "id": "57-q14",
+      "prompt": "How does coverage-guided fuzzing manage to get past a four-byte magic number that brute force would never guess?",
+      "options": [
+        "Comparison tracing instrumentation reports the operands of comparisons, so the mutator learns the constant it must produce.",
+        "Edge coverage counters reward any input that reaches the comparison, so repeated mutation of that region converges on the value.",
+        "The sanitizer runtime rewrites the comparison into a range check, which a byte-wise mutator can satisfy incrementally.",
+        "The dictionary file is mandatory for binary protocols and supplies every constant the target compares against."
+      ],
+      "correctIndex": 0,
+      "explanation": "Edge-coverage instrumentation alone would give no gradient across an all-or-nothing equality test. Comparison tracing hooks feed the actual operands back to the mutator, and memcmp and strcmp are intercepted for the same reason — which is also why obscuring comparisons behind a precomputed checksum blinds the fuzzer.",
+      "sourceAnchor": "576-fuzzing-native-code",
+      "difficulty": "recall"
+    },
+    {
+      "id": "57-q15",
+      "prompt": "Your feed decoder validates a CRC before parsing, and the fuzzer makes no progress past that gate. What is the recommended remedy?",
+      "options": [
+        "Disable checksum validation behind a fuzzing-only build macro so the mutator can reach the parsing logic beyond the gate.",
+        "Seed the corpus with many more valid captures so the mutator has enough correct checksums to recombine from.",
+        "Raise the maximum input length so the fuzzer has room to encode both a payload and a matching checksum value.",
+        "Switch to a structure-aware harness that emits the checksum itself, which removes the need for any raw-byte harness."
+      ],
+      "correctIndex": 0,
+      "explanation": "A checksum computed before the branch destroys the coverage gradient, so the fuzzer stalls at the gate no matter how long it runs. Gating the check behind a build macro used only in fuzz builds is the standard escape. A structure-aware harness helps reach deep logic but stops finding framing bugs, so both harnesses are run.",
+      "sourceAnchor": "576-fuzzing-native-code",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q16",
+      "prompt": "What does a fuzzing campaign lose by running without ASan, UBSan, or MSan?",
+      "options": [
+        "It only finds inputs that crash outright, missing out-of-bounds reads, use-after-free, integer overflow, and misaligned loads that do not fault.",
+        "It only finds memory-safety bugs, because logic assertions are compiled out unless a sanitizer runtime is linked into the target.",
+        "It loses comparison tracing, since the instrumentation that records operands is provided by the sanitizer runtime rather than the compiler.",
+        "It loses corpus minimization, because coverage counters are maintained by the sanitizer's shadow memory bookkeeping."
+      ],
+      "correctIndex": 0,
+      "explanation": "Without a sanitizer the only detectable failure is a hard crash, so an out-of-bounds read that happens to land on mapped memory passes silently. Note that integer overflow checking is not in the default UBSan set and must be requested, and MSan needs every dependency rebuilt instrumented or it drowns in false positives.",
+      "sourceAnchor": "576-fuzzing-native-code",
+      "difficulty": "trap"
+    },
+    {
+      "id": "57-q17",
+      "prompt": "Ranking sources of protocol vectors by trustworthiness, where does your own encoder's output sit?",
+      "options": [
+        "Last, and effectively worthless as a decoder test, because it proves only self-consistency rather than conformance to the venue.",
+        "Second, behind a live capture but ahead of the venue's conformance file, because it always matches the schema version you build against.",
+        "First for regression purposes, since it is the only source guaranteed to stay in step with schema changes automatically.",
+        "Equivalent to hand-typed spec examples, since both are derived from the same published field layout tables."
+      ],
+      "correctIndex": 0,
+      "explanation": "The ordering runs live or UAT capture, then the venue's published conformance file, then hand-typed spec examples, then your own encoder. Testing a decoder with your encoder's bytes reproduces the round-trip trap: a shared field-offset error cancels out and the suite stays green while the wire format is wrong.",
+      "sourceAnchor": "577-protocol-vector-tests",
+      "difficulty": "recall"
+    },
+    {
+      "id": "57-q18",
+      "prompt": "Which vector-suite variant most directly prevents a decoder that works in test but fails on a busy production day?",
+      "options": [
+        "Feeding the same vector to the decoder one byte at a time, plus cases with two messages in one segment and a partial trailing message.",
+        "Repeating every vector a thousand times in a tight loop to confirm the decoder holds no state between successive messages.",
+        "Decoding every vector under both little-endian and big-endian interpretations and asserting that exactly one of them succeeds.",
+        "Timing the decode of each vector and asserting it completes within the budget derived from the venue's peak message rate."
+      ],
+      "correctIndex": 0,
+      "explanation": "Message boundaries are where framing assumptions break: a decoder that only works when a whole message arrives at once is an incident waiting for a day when segments coalesce or split. Byte-at-a-time feeding forces the incremental state machine to be correct, and coalesced and truncated cases cover the rest.",
+      "sourceAnchor": "577-protocol-vector-tests",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q19",
+      "prompt": "A decoder computes remaining = hdr.length - sizeof(Header) into a size_t and then checks bytes_consumed + remaining <= buffer_size. Why does this fail?",
+      "options": [
+        "When hdr.length is smaller than the header, the subtraction wraps to an enormous value and the addition in the check overflows back into range.",
+        "size_t is narrower than the length field on 32-bit targets, so the subtraction truncates before the comparison is performed.",
+        "The compiler is permitted to assume the subtraction does not wrap, so it removes the bounds check entirely at higher optimization levels.",
+        "bytes_consumed is signed in most framing loops, so the mixed-sign comparison promotes the buffer size to a negative value."
+      ],
+      "correctIndex": 0,
+      "explanation": "Unsigned underflow yields roughly 1.8e19, and adding it to bytes_consumed wraps the sum back below buffer_size, so the guard passes and the parser reads far out of bounds. Validate before subtracting: reject when the length is below the header size or above the available bytes, keeping the arithmetic on the known-good side.",
+      "sourceAnchor": "578-malformed-message-fuzzing",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q20",
+      "prompt": "For malformed market-data input, why is asserting the absence of a crash an inadequate test?",
+      "options": [
+        "The decoder may silently drop the rest of the packet, leaving a stale book with no alarm — an outcome strictly worse than crashing.",
+        "Sanitizers already guarantee that no crash occurs, so the assertion is vacuous in any build configuration used for this testing.",
+        "Absence of a crash cannot be observed reliably, because the harness process may be killed by the watchdog before it reports.",
+        "Crashes are the only defect class malformed input can produce, so the assertion duplicates what the runtime already reports."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each malformed input must produce a specified behaviour: reject and resynchronize at the next framing boundary, increment a named counter, and continue — or declare a gap and request replay when the stream is unrecoverable. Silent truncation of a packet produces a stale book that nothing alarms on, which is the worse failure.",
+      "sourceAnchor": "578-malformed-message-fuzzing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "57-q21",
+      "prompt": "Which explanation best captures why running a concurrency test a million times cannot establish memory-ordering correctness?",
+      "options": [
+        "The needed interleaving may be impossible on this hardware, compiler reordering is fixed per build, and observing an outcome says nothing about what the model permits.",
+        "A million iterations is far too few; the required interleaving probability is roughly one in a billion on modern hardware.",
+        "Test harness overhead serializes the threads, so no genuine concurrency is exercised regardless of the iteration count.",
+        "Atomic operations are implemented with locks in test builds, which removes the reordering the test was meant to observe."
+      ],
+      "correctIndex": 0,
+      "explanation": "Three independent reasons: x86 TSO never performs the store-store or load-load reordering the bug needs, so an ARM-only failure is invisible; the same binary always reorders the same way, so repetition explores schedules but not compilations; and the memory model is about what is permitted, not what happens to be observed.",
+      "sourceAnchor": "579-concurrency-stress-and-soak-testing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "57-q22",
+      "prompt": "A lock-free ring built from hand-written inline assembly and compiler intrinsics reports no races under ThreadSanitizer. What should you conclude?",
+      "options": [
+        "Nothing reassuring: inline assembly and intrinsics are not instrumented, so the accesses are invisible and the silence is a false negative.",
+        "That the structure is race-free on this architecture, though the same code may still race once ported to a weaker memory model.",
+        "That the workload never reached the contended path, since the tool reports races even in uninstrumented code once both threads run.",
+        "That the tool needs a larger history size, which is the usual reason the second access stack is missing from a report."
+      ],
+      "correctIndex": 0,
+      "explanation": "The tool instruments compiler-visible memory accesses and understands std::atomic; hand-rolled assembly and intrinsic loads pass straight through unseen. Custom synchronization is likewise invisible unless annotated with the acquire and release annotation hooks. Building lock-free code from std::atomic is what makes it checkable at all.",
+      "sourceAnchor": "579-concurrency-stress-and-soak-testing",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q23",
+      "prompt": "A team's CI builds one binary with both -fsanitize=thread and -fsanitize=address to catch everything in a single run. What is wrong?",
+      "options": [
+        "The two sanitizers are mutually incompatible and require separate build configurations, so the combination cannot be built and run as one target.",
+        "The combination works but multiplies slowdown to roughly a hundredfold, which makes the run too slow for continuous integration.",
+        "The address sanitizer's redzones perturb layout enough that the thread sanitizer's vector clocks lose precision on shared members.",
+        "Nothing is wrong; the standard recommendation is to combine them and add the undefined-behaviour checks to the same binary."
+      ],
+      "correctIndex": 0,
+      "explanation": "Thread and address sanitizers cannot be combined and need separate builds — one of the practical limits that makes just run the sanitizer an incomplete answer. Others: roughly five to fifteen times slowdown that can perturb timing until some races become unreachable, bounded per-location access history, and blindness to inline assembly.",
+      "sourceAnchor": "579-concurrency-stress-and-soak-testing",
+      "difficulty": "trap"
+    },
+    {
+      "id": "57-q24",
+      "prompt": "What guarantee does a PCT-style randomized scheduler offer that ordinary stress testing does not?",
+      "options": [
+        "For a bug of depth d it triggers per run with probability at least 1/(n·k^(d-1)) for n threads and k instrumented points, a bound you can multiply by run count.",
+        "It enumerates every interleaving of the instrumented points exhaustively, so a completed run constitutes a proof for that program.",
+        "It guarantees the bug reproduces on the first run once the depth of the bug has been supplied to the scheduler as a parameter.",
+        "It removes the dependence on hardware memory ordering, so a run on x86 covers the reorderings a weak-memory machine would allow."
+      ],
+      "correctIndex": 0,
+      "explanation": "The insight is that most concurrency bugs have small depth — the number of ordering constraints needed to trigger them, typically one to three — so inserting d-1 random priority-change points gives a genuine probabilistic lower bound per run. Stress testing offers only hope; this offers arithmetic you can plan a run budget with.",
+      "sourceAnchor": "5710-randomized-scheduler-testing",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q25",
+      "prompt": "A shop runs its concurrency suite exclusively on pinned, isolated cores to reduce flakiness. What class of bug does this guarantee to miss?",
+      "options": [
+        "Preemption bugs, such as a spinlock held across a preemption, because an isolated core with one thread is essentially never preempted.",
+        "Cache-coherence bugs, because isolated cores do not share the last-level cache with the threads generating contention.",
+        "Store-buffer visibility bugs, because pinning prevents the store buffer from draining between the paired accesses.",
+        "Lifetime bugs, because isolation prevents an object from being destroyed while another core still holds a reference to it."
+      ],
+      "correctIndex": 0,
+      "explanation": "With one thread per isolated core the scheduler never interrupts a critical section, so lock convoys and priority inversions never manifest in testing and appear only when a housekeeping thread lands on the wrong core in production. The remedy is to run the suite deliberately oversubscribed, unpinned, with differentiated priorities.",
+      "sourceAnchor": "5710-randomized-scheduler-testing",
+      "difficulty": "trap"
+    },
+    {
+      "id": "57-q26",
+      "prompt": "What is the practical methodology for applying an exhaustive memory-model checker to a real system?",
+      "options": [
+        "Extract the synchronization skeleton into a tiny standalone harness, verify that, and keep the harness in the repository beside the implementation.",
+        "Run the checker over the whole binary nightly, since partial-order reduction makes program size largely irrelevant to feasibility.",
+        "Replace every std::atomic in the production code with the checker's types behind a macro so release and verification builds stay identical.",
+        "Verify each translation unit independently and compose the per-unit results, since the memory model is compositional across units."
+      ],
+      "correctIndex": 0,
+      "explanation": "State-space explosion limits exhaustive checking to two or three threads with a handful of operations each, so whole-program verification is out of reach. Extracting the skeleton and committing it next to the real code keeps the two edited together; partial-order reduction is what makes even the small cases tractable.",
+      "sourceAnchor": "5711-memory-model-model-checking",
+      "difficulty": "recall"
+    },
+    {
+      "id": "57-q27",
+      "prompt": "Deterministic simulation testing makes a whole run a pure function of the seed. Which requirement is structural and must be designed in?",
+      "options": [
+        "No real threads: components are state machines or coroutines driven by the simulator's event queue, which is the strongest testability argument for a single-writer event loop.",
+        "No dynamic allocation after startup, so that the simulator can reproduce identical heap addresses across runs of the same seed.",
+        "No use of virtual functions anywhere in the system, since dynamic dispatch order varies with the link order chosen by the build.",
+        "No message batching in the I/O layer, because batching makes the simulated event ordering depend on real timing."
+      ],
+      "correctIndex": 0,
+      "explanation": "The four structural requirements are all I/O behind an interface with real and simulated implementations, all time from an injected clock, no real threads, and all randomness from the seeded generator including the simulator's own scheduling and fault choices. Simulation validates logic under adverse orderings, never latency.",
+      "sourceAnchor": "5712-deterministic-simulation",
+      "difficulty": "recall"
+    },
+    {
+      "id": "57-q28",
+      "prompt": "How do you test a thirty-second session heartbeat timeout without the test taking thirty seconds?",
+      "options": [
+        "Inject a virtual clock, advance it 29 seconds and assert the session is alive, then advance 2 more and assert the timeout fired.",
+        "Reduce the timeout to 30 milliseconds through a build-time constant and sleep for that long in the test to observe the transition.",
+        "Fire the timer callback directly from the test and assert on the resulting state, bypassing the timer wheel entirely.",
+        "Run the test under a time-dilating LD_PRELOAD shim that scales the process's view of the monotonic clock by a fixed factor."
+      ],
+      "correctIndex": 0,
+      "explanation": "Advancing a virtual clock fires due timers in timestamp order, so the assertion is exact and instantaneous. Sleeping is both slow everywhere and flaky on a loaded machine, and shortening the timeout tests a different configuration than the one that ships. Ties at the same virtual nanosecond need a stable insertion-order key.",
+      "sourceAnchor": "5713-virtual-clocks",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q29",
+      "prompt": "Why must a capture be checked for kernel drops before it is used as a replay input for gap-recovery logic?",
+      "options": [
+        "A lossy capture produces phantom sequence gaps, so the recovery logic is trained and validated against fiction rather than venue behaviour.",
+        "Dropped packets shift every subsequent capture timestamp, which invalidates the paced replay mode but not the logical one.",
+        "Kernel drops are recorded as zero-length frames, which the decoder will treat as a non-advancing loop and hang on.",
+        "A capture with drops cannot be replayed on the wire at all, because the replay tool refuses files with inconsistent frame counts."
+      ],
+      "correctIndex": 0,
+      "explanation": "The capture tool reports packets dropped by kernel; gaps introduced by the capture host are indistinguishable from gaps on the feed, so every replay-derived conclusion about recovery becomes unsound. Reject lossy captures. Remember too that capture timestamps are capture-point timestamps, not the venue's send time.",
+      "sourceAnchor": "5714-recorded-packet-replay",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q30",
+      "prompt": "Why is failing the n-th fallible operation in turn preferable to injecting failures at random?",
+      "options": [
+        "It deterministically covers every error site in a bounded number of runs with no randomness, making it the error-path analogue of coverage guidance.",
+        "It exercises error sites in the order the code will encounter them in production, which random injection cannot reproduce.",
+        "It avoids the need for a simulated I/O layer, since the counter can be maintained inside the allocator rather than the interface.",
+        "It produces failures that shrink automatically, because the failing operation index is already the minimal description of the case."
+      ],
+      "correctIndex": 0,
+      "explanation": "Run the scenario repeatedly failing the first fallible operation, then the second, and so on until the index exceeds the operation count; every error site is covered deterministically. It composes with deterministic simulation, where the simulator picks the injection point from the seed so each failure replays exactly.",
+      "sourceAnchor": "5715-fault-injection",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q31",
+      "prompt": "A load harness sends the next request only after the previous response arrives and reports a p99 far better than production. What is happening?",
+      "options": [
+        "Coordinated omission: the harness stops sending exactly while the system is slow, so the slow period is under-sampled and the tail is understated.",
+        "The harness is measuring its own request construction cost, which dominates the measurement once the system under test is fast enough.",
+        "Response batching in the system under test collapses many requests into one reply, so most samples record a shared completion time.",
+        "The percentile is computed over an interval average, which mathematically cannot exceed the arithmetic mean of the samples."
+      ],
+      "correctIndex": 0,
+      "explanation": "Closed-loop generation lets the system throttle its own measurement, hiding precisely the intervals that matter and understating the tail by orders of magnitude. The fix is open-loop sending on a fixed schedule, with latency recorded against the intended send time, and harness stalls recorded rather than hidden.",
+      "sourceAnchor": "5716-load-burst-and-soak-testing",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q32",
+      "prompt": "Which failover fault class is most often untested, and what danger does it create?",
+      "options": [
+        "A stopped-but-alive primary, where heartbeats cease while the process still holds resources and later resumes to act on stale state.",
+        "A clean shutdown, where the relinquish message races the standby's promotion and both sides briefly believe they are secondary.",
+        "A standby crash during normal operation, which leaves the primary with no failover target and no alarm that this has happened.",
+        "A primary restart after a successful failover, which reloads configuration files that have drifted from the standby's copy."
+      ],
+      "correctIndex": 0,
+      "explanation": "A stopped process, a long stall, or an asymmetric partition all stop heartbeats without stopping the primary, and the resumed primary produces split-brain. The assertion is fencing: a monotonic epoch token checked by the exchange session or a shared resource, with a resumed old primary's orders rejected.",
+      "sourceAnchor": "5717-failover-testing",
+      "difficulty": "application"
+    },
+    {
+      "id": "57-q33",
+      "prompt": "In a hardware-in-the-loop rig, why must latency measurement come from an external tap rather than in-process timestamps?",
+      "options": [
+        "In-process timestamps omit driver, NIC, and PCIe time, so any figure taken that way understates the true wire-to-wire latency.",
+        "In-process timestamps use the system clock, which is disciplined by NTP and therefore steps during the measurement window.",
+        "The rig's isolated cores have no access to the timestamp counter, so an in-process reading falls back to a coarse clock source.",
+        "External taps are required because the venue emulator refuses connections from hosts that timestamp inside the application."
+      ],
+      "correctIndex": 0,
+      "explanation": "Only a passive tap or port-mirror capture with hardware timestamps on both market-data ingress and order egress captures everything outside the process. Hardware-in-the-loop exists precisely for what simulation cannot reach: NIC rings and coalescing, bypass and FPGA paths, switch buffering, and BIOS and C-state effects.",
+      "sourceAnchor": "5718-hardware-in-the-loop-testing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "57-q34",
+      "prompt": "A team quotes an 8 microsecond round trip measured over 127.0.0.1 as evidence of their stack's latency. Why is the number meaningless?",
+      "options": [
+        "Loopback bypasses the driver, NIC, DMA, and interrupts, and a kernel-bypass stack does not intercept it, so it measures a path that does not exist in production.",
+        "Loopback traffic is processed at a lower interrupt priority, so the measured figure is systematically worse than the production path.",
+        "Loopback frames skip checksum computation, which is the dominant term in the round trip on any modern server platform.",
+        "The loopback interface has no fixed MTU, so segmentation costs vary run to run and the measurement is not reproducible."
+      ],
+      "correctIndex": 0,
+      "explanation": "Loopback is useful for functional testing and for measuring application processing time, but it removes almost everything that makes the production path expensive. Anything you intend to quote must come from a cable or switch loop — and round trip halved is not one-way latency, since ingress and egress paths are asymmetric.",
+      "sourceAnchor": "5719-loopback-latency-testing",
+      "difficulty": "trap"
+    }
+  ]
+}

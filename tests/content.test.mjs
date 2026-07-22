@@ -43,14 +43,17 @@ test('quiz banks satisfy the public data contract', async () => {
   assert.ok(total >= 1200, `expected at least 1,200 questions, found ${total}`);
 });
 
+test('every chapter has a hand-authored quiz bank', async () => {
+  const rootChapters = (await readdir(root)).filter((file) => /^chapter-\d{2}-.+\.md$/.test(file)).sort();
+  const banks = new Set((await readdir(path.join(root, 'quiz-banks'))).filter((file) => file.endsWith('.json')));
+  const missing = rootChapters.filter((file) => !banks.has(file.replace('.md', '.json')));
+  assert.deepEqual(missing, [], `chapters without an authored quiz bank: ${missing.join(', ')}`);
+  assert.equal(banks.size, rootChapters.length);
+});
+
 test('hand-authored quiz banks meet the authoring standards', async () => {
   const bankDir = path.join(root, 'quiz-banks');
-  let files;
-  try {
-    files = (await readdir(bankDir)).filter((file) => file.endsWith('.json')).sort();
-  } catch {
-    return; // no authored banks yet
-  }
+  const files = (await readdir(bankDir)).filter((file) => file.endsWith('.json')).sort();
 
   for (const file of files) {
     const bank = JSON.parse(await readFile(path.join(bankDir, file), 'utf8'));

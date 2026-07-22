@@ -1,0 +1,537 @@
+{
+  "slug": "chapter-58-native-debugging",
+  "questions": [
+    {
+      "id": "58-q01",
+      "prompt": "Why is attaching a debugger to a live trading process almost always the wrong production move?",
+      "options": [
+        "Attaching stops the world, so market data is dropped, watchdogs trip, and a missed heartbeat can get the exchange session disconnected.",
+        "Attaching rewrites the text segment on attach, which invalidates the instruction cache and permanently slows the process afterwards.",
+        "Attaching requires the process to be relinked with debug support, which production binaries deliberately omit for size reasons.",
+        "Attaching resets the process's scheduling class to the default, which cannot be restored while the debugger remains attached."
+      ],
+      "correctIndex": 0,
+      "explanation": "The safer production sequence is to capture a core with gcore, which stops the process only for the duration of the dump, or to let the process crash into a core and analyse it offline. Live inspection that must not stop the process belongs to uprobes and tracing tools instead.",
+      "sourceAnchor": "581-gdb-and-lldb-fundamentals",
+      "difficulty": "recall"
+    },
+    {
+      "id": "58-q02",
+      "prompt": "You are the same user as the target process but the debugger refuses to attach. What is the usual cause?",
+      "options": [
+        "The Yama ptrace_scope setting, whose default value permits attaching only from a parent process rather than from any same-uid process.",
+        "The process was launched with a different umask, so the debugger cannot open its memory file under the current permissions.",
+        "The binary was stripped, and a debugger cannot ptrace a process whose mapped image has no symbol table available.",
+        "The target has more threads than the debugger's default thread limit, which must be raised before an attach can succeed."
+      ],
+      "correctIndex": 0,
+      "explanation": "It is usually Yama, not file permissions: the scope value of zero allows any same-uid attach, one restricts attaching to a parent, and three forbids it outright. Reaching for chmod or sudo before checking that setting is the classic wasted step.",
+      "sourceAnchor": "581-gdb-and-lldb-fundamentals",
+      "difficulty": "trap"
+    },
+    {
+      "id": "58-q03",
+      "prompt": "How do software and hardware breakpoints differ in mechanism and limits?",
+      "options": [
+        "Software patches the instruction with a trap byte and is unlimited but modifies text; hardware uses four debug registers, modifies nothing, and covers 1, 2, 4, or 8 aligned bytes.",
+        "Software is implemented by the kernel scheduler and is unlimited; hardware is implemented by the debugger and is limited only by available memory for its tables.",
+        "Software works only on code compiled with debug information; hardware works on any address but requires the page to be writable at the time it is set.",
+        "Software traps on execute only; hardware traps on execute only as well, but with lower latency because no signal is delivered to the debugger."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each software breakpoint hit costs two context switches to the debugger, which makes one in a ten-million-event loop unusable, and text modification means a checksum over the code section fails under a debugger. Hardware breakpoints are the choice for read-only pages and for JIT or self-modifying code.",
+      "sourceAnchor": "582-breakpoints-and-watchpoints",
+      "difficulty": "recall"
+    },
+    {
+      "id": "58-q04",
+      "prompt": "A watchpoint on a 64-byte structure makes the program roughly a thousand times slower. Why, and what is the fix?",
+      "options": [
+        "The region exceeds the debug registers' capacity, so the debugger falls back to single-stepping and re-evaluating; watch the single 8-byte field that gets corrupted.",
+        "The debugger recomputes the structure's checksum on every access; disable pretty printing so the raw bytes are compared instead.",
+        "Each access traps twice because both a read and a write watchpoint are installed; use the write-only form to halve the cost.",
+        "The structure crosses a page boundary, forcing a page-protection trap per access; align the object so it fits within one page."
+      ],
+      "correctIndex": 0,
+      "explanation": "A hardware watchpoint traps in the CPU and is essentially free; a software watchpoint single-steps the whole program and re-evaluates the expression after every instruction. The confirmation message distinguishes the two, and narrowing the watch to one 8-byte field usually gets the hardware path back.",
+      "sourceAnchor": "582-breakpoints-and-watchpoints",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q05",
+      "prompt": "Why does the -l flag matter when setting a watchpoint on obj->field?",
+      "options": [
+        "Without it the watchpoint tracks the expression and is deleted when the expression's scope exits, rather than watching the address itself.",
+        "Without it the watchpoint applies to the whole object rather than the named member, which forces the slow single-stepping mode.",
+        "Without it the watchpoint is evaluated only when the debugger regains control, so writes from other threads are missed entirely.",
+        "Without it the watchpoint is placed on the pointer variable instead of the member, so it fires on every reassignment of the pointer."
+      ],
+      "correctIndex": 0,
+      "explanation": "The flag makes the debugger resolve the expression once and watch the resulting address, which is what the corruption workflow needs: run to construction, take the address of the field, watch that location, continue, and the debugger stops on the exact instruction that wrote it, with a stack.",
+      "sourceAnchor": "582-breakpoints-and-watchpoints",
+      "difficulty": "trap"
+    },
+    {
+      "id": "58-q06",
+      "prompt": "You need to stop when order_id equals 99123 in a function called millions of times per second. Which approach avoids the pathological slowdown?",
+      "options": [
+        "Compile a debug build containing an explicit comparison that executes a trap instruction when the id matches, so no per-hit debugger round trip occurs.",
+        "Set a plain breakpoint with an ignore count equal to the expected number of prior hits, which skips them without evaluating anything.",
+        "Set the conditional breakpoint but raise the debugger's expression cache size so the condition compiles once and is reused per hit.",
+        "Set a hardware breakpoint on the function entry, since hardware breakpoints evaluate their condition in the CPU rather than in the debugger."
+      ],
+      "correctIndex": 0,
+      "explanation": "A breakpoint condition is evaluated in the debugger, so every hit costs two context switches whether or not the condition holds; an ignore count pays exactly the same per-hit price. An in-code comparison that traps, a dprintf, a fast scripted stop predicate, or a uprobe are the practical alternatives.",
+      "sourceAnchor": "582-breakpoints-and-watchpoints",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q07",
+      "prompt": "What does an optimized-out variable actually indicate about the debug information?",
+      "options": [
+        "The location expression covers PC ranges, and at this program counter the value lives nowhere — the register was reused, or the value was folded away or never materialized.",
+        "The debug information for that compilation unit was stripped, so no location can be resolved for any variable in the enclosing function.",
+        "The variable was declared in a header that was compiled with different flags, so its type description and its location record disagree.",
+        "The debugger lacks a pretty printer for the variable's type and therefore declines to display any representation of it."
+      ],
+      "correctIndex": 0,
+      "explanation": "DWARF describes a variable's location as an expression that varies by program counter range, so the debugger is telling the truth rather than failing. Recovery options are to move to a frame or PC where the value is live, read the holding register directly, or recompute it from values that are available.",
+      "sourceAnchor": "583-debugging-optimized-code",
+      "difficulty": "recall"
+    },
+    {
+      "id": "58-q08",
+      "prompt": "A team builds production without -g to avoid the runtime cost. What is wrong with that reasoning?",
+      "options": [
+        "The flag only adds non-loaded debug sections and does not change the generated code, so it costs nothing at runtime while its absence costs every future postmortem.",
+        "The flag disables some optimizations at -O2, so the cost is real but is better paid by lowering the optimization level to -Og instead.",
+        "The flag increases the resident set because the debug sections are mapped at load time, which matters only on memory-constrained hosts.",
+        "The flag forces frame pointers to be retained, which is the actual source of the roughly one percent slowdown they are avoiding."
+      ],
+      "correctIndex": 0,
+      "explanation": "Debug information lives in sections that are never loaded and never executed; code generation is identical with and without it. The correct default is to build with full optimization plus debug info, then split or strip the debug data into a symbol store keyed by build ID.",
+      "sourceAnchor": "583-debugging-optimized-code",
+      "difficulty": "trap"
+    },
+    {
+      "id": "58-q09",
+      "prompt": "A crash reproduces reliably at -O2 but disappears at -O0. What is the productive next step?",
+      "options": [
+        "Run the optimized build under the sanitizers, since the cause is usually undefined behaviour, a race, or uninitialized memory rather than a compiler bug.",
+        "Debug at -O0 anyway and add printouts until the timing shifts enough for the fault to reappear in the unoptimized build.",
+        "Bisect the optimization passes with individual -fno- flags until the pass responsible for miscompiling the function is identified.",
+        "Rebuild at -O2 with debug info disabled, since the debug sections are the most likely cause of the behaviour difference between the two builds."
+      ],
+      "correctIndex": 0,
+      "explanation": "Disappearing at -O0 points at undefined behaviour the optimizer exploited, a race whose window changed with scheduling, or uninitialized memory that happened to be zero in the larger unoptimized frames. Sanitizers find the defect rather than the symptom; -Og or disabling inlining is a middle ground that often keeps the bug alive.",
+      "sourceAnchor": "583-debugging-optimized-code",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q10",
+      "prompt": "A backtrace from an optimized build shows five frames for what you know is a twenty-call-deep path. What explains the discrepancy?",
+      "options": [
+        "Inlined callees are not physical frames and tail calls remove the caller's frame entirely, so the physical stack is much shallower than the source-level call chain.",
+        "The debugger truncates backtraces at five frames by default and the limit must be raised before the full chain becomes visible.",
+        "Frame pointers were omitted, which caps unwinding at the number of frames described by the innermost unwind table entry.",
+        "The intermediate functions had internal linkage, and functions without external symbols are skipped when the stack is walked."
+      ],
+      "correctIndex": 0,
+      "explanation": "With debug information the debugger can display inlined subroutine records, but they are not real frames, so operations like finishing a frame behave oddly and a raw stack read shows nothing of them. Sibling-call optimization deletes the caller's frame outright; disabling it in debug builds restores the link.",
+      "sourceAnchor": "583-debugging-optimized-code",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q11",
+      "prompt": "Which statement correctly describes the contents of a core dump?",
+      "options": [
+        "It holds dumped memory, every thread's registers, and the signal information, but not descriptor contents, kernel state, or any history of how the process arrived there.",
+        "It holds the full address space including pages never faulted in, plus the open descriptors' contents, so file state can be reconstructed offline.",
+        "It holds a snapshot of memory and a recording of the last few thousand instructions, which is what makes reverse stepping possible from a core.",
+        "It holds only the faulting thread's stack and registers, which is why other threads must be captured separately before the process dies."
+      ],
+      "correctIndex": 0,
+      "explanation": "The signal information is the most valuable single field for a segmentation fault, since it carries the faulting address. The absence of history is exactly the limitation that record-and-replay tools address, by making execution deterministic so a replay session supports reverse execution and reverse watchpoints.",
+      "sourceAnchor": "584-core-dumps",
+      "difficulty": "recall"
+    },
+    {
+      "id": "58-q12",
+      "prompt": "A process with 64 GB of huge-page-backed arenas writes cores that take minutes and fill the disk. Which pair of mitigations is correct?",
+      "options": [
+        "Clear the huge-page and shared bits in the process's coredump filter, and mark the large ring buffers as do-not-dump so only the stacks and heap you need remain.",
+        "Lower the core size limit so the kernel truncates the dump, and redirect the output to network storage so the local disk is never filled.",
+        "Disable huge pages for the arenas and reduce the resident set, since the dump size is governed by the number of distinct mappings rather than their size.",
+        "Compress the dump inline by setting the core pattern to a compressor, and reduce the arena count so fewer regions must be serialized."
+      ],
+      "correctIndex": 0,
+      "explanation": "The coredump filter is a per-process, inheritable bitmask selecting which mapping classes are dumped, and clearing the huge-page and shared bits typically shrinks a core by orders of magnitude. Excluding specific large regions via a memory advice call is the surgical version, and cores should go to fast local storage with capped retention.",
+      "sourceAnchor": "584-core-dumps",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q13",
+      "prompt": "Which workflow lets you land directly on the instruction that corrupted a value, rather than on the crash it eventually caused?",
+      "options": [
+        "Record the run with a deterministic record-and-replay tool, replay to the crash, watch the corrupted address, and reverse-continue to the writing instruction.",
+        "Take a core at the crash, set a watchpoint on the corrupted address in the core, and continue, since a core preserves the register state needed to resume.",
+        "Enable the allocator's perturbation option so freed memory is filled, then compare the pattern at the crash to determine which write came first.",
+        "Attach after the crash with the reset-on-fault option so the kernel restarts the process from the last checkpoint and re-executes the write."
+      ],
+      "correctIndex": 0,
+      "explanation": "Deterministic recording works by serializing execution onto one core, recording syscall results, and disabling address randomization; replay then supports reverse execution and reverse watchpoints. The costs are roughly 1.2 to 2 times record overhead, single-core execution, and a requirement for performance-counter access.",
+      "sourceAnchor": "584-core-dumps",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q14",
+      "prompt": "A process crashes, the core size limit is unlimited, yet no core file appears in the configured directory. What should you check first?",
+      "options": [
+        "Whether the kernel's core pattern begins with a pipe, in which case the dump was handed to a collector daemon and must be retrieved through its own tooling.",
+        "Whether the filesystem was mounted read-only at the moment of the crash, which silently discards the write without any kernel message.",
+        "Whether the crashing thread was running on an isolated core, since dumps from isolated cores are written only after the housekeeping thread schedules.",
+        "Whether the signal was delivered while a handler was installed, since an installed handler suppresses the dump regardless of what the handler does."
+      ],
+      "correctIndex": 0,
+      "explanation": "A core pattern starting with a pipe sends the dump to a program such as a system core collector, so the file never appears where expected and is retrieved through that daemon's list and debug commands. A setuid process, or one that cleared its dumpable flag, does not dump at all.",
+      "sourceAnchor": "584-core-dumps",
+      "difficulty": "trap"
+    },
+    {
+      "id": "58-q15",
+      "prompt": "What is the cost model of a std::stacktrace_entry?",
+      "options": [
+        "The entry is essentially a program counter; the description, file, and line are resolved lazily by reading debug information, which is slow, allocating, and may take locks.",
+        "The entry stores the fully symbolized description at capture time, so iteration is cheap but capturing the trace itself dominates the cost.",
+        "The entry stores a compressed DWARF slice per frame, making both capture and later inspection independent of the debug information on disk.",
+        "The entry caches its symbolization process-wide after first use, so only the first trace in a program pays the resolution cost."
+      ],
+      "correctIndex": 0,
+      "explanation": "Capturing walks the stack and stores addresses, which is comparatively cheap but still allocates — the type is allocator-aware, so a monotonic resource can be supplied. Resolution costs milliseconds, may open files, and takes locks, which is also why the facility is not async-signal-safe.",
+      "sourceAnchor": "585-stdstacktrace",
+      "difficulty": "recall"
+    },
+    {
+      "id": "58-q16",
+      "prompt": "You want stack traces from a latency-sensitive path. What is the right split of work?",
+      "options": [
+        "Capture raw return addresses into a fixed array in the hot path and symbolize them in a separate process or offline, never in the latency-critical path.",
+        "Capture and symbolize immediately but on a background thread, so the hot path only pays for the handoff of the completed trace.",
+        "Capture and symbolize inline but cache the results by address, so only the first occurrence of each distinct stack pays the resolution cost.",
+        "Capture only the top three frames and symbolize them inline, since resolution cost scales linearly with the number of frames requested."
+      ],
+      "correctIndex": 0,
+      "explanation": "Symbolization reads debug information, allocates, and takes locks, so it must never happen on a hot path or inside a signal handler. Capturing addresses with a lightweight unwinder into preallocated storage keeps the cost to microseconds, and shipping addresses plus the build ID lets the symbol store do the rest.",
+      "sourceAnchor": "585-stdstacktrace",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q17",
+      "prompt": "Why has the industry swung back toward keeping frame pointers in production builds?",
+      "options": [
+        "Unwinding becomes a trivial linked-list walk, so profilers, tracers, and crash handlers all unwind faster and more reliably for roughly one percent of performance.",
+        "Frame pointers eliminate the need for unwind information entirely, allowing binaries to be shipped without the exception-handling sections.",
+        "Frame pointers let the debugger recover variables that would otherwise be optimized out, because locals must then be spilled to the frame.",
+        "Frame pointers prevent tail-call optimization, which keeps every source-level call visible as a distinct entry in a backtrace."
+      ],
+      "correctIndex": 0,
+      "explanation": "With a frame pointer, the saved pointer and the return address sit at fixed offsets, so each step of the unwind is two loads. Without one, unwinding needs the per-program-counter call frame information, which is correct but expensive and fails in hand-written assembly, some JIT code, or a corrupted stack.",
+      "sourceAnchor": "586-postmortem-register-and-stack-analysis",
+      "difficulty": "recall"
+    },
+    {
+      "id": "58-q18",
+      "prompt": "A core shows the instruction pointer at zero. What happened, and where do you look for the caller?",
+      "options": [
+        "A call through a null or garbage function pointer, or a null vtable slot; the value at the top of the stack is the return address and names the caller.",
+        "The process was killed while in a system call, so the saved user register is zero; the caller must be recovered from the kernel-side stack instead.",
+        "The stack was smashed and the frame pointer chain destroyed; only a scan of the whole address space for return-address candidates can proceed.",
+        "The binary was stripped, so the debugger substitutes zero for an address it cannot map to a symbol; reloading symbols restores the true value."
+      ],
+      "correctIndex": 0,
+      "explanation": "The call pushed a return address before transferring control, so even with no valid instruction pointer the top of the stack identifies the caller. A tiny non-zero value such as eight has the same cause, and an instruction pointer inside a non-executable region means control jumped into data.",
+      "sourceAnchor": "586-postmortem-register-and-stack-analysis",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q19",
+      "prompt": "A segmentation fault reports a faulting address of 0x28. What does that value tell you?",
+      "options": [
+        "It is a null-pointer dereference and the value is the member's offset within the object, which usually identifies the field and therefore the source line.",
+        "It is an unmapped address in the first page, which means an allocation returned a small integer that was then treated as a pointer.",
+        "It is a permission violation on the zero page, which distinguishes a write to read-only memory from a genuinely unmapped access.",
+        "It is a guard-page hit at the very bottom of the stack, indicating deep recursion that exhausted the thread's stack allocation."
+      ],
+      "correctIndex": 0,
+      "explanation": "Dereferencing a member through a null object faults at the member's offset, so the offset narrows the access down to a specific field. Related readings from the same field: a value just below a valid mapping means a guard-page hit from stack overflow, and an all-ones value means an unsigned underflow used as an index or size.",
+      "sourceAnchor": "586-postmortem-register-and-stack-analysis",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q20",
+      "prompt": "Frame pointers are absent, the call frame information does not cover the crash address, and the backtrace is unusable. What technique remains?",
+      "options": [
+        "Dump a few hundred stack words and keep the ones that fall inside executable mappings and are preceded by a call instruction, giving an approximate chain including stale frames.",
+        "Reconstruct the chain from the allocator's metadata, since each frame's locals were allocated from the same arena in call order.",
+        "Rebuild the binary with frame pointers and load the new unwind tables against the existing core, since unwind data is position independent.",
+        "Read the kernel's per-thread stack file for the process, which records each user-space return address as it is pushed."
+      ],
+      "correctIndex": 0,
+      "explanation": "Manual stack scanning identifies plausible return addresses by two tests: the value lands in a mapped executable region, and the bytes just before it decode as a call. False positives from dead frames are the weakness and also a strength, since they show where the code has recently been.",
+      "sourceAnchor": "586-postmortem-register-and-stack-analysis",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q21",
+      "prompt": "In a System V AMD64 frame, when are the integer argument registers still trustworthy as the function's arguments?",
+      "options": [
+        "Only at function entry, before the body reuses them; deeper into the function they hold unrelated values, which is why arguments so often display as unavailable.",
+        "Throughout the function, because the ABI designates them as callee-saved and any use requires saving and restoring them first.",
+        "Only after the prologue completes, because the prologue is where the arguments are copied from the stack into their designated registers.",
+        "Only in leaf functions, because a non-leaf function must spill all arguments to the red zone before making any call."
+      ],
+      "correctIndex": 0,
+      "explanation": "So a crash in the prologue means the first integer argument register still holds the object pointer. Once the body reuses them the values are gone, and recovering an argument means disassembling backwards from the return address in the caller's frame to find the instructions that set it up.",
+      "sourceAnchor": "586-postmortem-register-and-stack-analysis",
+      "difficulty": "recall"
+    },
+    {
+      "id": "58-q22",
+      "prompt": "Why can a fully stripped binary still be unwound even though it cannot be symbolized?",
+      "options": [
+        "The unwind section is an allocated, loaded section required for C++ exception handling, so stripping debug data leaves it intact.",
+        "The dynamic symbol table is never stripped, and unwinding is driven entirely by the exported function addresses it contains.",
+        "The kernel records unwind tables for every mapped executable at load time, independently of what the binary itself carries.",
+        "Unwinding needs only the frame pointer chain, which is a property of the generated code rather than of any section."
+      ],
+      "correctIndex": 0,
+      "explanation": "Exception unwinding needs the call frame information at runtime, so that section is loaded rather than merely descriptive, and it survives stripping while the descriptive debug sections do not. That is exactly why a stripped production binary gives you frame addresses but no names until the symbol store is consulted.",
+      "sourceAnchor": "587-dwarf-and-split-debug-information",
+      "difficulty": "recall"
+    },
+    {
+      "id": "58-q23",
+      "prompt": "What does building with split DWARF change about the link and the shipped binary?",
+      "options": [
+        "Debug information stays in per-object side files that are never linked in, so links are dramatically faster and the binary keeps only a skeleton pointing at them.",
+        "Debug information is compressed inside the binary, so the binary shrinks while remaining fully self-describing to any debugger.",
+        "Debug information is moved into the dynamic symbol table, which the loader maps lazily so the resident cost is paid only when a debugger attaches.",
+        "Debug information is emitted per function rather than per compilation unit, letting the linker discard the parts belonging to unreferenced code."
+      ],
+      "correctIndex": 0,
+      "explanation": "Debug data for a template-heavy program commonly runs five to twenty times the size of the code, so keeping it out of the link is a large win. The side files must remain at their recorded paths or be packaged; the production recipe is optimized plus debug info plus frame pointers plus split debug, stripped, with the artifacts archived by build ID.",
+      "sourceAnchor": "587-dwarf-and-split-debug-information",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q24",
+      "prompt": "What problem do build IDs solve for postmortem analysis?",
+      "options": [
+        "They pair a binary with its debug information cryptographically rather than by name, so a core identifies exactly which symbols each mapped module needs.",
+        "They let the debugger reconstruct the source tree layout at the time of the build, so file and line references resolve without a source checkout.",
+        "They record the optimization flags used, allowing the debugger to compensate for reordering when attributing addresses to source lines.",
+        "They allow a stripped binary to be re-symbolized from its own contents, since the identifier is a reversible digest of the symbol table."
+      ],
+      "correctIndex": 0,
+      "explanation": "A core records the identifier of every mapped module, so the debugger or a network symbol service fetches precisely the right debug data. Without that check, debugging today's core with last week's binary yields a confident and entirely fictional backtrace — the single biggest time sink in postmortem work.",
+      "sourceAnchor": "588-build-ids-and-symbol-servers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "58-q25",
+      "prompt": "You have a thousand cores from a fleet and want to know how many distinct bugs they represent. What is the correct grouping key?",
+      "options": [
+        "A hash of the top few frames' symbolized function names, computed after offline symbolization, because raw addresses vary with randomization and build.",
+        "A hash of the top few frames' raw return addresses, which is cheaper and avoids any dependence on the symbol store being complete.",
+        "The faulting address reported in the signal information, since distinct bugs almost never fault at the same address.",
+        "The build identifier of the crashing module, since a given defect is introduced by one build and fixed in the next."
+      ],
+      "correctIndex": 0,
+      "explanation": "Addresses shift with address randomization and with every rebuild, so hashing them scatters one bug across many buckets. Symbolizing first and hashing names collapses a thousand cores into a handful of distinct defects ranked by frequency, which is what makes fleet-scale triage tractable.",
+      "sourceAnchor": "588-build-ids-and-symbol-servers",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q26",
+      "prompt": "What is the immediate diagnostic signature that distinguishes a deadlock from a livelock?",
+      "options": [
+        "Deadlock shows zero percent CPU with threads parked in futex waits; livelock shows full CPU utilization with no progress counters advancing.",
+        "Deadlock shows full CPU utilization because waiters spin adaptively; livelock shows zero percent because every thread has backed off and parked.",
+        "Deadlock terminates the process once the watchdog fires; livelock never terminates because the threads continue to make syscalls.",
+        "Deadlock produces a rising resident set as blocked work queues up; livelock keeps the resident set flat because no new work is accepted."
+      ],
+      "correctIndex": 0,
+      "explanation": "The two are opposites in CPU terms, which makes the first triage step a glance at utilization. In a busy-poll system the reading is ambiguous, since a healthy poll loop also pegs a core, so the diagnosis must be anchored on application progress counters rather than on CPU alone.",
+      "sourceAnchor": "589-deadlock-diagnosis",
+      "difficulty": "recall"
+    },
+    {
+      "id": "58-q27",
+      "prompt": "From a core, how do you determine which thread holds a contended pthread mutex?",
+      "options": [
+        "Print the mutex object and read the owner field, which holds the owning thread's kernel id, then map that id to a debugger thread number.",
+        "Print the mutex object and read the count field, whose value is the debugger's own thread number for the owning thread.",
+        "Scan every thread's stack for the mutex address, since the owner necessarily has it as a live local at the point it locked.",
+        "Inspect the kernel wait channel for each thread, which names the owner because the futex records the holder rather than the waiters."
+      ],
+      "correctIndex": 0,
+      "explanation": "The glibc mutex structure carries the owning thread id, and a lock value indicating locked-with-waiters is what forces a futex syscall on unlock. Walking from each blocked thread to its lock's owner reveals the cycle. This works for std::mutex because it is a thin wrapper over the same structure.",
+      "sourceAnchor": "589-deadlock-diagnosis",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q28",
+      "prompt": "Every thread is parked in a condition-variable wait, the work queue is non-empty, and the predicate is true. Is this a deadlock?",
+      "options": [
+        "No — there is no lock cycle; it is a lost wakeup, where the predicate became true while no thread was waiting or notify ran without the guarding mutex held.",
+        "Yes — a condition variable holds its associated mutex while waiting, so all threads waiting on it form a cycle through that mutex.",
+        "Yes — a non-empty queue with all threads blocked is the definition of a wait-for cycle, with the queue itself as the contended resource.",
+        "No — it is priority inversion, where a low-priority producer cannot run because the waiting consumers hold the runqueue."
+      ],
+      "correctIndex": 0,
+      "explanation": "A condition-variable wait releases the mutex, so no thread holds a resource another needs and there is no cycle to find. The signature to recognize is everyone waiting with the predicate already true, which points at a notification that happened when no waiter existed or at a predicate mutated without the mutex held.",
+      "sourceAnchor": "589-deadlock-diagnosis",
+      "difficulty": "trap"
+    },
+    {
+      "id": "58-q29",
+      "prompt": "A child process hangs inside the allocator immediately after a fork from a multithreaded parent. What is the cause?",
+      "options": [
+        "The child inherited mutexes locked by threads that do not exist in it, so the allocator's arena lock can never be released and any allocation blocks forever.",
+        "The child inherited the parent's arena but not its memory mappings, so the first allocation faults on an unmapped arena header and retries indefinitely.",
+        "The child's copy-on-write pages must be duplicated before the allocator can proceed, and the duplication cannot complete while the parent still runs.",
+        "The child inherited the parent's thread count in the allocator's bookkeeping, so it waits for threads that will never register themselves."
+      ],
+      "correctIndex": 0,
+      "explanation": "Only the forking thread survives into the child, and any lock held by another thread at fork time stays held forever. That is why only async-signal-safe calls are legal between fork and exec, and why atfork handlers exist. The signature is a child hung in the allocator's internals right after the fork.",
+      "sourceAnchor": "589-deadlock-diagnosis",
+      "difficulty": "trap"
+    },
+    {
+      "id": "58-q30",
+      "prompt": "A process is at 100 percent CPU with no progress. How do you tell a spinning loop from a memory-stalled one without stopping it?",
+      "options": [
+        "Sample hardware counters: high instructions per cycle concentrated in one function indicates a spin, while high cycles with low instructions indicates stalling on memory or false sharing.",
+        "Compare user and system time, since a spin accumulates system time through repeated scheduler yields while a stall accumulates only user time.",
+        "Read the thread's voluntary context switch count, which rises steadily under a spin and stays flat when the thread is memory bound.",
+        "Check the resident set trend, since a spinning loop touches no new pages while a stalled one grows its working set continuously."
+      ],
+      "correctIndex": 0,
+      "explanation": "A flat profile dominated by one function with high instruction throughput is an infinite loop; a profile dominated by an atomic read-modify-write with low throughput is contention. Sampling profilers and counter reads work against a live process with negligible perturbation, unlike attaching a debugger.",
+      "sourceAnchor": "5810-livelock-and-cpu-spin-diagnosis",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q31",
+      "prompt": "Why is CPU utilization an unreliable health signal in a low-latency system?",
+      "options": [
+        "A healthy busy-poll loop is also pegged at full utilization, so only application progress counters distinguish normal operation from a hang.",
+        "Utilization is sampled over a window long enough that microsecond stalls are averaged away, so it never reflects latency-relevant behaviour.",
+        "Isolated cores are excluded from the kernel's utilization accounting, so the reported figure omits exactly the threads that matter.",
+        "Utilization counts time spent in interrupt handlers against whichever thread was interrupted, which systematically overstates application work."
+      ],
+      "correctIndex": 0,
+      "explanation": "Busy polling deliberately consumes a whole core, so a spin bug and correct operation look identical from utilization alone. The diagnosis has to be based on whether counters advance, and the same trap runs the other way in blocking systems, where low utilization can hide a stall.",
+      "sourceAnchor": "5810-livelock-and-cpu-spin-diagnosis",
+      "difficulty": "trap"
+    },
+    {
+      "id": "58-q32",
+      "prompt": "A process aborts inside free with a message about an invalid next size. Where is the defect?",
+      "options": [
+        "Elsewhere and earlier: an adjacent-block overflow overwrote allocator metadata, and the abort is the consequence rather than the cause.",
+        "In the allocator, since a correct program cannot cause the allocator's own consistency checks to fail during a plain deallocation.",
+        "In the freeing call site, which passed a pointer that was offset from the original allocation by a small positive amount.",
+        "In a concurrent thread that freed the same block, since only a double free can produce a size inconsistency in the block header."
+      ],
+      "correctIndex": 0,
+      "explanation": "The defining property of heap corruption is that the crash is far from the bug in both time and space, and the allocator's messages about invalid sizes or corrupted top all mean metadata was overwritten by an overflow. Reproducing under the address sanitizer moves the report back to the offending write.",
+      "sourceAnchor": "5811-memory-corruption-diagnosis",
+      "difficulty": "recall"
+    },
+    {
+      "id": "58-q33",
+      "prompt": "An invariant is violated intermittently but no sanitizer reports anything about memory. Which tool matches the symptom?",
+      "options": [
+        "The thread sanitizer, because a race producing torn state involves legitimately allocated, initialized memory that the memory-error tools cannot flag.",
+        "The address sanitizer with stack-use-after-return enabled, since intermittent invariant violations are almost always dangling stack references.",
+        "The memory sanitizer with origin tracking, since an intermittently wrong value indicates an uninitialized read whose origin must be traced.",
+        "Valgrind's memory checker, since it needs no rebuild and detects both invalid and uninitialized accesses that the compiler-based tools miss."
+      ],
+      "correctIndex": 0,
+      "explanation": "The tools detect non-overlapping defect classes and cannot be combined into one build: memory errors, uninitialized reads, and races each need their own. A race that tears a wide structure, or a use-after-free hidden inside a deferred reclamation scheme, leaves the memory validly allocated throughout, so only happens-before reasoning finds it.",
+      "sourceAnchor": "5811-memory-corruption-diagnosis",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q34",
+      "prompt": "What is the most effective way to enforce a no-allocation policy on a hot path?",
+      "options": [
+        "Interpose a global allocation operator that executes a trap instruction while a flag is set, so the fault's stack points directly at the offending call site.",
+        "Increment a counter in an interposed allocation operator and assert on the total after the section, which localizes the regression to that section.",
+        "Profile allocations with a heap profiler during a soak run and review the top allocation sites for anything that appears in hot-path stacks.",
+        "Set the allocator's arena maximum to one so any hot-path allocation contends visibly and shows up as a latency spike in the profile."
+      ],
+      "correctIndex": 0,
+      "explanation": "Trapping gives an immediate fault with the offending stack, which is strictly more useful than a count that tells you how many but not where. The same assert-the-absence pattern extends to syscalls via a filter and to page faults via minor-fault deltas, and together those three define a clean hot path checkably in continuous integration.",
+      "sourceAnchor": "5812-heap-debugging",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q35",
+      "prompt": "A thread-per-connection service shows enormous virtual size and stepped resident growth, but the leak checker reports nothing. What is the likely explanation?",
+      "options": [
+        "The allocator creates a large per-thread arena up to a multiple of the core count, so arena growth and fragmentation inflate the footprint without leaking anything.",
+        "The leak checker only reports at exit, and a long-running service never exits, so leaks accumulate invisibly and appear as stepped growth.",
+        "Freed memory is returned to the allocator but never to the kernel until the process exits, so all resident growth is permanent by design.",
+        "Thread stacks are allocated eagerly at their maximum size, so each connection commits its full stack limit as resident memory immediately."
+      ],
+      "correctIndex": 0,
+      "explanation": "Per-thread arenas produce a footprint that looks alarming and is not a leak; capping the arena count or switching allocator is the standard mitigation, and trimming returns free top-of-heap memory that deallocation alone leaves behind. Exit-time leak checking is separately useless here, so a periodic recoverable check is used instead.",
+      "sourceAnchor": "5812-heap-debugging",
+      "difficulty": "trap"
+    },
+    {
+      "id": "58-q36",
+      "prompt": "Which pair of choices is essential for a crash handler that must still leave a usable core dump?",
+      "options": [
+        "Install it on an alternate signal stack, and finish by restoring the default disposition and re-raising so the kernel writes the core with the original context.",
+        "Install it with the restart flag, and finish by calling the exit function after the diagnostic record has been flushed to its descriptor.",
+        "Install it on the thread's own stack for locality, and finish by longjmp-ing to a recovery point so the process can continue and dump later.",
+        "Install it for every signal including terminating ones, and finish by forking a child that writes the dump while the parent continues running."
+      ],
+      "correctIndex": 0,
+      "explanation": "Without an alternate stack, a stack-overflow fault runs the handler on the exhausted stack, faults again, and produces no output at all. Calling any exit function destroys the most valuable artifact available, so the correct ending restores the default handler and re-raises the original signal.",
+      "sourceAnchor": "5813-crash-handler-limitations",
+      "difficulty": "application"
+    },
+    {
+      "id": "58-q37",
+      "prompt": "Why is capturing a std::stacktrace from inside a segmentation-fault handler formally unsound and practically dangerous?",
+      "options": [
+        "It allocates and may take the loader lock, so if the fault happened inside the allocator the handler deadlocks and you get a hung process with no report at all.",
+        "It reads the debug sections, which are unmapped by the kernel once a fatal signal has been raised, so the call returns an empty trace.",
+        "It runs on the alternate signal stack, which is too small to hold the symbolized frames and therefore overflows it immediately.",
+        "It resets the signal disposition as a side effect of unwinding, so a second fault inside the handler terminates without a core."
+      ],
+      "correctIndex": 0,
+      "explanation": "Only async-signal-safe functions are legal in a handler, which rules out allocation and therefore strings, streams, formatting into dynamic buffers, and stack capture. Heap corruption commonly faults inside the allocator with its lock already held, which turns the unsafe call into a guaranteed hang.",
+      "sourceAnchor": "5813-crash-handler-limitations",
+      "difficulty": "trap"
+    },
+    {
+      "id": "58-q38",
+      "prompt": "Where should the responsibility for cancelling live orders sit when a trading process crashes?",
+      "options": [
+        "Outside the crashing process — an external watchdog or risk process observing the missing heartbeat, plus the exchange's cancel-on-disconnect behaviour.",
+        "Inside the crash handler, which should send the cancel messages first and only then restore the default disposition and re-raise.",
+        "Inside a dedicated thread that the handler signals, so the cancels are sent from a context that is not itself in a signal handler.",
+        "Inside the exchange session library, which should detect the fault via its own handler and flush pending cancels before the process dies."
+      ],
+      "correctIndex": 0,
+      "explanation": "A crashing process cannot be trusted to clean up after itself: a send may block, may need a lock, or may target an already-broken socket, and the handler is bound by async-signal-safety anyway. Putting the safety action in a separate observer removes the dependency on the failed process entirely.",
+      "sourceAnchor": "5813-crash-handler-limitations",
+      "difficulty": "application"
+    }
+  ]
+}
