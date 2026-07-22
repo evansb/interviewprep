@@ -1,0 +1,397 @@
+{
+  "slug": "chapter-72-anti-entropy-and-dissemination",
+  "questions": [
+    {
+      "id": "72-q01",
+      "prompt": "Why do replicas in a leaderless (Dynamo-style) system diverge as a normal steady state rather than an exception?",
+      "options": [
+        "The write path deliberately waits for only W of N replicas, so dropped messages, downed nodes, and concurrent writes routinely leave some replicas stale.",
+        "Replicas run different versions of the database software that store values in incompatible formats.",
+        "The coordinator randomly corrupts one replica's value on every write to test the repair machinery.",
+        "Clocks on the replicas are never synchronized, so each replica computes a different value for every key."
+      ],
+      "correctIndex": 0,
+      "explanation": "Availability and latency require acknowledging after W < N acks, so a replica can miss a write via a dropped message, an outage, or a concurrent write with no leader to order it. Correctness rests on eventual convergence, not on never diverging.",
+      "sourceAnchor": "721-the-problem-replicas-diverge",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q02",
+      "prompt": "What is the essential difference between foreground and background repair?",
+      "options": [
+        "Foreground repair runs on the client read/write path and covers only touched keys; background repair runs off the path and covers all keys including cold ones.",
+        "Foreground repair uses Merkle trees while background repair uses read repair exclusively.",
+        "Foreground repair is only used by single-leader systems; background repair is only for leaderless systems.",
+        "Foreground repair reconciles metadata while background repair reconciles nothing but tombstones."
+      ],
+      "correctIndex": 0,
+      "explanation": "Foreground techniques like read repair and hinted handoff are low-latency but limited to keys clients touch; background Merkle repair is periodic and expensive but sweeps every key, so a never-read key can only be fixed by the background backstop.",
+      "sourceAnchor": "722-anti-entropy-convergence-and-repair",
+      "difficulty": "recall"
+    },
+    {
+      "id": "72-q03",
+      "prompt": "In Petrov's overview, why is direct notification/broadcast considered fragile compared to gossip?",
+      "options": [
+        "It has no built-in redundancy or retry, so if the source dies mid-broadcast or a target is briefly unreachable, that target may never learn the fact.",
+        "It sends far more messages than gossip and therefore saturates the network on every update.",
+        "It can only deliver messages to nodes in the same rack, so remote replicas are never reached.",
+        "It requires every node to hold the full dataset in memory before any broadcast can begin."
+      ],
+      "correctIndex": 0,
+      "explanation": "Broadcast is cheap in messages and immediate but offers a single path to each target with no topological retry. Gossip trades extra messages for redundant paths so no single failure strands a node.",
+      "sourceAnchor": "723-dissemination-approaches-the-overview",
+      "difficulty": "recall"
+    },
+    {
+      "id": "72-q04",
+      "prompt": "During a quorum read, how does read repair fix a stale replica?",
+      "options": [
+        "The coordinator selects the winning version from the responses, returns it, and writes that value back to any replica that returned a stale version.",
+        "The stale replica detects its own staleness by comparing timestamps and pulls the fresh value from a random peer.",
+        "The coordinator deletes the key from every replica and forces the client to write it again.",
+        "The background Merkle process is triggered synchronously to rebuild trees for the whole token range."
+      ],
+      "correctIndex": 0,
+      "explanation": "The coordinator already has all responses, so comparing versions and issuing a corrective write to laggards is cheap. It heals exactly the read-hot key set at the moment a client cares about that key.",
+      "sourceAnchor": "724-read-repair",
+      "difficulty": "recall"
+    },
+    {
+      "id": "72-q05",
+      "prompt": "What does blocking (synchronous) read repair provide that asynchronous read repair does not?",
+      "options": [
+        "It waits for repair acks before answering, so a later quorum read is guaranteed to see the repaired value even with minimally overlapping quorums, at the cost of tail latency.",
+        "It repairs cold keys that no client ever reads, giving full-dataset convergence on every read.",
+        "It removes the need for Merkle-tree repair entirely by fixing every replica on the first read.",
+        "It guarantees the write is durably fsynced on all N replicas before the client sees success."
+      ],
+      "correctIndex": 0,
+      "explanation": "By pushing the fresh value into laggards before the read completes, blocking repair closes the residual gap that dropped writes leave in an R+W>N scheme, adding an ordering guarantee. Async repair is best-effort and lower latency.",
+      "sourceAnchor": "725-blocking-vs-asynchronous-read-repair",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q06",
+      "prompt": "How does a digest read reduce bandwidth on a quorum read?",
+      "options": [
+        "It requests the full value from one replica and only a hash from the others; data beyond one copy moves only when a digest mismatches.",
+        "It compresses each replica's full response with a dictionary encoder before sending it over the wire.",
+        "It reads from a single replica and skips the quorum entirely, trusting that replica's value.",
+        "It sends the client a hash and lets the client fetch the value directly from the nearest replica."
+      ],
+      "correctIndex": 0,
+      "explanation": "On the common no-conflict path only one payload plus tiny hashes move; a mismatch escalates to a full read of the disagreeing replicas. It is the read-path analogue of the Merkle idea: summarize to detect, transfer to repair.",
+      "sourceAnchor": "726-digest-reads-saving-bandwidth",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q07",
+      "prompt": "What is hinted handoff?",
+      "options": [
+        "When a replica is down during a write, the coordinator stores a hint recording the owed write and replays it to the replica once it recovers.",
+        "A technique where the client caches its own writes and replays them if any read returns a stale value.",
+        "A background job that rebuilds Merkle trees whenever a node rejoins the cluster.",
+        "A gossip message that hints to peers which token ranges they should repair next."
+      ],
+      "correctIndex": 0,
+      "explanation": "The hint proactively fills the gap left by a transient outage instead of waiting for a read or full repair. Hints carry a TTL (max_hint_window, roughly 3 hours by default); past it, collection stops and full repair is expected.",
+      "sourceAnchor": "727-hinted-handoff",
+      "difficulty": "recall"
+    },
+    {
+      "id": "72-q08",
+      "prompt": "Why does a sloppy quorum weaken the consistency guarantee of R + W > N?",
+      "options": [
+        "The W acking nodes during a failure include stand-in hint holders, not the N owners, so a later strict read of the owners can miss the value until handoff completes.",
+        "It lowers W below a majority, so two writes can both succeed without overlapping at all.",
+        "It disables version vectors, making concurrent writes silently overwrite one another.",
+        "It stores hints only in memory, so any node restart loses the acknowledged write immediately."
+      ],
+      "correctIndex": 0,
+      "explanation": "R+W>N guarantees the read and write sets intersect by node only when both sets are the N owners. A sloppy quorum writes to non-owners for availability, so the value can sit as hints invisible to a normal preference-list read until it is handed off.",
+      "sourceAnchor": "728-sloppy-quorums-and-hinted-handoff",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q09",
+      "prompt": "What is a hint storm and how is it mitigated?",
+      "options": [
+        "When a long-down node returns, all hint holders replay at once and can overwhelm it; throttling, the hint-window TTL, and jittered replay times mitigate it.",
+        "When gossip fan-out is too high, duplicate hints flood the network and crash the coordinator.",
+        "When a Merkle tree grows too deep, its hints exceed memory and the build aborts.",
+        "When too many clients read the same hot key, read repair storms overwrite the value repeatedly."
+      ],
+      "correctIndex": 0,
+      "explanation": "A recovered node under heavy prior write load faces a thundering herd of simultaneous hint replays that can knock it back over. Backpressure, the TTL that caps backlog, and randomized replay start times spread the load.",
+      "sourceAnchor": "729-hint-storms-and-handoff-failure-modes",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q10",
+      "prompt": "Why can hinted handoff never replace periodic Merkle-tree repair?",
+      "options": [
+        "A hint is durable only on its holder, so if that holder dies before handoff the hint is lost and the gap persists until a full repair sweeps it.",
+        "Hinted handoff only works for reads, while Merkle repair only works for writes.",
+        "Hints cannot represent deletes, so tombstones must always be reconciled by Merkle trees.",
+        "Merkle repair runs on the client path and is therefore always faster than replaying hints."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because a hint lives only on the node that stored it, a holder crash or disk failure before replay destroys it. Hints reduce repair work but can vanish, so the background repair backstop must assume they can be lost.",
+      "sourceAnchor": "729-hint-storms-and-handoff-failure-modes",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q11",
+      "prompt": "How does a Merkle tree let two replicas find divergent data cheaply?",
+      "options": [
+        "They compare roots first (equal means identical), then descend only into subtrees whose hashes differ, pinpointing divergent leaf ranges in O(log M) comparisons.",
+        "Each replica sends its entire sorted key list and the other diffs it line by line in O(M) time.",
+        "They exchange Bloom filters of their keys and treat any filter mismatch as a divergent range.",
+        "They compare only the newest key on each replica and assume the rest of the range matches."
+      ],
+      "correctIndex": 0,
+      "explanation": "Leaves hash key sub-ranges and internal nodes hash their children, so an equal root proves whole-dataset agreement in one comparison, and descent transfers only the data in differing leaf ranges rather than the whole dataset.",
+      "sourceAnchor": "7210-merkle-trees-for-anti-entropy",
+      "difficulty": "recall"
+    },
+    {
+      "id": "72-q12",
+      "prompt": "What is the dominant cost of using Merkle trees for anti-entropy, and why does it shape scheduling?",
+      "options": [
+        "Building the tree is O(M) because every key/value must be hashed, so repair reads the whole range and competes with live traffic, forcing throttled off-peak scheduling.",
+        "Comparing roots is O(M) because both full trees must be transmitted before any comparison can start.",
+        "Streaming divergent ranges is O(M) regardless of how many keys actually differ between replicas.",
+        "Storing the tree is O(M squared) because each internal node duplicates all of its descendants' hashes."
+      ],
+      "correctIndex": 0,
+      "explanation": "Detection is cheap (O(log M)) but construction requires hashing every key in the range, which in Cassandra is a validation compaction that reads the whole range. That heavy full read is why repair is throttled and run infrequently.",
+      "sourceAnchor": "7210-merkle-trees-for-anti-entropy",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q13",
+      "prompt": "In Cassandra's nodetool repair, what happens after Merkle trees are compared and mismatching leaf ranges are found?",
+      "options": [
+        "Replicas stream only the differing data for those ranges to one another and reconcile by cell timestamp so each ends with the union.",
+        "The coordinator deletes the entire token range on all replicas and reloads it from a snapshot.",
+        "Every replica rebuilds its full dataset from the WAL of the most up-to-date node.",
+        "The mismatching ranges are marked read-only until the next full repair cycle resolves them."
+      ],
+      "correctIndex": 0,
+      "explanation": "Only the divergent ranges are streamed, not the whole dataset, and last-write-wins timestamps (or version vectors) resolve which value survives. Full, incremental, and sub-range variants change how much data the trees cover.",
+      "sourceAnchor": "7211-merkle-tree-repair-in-cassandra-nodetool-repair",
+      "difficulty": "recall"
+    },
+    {
+      "id": "72-q14",
+      "prompt": "Why must Cassandra repair complete within gc_grace_seconds?",
+      "options": [
+        "Deletes are tombstones purged after that window; if a replica missed a delete and repair does not reconcile it first, the deleted data can resurrect as a zombie.",
+        "The Merkle trees expire after that window and must be rebuilt from scratch before any comparison.",
+        "Hints are collected only within that window, so repair after it will have no data to stream.",
+        "The gossip generation counter wraps after that window, making the token ranges unaddressable."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because a delete is a tombstone collected after gc_grace_seconds (default 10 days), a replica that never saw the delete can reintroduce the old data once the tombstone is gone everywhere. Repair frequency is thus a correctness requirement for deletion.",
+      "sourceAnchor": "7211-merkle-tree-repair-in-cassandra-nodetool-repair",
+      "difficulty": "trap"
+    },
+    {
+      "id": "72-q15",
+      "prompt": "What is the Merkle-tree leaf granularity trade-off?",
+      "options": [
+        "Fine leaves pinpoint divergence and stream little but make a large, costly tree; coarse leaves make a small tree but over-stream because one changed key marks its whole range.",
+        "Fine leaves are always better because they both shrink the tree and reduce streaming to exact keys.",
+        "Coarse leaves reduce streaming to exact keys while fine leaves force the whole range to transfer.",
+        "Leaf granularity affects only build time and has no effect on how much data is streamed."
+      ],
+      "correctIndex": 0,
+      "explanation": "A mismatching leaf marks its entire range divergent, so coarse leaves force transferring a whole range for a single changed key, while fine leaves need far more memory and hashing. You size the tree to fit memory while keeping over-streaming tolerable.",
+      "sourceAnchor": "7212-merkle-tree-granularity-trade-offs",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q16",
+      "prompt": "How does a bitmap version vector keep causal metadata compact?",
+      "options": [
+        "It stores each source node's contiguous prefix of seen updates as a single base counter, plus a small bitmap only for the sparse out-of-order tail.",
+        "It hashes all seen update ids into a fixed-size Bloom filter with a tuned false-positive rate.",
+        "It keeps only the single highest update id per node and discards any knowledge of gaps.",
+        "It compresses the full list of seen update ids with run-length encoding on every reconciliation."
+      ],
+      "correctIndex": 0,
+      "explanation": "A replica usually has seen a contiguous prefix of another node's updates, compressible to one integer, plus occasional gaps stored as bits. This keeps metadata roughly O(nodes) and lets reconciling replicas compute exactly which dots are missing.",
+      "sourceAnchor": "7213-bitmap-version-vectors-and-compact-causal-metadata",
+      "difficulty": "recall"
+    },
+    {
+      "id": "72-q17",
+      "prompt": "Roughly how many rounds and how many total messages does gossip need to disseminate one update to n nodes?",
+      "options": [
+        "About O(log n) rounds and O(n log n) total messages, trading a log factor of redundant delivery for coordinator-free reliability.",
+        "About O(n) rounds and O(n) total messages, identical to a linear chain of forwards.",
+        "About O(1) rounds and O(n squared) total messages, since every node contacts every other node once.",
+        "About O(log n) rounds and exactly O(n) messages, the same optimal count as a spanning tree."
+      ],
+      "correctIndex": 0,
+      "explanation": "The infected set grows geometrically, so latency is logarithmic; each node participates in about log n rounds sending fan-out messages, giving near-linear-times-log traffic. The extra log factor is redundant delivery, the premium for reliability without a coordinator.",
+      "sourceAnchor": "7214-gossip-dissemination-epidemic-protocols",
+      "difficulty": "recall"
+    },
+    {
+      "id": "72-q18",
+      "prompt": "Why does push-pull gossip converge faster than pure push or pure pull?",
+      "options": [
+        "Push spreads fast early but has a long tail once most nodes know; pull is slow early but fast late; push-pull is fast throughout, roughly squaring the uninformed fraction each round.",
+        "Push-pull uses twice the fan-out of the others, so it simply contacts more peers per round.",
+        "Push-pull disables redundant deliveries entirely, so every message reaches a new node.",
+        "Push-pull elects a coordinator that sequences the exchange, removing all randomness from spread."
+      ],
+      "correctIndex": 0,
+      "explanation": "Pure push wastes late rounds landing on informed peers; pure pull wastes early rounds hitting ignorant peers. Doing both combines the fast start of push with the fast finish of pull, collapsing the tail so the uninformed set shrinks doubly exponentially.",
+      "sourceAnchor": "7215-push-pull-and-push-pull",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q19",
+      "prompt": "In the SIR epidemic model applied to gossip, what does the 'removed' state mean and what does it trade off?",
+      "options": [
+        "A node that has the update but has stopped forwarding it; stopping bounds wasted messages but risks a few nodes never being reached.",
+        "A node that has been permanently evicted from the cluster and can no longer receive any updates.",
+        "A node whose update was rolled back, so it must be re-infected from scratch each round.",
+        "A node that only pulls updates and never pushes, cutting message cost exactly in half."
+      ],
+      "correctIndex": 0,
+      "explanation": "SIR nodes stop spreading after seeing an update redundantly enough times, which caps the wasted traffic of SI (spread-forever) at the cost of a small chance some susceptible node is never reached. The stop threshold k tunes reliability against cost.",
+      "sourceAnchor": "7216-the-epidemic-model-si-sir-and-the-math",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q20",
+      "prompt": "How does increasing the gossip fan-out b affect convergence and cost?",
+      "options": [
+        "It reduces the number of rounds by changing the log base but linearly raises messages per round and redundant deliveries.",
+        "It reduces both the number of rounds and the total messages, so higher is strictly better.",
+        "It has no effect on rounds and only changes how state is merged on receipt.",
+        "It increases the number of rounds because each node must wait for more peers to respond."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because rounds scale as log base (b+1) of n, doubling b barely dents the round count while linearly increasing per-round traffic. There is also a percolation threshold below which the spread can die out, so a small constant like 3 to 4 is used.",
+      "sourceAnchor": "7217-fan-out-rounds-and-the-cost-trade-offs",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q21",
+      "prompt": "What guarantee does gossiped-state reconciliation require to converge correctly?",
+      "options": [
+        "The merge must be commutative and idempotent so newer-wins holds regardless of the order or duplication of received updates.",
+        "The merge must be applied under a global lock so only one node updates state at a time.",
+        "Every node must receive updates in exactly the order they were produced, or state diverges.",
+        "The merge must discard any update seen more than once to avoid double-counting values."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because gossip delivers the same fact via many paths in arbitrary orders, merging must converge to the same result no matter the order or repetition. Versioning with heartbeat counters or CRDT-like merges provides this, and failure detection piggybacks on the counters.",
+      "sourceAnchor": "7218-gossip-mechanics-peer-selection-and-state-reconciliation",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q22",
+      "prompt": "What is the core trade-off between structured and unstructured overlay networks?",
+      "options": [
+        "Structure buys efficiency with near-optimal non-redundant paths but is fragile and needs maintenance; lack of structure is robust and self-healing but sends redundant traffic.",
+        "Structured overlays are always slower but cheaper; unstructured overlays are always faster but more expensive.",
+        "Structured overlays work only in memory while unstructured overlays require disk-backed state.",
+        "Structured overlays cannot detect node failure while unstructured overlays cannot disseminate data."
+      ],
+      "correctIndex": 0,
+      "explanation": "A structured topology like a tree or ring reaches each node about once in O(n) messages but a failed structural node severs paths and must be repaired, whereas random unstructured gossip heals around failures at the price of O(n log n) redundant messages.",
+      "sourceAnchor": "7219-overlay-networks-structured-vs-unstructured",
+      "difficulty": "recall"
+    },
+    {
+      "id": "72-q23",
+      "prompt": "How does Plumtree combine broadcast-tree efficiency with gossip-grade fault tolerance?",
+      "options": [
+        "Eager-push links form a spanning tree carrying full payloads, while lazy-push links carry only 'I have m' headers used to pull and graft around a failed tree link.",
+        "It floods full payloads over every link and deduplicates them at each node after the fact.",
+        "It elects a coordinator that pushes payloads and falls back to random gossip only if the coordinator dies.",
+        "It sends payloads over the tree and periodically rebuilds the entire tree from a central registry."
+      ],
+      "correctIndex": 0,
+      "explanation": "The eager tree delivers payloads once in O(n) messages; the lazy mesh advertises message IDs cheaply. When a tree link fails, a node that hears a lazy header for a missing message pulls it, grafts that link into the tree, and prunes the broken branch, self-healing without a central rebuild.",
+      "sourceAnchor": "7220-hybrid-gossip-plumtree-and-spanning-tree-backbones",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q24",
+      "prompt": "How does HyParView let gossip scale to very large clusters?",
+      "options": [
+        "Each node keeps a small active view (~log n) it gossips with plus a larger passive reserve view, so per-node state is O(log n) instead of O(n) yet connectivity holds.",
+        "Each node caches the full membership on disk and pages it in only when gossiping, avoiding memory cost.",
+        "It shards the cluster into fixed groups that never gossip across group boundaries.",
+        "It replaces random peer selection with a central directory service that assigns peers."
+      ],
+      "correctIndex": 0,
+      "explanation": "The union of small active views forms a connected low-diameter random graph, so messages still reach everyone in O(log n) rounds while no node knows more than a handful of peers. The passive view supplies replacements to keep the active graph connected under churn.",
+      "sourceAnchor": "7221-partial-views-hyparview-and-scalable-membership",
+      "difficulty": "recall"
+    },
+    {
+      "id": "72-q25",
+      "prompt": "For guaranteeing that even never-read, cold keys eventually converge, which mechanism is required?",
+      "options": [
+        "Periodic anti-entropy with Merkle trees, since it is the only technique that considers every key regardless of client access.",
+        "Read repair, because every key is eventually read by some client and thereby repaired.",
+        "Hinted handoff, because hints are stored for every key whether or not a replica is down.",
+        "Gossip dissemination, because membership propagation also carries every key's latest value."
+      ],
+      "correctIndex": 0,
+      "explanation": "Read repair only touches read keys and hinted handoff only covers writes during outages (and can be lost), so a written-once, never-read key falls through both. Only background Merkle repair sweeps the entire dataset to reconcile such keys.",
+      "sourceAnchor": "7222-choosing-gossip-vs-broadcast-tree-vs-anti-entropy",
+      "difficulty": "application"
+    },
+    {
+      "id": "72-q26",
+      "prompt": "Why does classic single-leader PostgreSQL streaming replication need almost no anti-entropy machinery?",
+      "options": [
+        "All writes go through one primary that ships an ordered WAL, so standbys only lag and never diverge, leaving nothing for read repair or Merkle trees to reconcile.",
+        "PostgreSQL replicates by gossiping each row change to standbys, which self-corrects any divergence automatically.",
+        "PostgreSQL standbys each accept writes independently but merge them with version vectors on read.",
+        "PostgreSQL uses synchronous quorums on every write, so replicas are byte-identical the instant a commit returns."
+      ],
+      "correctIndex": 0,
+      "explanation": "With one authority ordering all writes and standbys replaying the identical log, a replica can only be behind, never hold a conflicting value. There are no independent writes, hence no conflicts, no per-key causal metadata, and no repair to run.",
+      "sourceAnchor": "7223-the-postgresql-contrast-why-single-leader-needs-almost-none-of-this",
+      "difficulty": "recall"
+    },
+    {
+      "id": "72-q27",
+      "prompt": "A candidate says 'hinted handoff is the same thing as a sloppy quorum.' Why is that imprecise?",
+      "options": [
+        "Hinted handoff is the mechanism of buffering a write for a down node; a sloppy quorum is the policy of counting stand-in hint holders toward W, which Cassandra does not do by default.",
+        "Hinted handoff applies only to reads and sloppy quorums apply only to writes, so they never overlap.",
+        "Sloppy quorums are used only in single-leader systems while hinted handoff is only for leaderless ones.",
+        "They are indeed identical; the two terms are interchangeable across all Dynamo-style systems."
+      ],
+      "correctIndex": 0,
+      "explanation": "One is a storage mechanism and the other is a consistency policy about which acks satisfy W. In Cassandra hints do not count toward the consistency level by default, so it uses hinted handoff without a true sloppy quorum in the acking sense.",
+      "sourceAnchor": "728-sloppy-quorums-and-hinted-handoff",
+      "difficulty": "trap"
+    },
+    {
+      "id": "72-q28",
+      "prompt": "How does a bitmap version vector differ from a Bloom filter, and why does the distinction matter?",
+      "options": [
+        "A bitmap version vector exactly encodes which update dots a replica has seen with no false positives; a Bloom filter is a probabilistic membership test that admits false positives.",
+        "Both are probabilistic, but a bitmap version vector has a higher false-positive rate than a Bloom filter.",
+        "A Bloom filter tracks causal order between updates while a bitmap version vector only counts them.",
+        "A bitmap version vector can only represent a single node's updates while a Bloom filter covers the whole cluster exactly."
+      ],
+      "correctIndex": 0,
+      "explanation": "Both are compact set summaries, but reconciliation needs exactness: a version vector's base-counter-plus-tail-bits reports precisely which dots are missing, whereas a Bloom filter (Ch. 21 section 21.19) could falsely claim a replica has an update it lacks, which would silently skip needed repair.",
+      "sourceAnchor": "7213-bitmap-version-vectors-and-compact-causal-metadata",
+      "difficulty": "trap"
+    }
+  ]
+}

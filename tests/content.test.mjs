@@ -8,10 +8,11 @@ const chapterDir = path.join(root, 'src/content/docs/chapters');
 const quizDir = path.join(root, 'src/data/quizzes');
 
 test('all chapters and quizzes are generated', async () => {
+  const rootChapters = (await readdir(root)).filter((file) => /^chapter-\d{2}-.+\.md$/.test(file));
   const chapters = (await readdir(chapterDir)).filter((file) => file.endsWith('.md'));
   const quizzes = (await readdir(quizDir)).filter((file) => file.endsWith('.json'));
-  assert.equal(chapters.length, 60);
-  assert.equal(quizzes.length, 60);
+  assert.equal(chapters.length, rootChapters.length);
+  assert.equal(quizzes.length, rootChapters.length);
 });
 
 test('quiz banks satisfy the public data contract', async () => {
@@ -92,13 +93,17 @@ test('hand-authored quiz banks meet the authoring standards', async () => {
   }
 });
 
-test('generated navigation covers chapters 1 through 60 once', async () => {
+test('generated navigation covers every chapter once', async () => {
+  const rootChapters = (await readdir(root)).filter((file) => /^chapter-\d{2}-.+\.md$/.test(file));
+  const topics = await readFile(path.join(root, 'TOPICS.md'), 'utf8');
+  const groupCount = (topics.match(/^##\s+/gm) || []).length;
   const moduleUrl = new URL('../src/generated/navigation.mjs', import.meta.url);
   const { sidebar } = await import(`${moduleUrl.href}?t=${Date.now()}`);
-  assert.equal(sidebar.length, 14);
+  assert.equal(sidebar.length, groupCount);
   const slugs = sidebar.flatMap((group) => group.items.map((item) => item.slug));
-  assert.equal(slugs.length, 60);
-  assert.equal(new Set(slugs).size, 60);
+  assert.equal(slugs.length, rootChapters.length);
+  assert.equal(new Set(slugs).size, rootChapters.length);
   assert.ok(slugs[0].includes('chapter-01-'));
-  assert.ok(slugs[59].includes('chapter-60-'));
+  const lastNum = String(rootChapters.length).padStart(2, '0');
+  assert.ok(slugs[slugs.length - 1].includes(`chapter-${lastNum}-`));
 });

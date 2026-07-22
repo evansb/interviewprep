@@ -1039,3 +1039,179 @@
   - Resource limits and descriptor exhaustion
   - Disk and log-retention failures
   - Capacity headroom
+
+## Database Storage Engines
+
+- **Chapter 61: Introduction and Overview**
+  - What a DBMS is and how it is layered
+  - The PostgreSQL process model
+  - Memory- versus disk-based DBMS
+  - Durability in memory-based stores
+  - Row- versus column-oriented storage
+  - The Postgres heap tuple layout
+  - Column-oriented data layout in practice
+  - Vectorized execution and hybrids
+  - Wide-column stores versus column stores
+  - Data files and index files
+  - Heap-organized versus index-organized tables
+  - Primary, secondary, clustered, and non-clustered indexes
+  - The primary index as indirection
+  - Buffering, immutability, and ordering
+  - The life of a query
+- **Chapter 62: B-Tree Basics**
+  - Why in-memory search trees fail on disk
+  - Trees for disk-based storage
+  - B-trees versus B+trees
+  - B-tree hierarchy and fanout
+  - Separator and high keys
+  - B-tree lookup complexity and algorithm
+  - Occupancy invariants
+  - Node splits
+  - Node merges and rebalancing
+  - PostgreSQL nbtree specifics
+- **Chapter 63: File Formats**
+  - Motivation for on-disk formats
+  - Binary encoding and primitive types
+  - Strings and variable-size data
+  - Bit-packed booleans, enums, and flags
+  - Page structure
+  - Slotted pages
+  - Cell layout
+  - Managing variable-size data and TOAST
+  - Versioning and magic numbers
+  - Checksumming and torn pages
+- **Chapter 64: Implementing B-Trees**
+  - Page header
+  - Sibling and rightmost links
+  - Node high keys
+  - Overflow pages
+  - Binary search with indirection pointers
+  - Propagating splits and merges
+  - Breadcrumbs
+  - B-link trees and concurrent descent
+  - Right-only appends and bulk loading
+  - Compression and deduplication
+  - Vacuum, fragmentation, and defragmentation
+- **Chapter 65: Transaction Processing and Recovery**
+  - Buffer management
+  - Cache eviction and page replacement
+  - Recovery and log semantics
+  - Steal and force policies
+  - Write-ahead logging and LSNs
+  - ARIES
+  - Full-page writes and checkpoints
+  - Serializability
+  - Read and write anomalies
+  - Isolation levels
+  - Optimistic concurrency control
+  - Multiversion concurrency control
+  - Pessimistic and lock-based concurrency control
+  - Deadlocks
+  - Locks, latches, and latch crabbing
+- **Chapter 66: B-Tree Variants**
+  - Copy-on-write B-trees and LMDB
+  - Abstracting node updates
+  - Lazy B-trees and WiredTiger
+  - FD-trees and fractional cascading
+  - Fractal and Bε-trees
+  - Bw-trees and latch-free updates
+  - Structural modification operations
+  - Consolidation and garbage collection
+  - Cache-oblivious B-trees
+- **Chapter 67: Log-Structured Storage**
+  - LSM tree structure
+  - Memtables and SSTables
+  - Tombstones, updates, and deletes
+  - LSM lookups and read amplification
+  - Merge-iteration and reconciliation
+  - Leveled versus size-tiered compaction
+  - Read, write, and space amplification
+  - The RUM conjecture
+  - Sorted string tables
+  - Bloom filters and skip lists
+  - Unordered LSM storage: Bitcask and WiscKey
+  - Concurrency in LSM trees
+  - Log stacking and the flash translation layer
+
+## Distributed Data Systems
+
+- **Chapter 68: Distributed Systems: Introduction and Overview**
+  - Why distribution is hard
+  - Concurrent execution and shared state
+  - Fallacies of distributed computing
+  - Clocks and time
+  - Network partitions and partial failures
+  - Cascading failures
+  - Links and message delivery
+  - The Two Generals' Problem
+  - FLP impossibility
+  - System synchrony models
+  - Failure models
+- **Chapter 69: Failure Detection**
+  - Failure detectors: completeness and accuracy
+  - Timeouts
+  - Heartbeats and pings
+  - Timeout-free failure detectors
+  - Outsourced heartbeats
+  - Phi-accrual failure detector
+  - Gossip and failure detection
+  - SWIM and indirect probing
+  - Reversing failure detection
+  - GC pauses and false positives
+- **Chapter 70: Leader Election**
+  - Why a leader
+  - Safety and liveness of election
+  - Bully algorithm
+  - Next-in-line and invitation variants
+  - Ring algorithm
+  - Epochs, terms, and fencing tokens
+  - Split-brain and quorums
+  - Leases
+  - Real-world election: ZooKeeper, etcd, Patroni
+- **Chapter 71: Replication and Consistency**
+  - Why replicate
+  - Replication topologies
+  - Synchronous versus asynchronous replication
+  - Harvest and yield
+  - The CAP theorem and PACELC
+  - Linearizability
+  - Sequential and causal consistency
+  - Vector clocks
+  - Session and client-centric models
+  - Eventual and tunable consistency
+  - Quorums
+  - CRDTs and strong eventual consistency
+- **Chapter 72: Anti-Entropy and Dissemination**
+  - Replica divergence and anti-entropy
+  - Read repair and digest reads
+  - Hinted handoff
+  - Merkle trees
+  - Bitmap version vectors
+  - Gossip dissemination
+  - Push, pull, and push-pull
+  - Overlay networks and hybrid gossip
+  - Partial views
+- **Chapter 73: Distributed Transactions**
+  - Atomic commitment
+  - Two-phase commit
+  - Cohort and coordinator failures
+  - The blocking problem
+  - Three-phase commit
+  - Consensus-backed commit
+  - Calvin and deterministic transactions
+  - Spanner and TrueTime
+  - Database partitioning and consistent hashing
+  - Percolator
+  - Coordination avoidance
+- **Chapter 74: Consensus**
+  - The consensus problem
+  - State-machine replication
+  - Atomic broadcast and virtual synchrony
+  - ZooKeeper Atomic Broadcast
+  - Paxos
+  - Paxos quorums and failure scenarios
+  - Multi-Paxos and variants
+  - Raft
+  - Raft log replication and safety
+  - Byzantine consensus and PBFT
+  - Consensus in practice

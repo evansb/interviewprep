@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-64-implementing-b-trees",
+  "questions": [
+    {
+      "id": "64-q01",
+      "prompt": "What does the page LSN in a B-tree page header enforce?",
+      "options": [
+        "Write-ahead logging: the dirty page may not be flushed until the WAL up to that LSN is durable, and it drives idempotent redo.",
+        "The physical block number where the page will be written on disk.",
+        "The maximum number of entries the page may hold before splitting.",
+        "The collation used when comparing keys stored on the page."
+      ],
+      "correctIndex": 0,
+      "explanation": "The LSN records the last WAL record that changed the page. The buffer manager refuses to flush the page until that WAL is on disk (the write-ahead rule), and recovery compares LSNs to apply each logged change exactly once.",
+      "sourceAnchor": "641-the-b-tree-node-header",
+      "difficulty": "recall"
+    },
+    {
+      "id": "64-q02",
+      "prompt": "Why are free-space pointers (such as pd_lower and pd_upper) kept in the page header?",
+      "options": [
+        "So an insert can decide in O(1) whether a new key fits without scanning, since the slot array and cells grow toward each other.",
+        "So the tree height can be read directly without descending from the root.",
+        "So the engine can locate the left and right sibling pages quickly.",
+        "So each key's collation-aware comparator can be selected at runtime."
+      ],
+      "correctIndex": 0,
+      "explanation": "In a slotted page the slot array grows down from the lower pointer and cells grow up from the upper pointer; the gap between them is free space, making the fit-or-split decision a constant-time subtraction.",
+      "sourceAnchor": "641-the-b-tree-node-header",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q03",
+      "prompt": "In PostgreSQL's nbtree, where is the current root of the tree found, and why isn't it at a fixed block?",
+      "options": [
+        "The block-0 metapage stores a pointer to the current root, because the root moves whenever it splits.",
+        "The root is always physically stored at block 1, immediately after the metapage.",
+        "The rightmost leaf page records the root's block number in its opaque footer.",
+        "The root has no fixed identity; each backend caches its own private root copy."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because a root split allocates a new root page, the root's block number changes over time. A stable block-0 metapage holds magic, version, and a pointer to the current (and fast) root, read at the start of every descent.",
+      "sourceAnchor": "642-magic-numbers-and-the-metapage",
+      "difficulty": "recall"
+    },
+    {
+      "id": "64-q04",
+      "prompt": "What problem does a magic number stored in the metapage solve?",
+      "options": [
+        "It lets the engine refuse a page whose format or version is wrong rather than misinterpreting corrupt or torn data.",
+        "It uniquely identifies each row so duplicate keys can be deduplicated.",
+        "It encodes the fill factor used when the index was bulk-loaded.",
+        "It records the transaction that most recently split the page."
+      ],
+      "correctIndex": 0,
+      "explanation": "A magic number is a fixed constant checked on read; a mismatch means the page is not the expected structure or version, so the engine rejects it instead of interpreting corruption, a torn write, or an old on-disk format as valid data.",
+      "sourceAnchor": "642-magic-numbers-and-the-metapage",
+      "difficulty": "recall"
+    },
+    {
+      "id": "64-q05",
+      "prompt": "Besides range scans, what is the critical role of same-level sibling links in nbtree?",
+      "options": [
+        "They give a descender a right-link to follow when a concurrent split has moved its target data to a new sibling.",
+        "They store the parent downlink so splits never need to update the parent page.",
+        "They hold the page checksum used to detect corruption on read.",
+        "They record which transactions have read the page for MVCC visibility."
+      ],
+      "correctIndex": 0,
+      "explanation": "nbtree links every level into a doubly-linked list. The right-link is the Lehman-Yao escape hatch: when a split has relocated data, a reader that overshoots a page's high key follows the right-link to reach it, without locking the parent.",
+      "sourceAnchor": "643-sibling-links-and-rightmost-pointers",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q06",
+      "prompt": "How does nbtree mark the rightmost page at a given level?",
+      "options": [
+        "Its right-link (btpo_next) is set to P_NONE and it carries no high key, with an implicit upper bound of positive infinity.",
+        "It stores a special high key equal to the largest possible key value.",
+        "It is always placed at the highest physical block number in the file.",
+        "It sets a dedicated BTP_RIGHTMOST flag that VACUUM clears on each pass."
+      ],
+      "correctIndex": 0,
+      "explanation": "The rightmost node terminates the level's linked list with btpo_next = P_NONE and omits the high key entirely, so its implicit upper bound is +infinity, meaning no move-right is ever possible past it.",
+      "sourceAnchor": "643-sibling-links-and-rightmost-pointers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "64-q07",
+      "prompt": "A descender searching for key k reaches a non-rightmost page and finds k is greater than or equal to that page's high key. What has happened and what does it do?",
+      "options": [
+        "A concurrent split moved k's data to the right, so it follows the right-link to the sibling without locking the parent.",
+        "The key k does not exist anywhere in the tree, so it returns not-found immediately.",
+        "The page is corrupt, so it aborts the scan and forces a REINDEX.",
+        "It must restart the descent from the root while holding a lock on the parent."
+      ],
+      "correctIndex": 0,
+      "explanation": "The high key is a hard upper bound on the page's contents. If the search key reaches or exceeds it, the data was split off to the right sibling, so the reader moves right along the link, guaranteed to make progress toward the owning page, holding no parent lock.",
+      "sourceAnchor": "644-high-keys",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q08",
+      "prompt": "How is the separator that a split installs in the parent related to the child's high key?",
+      "options": [
+        "It is a (truncated) copy of the left page's new high key, so the same bounding value exists as both the child's high key and the parent's separator.",
+        "It is the median heap TID of the two split halves, unrelated to any high key.",
+        "It is always the smallest key on the new right page, with no truncation.",
+        "It is a randomly chosen key that lies between the two halves for balance."
+      ],
+      "correctIndex": 0,
+      "explanation": "When a page splits, its new high key becomes the split boundary; the parent downlink separator is derived (and suffix-truncated) from that same high key. The child's copy is authoritative during the window before the parent downlink is installed.",
+      "sourceAnchor": "644-high-keys",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q09",
+      "prompt": "Why does searching within a node binary-search the slot array rather than the cells directly?",
+      "options": [
+        "The cells are variable-length and stored at arbitrary unsorted offsets, while the fixed-width slot array is sorted and O(1)-indexable.",
+        "The cells are encrypted, so only the slot array is readable during a search.",
+        "Binary search requires the data to be in a hash table, which the slots provide.",
+        "The slot array already contains the full key bytes, so cells are never touched."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each line pointer is a fixed 4 bytes, so the sorted slot array can be indexed in constant time for binary search; each probe then dereferences the slot to its variable-length cell to compare the actual key. The cells themselves are neither contiguous nor sorted.",
+      "sourceAnchor": "645-binary-search-within-a-node",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q10",
+      "prompt": "Roughly how many key comparisons does a search perform inside one nbtree node of 300 to 500 entries?",
+      "options": [
+        "About 8 to 9, since binary search is logarithmic in the node's fanout.",
+        "About 300 to 500, since it linearly scans every entry.",
+        "Exactly 1, since the slot array is a hash table.",
+        "About 32 to 40, one per level of the entire tree."
+      ],
+      "correctIndex": 0,
+      "explanation": "Binary search costs the ceiling of log2 of the fanout, which is roughly 8 to 9 comparisons for a few-hundred-entry page. Each comparison dereferences a scattered cell, so the cell fetch, not the comparison count, dominates cost.",
+      "sourceAnchor": "645-binary-search-within-a-node",
+      "difficulty": "recall"
+    },
+    {
+      "id": "64-q11",
+      "prompt": "How does PostgreSQL handle an attempt to B-tree-index a value larger than about 2704 bytes?",
+      "options": [
+        "It rejects the entry with an error, since nbtree caps index tuples and has no overflow pages.",
+        "It silently spills the excess bytes to a chain of overflow pages linked off the cell.",
+        "It TOASTs the index tuple so only an 18-byte pointer remains in the leaf.",
+        "It compresses the key with dictionary encoding until it fits under the cap."
+      ],
+      "correctIndex": 0,
+      "explanation": "nbtree caps a single entry at BTMaxItemSize (about 2704 bytes, one-third of the page) and has no overflow pages, so an oversized key raises an error. The workaround is to index an expression such as a hash or a left prefix.",
+      "sourceAnchor": "646-oversized-keys-and-values-overflow-pages-versus-toast",
+      "difficulty": "recall"
+    },
+    {
+      "id": "64-q12",
+      "prompt": "A candidate says 'TOAST lets Postgres B-tree-index arbitrarily large text values.' Why is this wrong?",
+      "options": [
+        "TOAST shrinks the heap tuple, but the index stores the key value itself, so a huge key still exceeds the per-entry cap.",
+        "TOAST is disabled whenever an index exists on the column, so it never applies.",
+        "TOAST only works on integer columns, which are never large enough to matter.",
+        "TOAST moves the index into overflow pages, which are limited to 2704 bytes each."
+      ],
+      "correctIndex": 0,
+      "explanation": "TOAST offloads large attribute values from the heap tuple, but a B-tree entry contains the key value directly and is bounded by BTMaxItemSize regardless of TOAST. Indexing a wide column directly still errors; you index a hash or prefix expression instead.",
+      "sourceAnchor": "646-oversized-keys-and-values-overflow-pages-versus-toast",
+      "difficulty": "trap"
+    },
+    {
+      "id": "64-q13",
+      "prompt": "Under what condition does a B-tree grow taller by one level?",
+      "options": [
+        "Only when the root itself splits, creating a new root above the two halves.",
+        "Whenever any leaf page splits and pushes a downlink to its parent.",
+        "Whenever the number of leaves crosses a power of the fanout.",
+        "Whenever VACUUM recycles enough empty pages to rebalance the tree."
+      ],
+      "correctIndex": 0,
+      "explanation": "Splits propagate upward, but height increases only at the top: when the root overflows, a new root is allocated pointing at the two halves and the metapage level is bumped. B-trees therefore grow from the leaves upward.",
+      "sourceAnchor": "647-propagating-splits-up-the-tree",
+      "difficulty": "recall"
+    },
+    {
+      "id": "64-q14",
+      "prompt": "A crash occurs after a leaf split writes the right page and right-link but before the parent downlink is installed. Why is no data lost?",
+      "options": [
+        "The right-link is written first and is always followable, and the left page is flagged incomplete so a later descent or VACUUM finishes the parent insert.",
+        "The split is rolled back entirely on restart, restoring the original single page.",
+        "The parent downlink is reconstructed from the WAL before any query can run.",
+        "The right page is discarded and its entries are re-inserted from the heap."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because the right-link is published before the parent update, the moved data stays reachable via move-right. The left page is marked BTP_INCOMPLETE_SPLIT, and the next descender or VACUUM that notices completes the deferred downlink insertion.",
+      "sourceAnchor": "647-propagating-splits-up-the-tree",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q15",
+      "prompt": "What are breadcrumbs in a B-tree insertion, and why are they treated as a hint?",
+      "options": [
+        "The remembered descent path used to find parents for downlink insertion; the parent may have split since, so the high key re-verifies and moves right if stale.",
+        "Cached copies of the leaf's entries used to speed up the next range scan.",
+        "The WAL records that must be replayed before a split can be committed.",
+        "The list of dead tuples that microvacuum will remove before splitting."
+      ],
+      "correctIndex": 0,
+      "explanation": "A descent records the page and slot at each level (nbtree's BTStack) so a split can walk back up without re-traversing. Between recording and use, a parent may itself split, so the breadcrumb is verified against the high key and followed right when the target has moved.",
+      "sourceAnchor": "648-breadcrumbs",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q16",
+      "prompt": "Does PostgreSQL merge under-full B-tree pages after deletes, and how does InnoDB differ?",
+      "options": [
+        "Postgres never merges or borrows and only recycles fully-empty pages, while InnoDB merges pages that fall below its merge threshold.",
+        "Both merge pages below half full, so neither accumulates index bloat.",
+        "Postgres merges eagerly while InnoDB only recycles fully-empty pages.",
+        "Neither ever reclaims space until an explicit rebuild command is run."
+      ],
+      "correctIndex": 0,
+      "explanation": "nbtree does no rebalancing on delete and reclaims a page only when it becomes completely empty, trading the half-full invariant for concurrency. InnoDB merges pages below MERGE_THRESHOLD (default 50 percent), keeping its indexes denser at the cost of more structure-modification contention.",
+      "sourceAnchor": "649-merges-and-rebalancing",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q17",
+      "prompt": "State the core concurrency problem a concurrent B-tree must solve.",
+      "options": [
+        "A reader descending the tree can land on a page whose data a concurrent writer split off to a new sibling the reader never learned about.",
+        "Two readers examining the same leaf can each corrupt the other's cached copy.",
+        "A writer can deadlock with the checkpointer while flushing a dirty page.",
+        "A range scan can read the same leaf twice if the buffer pool evicts it mid-scan."
+      ],
+      "correctIndex": 0,
+      "explanation": "If a writer splits a node on the reader's path after the reader read the parent downlink, the reader can arrive at a page missing its key, which was moved to a new right sibling. The naive fix is path locking; the scalable fixes are crabbing or B-link trees.",
+      "sourceAnchor": "6410-the-concurrency-problem",
+      "difficulty": "recall"
+    },
+    {
+      "id": "64-q18",
+      "prompt": "What is the ordering rule that makes a Lehman-Yao B-link tree correct during a split?",
+      "options": [
+        "The new right sibling and the splitting page's right-link and high key are published first; the parent downlink is installed second and may be deferred.",
+        "The parent downlink is installed first so descenders never see a half-split tree.",
+        "The entire root-to-leaf path is locked before any page is modified.",
+        "The split is applied to the parent and child in a single atomic multi-page write."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because the right-link and high key are written before the parent update, the intermediate state is a legal B-link tree: moved data is reachable via the right-link, and the high key tells a descender when to move right. This lets the parent update be lazy and lock-free on the read path.",
+      "sourceAnchor": "6411-lehman-yao-b-link-trees",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q19",
+      "prompt": "Why is following the right-link on a high-key overshoot guaranteed to make progress toward the correct page?",
+      "options": [
+        "The high key is a hard upper bound on the page, so the key must be to the right, and splits keep the right-link chain intact.",
+        "The right sibling is always physically adjacent, so the seek is cheap.",
+        "The right-link points directly at the leaf owning the key, skipping intermediate pages.",
+        "The reader holds a lock on the parent that prevents any further splits."
+      ],
+      "correctIndex": 0,
+      "explanation": "If the search key reaches or exceeds a page's high key, the key is definitely not on that page and definitely resides to the right; since a split publishes the right-link before anything else, the chain is always followable, so moving right always advances toward the owning page.",
+      "sourceAnchor": "6411-lehman-yao-b-link-trees",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q20",
+      "prompt": "How many pages does an nbtree read-path descent lock at once, and why can it release the parent before locking the child?",
+      "options": [
+        "One page at a time; move-right handles any concurrent split, so no lock coupling is needed on reads.",
+        "Two pages, coupled hand-over-hand, to prevent a concurrent split from relocating data.",
+        "The entire root-to-leaf path, released only once the leaf is found.",
+        "Zero pages, because reads are served entirely from an in-memory copy of the tree."
+      ],
+      "correctIndex": 0,
+      "explanation": "nbtree takes a short shared content lock on a single page, uses move-right for correctness if a split occurred, and releases the parent before locking the child. This is a genuine Lehman-Yao property that crabbing engines cannot match, since they must hold two latches.",
+      "sourceAnchor": "6412-how-postgresql-nbtree-implements-lehman-yao",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q21",
+      "prompt": "Lehman-Yao assumes unique keys, but real indexes have duplicates. How does nbtree reconcile this since PG 12?",
+      "options": [
+        "It appends the heap TID as an implicit final key column, making every key logically unique with a stable order.",
+        "It rejects any insertion that would create a duplicate key value.",
+        "It stores all duplicates of a key on a dedicated overflow page chain.",
+        "It disables move-right whenever duplicate keys are present on a page."
+      ],
+      "correctIndex": 0,
+      "explanation": "By treating the heap TID as the last sort column, nbtree gives duplicates a total order and restores the uniqueness Lehman-Yao assumes. This also enables suffix truncation and orderly duplicate handling, curing the pre-12 duplicate-storm split pathology.",
+      "sourceAnchor": "6412-how-postgresql-nbtree-implements-lehman-yao",
+      "difficulty": "recall"
+    },
+    {
+      "id": "64-q22",
+      "prompt": "How does latch coupling (crabbing) differ fundamentally from the Lehman-Yao approach?",
+      "options": [
+        "Crabbing prevents the split race by holding two latches hand-over-hand; Lehman-Yao tolerates the race and recovers via right-links and high keys.",
+        "Crabbing uses right-links while Lehman-Yao uses two latches per level.",
+        "Crabbing is lock-free while Lehman-Yao serializes every descent at the root.",
+        "Crabbing applies only to writes while Lehman-Yao applies only to reads."
+      ],
+      "correctIndex": 0,
+      "explanation": "In crabbing the descender acquires the child's latch before releasing the parent's, so at most two are held and the race cannot occur. Lehman-Yao adds structure (right-links, high keys) so the race is recoverable, letting a reader hold just one page lock at a time.",
+      "sourceAnchor": "6413-latch-coupling-and-crabbing",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q23",
+      "prompt": "Which engine uses latch coupling with optimistic and pessimistic descents plus an adaptive hash index?",
+      "options": [
+        "InnoDB, which takes a leaf-only exclusive latch optimistically and falls back to latching from a safe ancestor when a structure change is needed.",
+        "PostgreSQL nbtree, which crabs down the tree taking two content locks per level.",
+        "SQLite, which crabs because it must support many concurrent writers.",
+        "Redis, whose in-memory B-tree needs no latching at all."
+      ],
+      "correctIndex": 0,
+      "explanation": "InnoDB crabs: an optimistic descent takes an exclusive latch only on the leaf, falling back to a pessimistic descent with latches from a safe ancestor when a split or merge is required, and it uses an adaptive hash index to shortcut descents on hot keys.",
+      "sourceAnchor": "6413-latch-coupling-and-crabbing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "64-q24",
+      "prompt": "For a monotonically increasing key, why does nbtree pack a rightmost split nearly full instead of splitting 50/50?",
+      "options": [
+        "A 50/50 rightmost split would leave the left half permanently half-empty, since all future keys are larger and go right.",
+        "A nearly-full left page reduces contention on the rightmost leaf's buffer lock.",
+        "Packing full is required so the heap TID tiebreaker stays sorted.",
+        "It ensures the new page inherits the correct high key from the parent."
+      ],
+      "correctIndex": 0,
+      "explanation": "With ascending keys, no future insert will ever land in the left half of a rightmost split, so a balanced split wastes about half the index. nbtree's fill-factor-aware heuristic packs the left page nearly full and leaves the free space on the right where inserts flow.",
+      "sourceAnchor": "6414-right-only-appends-and-the-rightmost-leaf-fast-path",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q25",
+      "prompt": "What is the residual hazard of monotonically increasing key inserts even with a rightmost fast path?",
+      "options": [
+        "Right-edge contention: every insert competes for the buffer content lock on the single rightmost leaf.",
+        "The tree grows one level taller on every insert, inflating lookup cost.",
+        "Range scans become impossible because the leaves are no longer linked.",
+        "The metapage must be rewritten on every insert to move the root pointer."
+      ],
+      "correctIndex": 0,
+      "explanation": "The fast path removes the descent, but all inserting backends still target the same rightmost page and serialize on its lock, a classic insertion hot spot. Mitigations include hashing or reversing the key or partitioning by time to rotate the hot edge.",
+      "sourceAnchor": "6414-right-only-appends-and-the-rightmost-leaf-fast-path",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q26",
+      "prompt": "Why does building an index by sorting then packing bottom-up beat inserting keys one at a time?",
+      "options": [
+        "It avoids per-key descents and splits, producing pages packed to fill factor and physically contiguous on disk.",
+        "It skips the sort entirely because heap order already matches key order.",
+        "It writes no WAL, so durability is achieved instantly.",
+        "It builds the root first and fills leaves downward, halving comparisons."
+      ],
+      "correctIndex": 0,
+      "explanation": "A sorted build scans and sorts the entries once, then packs leaves left-to-right to fill factor and builds internal levels upward with no splits or random descents. The result is dense (about 90 percent full) and sequential, unlike a scattered incrementally-built index.",
+      "sourceAnchor": "6415-bulk-loading",
+      "difficulty": "recall"
+    },
+    {
+      "id": "64-q27",
+      "prompt": "What does suffix truncation do to a separator key pushed into the parent at a leaf split?",
+      "options": [
+        "It keeps only the shortest prefix of attributes that still distinguishes the two halves, dropping trailing columns.",
+        "It removes the leading attributes shared with the parent's low bound.",
+        "It replaces the whole separator with the heap TID of the split point.",
+        "It compresses the separator using dictionary encoding to save bytes."
+      ],
+      "correctIndex": 0,
+      "explanation": "A separator only needs to route, so nbtree keeps just enough leading attributes to tell left from right, falling back to the heap TID if needed. Shorter separators raise internal fanout, lower tree height, and shrink the cached upper levels.",
+      "sourceAnchor": "6416-prefix-and-suffix-truncation-of-separator-keys",
+      "difficulty": "recall"
+    },
+    {
+      "id": "64-q28",
+      "prompt": "What does nbtree deduplication (PG 13) store, and when does it run?",
+      "options": [
+        "A posting-list tuple holding the key once plus a sorted array of TIDs, run lazily as a delay-the-split step under page pressure.",
+        "A separate hash table mapping each key to its duplicate count, updated on every insert.",
+        "A compressed copy of the whole page, rebuilt eagerly after each insert.",
+        "One tuple per key with the heap value inlined, run only during VACUUM."
+      ],
+      "correctIndex": 0,
+      "explanation": "Consecutive equal-key tuples merge into a posting-list tuple that stores the key value once followed by a sorted TID array. It runs only when a leaf is about to split, so it costs nothing until a page is under pressure, and can shrink low-cardinality indexes several-fold.",
+      "sourceAnchor": "6417-deduplication-and-posting-lists",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q29",
+      "prompt": "What is the kill_prior_tuple / LP_DEAD mechanism in nbtree?",
+      "options": [
+        "An index scan that finds a heap tuple dead to everyone sets a known-dead hint on the index tuple so future scans skip it and microvacuum can remove it.",
+        "A background worker that periodically deletes the oldest tuple on every leaf page.",
+        "A WAL record that marks a tuple dead before the heap version is removed.",
+        "A lock that kills any transaction still reading a tuple being deleted."
+      ],
+      "correctIndex": 0,
+      "explanation": "When a scan follows an index entry to a heap tuple that is dead to all transactions, it sets an LP_DEAD hint on the index tuple. This cheap hint lets later scans skip the entry and lets the pre-split microvacuum physically delete it, often avoiding a split entirely.",
+      "sourceAnchor": "6418-simple-deletion-kill_prior_tuple-and-microvacuum",
+      "difficulty": "recall"
+    },
+    {
+      "id": "64-q30",
+      "prompt": "Why is nbtree page recycling a two-phase (delete, then later recycle) protocol?",
+      "options": [
+        "A paused scanner may still hold a stale right-link to a just-emptied page, so it is recycled only once no running transaction could still reach it.",
+        "The first phase writes WAL and the second phase fsyncs it, as with any durable write.",
+        "One phase updates the parent and the other updates the metapage, and they cannot be atomic.",
+        "The FSM requires two passes to compute free space accurately on large indexes."
+      ],
+      "correctIndex": 0,
+      "explanation": "Under Lehman-Yao, a descender paused mid-scan might still follow a right-link into a page that just became empty. So VACUUM marks the page deleted and stamps an XID, and only hands it to the FSM for reuse once the oldest running transaction has passed that stamp.",
+      "sourceAnchor": "6419-vacuum-page-deletion-and-recycling",
+      "difficulty": "application"
+    },
+    {
+      "id": "64-q31",
+      "prompt": "Why does a DELETE-heavy workload leave a Postgres index bloated, and what compacts it without an exclusive lock?",
+      "options": [
+        "Partially-empty pages are never merged and freed pages go to the FSM for reuse, not the OS; REINDEX CONCURRENTLY rebuilds it densely online.",
+        "The WAL retains every deleted entry until a checkpoint; a manual CHECKPOINT shrinks the file.",
+        "Autovacuum disables itself on large indexes; running ANALYZE re-enables compaction.",
+        "Deleted entries are moved to overflow pages; DROP INDEX ... CASCADE reclaims them."
+      ],
+      "correctIndex": 0,
+      "explanation": "Deletes leave half-empty leaves that nbtree does not merge, and even fully-empty pages are recycled internally via the FSM rather than returned to the filesystem, so the file rarely shrinks. REINDEX CONCURRENTLY builds a fresh dense index alongside the old one and swaps under a brief lock.",
+      "sourceAnchor": "6420-index-bloat-and-reindex",
+      "difficulty": "trap"
+    },
+    {
+      "id": "64-q32",
+      "prompt": "With a fanout around 400, roughly how many rows can a 4-level nbtree index, and what does that imply for a warm lookup?",
+      "options": [
+        "On the order of tens of billions of rows; upper levels stay cached, so a warm point lookup is effectively one leaf access or fewer.",
+        "About one million rows; every lookup must read all four levels from disk.",
+        "About 64 million rows, the same as a 3-level tree, because leaves do not count.",
+        "Unlimited rows, because height is independent of fanout in a B-tree."
+      ],
+      "correctIndex": 0,
+      "explanation": "Height is the log base fanout of the row count, so at fanout 400 four levels index roughly 25 billion rows. The metapage, root, and usually the whole non-leaf portion stay in shared_buffers, so a warm lookup costs only the leaf access, sub-microsecond if cached.",
+      "sourceAnchor": "6421-practical-numbers-and-failure-modes",
+      "difficulty": "application"
+    }
+  ]
+}

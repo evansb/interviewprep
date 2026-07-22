@@ -1,0 +1,425 @@
+{
+  "slug": "chapter-70-leader-election",
+  "questions": [
+    {
+      "id": "70-q01",
+      "prompt": "What is the primary benefit of routing all writes through a single elected leader?",
+      "options": [
+        "It serializes decisions into one total order, so followers replay it without conflict resolution.",
+        "It doubles the write throughput by parallelizing writes across every replica at once.",
+        "It removes the need for any failure detection because the leader never fails.",
+        "It lets each replica accept conflicting writes and merge them later automatically."
+      ],
+      "correctIndex": 0,
+      "explanation": "A leader assigns every write a position in a single total order, so there is one authoritative history and followers simply apply it. This eliminates concurrent write-write conflict resolution at the cost of a single point of failure and a write-throughput ceiling.",
+      "sourceAnchor": "701-why-elect-a-leader-at-all",
+      "difficulty": "recall"
+    },
+    {
+      "id": "70-q02",
+      "prompt": "A candidate argues leader-based replication scales write throughput. Why is this wrong?",
+      "options": [
+        "All writes still funnel through one leader, so leadership solves ordering, not throughput; scaling writes needs sharding.",
+        "Leader-based replication actually caps reads, not writes, at one node's capacity.",
+        "The leader parallelizes writes across followers, so throughput scales linearly with nodes.",
+        "Write throughput is unlimited because followers can accept writes during elections."
+      ],
+      "correctIndex": 0,
+      "explanation": "A single leader is a serialization point: every write passes through it, so you cannot exceed what one machine can order. Scaling writes requires partitioning the data across multiple leaders or adopting a leaderless design.",
+      "sourceAnchor": "701-why-elect-a-leader-at-all",
+      "difficulty": "application"
+    },
+    {
+      "id": "70-q03",
+      "prompt": "What is the achievable safety guarantee for leader election, stated precisely?",
+      "options": [
+        "At most one active leader per epoch, where an active leader is one that can commit.",
+        "Exactly one leader continuously, with no gaps and no overlap ever.",
+        "At least two leaders at all times, for redundancy against failure.",
+        "Any node may commit as leader as long as it recently sent a heartbeat."
+      ],
+      "correctIndex": 0,
+      "explanation": "Systems cannot guarantee exactly one leader continuously, so they enforce that at most one leader per epoch can actually commit, using majority quorums whose members are unique per epoch. Several nodes may believe they lead, but only one can act.",
+      "sourceAnchor": "702-correctness-goals-safety-and-liveness",
+      "difficulty": "recall"
+    },
+    {
+      "id": "70-q04",
+      "prompt": "Why can no protocol guarantee exactly one continuously-correct leader in an asynchronous system?",
+      "options": [
+        "By FLP, a crashed node is indistinguishable from a slow or partitioned one, so any timeout decision can be wrong.",
+        "Because network cards cannot send messages fast enough to keep a leader current.",
+        "Because monotonic clocks always drift far enough to invalidate every lease instantly.",
+        "Because majority quorums are mathematically impossible to assemble under load."
+      ],
+      "correctIndex": 0,
+      "explanation": "Electing a leader is a consensus problem, and FLP proves consensus cannot be guaranteed with even one crash in a fully asynchronous system. You cannot tell a dead leader from a slow one, so declaring it dead may be wrong and produce two leaders.",
+      "sourceAnchor": "703-why-exactly-one-leader-is-impossible",
+      "difficulty": "application"
+    },
+    {
+      "id": "70-q05",
+      "prompt": "In the Bully algorithm, which node ultimately becomes leader?",
+      "options": [
+        "The highest-id node that is currently alive, which preempts any lower-id incumbent on return.",
+        "The lowest-id node, because it is the first to notice the leader is gone.",
+        "The node whose log is most up-to-date, regardless of its id.",
+        "Whichever node first receives a majority of votes in the current term."
+      ],
+      "correctIndex": 0,
+      "explanation": "Bully elects the highest-id live node: a node pings all higher ids and wins only if none answer. When a higher-id node recovers it bullies the incumbent out, which causes churn but keeps the winner deterministic by identity.",
+      "sourceAnchor": "704-the-bully-algorithm",
+      "difficulty": "recall"
+    },
+    {
+      "id": "70-q06",
+      "prompt": "What are the three message types in the Bully algorithm?",
+      "options": [
+        "ELECTION (to higher ids), ANSWER (I outrank you, stand down), and COORDINATOR (I am leader).",
+        "REQUESTVOTE, VOTEGRANTED, and APPENDENTRIES heartbeat messages.",
+        "PING, PONG, and a periodic gossip digest of cluster membership.",
+        "PROPOSE, PROMISE, and ACCEPT as in the Paxos ballot phases."
+      ],
+      "correctIndex": 0,
+      "explanation": "A node sends ELECTION to all higher-id nodes; a higher node replies ANSWER to make it stand down and runs its own election; the eventual winner broadcasts COORDINATOR to all lower ids. The others belong to Raft and Paxos, not Bully.",
+      "sourceAnchor": "704-the-bully-algorithm",
+      "difficulty": "recall"
+    },
+    {
+      "id": "70-q07",
+      "prompt": "What is the worst-case message complexity of the Bully algorithm, and when does it occur?",
+      "options": [
+        "O(n squared), when the lowest-id node initiates and elections cascade up through every higher node.",
+        "O(log n), because the ring is traversed with binary search on ids.",
+        "O(1), because the highest-id node is known in advance and just declares itself.",
+        "O(n factorial), because every node must message every permutation of the others."
+      ],
+      "correctIndex": 0,
+      "explanation": "When the lowest-id node starts, it messages all higher nodes, each of which starts its own election messaging its higher nodes, cascading to roughly n(n-1)/2 ELECTION messages. Best case (second-highest node initiates) is O(n).",
+      "sourceAnchor": "704-the-bully-algorithm",
+      "difficulty": "application"
+    },
+    {
+      "id": "70-q08",
+      "prompt": "How does the Chang-Roberts ring election determine the winner?",
+      "options": [
+        "An ELECTION message carrying the largest id circulates; a node seeing its own id return knows it is the maximum.",
+        "Each node broadcasts to all others and counts votes until one has a majority.",
+        "The node holding the token when a timer expires declares itself leader.",
+        "Nodes flood their ids and the last id to arrive anywhere wins the election."
+      ],
+      "correctIndex": 0,
+      "explanation": "Nodes forward only ids larger than their own around the logical ring, so lower-id initiations are absorbed and only the global maximum survives. When a node receives an ELECTION message bearing its own id, it knows it is the highest and becomes leader.",
+      "sourceAnchor": "706-the-ring-algorithm-changroberts",
+      "difficulty": "recall"
+    },
+    {
+      "id": "70-q09",
+      "prompt": "Why is the ring election topology fragile in practice?",
+      "options": [
+        "A single dead node breaks the ring unless nodes track their successor's successor to route around it.",
+        "The ring requires a physical bus topology that modern data-center networks cannot provide.",
+        "Ring elections always take O(n factorial) messages, which is too slow for any cluster.",
+        "The ring cannot assign monotonic ids, so epochs and fencing become impossible."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because each node knows only its successor, one failure severs message circulation unless nodes maintain knowledge of the successor's successor, which reintroduces failure detection. This fragility is why production systems favor quorum-based election over rings.",
+      "sourceAnchor": "706-the-ring-algorithm-changroberts",
+      "difficulty": "application"
+    },
+    {
+      "id": "70-q10",
+      "prompt": "Why did production databases abandon Bully and ring election for quorum-based approaches?",
+      "options": [
+        "Bully and ring elect the highest reachable id, so each side of a partition elects its own leader: split-brain.",
+        "Bully and ring require synchronized atomic clocks that data centers cannot provide.",
+        "Quorum election has lower message complexity in every possible case.",
+        "Bully and ring cannot assign ids to more than 64 nodes at a time."
+      ],
+      "correctIndex": 0,
+      "explanation": "Highest-id-wins picks the maximum among reachable nodes, so a partition makes each side elect a different leader. Quorum election requires a majority, which a minority partition can never assemble, making at most one leader per epoch and thus partition-safe.",
+      "sourceAnchor": "707-algorithm-comparison-and-message-complexity",
+      "difficulty": "application"
+    },
+    {
+      "id": "70-q11",
+      "prompt": "Besides message complexity, how does election in a replicated database differ from classic Bully/ring?",
+      "options": [
+        "It must elect the most up-to-date replica, not a static-priority node, or committed writes would be lost.",
+        "It must elect the node with the lowest network latency to the clients.",
+        "It must elect a new leader on every single write for freshness.",
+        "It must elect two co-leaders so one can validate the other's decisions."
+      ],
+      "correctIndex": 0,
+      "explanation": "Classic algorithms elect on static identity, which is fine for interchangeable nodes. Electing a replica requires the winner to hold every committed entry, so protocols like Raft add an election restriction that rejects candidates whose log is behind.",
+      "sourceAnchor": "707-algorithm-comparison-and-message-complexity",
+      "difficulty": "application"
+    },
+    {
+      "id": "70-q12",
+      "prompt": "What is an epoch (or term) and how does it make leadership safe?",
+      "options": [
+        "A monotonic reign number stamped on every message; peers remember the highest seen and reject older ones.",
+        "A fixed time window during which no node may send any messages at all.",
+        "A random nonce that each leader picks to encrypt its heartbeats.",
+        "The total count of nodes that must acknowledge a write before commit."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each successful election increments the epoch, and the leader stamps it on every message. A follower rejects any message from a lower epoch, so a deposed leader's messages are rejected as stale once a peer has advanced, neutralizing it among cooperating nodes.",
+      "sourceAnchor": "708-epochs-terms-and-fencing-tokens",
+      "difficulty": "recall"
+    },
+    {
+      "id": "70-q13",
+      "prompt": "Why is an epoch stamped on messages insufficient to stop a paused leader from corrupting shared storage?",
+      "options": [
+        "A paused leader may resume and write directly to storage without ever receiving a newer-epoch message.",
+        "Epochs overflow after 65536 increments and wrap back to a valid value.",
+        "Storage devices increment the epoch faster than the leader can, so it always looks stale.",
+        "The epoch is encrypted, so the storage layer cannot compare it to anything."
+      ],
+      "correctIndex": 0,
+      "explanation": "Epochs protect messages between cooperating nodes, but a leader that pauses (e.g. GC) can resume and complete a write to an external resource without ever seeing a higher epoch. The resource itself must validate a fencing token to reject the stale write.",
+      "sourceAnchor": "708-epochs-terms-and-fencing-tokens",
+      "difficulty": "application"
+    },
+    {
+      "id": "70-q14",
+      "prompt": "What are the two essential requirements for a fencing token to work?",
+      "options": [
+        "The token must be monotonic, and the protected resource must itself validate and reject stale tokens.",
+        "The token must be random, and every follower must sign it before use.",
+        "The token must be encrypted, and the leader must renew it every second.",
+        "The token must equal the node id, and clocks must be perfectly synchronized."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each new leader's token must strictly exceed all previous ones (a fresh-majority-minted epoch satisfies this), and the resource performing the side effect must check it, rejecting any operation with a lower token. A token nobody validates is decorative.",
+      "sourceAnchor": "708-epochs-terms-and-fencing-tokens",
+      "difficulty": "recall"
+    },
+    {
+      "id": "70-q15",
+      "prompt": "What exactly is split-brain?",
+      "options": [
+        "Two or more nodes simultaneously believe they are leader and both accept writes, producing divergent histories.",
+        "A single leader that splits its workload across two threads for parallelism.",
+        "A follower that caches two versions of the log to speed up recovery.",
+        "A cluster that intentionally runs two leaders to balance read traffic."
+      ],
+      "correctIndex": 0,
+      "explanation": "Split-brain is the safety violation where multiple nodes act as leader at once, typically triggered by a network partition where each side elects its own leader. The resulting divergent histories usually require data loss or manual repair to reconcile.",
+      "sourceAnchor": "709-split-brain",
+      "difficulty": "recall"
+    },
+    {
+      "id": "70-q16",
+      "prompt": "A quorum-based system prevents two nodes from both committing, but what does it NOT prevent?",
+      "options": [
+        "It does not prevent a minority-side node from believing it is a leader candidate; only its ability to commit is blocked.",
+        "It does not prevent the majority side from ever electing a leader at all.",
+        "It does not prevent messages from carrying an epoch number.",
+        "It does not prevent the cluster from tolerating any node failures."
+      ],
+      "correctIndex": 0,
+      "explanation": "Majority quorum stops two nodes from both committing, because two majorities intersect, but a minority-partition node may still believe it is a candidate. Safety comes from constraining action (it can never gather a majority) plus fencing, not from constraining belief.",
+      "sourceAnchor": "709-split-brain",
+      "difficulty": "trap"
+    },
+    {
+      "id": "70-q17",
+      "prompt": "Why do any two majorities of the same node set guarantee at most one leader per epoch?",
+      "options": [
+        "Two subsets each larger than half must share a member, and each node votes only once per epoch.",
+        "Because the highest-id node is always in every majority by definition.",
+        "Because a majority is always exactly two nodes regardless of cluster size.",
+        "Because minority partitions are forbidden from running any election code."
+      ],
+      "correctIndex": 0,
+      "explanation": "Two subsets each of size greater than n/2 cannot be disjoint, so they share at least one member. Since each node grants at most one vote per epoch, two candidates both winning the same epoch would need a shared voter to vote twice, which is impossible.",
+      "sourceAnchor": "7010-quorums-and-majorities",
+      "difficulty": "application"
+    },
+    {
+      "id": "70-q18",
+      "prompt": "Why are odd cluster sizes preferred for quorum-based election?",
+      "options": [
+        "Fault tolerance is floor((n-1)/2), so n=4 tolerates the same one failure as n=3 but adds even-split risk.",
+        "Odd sizes let the leader break ties by voting twice.",
+        "Even sizes cannot assign monotonic epochs, only odd ones can.",
+        "Odd sizes halve the message complexity of every election round."
+      ],
+      "correctIndex": 0,
+      "explanation": "With n=4 the majority is 3, tolerating only one failure just like n=3, while adding the risk of a 2-2 split where no side has a majority and progress halts. Adding nodes in odd steps (3, 5, 7) increases fault tolerance meaningfully.",
+      "sourceAnchor": "7010-quorums-and-majorities",
+      "difficulty": "application"
+    },
+    {
+      "id": "70-q19",
+      "prompt": "What is STONITH, and when is it needed?",
+      "options": [
+        "Forcibly powering off or isolating the former leader before promotion, needed when the resource can't check a token.",
+        "A gossip protocol that shares node health across the cluster every second.",
+        "A lease-renewal scheme that extends leadership by heartbeating a quorum.",
+        "An election algorithm that picks the leader with the highest uptime."
+      ],
+      "correctIndex": 0,
+      "explanation": "STONITH (Shoot The Other Node In The Head) power-fences, storage-fences, or network-isolates the old leader before promoting a new one. It is needed for shared resources like a SAN volume that cannot validate a fencing token, so at-most-one-writer is enforced by destruction.",
+      "sourceAnchor": "7011-fencing-at-the-infrastructure-level-stonith",
+      "difficulty": "recall"
+    },
+    {
+      "id": "70-q20",
+      "prompt": "What does a lease provide, and what critical assumption does it rest on?",
+      "options": [
+        "Time-bounded leadership enabling automatic failover and local reads, resting on a bounded-clock-drift assumption.",
+        "Permanent leadership with no renewal, resting on the network never partitioning.",
+        "A guarantee of zero data loss, resting on synchronous replication to every replica.",
+        "Unlimited concurrent leaders, resting on each having a distinct random id."
+      ],
+      "correctIndex": 0,
+      "explanation": "A lease is leadership for a bounded duration that must be renewed; it makes failover automatic and lets the holder serve reads locally. But granter and holder measure the same duration on different clocks, so it requires bounded clock drift plus safety margins to stay safe.",
+      "sourceAnchor": "7012-leases-time-bounded-leadership",
+      "difficulty": "recall"
+    },
+    {
+      "id": "70-q21",
+      "prompt": "Why must a lease be backed by a fencing token rather than trusted alone?",
+      "options": [
+        "A GC pause or clock drift can make a holder act after its lease was reassigned, reopening the two-leaders window.",
+        "Leases expire too quickly to ever complete a single write operation safely.",
+        "Fencing tokens are faster to compare than lease timestamps on modern CPUs.",
+        "A lease cannot be stored in a linearizable store, but a token can be."
+      ],
+      "correctIndex": 0,
+      "explanation": "A lease bounds only the common-case window; a paused process may resume believing its lease is still valid after leadership moved, and clock drift can widen the gap. A fencing token validated by the resource protects against that pathological case, so the two are complementary.",
+      "sourceAnchor": "7012-leases-time-bounded-leadership",
+      "difficulty": "trap"
+    },
+    {
+      "id": "70-q22",
+      "prompt": "In the ZooKeeper election recipe, which candidate becomes leader?",
+      "options": [
+        "The one whose ephemeral-sequential znode has the lowest sequence number; failover moves to the next-lowest.",
+        "The one whose znode has the highest sequence number, matching Bully's highest-id rule.",
+        "The one that most recently updated its znode's data field.",
+        "The one chosen by a majority vote among all watching clients."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each candidate creates an ephemeral-sequential znode; the lowest sequence number wins. When the leader's session dies, ZooKeeper auto-deletes its ephemeral znode and the next-lowest becomes leader. The sequence number doubles as a fencing token.",
+      "sourceAnchor": "7013-real-systems-i-zookeeper-ephemeral-znode-election",
+      "difficulty": "recall"
+    },
+    {
+      "id": "70-q23",
+      "prompt": "How does the ZooKeeper recipe avoid the herd effect during a leadership change?",
+      "options": [
+        "Each candidate watches only the next-lower znode, so exactly one watch fires per deletion.",
+        "All candidates poll the leader znode on a randomized backoff timer instead of watching.",
+        "ZooKeeper batches all watch notifications and sends them once per minute.",
+        "Only the leader is allowed to set watches, so followers are never woken."
+      ],
+      "correctIndex": 0,
+      "explanation": "If every follower watched the single leader znode, its deletion would wake all of them (thundering herd). Instead each candidate watches only the znode with the next-lower sequence number, so a deletion wakes exactly one node, its immediate successor.",
+      "sourceAnchor": "7013-real-systems-i-zookeeper-ephemeral-znode-election",
+      "difficulty": "application"
+    },
+    {
+      "id": "70-q24",
+      "prompt": "How does Raft use randomized election timeouts?",
+      "options": [
+        "Followers pick random timeouts so one usually fires first and wins uncontested, breaking split-vote ties.",
+        "The leader randomly reassigns timeouts to followers to keep them from becoming candidates.",
+        "Timeouts are randomized so that every node becomes a candidate in the same round.",
+        "Randomization determines the term number rather than who starts an election."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each follower waits a randomly chosen timeout before becoming a candidate. If a vote splits, both retry with fresh random timeouts, so one almost surely fires first and wins uncontested. This randomization is Raft's escape from the FLP symmetry problem.",
+      "sourceAnchor": "7014-real-systems-ii-etcd-and-raft-leader-election",
+      "difficulty": "application"
+    },
+    {
+      "id": "70-q25",
+      "prompt": "In Raft, why must a voter reject a candidate whose log is behind its own?",
+      "options": [
+        "Because an out-of-date leader would overwrite or lose committed entries; the restriction guarantees the winner holds them all.",
+        "Because a behind candidate has a lower node id and Bully rules apply.",
+        "Because a behind candidate cannot compute the correct term number.",
+        "Because voting for it would exceed the one-vote-per-term limit."
+      ],
+      "correctIndex": 0,
+      "explanation": "Raft's election restriction makes voters reject candidates whose log is less up-to-date than their own, so the elected leader already holds every committed entry. This lets leadership change without ever losing committed data, unlike identity-based election.",
+      "sourceAnchor": "7014-real-systems-ii-etcd-and-raft-leader-election",
+      "difficulty": "application"
+    },
+    {
+      "id": "70-q26",
+      "prompt": "How does Patroni elect a PostgreSQL leader without implementing a consensus algorithm itself?",
+      "options": [
+        "The primary holds a TTL leader key in a DCS like etcd; on expiry replicas atomically race to recreate it.",
+        "Each Postgres node runs Raft directly and exchanges RequestVote messages with peers.",
+        "Patroni broadcasts its WAL position and the highest one wins by Bully rules.",
+        "The primary streams heartbeats to replicas, and the first to miss three promotes itself."
+      ],
+      "correctIndex": 0,
+      "explanation": "Patroni delegates consensus to a distributed configuration store (etcd, Consul, ZooKeeper). The primary renews a leader key with a TTL lease; if it lapses, replicas race to atomically create it, and the linearizable store guarantees exactly one winner, which then promotes.",
+      "sourceAnchor": "7015-real-systems-iii-postgresql-ha-via-patroni",
+      "difficulty": "recall"
+    },
+    {
+      "id": "70-q27",
+      "prompt": "Why can a Redis Sentinel failover lose writes the old master already acknowledged?",
+      "options": [
+        "Redis replication is asynchronous: the master acks before replicating, so unpropagated writes vanish on promotion.",
+        "Sentinel deliberately discards the last 100 writes to speed up promotion.",
+        "The promoted replica always starts from an empty dataset after failover.",
+        "Sentinel elects the least up-to-date replica to balance load across the cluster."
+      ],
+      "correctIndex": 0,
+      "explanation": "The master acknowledges a client write before replicating it, so if it fails before propagating, the promoted replica never saw that write and it is lost. Sentinel provides availability failover via majority sentinel election, not quorum-durable consistency.",
+      "sourceAnchor": "7016-real-systems-iv-redis-sentinel",
+      "difficulty": "trap"
+    },
+    {
+      "id": "70-q28",
+      "prompt": "In Redis Sentinel, what is the difference between the 'quorum' setting and the sentinel-leader majority?",
+      "options": [
+        "The quorum setting authorizes declaring the master down; a majority of all sentinels elects the one that fails over.",
+        "They are identical values that must always be set equal to each other.",
+        "The quorum elects the leader sentinel; the majority only marks the master subjectively down.",
+        "The quorum counts replicas, while the majority counts client connections."
+      ],
+      "correctIndex": 0,
+      "explanation": "The quorum parameter is how many sentinels must agree the master is objectively down to start a failover. Electing the single leader sentinel that actually performs it requires a majority of all sentinels, a separate stricter condition preventing concurrent failovers.",
+      "sourceAnchor": "7016-real-systems-iv-redis-sentinel",
+      "difficulty": "application"
+    },
+    {
+      "id": "70-q29",
+      "prompt": "What are the two distinct levels of election in Kafka?",
+      "options": [
+        "The controller election (who manages metadata) and per-partition leader election (which replica serves a partition).",
+        "The producer election and the consumer election for each topic.",
+        "The disk election and the network election for each broker.",
+        "The ZooKeeper election and a completely separate DNS-based election."
+      ],
+      "correctIndex": 0,
+      "explanation": "Kafka elects a controller broker that manages cluster metadata, and beneath it runs per-partition leader elections choosing an in-sync replica for each partition. The controller runs those partition elections; the controller itself is elected via ZooKeeper or KRaft Raft.",
+      "sourceAnchor": "7017-real-systems-v-mongodb-and-the-kafka-controller",
+      "difficulty": "recall"
+    },
+    {
+      "id": "70-q30",
+      "prompt": "What is the most effective fix for symmetric-timeout election livelock, where all followers become candidates at once?",
+      "options": [
+        "Randomized (jittered) election timeouts, so one node becomes a candidate first and wins uncontested.",
+        "Shortening every timeout equally so elections complete faster.",
+        "Forcing all followers to become candidates in lockstep to guarantee a vote.",
+        "Removing epochs so terms never need to increment during an election."
+      ],
+      "correctIndex": 0,
+      "explanation": "If all followers time out simultaneously they all become candidates, split the vote, and retry forever. Randomizing the timeouts spreads out who stands first, so one node almost surely starts and wins before others, which is exactly Raft's approach.",
+      "sourceAnchor": "7018-election-storms-flapping-and-damping",
+      "difficulty": "application"
+    }
+  ]
+}

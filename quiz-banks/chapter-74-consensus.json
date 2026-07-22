@@ -1,0 +1,537 @@
+{
+  "slug": "chapter-74-consensus",
+  "questions": [
+    {
+      "id": "74-q01",
+      "prompt": "Which consensus property is the sole liveness property, the one practical algorithms sacrifice under network asynchrony?",
+      "options": [
+        "Termination: every correct process eventually decides.",
+        "Agreement: no two correct processes decide different values.",
+        "Validity: any decided value was proposed by some process.",
+        "Integrity: each process decides at most once and finally."
+      ],
+      "correctIndex": 0,
+      "explanation": "Agreement, validity, and integrity are safety properties that must always hold, while termination is the liveness property. Real algorithms keep safety unconditional and give up only eventual progress when the network misbehaves.",
+      "sourceAnchor": "741-the-consensus-problem-defined",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q02",
+      "prompt": "Why does practical database consensus require uniform agreement rather than merely regular agreement?",
+      "options": [
+        "A process may externalize a decision to a client and then crash, so survivors must not have decided differently.",
+        "Uniform agreement removes the need for majority quorums entirely.",
+        "Regular agreement only works when the network is fully synchronous.",
+        "Uniform agreement lets followers decide before the leader does."
+      ],
+      "correctIndex": 0,
+      "explanation": "Regular agreement constrains only surviving correct processes, but a doomed node may already have acknowledged a value to a client before dying. Uniform agreement forbids that crashing node from having decided differently, protecting acknowledged results.",
+      "sourceAnchor": "741-the-consensus-problem-defined",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q03",
+      "prompt": "What is the exact recipe that turns consensus into a fault-tolerant database?",
+      "options": [
+        "A deterministic state machine applying commands in a consensus-ordered log.",
+        "A quorum of caches synchronized by periodic anti-entropy gossip.",
+        "A two-phase commit coordinator plus a write-ahead log per node.",
+        "A primary that streams its byte-level redo log to read replicas."
+      ],
+      "correctIndex": 0,
+      "explanation": "State-machine replication starts every replica identically and applies the same commands in the same agreed order; determinism then forces identical state. Consensus supplies the agreed order, and the state machine is the database.",
+      "sourceAnchor": "742-consensus-and-state-machine-replication",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q04",
+      "prompt": "A command like SET t = now() is logged by a Raft leader for replication. What must happen for state-machine replication to stay correct?",
+      "options": [
+        "The leader evaluates now() and logs the concrete value so replicas apply a deterministic command.",
+        "Each replica evaluates now() locally when it applies the entry.",
+        "The command is rejected because timestamps cannot be replicated.",
+        "Followers skip the entry and request the value from the client."
+      ],
+      "correctIndex": 0,
+      "explanation": "If each replica evaluated now() independently they would diverge, breaking determinism. Nondeterminism must be resolved before the log, so the leader records the concrete evaluated value and replicas apply an already-deterministic command.",
+      "sourceAnchor": "742-consensus-and-state-machine-replication",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q05",
+      "prompt": "What does the FLP result prove about deterministic consensus?",
+      "options": [
+        "In an asynchronous system with even one crash fault, no deterministic protocol guarantees both safety and termination.",
+        "In a synchronous system, consensus is impossible when more than half the nodes fail.",
+        "Byzantine consensus is impossible for any number of faulty nodes.",
+        "Randomized consensus can never terminate with probability one."
+      ],
+      "correctIndex": 0,
+      "explanation": "FLP shows that under full asynchrony a single possible crash makes it impossible to always achieve both agreement and termination, because a crashed node is indistinguishable from a slow one. An adversarial scheduler can stall the decisive message forever.",
+      "sourceAnchor": "743-flp-and-how-consensus-sidesteps-it",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q06",
+      "prompt": "How should you answer 'how does Raft beat FLP?' in an interview?",
+      "options": [
+        "It does not beat FLP; it keeps safety unconditionally and concedes liveness during asynchrony.",
+        "It uses synchronized atomic clocks to eliminate all message-delay uncertainty.",
+        "It tolerates unlimited failures by using Byzantine quorums of 3f+1.",
+        "It randomizes acceptor votes so no adversarial schedule can ever exist."
+      ],
+      "correctIndex": 0,
+      "explanation": "No algorithm violates FLP. Raft preserves agreement no matter how asynchronous the network becomes and gives up only progress during those bad periods, which is exactly the concession FLP says is unavoidable. It routes around the result rather than defeating it.",
+      "sourceAnchor": "743-flp-and-how-consensus-sidesteps-it",
+      "difficulty": "trap"
+    },
+    {
+      "id": "74-q07",
+      "prompt": "What is the practical embodiment of partial synchrony that lets leader-based consensus make progress?",
+      "options": [
+        "A single leader that proposes, plus randomized timeouts that break symmetry when it fails.",
+        "A synchronized global clock shared by every node in the cluster.",
+        "A failure detector that never makes a mistake about any node's state.",
+        "A fixed round-robin schedule that rotates the leader every message."
+      ],
+      "correctIndex": 0,
+      "explanation": "A single leader avoids proposal collisions, and randomized election timeouts ensure that when the leader dies one follower's timer fires first and wins, breaking the symmetry the way randomization breaks FLP's adversarial schedule. Progress resumes once the network behaves.",
+      "sourceAnchor": "743-flp-and-how-consensus-sidesteps-it",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q08",
+      "prompt": "Reliable broadcast guarantees delivery agreement but lacks which property that atomic broadcast adds?",
+      "options": [
+        "A single total order in which all correct processes deliver messages.",
+        "The guarantee that a correct sender's message reaches every correct process.",
+        "Re-broadcasting so a message that reached anyone reaches everyone.",
+        "Protection against the original sender crashing partway through."
+      ],
+      "correctIndex": 0,
+      "explanation": "Reliable broadcast ensures that if any correct process delivers a message all correct processes do, even if the sender crashes, but two processes may still deliver different messages in opposite orders. Atomic broadcast adds one agreed global total order.",
+      "sourceAnchor": "744-broadcast-abstractions-best-effort-reliable-uniform-reliable",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q09",
+      "prompt": "What is the relationship between atomic (total-order) broadcast and consensus?",
+      "options": [
+        "They are equivalent: each can be reduced to the other, so both are equally hard.",
+        "Atomic broadcast is strictly weaker and is solvable in pure asynchrony.",
+        "Consensus is a special case of best-effort broadcast with no ordering.",
+        "Atomic broadcast requires Byzantine tolerance while consensus does not."
+      ],
+      "correctIndex": 0,
+      "explanation": "Running one consensus instance per log slot yields a total order, and atomically broadcasting proposals and deciding the first delivered message yields consensus. Because each reduces to the other, they are the same problem and neither is solvable in full asynchrony.",
+      "sourceAnchor": "745-atomic-total-order-broadcast-and-its-equivalence-to-consensus",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q10",
+      "prompt": "In the virtual synchrony model, what is a 'view'?",
+      "options": [
+        "The current agreed membership of the group, installed as a sequence as processes join or leave.",
+        "A read-only snapshot of the replicated log shared with clients.",
+        "The set of messages a single sender has broadcast so far.",
+        "A materialized query result cached at each group member."
+      ],
+      "correctIndex": 0,
+      "explanation": "Virtual synchrony centers on views, the agreed group membership installed in sequence as members join, leave, or are suspected. View-synchronous communication guarantees survivors agree on the set of messages delivered before each membership change.",
+      "sourceAnchor": "746-virtual-synchrony-and-view-synchronous-communication",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q11",
+      "prompt": "What does a ZooKeeper zxid encode, and why does its structure matter?",
+      "options": [
+        "Epoch in the high bits and a per-epoch counter in the low bits, giving a total order that identifies each leader.",
+        "A hash of the transaction payload used to detect corruption on replicas.",
+        "The client session id combined with a random nonce for uniqueness.",
+        "The commit timestamp from a synchronized global clock across the ensemble."
+      ],
+      "correctIndex": 0,
+      "explanation": "A zxid packs the epoch into the high 32 bits and a monotonically increasing counter into the low 32 bits, so zxids are totally ordered and reveal which leader created each transaction. That ordering underpins ZAB's delivery order and recovery.",
+      "sourceAnchor": "747-zookeeper-atomic-broadcast-zab",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q12",
+      "prompt": "By default, why can a ZooKeeper client read stale data?",
+      "options": [
+        "Reads are served locally by any follower and are therefore not linearizable.",
+        "Followers apply writes in a different order than the leader proposes them.",
+        "The leader acknowledges writes before any follower has persisted them.",
+        "ZAB commits transactions without ever reaching a majority quorum."
+      ],
+      "correctIndex": 0,
+      "explanation": "ZooKeeper routes writes through the leader for linearizable ordering, but a read can be answered from any follower's local state, which may lag the leader. That makes default reads non-linearizable; sync() forces a read to observe all prior writes.",
+      "sourceAnchor": "747-zookeeper-atomic-broadcast-zab",
+      "difficulty": "trap"
+    },
+    {
+      "id": "74-q13",
+      "prompt": "In Paxos, what is the role of the acceptors?",
+      "options": [
+        "They form quorums and durably remember what they have promised and accepted.",
+        "They advocate a value and drive the two-phase protocol with ballot numbers.",
+        "They observe the chosen value and apply it to the state machine.",
+        "They assign sequence numbers to client requests before broadcasting."
+      ],
+      "correctIndex": 0,
+      "explanation": "Acceptors are the memory of Paxos: a majority of them constitutes a quorum, and safety lives in their durable record of promises and accepted proposals. Proposers drive ballots and learners observe the chosen value.",
+      "sourceAnchor": "748-paxos-roles-and-the-big-picture",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q14",
+      "prompt": "After collecting a majority of Phase-1 promises, when may a Paxos proposer propose its own value?",
+      "options": [
+        "Only if no promising acceptor reported any previously accepted value.",
+        "Always, since Phase 1 grants it exclusive authority over the ballot.",
+        "Only if its own ballot number is the largest any acceptor has seen.",
+        "Whenever a majority of acceptors reported the same accepted value."
+      ],
+      "correctIndex": 0,
+      "explanation": "If any promising acceptor reports an accepted value, the proposer must adopt the value with the highest accepted ballot rather than its own. Only when no acceptor reports any accepted value is the proposer free to propose whatever it wants.",
+      "sourceAnchor": "748-paxos-roles-and-the-big-picture",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q15",
+      "prompt": "Which single fact underpins Paxos's guarantee that at most one value is ever chosen?",
+      "options": [
+        "Any two majorities of the same acceptor set intersect in at least one node.",
+        "Ballot numbers are assigned by a single global sequencer.",
+        "Acceptors only ever accept the very first value they receive.",
+        "The network delivers all messages in FIFO order per sender."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because any two majorities share at least one acceptor, a value chosen by one majority is reported by that shared acceptor to any later ballot's Phase-1 majority, forcing the new proposer to re-propose it. Quorum intersection carries the chosen value forward.",
+      "sourceAnchor": "7411-why-paxos-is-safe-quorum-intersection",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q17",
+      "prompt": "Two Paxos proposers keep issuing ever-higher Prepares that invalidate each other's Accepts. What is broken?",
+      "options": [
+        "Only liveness: no progress is made, but no two values are ever chosen.",
+        "Agreement: the two proposers cause conflicting values to be chosen.",
+        "Validity: an unproposed value can slip through during the duel.",
+        "Integrity: acceptors are forced to decide the same value twice."
+      ],
+      "correctIndex": 0,
+      "explanation": "Dueling proposers form a livelock where each new Prepare preempts the other's Accept, so Phase 2 never completes. This is a pure liveness failure; safety is untouched and no value is chosen incorrectly. The fix is a single leader with randomized backoff.",
+      "sourceAnchor": "7412-paxos-failure-scenarios-dueling-proposers-and-livelock",
+      "difficulty": "trap"
+    },
+    {
+      "id": "74-q18",
+      "prompt": "What key insight lets Multi-Paxos reduce steady-state cost to one round-trip per decision?",
+      "options": [
+        "Phase 1 references no value or slot, so a stable leader runs it once for all slots.",
+        "Acceptors skip durable logging once a leader has been elected.",
+        "Clients send values directly to acceptors, bypassing the leader.",
+        "The leader batches Phase 1 and Phase 2 into a single message."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because Prepare only claims a ballot and mentions neither a value nor a slot, a stable leader pays Phase 1 once at election and then runs only Phase 2 per command across all log slots. Phase 1 recurs only when the leadership changes.",
+      "sourceAnchor": "7413-multi-paxos-a-stable-leader-and-a-log",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q20",
+      "prompt": "In Fast Paxos, clients send proposals directly to acceptors. What is the cost of skipping the leader?",
+      "options": [
+        "Larger fast quorums and collision recovery when concurrent values conflict.",
+        "Loss of safety, since two values may now be chosen simultaneously.",
+        "A mandatory second disk sync on every acceptor per request.",
+        "The inability to tolerate any acceptor failures at all."
+      ],
+      "correctIndex": 0,
+      "explanation": "Without a leader ordering proposals first, acceptors may receive different values concurrently, so Fast Paxos needs larger fast quorums (about 3N/4, N greater than or equal to 3f+1) and must fall back to a classic coordinated round when collisions occur. It wins only under low contention.",
+      "sourceAnchor": "7414-fast-paxos",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q21",
+      "prompt": "What condition does Flexible Paxos show is actually required of Paxos quorums?",
+      "options": [
+        "Q1 + Q2 > N, so every Phase-1 quorum intersects every Phase-2 quorum.",
+        "Both Q1 and Q2 must each independently exceed N/2.",
+        "Q1 and Q2 must be equal so the two phases stay symmetric.",
+        "Every pair of Phase-2 quorums must intersect each other."
+      ],
+      "correctIndex": 0,
+      "explanation": "Safety needs only that a leader-election quorum meets every replication quorum, expressed as Q1 + Q2 > N. Same-phase quorums need not intersect, so majorities are one valid point in a design space, not a requirement. This enables cheap small write quorums.",
+      "sourceAnchor": "7415-flexible-paxos-fpaxos",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q23",
+      "prompt": "What is the defining mechanism of Egalitarian Paxos (EPaxos)?",
+      "options": [
+        "A leaderless protocol committing commands with dependency sets, executed by topological sort.",
+        "A stable leader that orders all commands into one linear log.",
+        "A rotating primary that signs each batch with a threshold signature.",
+        "A synchronous ring in which each node commits in a fixed turn."
+      ],
+      "correctIndex": 0,
+      "explanation": "EPaxos has no leader; any replica commits any command with a set of dependencies on interfering commands, building a dependency graph rather than a linear log. Non-interfering commands commit in parallel, and execution topologically sorts the graph.",
+      "sourceAnchor": "7416-egalitarian-paxos-epaxos",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q24",
+      "prompt": "Under what workload does EPaxos degrade toward its slow path?",
+      "options": [
+        "High conflict, where many commands touch the same keys and force dependency agreement.",
+        "Low conflict, where commands are spread evenly across distinct keys.",
+        "Read-heavy workloads served entirely from the nearest replica.",
+        "Any workload, since EPaxos always takes two round-trips per command."
+      ],
+      "correctIndex": 0,
+      "explanation": "EPaxos commits in one round-trip when a command has no interfering concurrent commands, but when many commands touch the same keys their dependencies disagree and it falls back to a second coordinated round. Performance therefore degrades under high contention.",
+      "sourceAnchor": "7416-egalitarian-paxos-epaxos",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q25",
+      "prompt": "What does Generalized Paxos exploit to avoid agreeing on a full total order?",
+      "options": [
+        "Command commutativity: commuting commands need only a partial order.",
+        "Threshold signatures that compress votes into a single message.",
+        "A synchronized clock that timestamps every command uniquely.",
+        "Speculative execution that is rolled back on any conflict."
+      ],
+      "correctIndex": 0,
+      "explanation": "If two commands commute, applying them in either order yields the same state, so replicas need not agree on their relative order. Generalized Paxos agrees only on a partial order consistent up to commutativity, invoking a slow round only when commands do not commute.",
+      "sourceAnchor": "7417-generalized-paxos-and-commuting-commands",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q26",
+      "prompt": "Why was Raft designed, relative to Multi-Paxos?",
+      "options": [
+        "For understandability, decomposing consensus into election, replication, and safety with strong constraints.",
+        "To tolerate Byzantine faults that Multi-Paxos cannot handle.",
+        "To remove the need for any leader in the common case.",
+        "To eliminate majority quorums in favor of single-node decisions."
+      ],
+      "correctIndex": 0,
+      "explanation": "Raft solves the same problem as Multi-Paxos but was designed so engineers can actually understand and implement it, splitting consensus into leader election, log replication, and safety, and adding constraints like one-directional log flow that shrink the state space.",
+      "sourceAnchor": "7419-raft-design-for-understandability",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q27",
+      "prompt": "What prevents two leaders from being elected in the same Raft term?",
+      "options": [
+        "Each node casts at most one vote per term, so two candidates cannot both win a majority.",
+        "A global lock in the configuration store serializes all elections.",
+        "Candidates must receive unanimous votes, not just a majority.",
+        "The previous leader explicitly hands off authority to exactly one successor."
+      ],
+      "correctIndex": 0,
+      "explanation": "A term has at most one leader because every node grants at most one vote in a term, making it impossible for two candidates to each collect a majority. A node seeing a higher term also reverts to follower, deposing any stale leader.",
+      "sourceAnchor": "7420-raft-leader-election-and-terms",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q29",
+      "prompt": "When is a Raft log entry considered committed?",
+      "options": [
+        "Once the leader has replicated it to a majority of the cluster, including itself.",
+        "As soon as the leader appends it to its own local log.",
+        "When every single follower has acknowledged the AppendEntries RPC.",
+        "After the client receives the response for that specific command."
+      ],
+      "correctIndex": 0,
+      "explanation": "An entry is committed once it resides on a majority under the current leader, making it durable and guaranteed never to be lost. The leader advances commitIndex and piggybacks it so followers apply committed entries in index order.",
+      "sourceAnchor": "7421-raft-log-replication-and-commitment",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q30",
+      "prompt": "Why may a Raft leader NOT declare a previous-term entry committed just because it now sits on a majority?",
+      "options": [
+        "A later leader could still overwrite it; it becomes committed only via a current-term entry above it.",
+        "Previous-term entries can never be replicated to a majority at all.",
+        "Followers refuse to acknowledge any entry from an earlier term.",
+        "The commit index cannot legally point at a previous term's index."
+      ],
+      "correctIndex": 0,
+      "explanation": "This is the Figure-8 hazard: an old-term entry on a majority could still be overwritten by a future leader. Raft only commits a prior-term entry indirectly, by committing a current-term entry above it, so it counts only current-term replication toward commitment.",
+      "sourceAnchor": "7421-raft-log-replication-and-commitment",
+      "difficulty": "trap"
+    },
+    {
+      "id": "74-q31",
+      "prompt": "How does the Raft election restriction guarantee a new leader holds every committed entry?",
+      "options": [
+        "A voter grants its vote only to a candidate whose log is at least as up-to-date as its own.",
+        "The candidate fetches any missing committed entries from followers before serving.",
+        "The previous leader transfers its committed log to the winner directly.",
+        "Committed entries are broadcast to all nodes before any election starts."
+      ],
+      "correctIndex": 0,
+      "explanation": "A committed entry sits on a majority, and a winning candidate needs a majority of votes; those majorities intersect in a node that will refuse to vote for a candidate lacking the entry. Thus no candidate missing a committed entry can win, and leaders never need to fetch.",
+      "sourceAnchor": "7422-raft-safety-log-matching-and-the-election-restriction",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q32",
+      "prompt": "How does a Raft leader repair a follower whose log has a divergent uncommitted tail?",
+      "options": [
+        "It decrements nextIndex until the consistency check matches, then overwrites the conflicting suffix.",
+        "It merges the follower's entries into its own log to preserve both.",
+        "It deletes the follower from the cluster and adds a fresh replica.",
+        "It asks the follower to elect itself leader and re-propose its entries."
+      ],
+      "correctIndex": 0,
+      "explanation": "Entries flow only leader to follower. On an AppendEntries rejection the leader backs up nextIndex until prevLogIndex and prevLogTerm match, then overwrites the follower's divergent suffix with its own entries. Those discarded entries were never committed, so nothing committed is lost.",
+      "sourceAnchor": "7423-raft-failure-scenarios-and-log-repair",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q33",
+      "prompt": "Why does naive membership change risk split brain, and how does joint consensus prevent it?",
+      "options": [
+        "Nodes switching configs at different times can form two disjoint majorities; joint consensus requires a majority of both old and new configs.",
+        "New nodes start with full logs that outvote existing members; joint consensus empties their logs first.",
+        "The leader loses its term during reconfiguration; joint consensus freezes the term counter.",
+        "Clients cache the old membership; joint consensus flushes all client caches atomically."
+      ],
+      "correctIndex": 0,
+      "explanation": "If some nodes use the old config and others the new one, two disjoint majorities could elect two leaders in one term. Joint consensus routes through a combined configuration where every decision needs a majority of both old and new, making disjoint majorities impossible.",
+      "sourceAnchor": "7424-raft-membership-changes-joint-consensus",
+      "difficulty": "trap"
+    },
+    {
+      "id": "74-q34",
+      "prompt": "Which statement captures a real structural difference between Raft and Multi-Paxos?",
+      "options": [
+        "Raft forbids log holes and flows entries only leader to follower; Multi-Paxos may leave holes and fill slots.",
+        "Raft tolerates Byzantine faults while Multi-Paxos tolerates only crashes.",
+        "Multi-Paxos needs no leader while Raft always requires one.",
+        "Raft uses 3f+1 nodes while Multi-Paxos uses 2f+1."
+      ],
+      "correctIndex": 0,
+      "explanation": "Both provide leader-based, majority-quorum, linearizable state-machine replication under crash faults. Raft enforces strictly one-directional flow and a contiguous, hole-free log with leader completeness, while Multi-Paxos permits log holes and per-slot recovery and leaves election unspecified.",
+      "sourceAnchor": "7425-raft-vs-multi-paxos",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q35",
+      "prompt": "Why do crash-consensus algorithms like Raft fail under Byzantine faults?",
+      "options": [
+        "They trust every message, so a lying leader can tell different followers different things with no cross-check.",
+        "They require synchronized clocks that Byzantine nodes disrupt.",
+        "Their quorums are too large to assemble when nodes act maliciously.",
+        "They cannot elect a leader when any node sends a forged vote."
+      ],
+      "correctIndex": 0,
+      "explanation": "Crash consensus assumes nodes either follow the protocol or halt, never lie. A Byzantine leader can tell one follower commit X and another commit Y, and since majorities count a liar as a valid vote with no mutual verification, the cluster diverges. Byzantine tolerance needs 3f+1 and cross-checking.",
+      "sourceAnchor": "7426-byzantine-faults-and-the-byzantine-generals-problem",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q36",
+      "prompt": "To tolerate f Byzantine faults with oral messages, how many nodes and what quorum size are required?",
+      "options": [
+        "N = 3f + 1 nodes with a quorum of 2f + 1.",
+        "N = 2f + 1 nodes with a quorum of f + 1.",
+        "N = 3f nodes with a quorum of 2f.",
+        "N = f + 1 nodes with a quorum of f."
+      ],
+      "correctIndex": 0,
+      "explanation": "Byzantine agreement with unsigned messages needs N at least 3f+1 and quorum 2f+1. Any two such quorums intersect in at least f+1 nodes, guaranteeing an honest node in common, and each quorum still holds a majority of honest nodes to outvote the liars.",
+      "sourceAnchor": "7426-byzantine-faults-and-the-byzantine-generals-problem",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q37",
+      "prompt": "In PBFT's normal case, why is there an all-to-all Prepare round before Commit?",
+      "options": [
+        "So replicas cross-check that the primary told everyone the same order, catching an equivocating primary.",
+        "To let each replica execute the request twice for redundancy.",
+        "To collect client signatures required before any execution.",
+        "To synchronize the clocks of all replicas within the view."
+      ],
+      "correctIndex": 0,
+      "explanation": "The all-to-all Prepare phase is what a lying primary cannot fake: replicas compare what the primary told each of them, and 2f matching PREPAREs prove a quorum agrees on the order within the view. Only then does the Commit phase make the order survive view changes.",
+      "sourceAnchor": "7427-pbft-practical-byzantine-fault-tolerance",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q38",
+      "prompt": "What is the primary scalability cost of PBFT, and how do modern BFT protocols address it?",
+      "options": [
+        "Its all-to-all rounds are O(N-squared) per request; HotStuff-style designs cut this to O(N) with threshold signatures.",
+        "Its disk syncs are O(N-squared); newer designs remove durable logging.",
+        "It needs 5f+1 nodes; newer designs reduce this to 3f+1.",
+        "It cannot tolerate view changes; newer designs add them."
+      ],
+      "correctIndex": 0,
+      "explanation": "PBFT's all-to-all prepare and commit rounds cost O(N-squared) messages per request, limiting it to small clusters. HotStuff and Tendermint reduce communication to O(N) using threshold signatures and a rotating leader with linear, pipelined messaging.",
+      "sourceAnchor": "7427-pbft-practical-byzantine-fault-tolerance",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q39",
+      "prompt": "How can a Raft/Paxos leader serve linearizable reads without a full log-append round-trip?",
+      "options": [
+        "Via a leader lease or ReadIndex confirming leadership, then reading local applied state.",
+        "By reading from the nearest follower without any coordination.",
+        "By appending every read to the log as a no-op entry first.",
+        "By caching the last write and returning it without any check."
+      ],
+      "correctIndex": 0,
+      "explanation": "ReadIndex confirms the node is still leader via one heartbeat quorum then reads locally once applied up to the commit index, while a leader lease grants a time-bounded exclusive-leader window allowing local reads with no round-trip. Leases depend on bounded clock drift.",
+      "sourceAnchor": "7428-consensus-in-practice-databases-config-stores-and-leader-leases",
+      "difficulty": "application"
+    },
+    {
+      "id": "74-q41",
+      "prompt": "What is the irreducible latency floor for a durable, linearizable consensus decision?",
+      "options": [
+        "One round-trip to a majority quorum plus a disk sync on each node.",
+        "One message delay to the single fastest follower only.",
+        "Zero, once batching and pipelining are enabled.",
+        "One round-trip to every node in the cluster, not just a majority."
+      ],
+      "correctIndex": 0,
+      "explanation": "You cannot commit faster than reaching and hearing back from the (f+1)-th fastest node, plus the durable sync each node performs. Batching and pipelining raise throughput but do not lower this per-decision floor, and geo-replication makes it speed-of-light bound.",
+      "sourceAnchor": "7429-the-latency-cost-and-how-to-amortize-it",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q43",
+      "prompt": "Does core PostgreSQL implement a consensus algorithm such as Paxos or Raft for replication?",
+      "options": [
+        "No; it uses primary/replica physical WAL shipping with no built-in consensus or automatic failover.",
+        "Yes; each Postgres backend participates in a Raft group per table.",
+        "Yes; synchronous replication is a full Paxos implementation.",
+        "No; it uses gossip-based anti-entropy to reconcile all replicas."
+      ],
+      "correctIndex": 0,
+      "explanation": "Core Postgres streams its byte-level WAL from a primary to replicas, either asynchronously or synchronously, with no built-in consensus, leader election, or split-brain-safe automatic failover. A crashed primary stays down until an external tool promotes a replica.",
+      "sourceAnchor": "7430-postgresql-patroni-and-consensus-as-an-external-dependency",
+      "difficulty": "recall"
+    },
+    {
+      "id": "74-q44",
+      "prompt": "In a Patroni-managed PostgreSQL cluster, where does the consensus algorithm actually run?",
+      "options": [
+        "In the external store (etcd/Consul/ZooKeeper) that holds the TTL leader key and elects the primary.",
+        "Inside each Postgres backend process as it applies WAL.",
+        "In the Patroni agent, which reimplements Raft in Python.",
+        "In the streaming replication protocol between primary and replicas."
+      ],
+      "correctIndex": 0,
+      "explanation": "Patroni delegates leader election and fencing to an external consensus store like etcd, where exactly one node holds a TTL leader key it must renew. A partitioned old primary that cannot renew demotes itself, and promotion requires the store's linearizable compare-and-swap, preventing split brain.",
+      "sourceAnchor": "7430-postgresql-patroni-and-consensus-as-an-external-dependency",
+      "difficulty": "application"
+    }
+  ]
+}

@@ -321,7 +321,7 @@ async function main() {
   const groups = parseInventory(topicMarkdown);
   const files = (await readdir(root)).filter((name) => /^chapter-\d{2}-.+\.md$/.test(name)).sort();
 
-  if (files.length !== 60) throw new Error(`Expected 60 chapters, found ${files.length}.`);
+  if (files.length !== 74) throw new Error(`Expected 74 chapters, found ${files.length}.`);
 
   await rm(chaptersDir, { recursive: true, force: true });
   await rm(quizzesDir, { recursive: true, force: true });

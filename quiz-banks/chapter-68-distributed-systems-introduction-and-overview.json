@@ -1,0 +1,453 @@
+{
+  "slug": "chapter-68-distributed-systems-introduction-and-overview",
+  "questions": [
+    {
+      "id": "68-q01",
+      "prompt": "Which pair of goals most directly motivates replication versus partitioning in a distributed data system?",
+      "options": [
+        "Availability motivates replication; capacity/scale motivates partitioning.",
+        "Security motivates replication; latency motivates partitioning.",
+        "Scale motivates replication; availability motivates partitioning.",
+        "Compression motivates replication; ordering motivates partitioning."
+      ],
+      "correctIndex": 0,
+      "explanation": "Replication keeps redundant copies so the system survives node loss, which is fundamentally about availability, while partitioning splits data so it exceeds one machine's capacity, which is about scale. The two goals are distinct and pull in different directions.",
+      "sourceAnchor": "681-why-distribute-at-all",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q02",
+      "prompt": "Which three guarantees does a single machine enjoy that a distributed system loses?",
+      "options": [
+        "Shared memory, a single global clock, and total (all-at-once) failure.",
+        "Encryption, compression, and total ordering of all writes.",
+        "Unlimited bandwidth, zero latency, and a single administrator.",
+        "Durable storage, ACID transactions, and a query optimizer."
+      ],
+      "correctIndex": 0,
+      "explanation": "A single process shares memory instantly, reads one monotonic clock, and fails all at once. A distributed system has none of these: state must be communicated, clocks drift with no global now, and components fail independently and partially.",
+      "sourceAnchor": "682-why-distribution-is-fundamentally-hard",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q03",
+      "prompt": "In a distributed system without shared memory, what is the status of a replica's view of another node's state?",
+      "options": [
+        "It is a delayed, possibly-stale copy reflecting the sender's past, not its present.",
+        "It is an exact real-time mirror kept coherent by hardware.",
+        "It is always ahead of the sender because messages arrive early.",
+        "It is undefined until a global lock is acquired across all nodes."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because the only way to learn another node's state is to receive a message that takes time to arrive, by the time it is applied the sender may have moved on. A replica therefore holds a delayed copy of the sender's past, which is why replication lag is a first-class concept.",
+      "sourceAnchor": "683-concurrent-execution-and-shared-state",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q04",
+      "prompt": "A developer writes an RPC loop that issues one call per row and it passes every local test, then times out badly in production across regions. Which fallacy did they rely on?",
+      "options": [
+        "That latency is zero, so the accumulated per-call round trips were assumed free.",
+        "That the network is secure, so no encryption was configured.",
+        "That there is one administrator, so configs would never diverge.",
+        "That bandwidth is infinite, so payload size did not matter."
+      ],
+      "correctIndex": 0,
+      "explanation": "An N+1 pattern makes one round trip per row; locally the loopback latency is microseconds, but a cross-region round trip is tens of milliseconds, so the summed latency explodes. This is the zero-latency fallacy, distinct from bandwidth or security concerns.",
+      "sourceAnchor": "684-the-fallacies-of-distributed-computing",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q05",
+      "prompt": "Which statement best captures the unifying lesson of the eight fallacies of distributed computing?",
+      "options": [
+        "The network is a hostile, lossy, changing, finite, insecure, heterogeneous medium you do not fully control.",
+        "The network is reliable enough that retries and timeouts are rarely needed.",
+        "The network's only real limitation is bandwidth, which more hardware fixes.",
+        "The network behaves like a local function call once TCP is used."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each fallacy denies one comforting assumption, and together they describe a medium that loses packets, adds latency, has finite bandwidth, is insecure and heterogeneous, and is administered by others. The RPC illusion of a reliable function call is exactly what they warn against.",
+      "sourceAnchor": "684-the-fallacies-of-distributed-computing",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q06",
+      "prompt": "Why is 'which event happened first' a subtle question across two nodes?",
+      "options": [
+        "Physical clocks can disagree, so order across nodes must come from causality, giving only a partial order.",
+        "Every node shares one authoritative clock, so the answer is always exact.",
+        "Events on different nodes are always concurrent and can never be ordered.",
+        "The network guarantees delivery order, so send order equals real order."
+      ],
+      "correctIndex": 0,
+      "explanation": "There is no global now, and wall clocks drift, so a later event can carry an earlier timestamp. Reliable ordering comes from the happened-before relation captured by logical clocks, which yields only a partial order because concurrent events are genuinely unordered.",
+      "sourceAnchor": "686-clocks-and-time-there-is-no-now",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q07",
+      "prompt": "What does a logical clock (such as a Lamport or vector clock) capture that a physical clock does not?",
+      "options": [
+        "The happened-before / causal relationship between events, independent of any wall clock.",
+        "The exact UTC wall-clock instant each event occurred, to nanosecond precision.",
+        "The remaining battery life of the quartz oscillator driving the counter.",
+        "The bandwidth consumed by each message between the two events."
+      ],
+      "correctIndex": 0,
+      "explanation": "Logical clocks assign counters that respect causality: if one event could have caused another, its logical timestamp is smaller. They sidestep physical time entirely and can distinguish ordered from concurrent events, which is what conflict resolution needs.",
+      "sourceAnchor": "686-clocks-and-time-there-is-no-now",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q08",
+      "prompt": "Roughly how well does NTP synchronize clocks, and what is the catch for correctness?",
+      "options": [
+        "It holds skew to about a millisecond scale but never to zero and can step a clock backward.",
+        "It guarantees identical clocks across all nodes to nanosecond accuracy.",
+        "It makes every node's clock strictly monotonic and forward-only.",
+        "It eliminates drift permanently so timestamps can safely order writes."
+      ],
+      "correctIndex": 0,
+      "explanation": "NTP disciplines clocks to roughly the millisecond range on a LAN, worse on the internet, and can adjust a clock backward to correct it, so CLOCK_REALTIME is not monotonic. Skew is bounded but nonzero, so wall-clock timestamps must not be trusted for correctness.",
+      "sourceAnchor": "687-clock-skew-ntp-and-the-limits-of-synchronized-time",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q09",
+      "prompt": "Cassandra resolves conflicting writes with last-write-wins based on wall-clock timestamps. What failure can this cause?",
+      "options": [
+        "Clock skew can give a logically later write a smaller timestamp, so it is silently discarded.",
+        "The earlier write always wins, so no data is ever lost under skew.",
+        "Writes are rejected outright whenever two clocks disagree by any amount.",
+        "The system blocks until NTP proves both clocks are exactly equal."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because last-write-wins compares physical timestamps, a genuinely newer write from a node whose clock lags can carry a smaller timestamp and be dropped in favor of an older value. This is a documented data-loss mode that motivates logical clocks or bounded time.",
+      "sourceAnchor": "687-clock-skew-ntp-and-the-limits-of-synchronized-time",
+      "difficulty": "trap"
+    },
+    {
+      "id": "68-q10",
+      "prompt": "How does Google Spanner's TrueTime differ from ordinary NTP-based time?",
+      "options": [
+        "It exposes time as a bounded interval and waits out the uncertainty before releasing a commit.",
+        "It assumes clock skew is exactly zero across all datacenters.",
+        "It replaces physical clocks entirely with Lamport logical counters.",
+        "It ignores clock uncertainty and orders commits by arrival order."
+      ],
+      "correctIndex": 0,
+      "explanation": "TrueTime returns an interval with a known bound enforced by GPS and atomic clocks, and Spanner pays a commit-wait equal to that uncertainty before releasing a commit, guaranteeing external consistency. It never claims skew is zero, only bounded and known.",
+      "sourceAnchor": "687-clock-skew-ntp-and-the-limits-of-synchronized-time",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q11",
+      "prompt": "By what order of magnitude does a same-datacenter network round trip typically exceed a main-memory access?",
+      "options": [
+        "About a thousand to ten thousand times (microseconds versus ~100 nanoseconds).",
+        "About two to three times, so they are roughly interchangeable.",
+        "About ten times, comparable to an L1 versus L3 cache difference.",
+        "About a billion times, similar to a cross-galaxy signal delay."
+      ],
+      "correctIndex": 0,
+      "explanation": "A DRAM reference is around 100 nanoseconds while a same-datacenter round trip is hundreds of microseconds, roughly a thousandfold to ten-thousandfold gap; cross-region climbs to a hundred-thousandfold or more. This asymmetry makes round trips, not bytes, the dominant cost.",
+      "sourceAnchor": "688-local-vs-remote-execution-the-cost-asymmetry",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q12",
+      "prompt": "Given the local-versus-remote cost asymmetry, which optimization principle follows most directly?",
+      "options": [
+        "Batch work into fewer round trips and minimize coordination on the fast path.",
+        "Prefer many tiny requests so each one finishes faster individually.",
+        "Add a cross-region consensus round to every read for safety.",
+        "Compress payloads aggressively since latency scales with byte count."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because latency is dominated by round trips rather than payload size until bandwidth limits, the winning move is to batch many items per request and avoid coordination where possible. Chatty per-item calls and needless consensus rounds are what wreck cross-network performance.",
+      "sourceAnchor": "688-local-vs-remote-execution-the-cost-asymmetry",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q13",
+      "prompt": "Node A sends a request to B and hears nothing back before its timeout. What can A conclude?",
+      "options": [
+        "Nothing definitive: B may have crashed, be slow, or be partitioned, and the effect may or may not have happened.",
+        "That B has definitely crashed and the request had no effect.",
+        "That the request was definitely lost before reaching B.",
+        "That B definitely processed the request and only the reply was lost."
+      ],
+      "correctIndex": 0,
+      "explanation": "Silence is ambiguous across several scenarios, including B crashing before or after processing, the reply being lost, B being merely slow, or a partition. A cannot distinguish crash from slow from broken link, which is the defining difficulty of partial failure.",
+      "sourceAnchor": "689-the-defining-feature-partial-failure",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q14",
+      "prompt": "Which single fact is described as the root of exactly-once impossibility, approximate failure detectors, and FLP?",
+      "options": [
+        "A node cannot distinguish a crashed peer from a slow one or a broken link.",
+        "Networks always deliver messages in the order they were sent.",
+        "Every node shares a perfectly synchronized global clock.",
+        "Disk writes are always durable once acknowledged by the OS."
+      ],
+      "correctIndex": 0,
+      "explanation": "The inability to tell dead from slow from unreachable means an observer only ever sees ambiguous silence. This one fact forces at-least-once plus idempotence, makes failure detectors necessarily approximate, and gives FLP its teeth in the asynchronous model.",
+      "sourceAnchor": "689-the-defining-feature-partial-failure",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q15",
+      "prompt": "During a network partition where both sides remain alive, what is the fundamental dilemma?",
+      "options": [
+        "Each side must either stop serving to stay consistent or keep serving and risk divergence.",
+        "One side always crashes automatically, so no choice is needed.",
+        "Both sides can safely keep serving writes with no risk of conflict.",
+        "The partition guarantees strong consistency because writes pause everywhere."
+      ],
+      "correctIndex": 0,
+      "explanation": "A partition leaves live nodes on each side unable to reach the other, so continuing to accept writes on both sides makes them diverge. The system must sacrifice either consistency (refuse service on a side) or availability (keep serving and risk conflict), which is the CAP choice.",
+      "sourceAnchor": "6810-network-partitions",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q16",
+      "prompt": "Which mechanisms turn a small partial failure into a system-wide cascading outage?",
+      "options": [
+        "Retry storms and unbounded queues amplifying load onto already-struggling peers.",
+        "Checksums and monotonic clocks slowing every write path.",
+        "Idempotent operations deduplicating too many messages at once.",
+        "Vector clocks growing until they exhaust memory on every node."
+      ],
+      "correctIndex": 0,
+      "explanation": "When a node slows or dies, its load shifts to peers, and clients that time out retry, multiplying load exactly when the system is weakest; unbounded queues let doomed work pile up. Backoff with jitter, retry budgets, bounded queues, load shedding, and circuit breakers break the loop.",
+      "sourceAnchor": "6811-cascading-failures",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q17",
+      "prompt": "Which are the three guaranteed properties of a fair-loss link?",
+      "options": [
+        "Fair loss (infinite retransmission is eventually delivered), finite duplication, and no creation.",
+        "Guaranteed in-order delivery, exactly-once delivery, and bounded latency.",
+        "No loss, no duplication, and no reordering under any circumstances.",
+        "Encrypted transport, authenticated senders, and total message ordering."
+      ],
+      "correctIndex": 0,
+      "explanation": "A fair-loss link, modeling raw IP datagrams, may drop and duplicate messages but promises that a message sent infinitely often is delivered infinitely often, that duplication is finite, and that it never invents messages. Everything stronger is built on top of it.",
+      "sourceAnchor": "6812-abstractions-links-and-the-fair-loss-foundation",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q18",
+      "prompt": "Why does retransmission, added to make delivery reliable, inevitably produce duplicates?",
+      "options": [
+        "A missing ACK is ambiguous: the message may have arrived and only the ACK was lost, so resending redelivers it.",
+        "The link intentionally clones every message twice for redundancy.",
+        "Sequence numbers force the receiver to accept each message repeatedly.",
+        "ACKs are never sent, so the sender must transmit each message forever."
+      ],
+      "correctIndex": 0,
+      "explanation": "The sender retransmits when no acknowledgment arrives, but it cannot tell whether the message was lost or the ACK was lost. In the latter case the receiver already processed the message and now receives it again, so duplicates require sequence numbers and dedup to remove.",
+      "sourceAnchor": "6813-acknowledgments-retransmits-and-the-duplicate-problem",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q19",
+      "prompt": "What important caveat limits the guarantees of a 'perfect link'?",
+      "options": [
+        "Its reliable, no-duplication guarantees hold only between correct (non-crashing) processes.",
+        "It guarantees delivery even if both endpoints crash permanently.",
+        "It provides total ordering across every sender in the system.",
+        "It works only over synchronous networks with a known delay bound."
+      ],
+      "correctIndex": 0,
+      "explanation": "A perfect link, built from a stubborn link plus deduplication, delivers each message exactly once with no creation, but only between processes that do not crash. If an endpoint crashes, an in-flight message may simply be lost, which is why it is not end-to-end exactly-once.",
+      "sourceAnchor": "6814-stubborn-links-and-perfect-links",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q20",
+      "prompt": "Why is exactly-once delivery impossible at the network transport layer?",
+      "options": [
+        "The sender cannot tell 'message lost' from 'ACK lost', so it must pick at-most-once or at-least-once.",
+        "Because networks always reorder messages, no count can be maintained.",
+        "Because acknowledgments are forbidden by the IP specification.",
+        "Because duplicate detection would require infinite memory on every node."
+      ],
+      "correctIndex": 0,
+      "explanation": "To deliver exactly once the sender would need to know whether the prior attempt succeeded, which partial failure denies it. So it either never retries (at-most-once, may lose) or retries until acknowledged (at-least-once, may duplicate); there is no third transport-level option.",
+      "sourceAnchor": "6815-why-exactly-once-delivery-is-a-myth",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q21",
+      "prompt": "A team claims their queue provides exactly-once delivery. What is actually happening under the hood?",
+      "options": [
+        "At-least-once delivery combined with idempotent operations or dedup by request id.",
+        "A network protocol that truly delivers each message precisely one time.",
+        "At-most-once delivery that silently drops any message it cannot confirm.",
+        "Synchronous clocks that let the sender detect duplicates by timestamp."
+      ],
+      "correctIndex": 0,
+      "explanation": "Exactly-once delivery cannot exist at the wire level, so effectively-once processing is achieved by delivering at least once and making the effect idempotent, or by having the receiver remember applied request ids and discard repeats. Anyone selling wire-level exactly-once is quietly doing dedup.",
+      "sourceAnchor": "6815-why-exactly-once-delivery-is-a-myth",
+      "difficulty": "trap"
+    },
+    {
+      "id": "68-q22",
+      "prompt": "Order the message-ordering guarantees from weakest to strongest.",
+      "options": [
+        "No ordering, then FIFO per sender, then causal, then total order.",
+        "Total order, then causal, then FIFO, then no ordering.",
+        "Causal, then total, then FIFO, then no ordering.",
+        "FIFO per sender, then no ordering, then total, then causal."
+      ],
+      "correctIndex": 0,
+      "explanation": "No ordering makes no promises, FIFO preserves each single sender's order, causal respects happened-before across all senders, and total order makes every node agree on one order even for concurrent messages. Total order requires agreement and is equivalent to consensus.",
+      "sourceAnchor": "6816-message-ordering",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q23",
+      "prompt": "Why is total-order broadcast the most expensive point on the ordering ladder?",
+      "options": [
+        "Nodes must agree on a single order even for concurrent messages, which requires consensus.",
+        "It must encrypt every message with a separate per-recipient key.",
+        "It duplicates each message to every node several times for durability.",
+        "It requires perfectly synchronized physical clocks on all nodes."
+      ],
+      "correctIndex": 0,
+      "explanation": "Delivering all messages in one identical order on every node means agreeing on an order for causally concurrent events, and that agreement is exactly consensus. This is why total-order (atomic) broadcast is equivalent in power to consensus and is avoided on the fast path.",
+      "sourceAnchor": "6816-message-ordering",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q24",
+      "prompt": "What does the Two Generals' Problem prove?",
+      "options": [
+        "No finite message exchange over a lossy link can guarantee certain mutual agreement.",
+        "Two nodes can always agree if they exchange enough acknowledgments.",
+        "Agreement is trivial as long as at least one messenger gets through.",
+        "A lossy link can be made reliable purely by adding more generals."
+      ],
+      "correctIndex": 0,
+      "explanation": "By an infinite-regress argument, the last message in any supposedly-sufficient exchange is unreliable, so it cannot be depended upon, meaning no finite protocol yields certainty. The lesson is to aim for high probability plus safe residual disagreement rather than guaranteed agreement.",
+      "sourceAnchor": "6817-the-two-generals-problem",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q25",
+      "prompt": "State FLP impossibility precisely.",
+      "options": [
+        "In an asynchronous system with even one crash failure, no deterministic algorithm guarantees consensus in bounded time.",
+        "In any system, consensus is outright impossible regardless of assumptions.",
+        "In a synchronous system, consensus can never terminate even without failures.",
+        "In an asynchronous system, consensus is impossible only if a majority crash."
+      ],
+      "correctIndex": 0,
+      "explanation": "FLP shows that with no bound on message delay or process speed, and even a single crash-stop failure, no deterministic protocol can always satisfy agreement, validity, and termination. It sacrifices guaranteed termination because a slow node is indistinguishable from a crashed one.",
+      "sourceAnchor": "6818-flp-impossibility",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q26",
+      "prompt": "Given FLP, how do real systems like Raft-based etcd achieve working consensus?",
+      "options": [
+        "They assume partial synchrony, keeping safety always and requiring only eventual timeliness for liveness.",
+        "They ignore FLP because it applies only to synchronous networks.",
+        "They guarantee bounded-time termination by using very short timeouts.",
+        "They abandon agreement and let nodes decide different values safely."
+      ],
+      "correctIndex": 0,
+      "explanation": "FLP forbids only guaranteed bounded-time deterministic termination in a fully asynchronous model. Practical algorithms keep safety (agreement and validity) unconditionally and make progress once the network is timely enough; randomization and failure detectors are the other escape hatches.",
+      "sourceAnchor": "6818-flp-impossibility",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q27",
+      "prompt": "Which synchrony model best describes real networks and is the practical target for consensus design?",
+      "options": [
+        "Partially synchronous: bounds exist but are unknown or hold only after some unknown time.",
+        "Synchronous: a known, always-respected upper bound on message delay.",
+        "Asynchronous: no timing assumptions can ever be made at all.",
+        "Deterministic: message delays are fixed constants known in advance."
+      ],
+      "correctIndex": 0,
+      "explanation": "Real networks are usually timely but occasionally stall from pauses or congestion, matching partial synchrony where bounds exist but are unknown and hold only eventually. Systems are designed so safety never depends on timing and liveness needs only an eventual synchronous window.",
+      "sourceAnchor": "6819-system-synchrony-models",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q28",
+      "prompt": "Order the failure models from most benign to most severe.",
+      "options": [
+        "Crash/fail-stop, then omission, then timing, then arbitrary/Byzantine.",
+        "Byzantine, then timing, then omission, then crash.",
+        "Omission, then crash, then Byzantine, then timing.",
+        "Timing, then Byzantine, then crash, then omission."
+      ],
+      "correctIndex": 0,
+      "explanation": "A crash-stop node simply halts; an omission node silently drops some messages; a timing node responds correctly but late; and a Byzantine node may do anything, including sending contradictory or malicious messages. Each model subsumes the milder ones and costs more to tolerate.",
+      "sourceAnchor": "6820-failure-models",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q29",
+      "prompt": "How many nodes are needed to tolerate f crash failures versus f Byzantine failures?",
+      "options": [
+        "2f+1 for crash faults and 3f+1 for Byzantine faults.",
+        "f+1 for crash faults and 2f+1 for Byzantine faults.",
+        "3f+1 for crash faults and 2f+1 for Byzantine faults.",
+        "2f for crash faults and 3f for Byzantine faults."
+      ],
+      "correctIndex": 0,
+      "explanation": "Crash and omission tolerance needs a surviving majority, so 2f+1 nodes tolerate f losses. Byzantine tolerance needs 3f+1 because faulty nodes can lie differently to different peers, requiring extra redundancy plus signatures and BFT protocols. Datacenters usually assume crash and use 2f+1.",
+      "sourceAnchor": "6820-failure-models",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q30",
+      "prompt": "Why do most datacenter databases assume crash faults rather than Byzantine faults?",
+      "options": [
+        "Inside a trusted datacenter, Byzantine tolerance's 3f+1 and cryptography cost is not justified.",
+        "Byzantine faults never occur in any real hardware or software.",
+        "Crash tolerance also automatically tolerates malicious nodes for free.",
+        "Byzantine protocols are simpler and cheaper than crash-tolerant ones."
+      ],
+      "correctIndex": 0,
+      "explanation": "Byzantine fault tolerance requires 3f+1 nodes, signatures, and specialized protocols, which is expensive and justified mainly in adversarial or cross-organization settings like public blockchains. Within a trusted datacenter, crash/omission tolerance suffices, though checksums still guard against silent corruption.",
+      "sourceAnchor": "6820-failure-models",
+      "difficulty": "recall"
+    },
+    {
+      "id": "68-q31",
+      "prompt": "Which two properties characterize a failure detector, and why can't both be perfect asynchronously?",
+      "options": [
+        "Completeness and accuracy; a perfect detector would let you solve consensus and contradict FLP.",
+        "Latency and bandwidth; both are physically bounded by the speed of light.",
+        "Durability and isolation; both require synchronous disk writes.",
+        "Consistency and availability; a partition forces sacrificing one of them."
+      ],
+      "correctIndex": 0,
+      "explanation": "Completeness means every crashed node is eventually suspected and accuracy means live nodes are not wrongly suspected. Achieving both perfectly in an asynchronous system would yield a perfect failure detector able to solve consensus, contradicting FLP, so practical detectors are only eventually accurate.",
+      "sourceAnchor": "6821-failure-detectors",
+      "difficulty": "application"
+    },
+    {
+      "id": "68-q32",
+      "prompt": "A heartbeat timeout is set very short to detect crashes quickly. What is the classic downside?",
+      "options": [
+        "It false-positives on merely slow nodes, so a GC pause triggers a needless failover.",
+        "It can never detect a genuinely crashed node in time.",
+        "It guarantees perfect accuracy but misses real crashes forever.",
+        "It removes the need for quorums because detection is now exact."
+      ],
+      "correctIndex": 0,
+      "explanation": "A short timeout speeds real-crash detection but wrongly suspects live-but-slow nodes, so a GC pause or brief overload looks like death and causes unnecessary failover and churn. This is the completeness-versus-accuracy trade-off, which adaptive detectors like phi-accrual try to soften.",
+      "sourceAnchor": "6821-failure-detectors",
+      "difficulty": "trap"
+    }
+  ]
+}

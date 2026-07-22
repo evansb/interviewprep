@@ -1,0 +1,425 @@
+{
+  "slug": "chapter-63-file-formats",
+  "questions": [
+    {
+      "id": "63-q01",
+      "prompt": "Why can a storage engine not simply write its in-memory structures directly to disk and read them back?",
+      "options": [
+        "In-memory structures hold pointers that are meaningless after restart, so on-disk references must use position-independent page-id + offset addressing.",
+        "Disk files cannot store more than 4 KB per record, forcing a different layout.",
+        "The operating system encrypts any bytes written through the page cache.",
+        "Compilers reorder struct members differently on each run, scrambling the layout."
+      ],
+      "correctIndex": 0,
+      "explanation": "A heap node's pointers are virtual addresses that become garbage after restart or in another process. On-disk formats therefore address data by page id plus offset, use fixed-size pages, and add explicit lengths, versions, and checksums.",
+      "sourceAnchor": "631-why-databases-define-their-own-on-disk-formats",
+      "difficulty": "recall"
+    },
+    {
+      "id": "63-q02",
+      "prompt": "In page-id + offset addressing, how does an engine convert a page id to a byte offset in the file?",
+      "options": [
+        "It multiplies the page id by the fixed page size, a shift rather than a directory lookup.",
+        "It consults a per-file page directory that maps ids to variable byte offsets.",
+        "It hashes the page id to find a bucket holding the offset.",
+        "It scans the file header, which lists every page's starting byte."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because pages are a fixed size, page N begins at byte N times the page size, so the conversion is arithmetic with no lookup. That O(1) addressing is the main reason formats use fixed-size pages.",
+      "sourceAnchor": "632-page-id-and-offset-addressing",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q03",
+      "prompt": "A Postgres varlena value of 40 bytes total length is stored. What header does it use, and why does that form exist?",
+      "options": [
+        "A short 1-byte header, which saves three bytes per value on tables full of small strings.",
+        "A 4-byte header, because all varlenas use the same fixed header width.",
+        "An 18-byte TOAST pointer, because any variable-length value is stored out-of-line.",
+        "A NUL terminator instead of a length, since short strings are C strings."
+      ],
+      "correctIndex": 0,
+      "explanation": "Values up to 126 bytes use a 1-byte header instead of the 4-byte form, saving three bytes each. On a wide table of short text columns this materially reduces on-disk size and raises fanout.",
+      "sourceAnchor": "634-variable-size-data-and-length-prefixed-strings",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q04",
+      "prompt": "What is the hard maximum size of a single Postgres field, and what enforces it?",
+      "options": [
+        "About 1 GB, because the varlena length is stored in a 30-bit field.",
+        "8 KB, because a value cannot exceed one page.",
+        "2 KB, the TOAST threshold, which no value may exceed.",
+        "4 GB, because the length header is a full 32-bit integer."
+      ],
+      "correctIndex": 0,
+      "explanation": "The 4-byte varlena header stores the length in 30 bits, capping a single attribute at 2^30 minus 1, just under 1 GB. TOAST lets values approach that limit despite the 8 KB page by moving them out-of-line.",
+      "sourceAnchor": "634-variable-size-data-and-length-prefixed-strings",
+      "difficulty": "recall"
+    },
+    {
+      "id": "63-q05",
+      "prompt": "In a Postgres heap tuple, how much space does a null column consume in the data area, and what is the side effect?",
+      "options": [
+        "Zero bytes, but its absence shifts the offsets of all columns that follow it.",
+        "Its full declared width, reserved and zero-filled for alignment.",
+        "One byte, storing a null flag inline with the column.",
+        "The width of the null bitmap, which is charged to that column."
+      ],
+      "correctIndex": 0,
+      "explanation": "A clear bit in the null bitmap means the column is null and occupies no data bytes at all. Because it is absent, every later column's offset shifts, so the bitmap must be consulted to locate subsequent columns.",
+      "sourceAnchor": "635-bit-packed-data-booleans-flags-and-null-bitmaps",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q06",
+      "prompt": "When is the null bitmap present in a Postgres heap tuple?",
+      "options": [
+        "Only when the row actually contains at least one null, indicated by the HEAP_HASNULL flag.",
+        "Always, so every column offset can be computed uniformly.",
+        "Only for tables that declare columns as NOT NULL.",
+        "Only when the tuple is TOASTed out-of-line."
+      ],
+      "correctIndex": 0,
+      "explanation": "The bitmap of one bit per column follows the fixed header only when HEAP_HASNULL is set; a row with no nulls omits it entirely and pays zero bitmap bytes.",
+      "sourceAnchor": "635-bit-packed-data-booleans-flags-and-null-bitmaps",
+      "difficulty": "recall"
+    },
+    {
+      "id": "63-q07",
+      "prompt": "A table is declared (a bool, b int8, c bool, d int4). Why is reordering to (b int8, d int4, a bool, c bool) smaller on disk?",
+      "options": [
+        "Each column is aligned to its type's boundary, so the small-before-large order inserts padding the packed order avoids.",
+        "Postgres stores booleans as bits only when they are declared first.",
+        "The reordered version stores fewer columns because bools merge.",
+        "Column order changes the page size from 8 KB to 4 KB."
+      ],
+      "correctIndex": 0,
+      "explanation": "Alignment padding is inserted before a column whose boundary is not met, exactly as in a C struct. Ordering largest-alignment-first eliminates the gaps, here shrinking the tuple data from 24 to 16 bytes.",
+      "sourceAnchor": "636-alignment-and-padding-in-on-disk-records",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q08",
+      "prompt": "In a general record layout, why does the offset of a column after the first variable-length field become non-constant?",
+      "options": [
+        "Its position depends on the decoded lengths of all preceding variable-length columns, so it must be walked to left to right.",
+        "Variable-length columns are stored in a separate file with random offsets.",
+        "The engine deliberately randomizes offsets to prevent scanning.",
+        "Only the first column ever has a constant offset in any format."
+      ],
+      "correctIndex": 0,
+      "explanation": "Fixed-width fields have constant offsets, but once a variable field appears its width is data-dependent, so every following field's offset depends on the earlier lengths. Postgres caches offsets only up to the first variable or nullable column.",
+      "sourceAnchor": "637-separating-fixed-and-variable-parts",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q09",
+      "prompt": "What are the default page sizes for PostgreSQL and InnoDB?",
+      "options": [
+        "8 KB for PostgreSQL and 16 KB for InnoDB.",
+        "4 KB for both, matching the OS page size.",
+        "16 KB for PostgreSQL and 8 KB for InnoDB.",
+        "1 MB for PostgreSQL and 512 B for InnoDB."
+      ],
+      "correctIndex": 0,
+      "explanation": "PostgreSQL uses an 8 KB block (BLCKSZ) and InnoDB a 16 KB page by default. Page size trades B-tree fanout against bytes read per point lookup and the torn-write window.",
+      "sourceAnchor": "638-fixed-size-pages-as-the-unit-of-io",
+      "difficulty": "recall"
+    },
+    {
+      "id": "63-q10",
+      "prompt": "In a slotted page, which structures grow from which ends, and what sits between them?",
+      "options": [
+        "Fixed-size slots grow from the front and variable cells from the back, with free space in the middle.",
+        "Cells grow from the front and slots from the back, meeting in a fixed directory.",
+        "Both slots and cells grow from the front, with free space at the tail.",
+        "Slots and cells are interleaved so each cell immediately follows its slot."
+      ],
+      "correctIndex": 0,
+      "explanation": "Line pointers grow downward from just after the header while tuples pack upward from the page end, leaving a contiguous free gap between the two pointers. This lets variable-size records coexist with only internal fragmentation.",
+      "sourceAnchor": "6310-slotted-pages",
+      "difficulty": "recall"
+    },
+    {
+      "id": "63-q11",
+      "prompt": "Why does a slotted page reference records by slot number rather than by their byte offset in the page?",
+      "options": [
+        "So compaction can move cells and rewrite only the slot's internal offset, leaving every external index reference valid.",
+        "Because byte offsets are too large to fit in a line pointer.",
+        "Because slot numbers compress better than offsets on disk.",
+        "Because the operating system forbids storing byte offsets in files."
+      ],
+      "correctIndex": 0,
+      "explanation": "The slot number is a stable indirection: sliding a cell during compaction updates the slot's offset while its number is unchanged, so indexes pointing at (block, slot) stay correct. A raw byte offset would require rewriting every reference on each move.",
+      "sourceAnchor": "6310-slotted-pages",
+      "difficulty": "trap"
+    },
+    {
+      "id": "63-q12",
+      "prompt": "Which Postgres page-header fields delimit the free space on a page?",
+      "options": [
+        "pd_lower (end of the line-pointer array) and pd_upper (start of the tuples); free bytes equal their difference.",
+        "pd_lsn and pd_checksum, which bracket the usable region.",
+        "pd_special and pd_flags, which mark the tuple area.",
+        "pd_pagesize_version and pd_prune_xid, which store the free-space size directly."
+      ],
+      "correctIndex": 0,
+      "explanation": "Free space is the contiguous gap between pd_lower (the end of the slot array) and pd_upper (the start of the cell area). Inserting a tuple grows pd_lower down and pd_upper up until they meet.",
+      "sourceAnchor": "639-the-page-header",
+      "difficulty": "recall"
+    },
+    {
+      "id": "63-q13",
+      "prompt": "How does Postgres store the page layout version, and why is that encoding possible?",
+      "options": [
+        "It ORs the version into the low 8 bits of pd_pagesize_version, which is free because the page size is a multiple of 256.",
+        "It writes a 4-byte version at the very end of every page.",
+        "It stores the version only once in the pg_control file, not per page.",
+        "It encodes the version in the checksum field when checksums are off."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because the page size is always a multiple of 256, its low 8 bits are zero and hold the layout version; an 8 KB version-4 page reads 0x2004. On read Postgres validates both size and version.",
+      "sourceAnchor": "639-the-page-header",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q14",
+      "prompt": "What are the four states a Postgres line-pointer (ItemIdData) can take via lp_flags?",
+      "options": [
+        "LP_UNUSED, LP_NORMAL, LP_REDIRECT, and LP_DEAD.",
+        "LP_FREE, LP_LOCKED, LP_DIRTY, and LP_CLEAN.",
+        "LP_LEAF, LP_INTERNAL, LP_ROOT, and LP_OVERFLOW.",
+        "LP_COMMITTED, LP_ABORTED, LP_INSERT, and LP_DELETE."
+      ],
+      "correctIndex": 0,
+      "explanation": "The 2-bit lp_flags encodes UNUSED (free), NORMAL (points at a live tuple), REDIRECT (points at another line pointer for HOT chains), and DEAD (tuple dead, space reclaimable). These states drive deletion and HOT.",
+      "sourceAnchor": "6311-the-postgresql-heap-page-in-full",
+      "difficulty": "recall"
+    },
+    {
+      "id": "63-q15",
+      "prompt": "What does a heap page's special space contain, and how does a B-tree index page differ?",
+      "options": [
+        "It is empty for a heap (pd_special = 8192), but a B-tree page puts sibling links and flags there.",
+        "It holds the null bitmap for a heap and the checksum for an index.",
+        "It stores the page header for a heap and the tuple data for an index.",
+        "It contains the free-space map for both heap and index pages."
+      ],
+      "correctIndex": 0,
+      "explanation": "Heap pages leave the special space empty, so pd_special equals the page size. B-tree pages store BTPageOpaqueData there, including the left/right sibling block numbers that thread leaves for range scans.",
+      "sourceAnchor": "6311-the-postgresql-heap-page-in-full",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q16",
+      "prompt": "Which Postgres tuple-header fields implement MVCC visibility?",
+      "options": [
+        "t_xmin and t_xmax, the inserting and deleting transaction ids, plus t_ctid linking to the next version.",
+        "t_hoff and t_infomask2, which store the row's checksum and length.",
+        "pd_lsn and pd_checksum copied into each tuple.",
+        "The null bitmap, which records which transactions can see the row."
+      ],
+      "correctIndex": 0,
+      "explanation": "t_xmin and t_xmax record the transactions that inserted and deleted a version; an update stamps the old xmax and writes a new tuple whose predecessor's t_ctid points forward. Both versions coexist until VACUUM reclaims the dead one.",
+      "sourceAnchor": "6312-the-heap-tuple-header",
+      "difficulty": "recall"
+    },
+    {
+      "id": "63-q17",
+      "prompt": "Roughly what is the minimum per-row overhead in a Postgres heap, before any column data?",
+      "options": [
+        "About 28 bytes: a 4-byte line pointer plus a 23-byte header padded to t_hoff of 24.",
+        "About 8 bytes: just the line pointer and a length word.",
+        "About 100 bytes, matching the page header size per row.",
+        "Zero, because the header is shared across all tuples on a page."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each row costs a 4-byte line pointer plus a 23-byte header MAXALIGN'd up to 24, about 28 bytes total. This dominates very narrow rows and caps tuples per 8 KB page near 291.",
+      "sourceAnchor": "6312-the-heap-tuple-header",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q18",
+      "prompt": "What is the difference between a key cell and a key-value cell in a B-tree?",
+      "options": [
+        "A key cell holds a separator key and a child page id for routing in internal nodes; a key-value cell holds a key and value in leaf nodes.",
+        "A key cell is compressed while a key-value cell is stored raw.",
+        "A key cell lives on disk and a key-value cell only in memory.",
+        "A key cell stores nulls and a key-value cell stores non-null values."
+      ],
+      "correctIndex": 0,
+      "explanation": "Key cells carry only routing information (a separator key plus a child pointer) in internal nodes, while key-value cells carry the actual payload (a row or TID) in leaves. The same slotted-page container holds both, which is why the levels share a format.",
+      "sourceAnchor": "6313-cell-layout-key-cells-and-key-value-cells",
+      "difficulty": "recall"
+    },
+    {
+      "id": "63-q19",
+      "prompt": "After many deletes and variable-size inserts, a slotted page has scattered holes among live cells. What kind of fragmentation is this and how is it resolved?",
+      "options": [
+        "Internal fragmentation, always reclaimable by compacting the live cells together into one contiguous free region.",
+        "External fragmentation that can only be fixed by rewriting the whole table.",
+        "Permanent fragmentation that the engine cannot reclaim.",
+        "Index fragmentation resolved by rebuilding every index on the table."
+      ],
+      "correctIndex": 0,
+      "explanation": "Slotted-page fragmentation is always internal to a page: the holes left by deleted cells are reclaimable by sliding live cells together. It never becomes the un-coalescable external fragmentation of a general heap allocator.",
+      "sourceAnchor": "6314-deletion-fragmentation-and-free-space",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q20",
+      "prompt": "Why is compacting a slotted page a page-local operation that needs no index updates?",
+      "options": [
+        "Compaction only rewrites each live slot's internal offset; external references use the slot number, which does not change.",
+        "Compaction rewrites every index entry as it moves each cell.",
+        "Indexes are rebuilt from scratch after every compaction.",
+        "Compaction moves the slots but leaves the cells in place, so nothing is relocated."
+      ],
+      "correctIndex": 0,
+      "explanation": "Sliding live cells together updates only the offset stored inside each slot; the slot number that indexes and sibling links hold is unchanged. Without the slot layer, compaction would have to find and rewrite every reference into the page.",
+      "sourceAnchor": "6315-defragmentation-and-compaction",
+      "difficulty": "trap"
+    },
+    {
+      "id": "63-q21",
+      "prompt": "How does TOAST store a large column value when compression alone is not enough?",
+      "options": [
+        "It splits the value into ~2 KB chunks in a side TOAST table and leaves an 18-byte pointer in the row.",
+        "It stores the whole value inline and expands the page beyond 8 KB.",
+        "It truncates the value to fit the 2 KB tuple threshold.",
+        "It moves the entire row, not just the column, to a separate overflow file."
+      ],
+      "correctIndex": 0,
+      "explanation": "When a tuple exceeds about 2 KB, TOAST compresses toastable columns and, if still too large, writes the value as chunks in pg_toast.pg_toast_<oid>, replacing the column with an 18-byte pointer. This keeps the visible row small while allowing ~1 GB values.",
+      "sourceAnchor": "6316-toast-oversized-attribute-storage",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q22",
+      "prompt": "Which TOAST storage strategy is the default for toastable types, and what does it do?",
+      "options": [
+        "EXTENDED: compress the value, and move it out-of-line if it is still too large.",
+        "PLAIN: never compress and never move out-of-line.",
+        "EXTERNAL: move out-of-line but never compress.",
+        "MAIN: always move out-of-line before compressing."
+      ],
+      "correctIndex": 0,
+      "explanation": "EXTENDED, the default, first compresses a value and moves it out-of-line only if it still does not fit. PLAIN forbids both, EXTERNAL skips compression for fast substring access, and MAIN prefers keeping the compressed value inline.",
+      "sourceAnchor": "6316-toast-oversized-attribute-storage",
+      "difficulty": "recall"
+    },
+    {
+      "id": "63-q23",
+      "prompt": "What is the purpose of a magic number at the start of a database or table file?",
+      "options": [
+        "A fixed signature that identifies the format so a wrong or corrupt file fails loudly instead of being misparsed.",
+        "A random salt that encrypts the rest of the file.",
+        "A counter of how many rows the file contains.",
+        "A pointer to the file's most recently written page."
+      ],
+      "correctIndex": 0,
+      "explanation": "A magic like SQLite's \"SQLite format 3\\0\" or Parquet's \"PAR1\" lets a reader instantly confirm the format and reject foreign files. Combined with a version number, it gates parsing and enables backward compatibility.",
+      "sourceAnchor": "6317-versioning-and-magic-numbers",
+      "difficulty": "recall"
+    },
+    {
+      "id": "63-q24",
+      "prompt": "A DBA claims enabling Postgres data checksums will stop torn pages from corrupting the database. What is the accurate correction?",
+      "options": [
+        "Checksums only detect torn pages and bit rot; they repair nothing, so recovery still needs full-page writes.",
+        "Checksums make 8 KB writes atomic, so torn pages can no longer occur.",
+        "Checksums replay the WAL automatically to fix any torn page.",
+        "Checksums move corrupted pages to a quarantine area and rewrite them."
+      ],
+      "correctIndex": 0,
+      "explanation": "A checksum is detection only: it flags a torn or bit-rotted page on read but cannot reconstruct it. Recovering a torn page requires full-page writes in the WAL, which overwrite the page with a known-good image during replay.",
+      "sourceAnchor": "6318-page-checksums",
+      "difficulty": "trap"
+    },
+    {
+      "id": "63-q25",
+      "prompt": "Beyond bit rot, what corruption does the Postgres page checksum specifically catch that a plain data hash might miss?",
+      "options": [
+        "A misdirected write to the wrong block, because the block number is mixed into the checksum.",
+        "Corruption of the WAL log records, which share the same checksum.",
+        "In-memory corruption that occurs before the page is written.",
+        "Corruption that happens in transit after the checksum is verified on read."
+      ],
+      "correctIndex": 0,
+      "explanation": "The FNV-1a-based checksum mixes in the block number, so a page written to the wrong location fails verification even if its bytes are internally consistent. It cannot catch in-memory corruption, which occurs before the checksum is stamped.",
+      "sourceAnchor": "6318-page-checksums",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q26",
+      "prompt": "Why can an 8 KB Postgres page be left torn after a crash?",
+      "options": [
+        "The device guarantees atomic writes only per sector (512 B or 4 KB), so an 8 KB page spans several sectors that may be partly written.",
+        "The buffer pool flushes pages one byte at a time.",
+        "The WAL writer interleaves records into the middle of the page.",
+        "Postgres always writes pages in 1 KB fragments across separate I/Os."
+      ],
+      "correctIndex": 0,
+      "explanation": "An 8 KB page covers 2 to 16 sectors, but hardware atomicity is only per sector, so a crash mid-write leaves some sectors new and some old. The resulting self-inconsistent page is what full-page writes exist to recover.",
+      "sourceAnchor": "6319-the-torn-page-problem-and-full-page-writes",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q27",
+      "prompt": "How do Postgres full-page writes let recovery fix a torn page?",
+      "options": [
+        "After each checkpoint the first change to a page logs the entire page image, which replay uses to overwrite the whole page before applying deltas.",
+        "They write every page twice to a dedicated doublewrite region on each flush.",
+        "They compute a per-page erasure code that reconstructs missing sectors.",
+        "They forbid writing any page larger than one sector."
+      ],
+      "correctIndex": 0,
+      "explanation": "With full_page_writes on, the first modification of a page after a checkpoint stores a full image (an FPI) in the WAL. On recovery, replaying the FPI overwrites the torn on-disk page with a consistent image, after which later deltas apply safely.",
+      "sourceAnchor": "6319-the-torn-page-problem-and-full-page-writes",
+      "difficulty": "recall"
+    },
+    {
+      "id": "63-q28",
+      "prompt": "How does InnoDB protect against torn pages, in contrast to Postgres full-page writes?",
+      "options": [
+        "The doublewrite buffer: each page is written first to a sequential doublewrite area and fsynced, then to its final location.",
+        "It logs a full page image into the redo log exactly like Postgres does.",
+        "It relies solely on the page checksum to reconstruct torn pages.",
+        "It shrinks pages to 512 bytes so writes are always atomic."
+      ],
+      "correctIndex": 0,
+      "explanation": "InnoDB writes each page twice, first to a doublewrite area and then to its home location, so a torn final page can be restored from the intact doublewrite copy on recovery. It achieves the same guarantee as full-page writes via a dedicated region rather than the WAL.",
+      "sourceAnchor": "6320-other-formats-sqlite-innodb-and-parquet",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q29",
+      "prompt": "Why is a SQLite database file byte-for-byte portable across architectures while a Postgres data directory is not?",
+      "options": [
+        "SQLite fixes all multi-byte integers big-endian and uses a host-independent record format; Postgres writes native byte order with endianness-dependent varlena headers.",
+        "SQLite compresses every page while Postgres stores pages raw.",
+        "SQLite stores no pointers at all while Postgres stores raw memory addresses on disk.",
+        "SQLite encrypts files with a portable key while Postgres does not."
+      ],
+      "correctIndex": 0,
+      "explanation": "SQLite's fixed big-endian integers and defined record encoding make its file identical on any machine, a stated design goal. Postgres writes host-native byte order and its varlena header bit-tests depend on endianness, so files cannot move between differing architectures.",
+      "sourceAnchor": "6320-other-formats-sqlite-innodb-and-parquet",
+      "difficulty": "application"
+    },
+    {
+      "id": "63-q30",
+      "prompt": "How does shrinking the size of a cell affect a B-tree?",
+      "options": [
+        "It raises fanout, so more cells fit per page, the tree is shallower, and fewer page reads occur per lookup.",
+        "It lowers fanout because smaller cells need more pointers.",
+        "It has no effect on fanout, which depends only on key type.",
+        "It forces every page to split, deepening the tree."
+      ],
+      "correctIndex": 0,
+      "explanation": "Prefix-truncated separators, short varlena headers, tight null bitmaps, and good column ordering all pack more cells per page, raising fanout and lowering tree height. That reduces the number of page reads for a point lookup.",
+      "sourceAnchor": "6321-endianness-alignment-cost-fanout-and-space",
+      "difficulty": "application"
+    }
+  ]
+}

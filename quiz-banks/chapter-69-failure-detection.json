@@ -1,0 +1,425 @@
+{
+  "slug": "chapter-69-failure-detection",
+  "questions": [
+    {
+      "id": "69-q01",
+      "prompt": "From a single node's vantage point, why can a crashed peer not be distinguished from a merely slow one?",
+      "options": [
+        "In an asynchronous system there is no upper bound on message delay, so 'no reply by my deadline' looks identical for a crash, a slow node, or a partition.",
+        "Crashed nodes always close their TCP connection, while slow nodes keep it open, so the two are easy to tell apart.",
+        "Slow nodes send a special 'busy' control message that crashed nodes cannot, revealing which case you are in.",
+        "The operating system reports process death to remote peers, so a crash is always known immediately."
+      ],
+      "correctIndex": 0,
+      "explanation": "With no bound on delay or processing speed, a slow node might answer just after you give up, so silence is produced identically by a crash, a slow node, and a partition. No finite timeout resolves the ambiguity.",
+      "sourceAnchor": "691-the-problem-crash-slow-or-partitioned",
+      "difficulty": "recall"
+    },
+    {
+      "id": "69-q02",
+      "prompt": "What is the correct characterization of a failure detector's output?",
+      "options": [
+        "A suspicion produced by an unreliable local oracle, which may be wrong in both directions.",
+        "A definitive fact about whether the peer process has halted.",
+        "A cryptographic proof of liveness signed by the monitored node.",
+        "A guaranteed-correct verdict as long as the network is TCP-based."
+      ],
+      "correctIndex": 0,
+      "explanation": "A failure detector is an unreliable local oracle that outputs the set of currently suspected nodes. It can make false positives and false negatives, and the algorithms above it are designed to tolerate those mistakes.",
+      "sourceAnchor": "692-a-failure-detector-is-suspicion-not-fact",
+      "difficulty": "recall"
+    },
+    {
+      "id": "69-q03",
+      "prompt": "A cluster falsely suspects a healthy primary that was mid-pause and triggers a failover. Which detector error is this, and what is its cost?",
+      "options": [
+        "A false positive: suspecting a live node, costing an unnecessary failover, fencing, or rebalancing.",
+        "A false negative: missing a real crash, costing requests routed to a black hole.",
+        "A completeness violation, meaning a real failure was never detected at all.",
+        "A clock-skew error that only affects lease renewal, not suspicion."
+      ],
+      "correctIndex": 0,
+      "explanation": "Suspecting a node that is actually alive is a false positive (a mistake). Its cost is real: needless failover, fencing a good node, data reshuffling, and often a cascade as the reshuffle load stresses survivors.",
+      "sourceAnchor": "692-a-failure-detector-is-suspicion-not-fact",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q04",
+      "prompt": "In the Chandra-Toueg framework, what do completeness and accuracy respectively capture?",
+      "options": [
+        "Completeness is liveness (every real failure is eventually suspected); accuracy is safety (no correct node is falsely suspected).",
+        "Completeness is safety (no false suspicion); accuracy is liveness (every failure detected).",
+        "Both are safety properties describing how fast detection happens.",
+        "Completeness measures network bandwidth; accuracy measures clock synchronization."
+      ],
+      "correctIndex": 0,
+      "explanation": "Completeness is the liveness guarantee that crashed processes are eventually suspected, while accuracy is the safety guarantee that correct processes are not falsely suspected. Strong, weak, and eventual variants refine each.",
+      "sourceAnchor": "693-formal-properties-completeness-and-accuracy",
+      "difficulty": "recall"
+    },
+    {
+      "id": "69-q05",
+      "prompt": "Why is a detector that suspects every node all the time considered useless despite being perfectly complete?",
+      "options": [
+        "It never misses a real failure but is maximally inaccurate, so it constantly falsely accuses live nodes.",
+        "It violates completeness because it also suspects nodes that later recover.",
+        "It cannot run without synchronized clocks across the whole cluster.",
+        "It is actually the ideal detector, since completeness is the only property that matters."
+      ],
+      "correctIndex": 0,
+      "explanation": "Suspecting everyone always is trivially complete (no real failure is missed) but maximally inaccurate, constantly accusing healthy nodes. The engineering difficulty is achieving completeness and accuracy simultaneously.",
+      "sourceAnchor": "693-formal-properties-completeness-and-accuracy",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q06",
+      "prompt": "Why is a Perfect (class P) failure detector impossible to implement in a purely asynchronous system?",
+      "options": [
+        "Strong accuracy needs a known upper bound on delay, which asynchrony denies; any deadline can be exceeded by a live node, and never giving up breaks completeness.",
+        "Because CPUs are too slow to compute the required probability distributions in real time.",
+        "Because packets can be corrupted, and P assumes a lossless network that never exists.",
+        "Because clocks always drift, and P only fails once drift exceeds one second."
+      ],
+      "correctIndex": 0,
+      "explanation": "Strong accuracy requires never suspecting a live-but-slow node, which requires an upper bound on message delay; asynchrony provides none. Any deadline can be exceeded (mistake) and never giving up breaks completeness, so P is unachievable.",
+      "sourceAnchor": "694-why-a-perfect-detector-is-impossible-in-an-asynchronous-system",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q07",
+      "prompt": "How do real distributed systems escape the impossibility of a perfect detector?",
+      "options": [
+        "They assume partial synchrony and target an Eventually Perfect (P-diamond) detector that stops making mistakes once conditions stabilize.",
+        "They add GPS clocks so message delay becomes exactly bounded and P becomes achievable.",
+        "They abandon failure detection entirely and rely only on manual operator intervention.",
+        "They use TCP, whose retransmission guarantees make asynchrony irrelevant."
+      ],
+      "correctIndex": 0,
+      "explanation": "Real networks are partially synchronous: mostly timely, occasionally not. In that model an Eventually Perfect (P-diamond) detector is achievable, adapting its timeouts upward after mistakes so accuracy is regained once the system behaves synchronously.",
+      "sourceAnchor": "694-why-a-perfect-detector-is-impossible-in-an-asynchronous-system",
+      "difficulty": "recall"
+    },
+    {
+      "id": "69-q08",
+      "prompt": "What happens to the false-positive rate when you shorten a detector's timeout to detect crashes faster?",
+      "options": [
+        "It rises: faster detection lowers detection time but also lowers the mistake-recurrence time, producing more false positives.",
+        "It falls: shorter timeouts always improve both speed and accuracy together.",
+        "It stays constant, because false positives depend only on the network, not the timeout.",
+        "It becomes zero, because a short timeout only fires for genuinely crashed nodes."
+      ],
+      "correctIndex": 0,
+      "explanation": "Detection time and mistake rate move in opposite directions on one knob: shortening the timeout speeds detection but crosses the threshold more often on transient delays, raising false positives. You pick a point on this curve, not escape it.",
+      "sourceAnchor": "695-the-three-way-tension-completeness-accuracy-and-speed",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q09",
+      "prompt": "Why is a single fixed timeout a poor failure detector over a real network link?",
+      "options": [
+        "It is a binary threshold over a wide, fat-tailed latency distribution, so no single value is both fast and free of false positives, and it never adapts to load shifts.",
+        "It uses too much CPU because it must recompute the timeout on every packet.",
+        "It requires synchronized clocks, which real networks cannot provide.",
+        "It works perfectly, which is why TCP keepalive is the industry standard for large clusters."
+      ],
+      "correctIndex": 0,
+      "explanation": "Latency is continuous, noisy, and fat-tailed. A fixed timeout set low flaps on load spikes; set high it detects real crashes slowly. And a static value chosen for today's load is wrong once traffic patterns shift.",
+      "sourceAnchor": "696-timeouts-the-crude-baseline",
+      "difficulty": "recall"
+    },
+    {
+      "id": "69-q10",
+      "prompt": "In the TCP-style adaptive timeout RTO = SRTT + 4*RTTVAR, what role does the RTTVAR term play?",
+      "options": [
+        "It floats the timeout above the mean by a multiple of observed jitter, so steady links get tight timeouts and jittery links get loose ones automatically.",
+        "It converts the smoothed RTT from milliseconds to microseconds for finer resolution.",
+        "It fixes the timeout at exactly four times the round-trip time regardless of variance.",
+        "It disables the timeout whenever variance is high, reverting to a fixed constant."
+      ],
+      "correctIndex": 0,
+      "explanation": "The variance term makes the timeout sit above the mean by a multiple of measured jitter. A steady link has small RTTVAR and a tight timeout; a jittery link has large RTTVAR and a loose one, adapting without hand-tuning.",
+      "sourceAnchor": "697-choosing-a-timeout-and-adaptive-timeouts",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q11",
+      "prompt": "What distinguishes a push (heartbeat) liveness check from a pull (ping) check?",
+      "options": [
+        "In push the monitored node proactively announces liveness; in pull the monitor probes and awaits an ack, testing the full round trip.",
+        "In push the monitor sends probes; in pull the monitored node sends heartbeats.",
+        "Push requires TCP while pull requires UDP, and neither can be mixed.",
+        "Push always uses more messages per check than pull because it is bidirectional."
+      ],
+      "correctIndex": 0,
+      "explanation": "Push has the monitored node emit periodic heartbeats (a one-way signal, cheap, natural for gossip). Pull has the monitor send a probe and wait for an ack, which tests the full round trip and catches asymmetric receive-but-not-send failures.",
+      "sourceAnchor": "698-heartbeats-and-pings-push-vs-pull",
+      "difficulty": "recall"
+    },
+    {
+      "id": "69-q12",
+      "prompt": "If a node heartbeats every T_hb and is declared dead after n missed beats, what bounds the detection time, and what is the cost of halving T_hb?",
+      "options": [
+        "Detection time is bounded below by roughly n * T_hb; halving T_hb doubles the heartbeat traffic.",
+        "Detection time is unrelated to T_hb; halving T_hb has no effect on traffic.",
+        "Detection time equals exactly T_hb regardless of n; halving T_hb halves the traffic.",
+        "Detection time grows with n only; T_hb affects accuracy but never message load."
+      ],
+      "correctIndex": 0,
+      "explanation": "You must wait roughly n missed intervals, so detection time is at least n * T_hb. Message load scales as 1/T_hb per link, so halving the interval doubles traffic, illustrating the cost versus detection-time trade.",
+      "sourceAnchor": "699-heartbeat-interval-and-the-costdetection-time-trade",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q13",
+      "prompt": "How does a timeout-free failure detector based on heartbeat counters work?",
+      "options": [
+        "Each node gossips a vector of per-member heartbeat counters merged by element-wise maximum; the detector exposes freshness and each application applies its own threshold.",
+        "It pings every peer on a fixed one-second timer and marks any that fail to reply within the timeout.",
+        "It uses synchronized clocks to compute an exact global deadline shared by all nodes.",
+        "It removes counters entirely and relies solely on TCP connection resets to signal death."
+      ],
+      "correctIndex": 0,
+      "explanation": "Nodes increment their own counter, gossip the whole vector, and merge by taking the largest counter seen per member plus the local time it was first seen. The detector never times out; each consumer applies its own freshness policy.",
+      "sourceAnchor": "6910-timeout-free-failure-detectors",
+      "difficulty": "recall"
+    },
+    {
+      "id": "69-q14",
+      "prompt": "Why does SWIM's indirect probing (ping-req) reduce false positives without lengthening detection time?",
+      "options": [
+        "A false positive then requires the direct path plus k independent indirect paths to all fail at once, and the k probes run in parallel within the same period.",
+        "It doubles the timeout for every probe, so slow nodes always get more time to answer.",
+        "It asks the monitored node to confirm its own death before it is suspected.",
+        "It replaces UDP with TCP, whose retransmissions guarantee no packet is ever lost."
+      ],
+      "correctIndex": 0,
+      "explanation": "When a direct ping fails, k other members probe the target in parallel; suspicion requires all k+1 independent paths to fail together, a far better proxy for real death. Because the indirect probes are parallel, base detection time is unchanged.",
+      "sourceAnchor": "6911-outsourced-heartbeats-and-indirect-probing-swims-ping-req",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q15",
+      "prompt": "What is the defining idea of the phi-accrual failure detector?",
+      "options": [
+        "It outputs a continuous suspicion level phi that rises as a heartbeat becomes overdue, letting each application pick its own threshold.",
+        "It outputs a boolean alive/dead flag recomputed once per second for the whole cluster.",
+        "It fixes a single global timeout and shares it via consensus among all nodes.",
+        "It stops sending heartbeats and instead relies on TCP keepalive at the kernel level."
+      ],
+      "correctIndex": 0,
+      "explanation": "Rather than a boolean, phi-accrual emits a continuous phi that grows the longer a heartbeat is overdue. Because the accusation decision is decoupled from the raw signal, different applications apply different phi thresholds to the same stream.",
+      "sourceAnchor": "6912-the-phi-accrual-failure-detector",
+      "difficulty": "recall"
+    },
+    {
+      "id": "69-q16",
+      "prompt": "In phi-accrual, phi = -log10(P_later). What does a phi value of 8 signify?",
+      "options": [
+        "P_later is about 10^-8, meaning roughly a 1-in-100-million chance that convicting the node is a mistake.",
+        "The node has missed exactly 8 consecutive heartbeats.",
+        "The timeout is 8 seconds long before the node is declared dead.",
+        "The node is 8 times slower than its historical average response time."
+      ],
+      "correctIndex": 0,
+      "explanation": "Phi equals the negative base-10 log of the probability that a gap this long is normal, so phi = 8 means P_later = 10^-8, about a 1-in-100-million mistake probability. The threshold is the tolerated mistake rate as a negative exponent.",
+      "sourceAnchor": "6912-the-phi-accrual-failure-detector",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q17",
+      "prompt": "Heartbeats average mu = 1000 ms with sigma = 100 ms. Widening sigma to 300 ms while keeping mu fixed has what effect on phi at a given amount of silence?",
+      "options": [
+        "Phi becomes smaller for the same silence, so the detector automatically tolerates more delay on a link it has learned is noisy.",
+        "Phi becomes larger, making the detector accuse the node sooner on the noisier link.",
+        "Phi is unaffected because it depends only on the mean, not the standard deviation.",
+        "Phi jumps to infinity because a larger sigma makes every gap look abnormal."
+      ],
+      "correctIndex": 0,
+      "explanation": "Phi is derived from the measured distribution: a larger sigma shrinks z = (dt - mu)/sigma, raising P_later and lowering phi for the same silence. The detector grows more patient on jittery links with no manual retuning.",
+      "sourceAnchor": "6913-phi-accrual-the-math-and-a-worked-example",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q18",
+      "prompt": "What is Cassandra's phi_convict_threshold default, and why do operators raise it on cloud networks?",
+      "options": [
+        "Default 8; raising it toward 10-12 suppresses false node-down events on flaky links that would trigger needless hinted-handoff and streaming.",
+        "Default 2; lowering it further speeds detection with no downside on any network.",
+        "Default 30 seconds; raising it converts phi into an absolute timeout in seconds.",
+        "Default 8; raising it makes detection faster by shortening the heartbeat interval."
+      ],
+      "correctIndex": 0,
+      "explanation": "The default phi_convict_threshold is 8 (range 5-16). On noisy cloud networks operators raise it to 10-12 so transient latency spikes do not falsely convict peers and trigger expensive hinted-handoff and data streaming.",
+      "sourceAnchor": "6914-cassandra-and-akka-phi_convict_threshold-in-practice",
+      "difficulty": "recall"
+    },
+    {
+      "id": "69-q19",
+      "prompt": "What problem does Akka's min-std-deviation floor on sigma solve?",
+      "options": [
+        "On an unrealistically steady link a tiny sigma would make phi explode on the slightest delay, so a floor keeps the detector from being hair-trigger.",
+        "It caps the maximum tolerated pause so the detector can never wait too long.",
+        "It converts the standard deviation into a fixed timeout for slow networks.",
+        "It disables phi-accrual entirely once variance drops below the floor."
+      ],
+      "correctIndex": 0,
+      "explanation": "If a link is unrealistically steady, sigma approaches zero and phi spikes on any tiny delay, causing flapping on healthy nodes. Flooring sigma builds in a noise-tolerance band, acknowledging that real heartbeats always have a noise floor.",
+      "sourceAnchor": "6914-cassandra-and-akka-phi_convict_threshold-in-practice",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q20",
+      "prompt": "How does SWIM disseminate membership and failure information across the cluster?",
+      "options": [
+        "By piggybacking updates on the ping/ack/ping-req probe messages, spreading infection-style so a change reaches all n nodes in O(log n) rounds.",
+        "By having each node broadcast every change to all other nodes on a dedicated channel.",
+        "Through a central coordinator that all nodes poll once per second.",
+        "By writing every membership change to a shared disk that all nodes memory-map."
+      ],
+      "correctIndex": 0,
+      "explanation": "SWIM separates dissemination from detection but rides updates on the probe traffic already flowing. Infection-style gossip spreads a change exponentially, reaching all nodes in O(log n) rounds at essentially zero extra message cost.",
+      "sourceAnchor": "6915-gossip-based-detection-swim-in-detail",
+      "difficulty": "recall"
+    },
+    {
+      "id": "69-q21",
+      "prompt": "Why does SWIM mark a node 'suspect' before 'dead' rather than declaring death immediately on a failed probe?",
+      "options": [
+        "The provisional, correctable suspect state lets other nodes refute the accusation before it becomes final, which is where accuracy comes from.",
+        "It saves memory by storing a smaller record for suspects than for dead nodes.",
+        "The suspect state is required by TCP before a connection can be torn down.",
+        "It speeds detection by skipping the confirmation step that dead nodes need."
+      ],
+      "correctIndex": 0,
+      "explanation": "A failed probe marks the node suspect and gossips that; peers that can still reach it may refute the suspicion, and only after a timeout does it become dead. This correctable middle state is the gossip analogue of phi-accrual's continuous phi.",
+      "sourceAnchor": "6915-gossip-based-detection-swim-in-detail",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q22",
+      "prompt": "How do incarnation numbers let a wrongly-suspected node refute the rumor, and why can no one forge the refutation?",
+      "options": [
+        "The node increments its own incarnation and floods Alive with the higher number, which overrides the older Suspect; only the node itself may increment its own incarnation.",
+        "The node asks a majority of peers to vote to clear the suspicion, and the majority signs the result.",
+        "Any peer can raise the suspected node's incarnation on its behalf, so refutation is a group effort.",
+        "The node lowers its incarnation to match the oldest record, forcing a reset of all rumors."
+      ],
+      "correctIndex": 0,
+      "explanation": "A live node bumps its own incarnation and broadcasts Alive with the newer value, which overrides the stale Suspect everywhere. Because only the node itself increments its incarnation, no other node can forge the refutation, and a dead node emits nothing.",
+      "sourceAnchor": "6916-incarnation-numbers-refuting-a-false-suspicion",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q23",
+      "prompt": "What is the per-node message load of SWIM versus all-to-all heartbeating, as a function of cluster size n?",
+      "options": [
+        "SWIM is O(1) per node (one target plus k constant indirect probes); all-to-all is O(n) per node and O(n^2) cluster-wide.",
+        "Both are O(n) per node, but SWIM uses smaller packets.",
+        "SWIM is O(n) per node; all-to-all is O(1) because each node checks only its neighbor.",
+        "Both are O(1) per node, differing only in dissemination latency."
+      ],
+      "correctIndex": 0,
+      "explanation": "SWIM probes one random target plus a constant k indirect probes per period, independent of n, so per-node load is O(1) and cluster-wide is O(n). All-to-all heartbeating is O(n) per node and O(n^2) total, which caps its scalability.",
+      "sourceAnchor": "6917-scalability-o1-vs-on-load-per-node",
+      "difficulty": "recall"
+    },
+    {
+      "id": "69-q24",
+      "prompt": "What is the 'reversed' or self-monitoring approach to failure detection, and its inherent limitation?",
+      "options": [
+        "Nodes self-report health to a sink and self-fence when they cannot make progress; the limit is that a truly crashed node cannot announce its own crash.",
+        "Monitors ping every node twice and take a majority vote, which fails only under network partitions.",
+        "The cluster elects one node to watch all others, which fails only if that watcher crashes.",
+        "Nodes broadcast their crash to all peers at the moment of failure, eliminating the need for timeouts."
+      ],
+      "correctIndex": 0,
+      "explanation": "Instead of outsiders inferring health from silence, each node reports its own health to a sink and self-fences on losing quorum or its lease. It catches richer, faster self-observable failures, but a fully crashed node cannot report anything, so external detection is still required.",
+      "sourceAnchor": "6918-reversing-the-problem-self-monitoring-and-the-sink-approach",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q25",
+      "prompt": "How does a lease convert an unreliable suspicion into a safe basis for action such as leadership?",
+      "options": [
+        "The holder must renew a TTL grant; if it stops, the lease expires on its own and the protected resource is released, a fact defined by one clock rather than agreement about the holder's state.",
+        "The lease forces all nodes to synchronize clocks so suspicion becomes a globally agreed fact.",
+        "The lease pings the holder continuously and only expires after a human confirms the crash.",
+        "The lease makes the detector perfect by adding cryptographic signatures to heartbeats."
+      ],
+      "correctIndex": 0,
+      "explanation": "A lease is a self-expiring TTL grant the holder must keep renewing. If it stops (crash, slow, or partition), the lease expires by the grantor's clock alone and the protected resource is released, turning a suspicion into a fenced, provable fact.",
+      "sourceAnchor": "6919-leases-sessions-and-fencing-zookeeper-etcd-and-patroni",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q26",
+      "prompt": "How does Patroni provide PostgreSQL high availability and prevent split-brain?",
+      "options": [
+        "It stores a TTL leader key in a DCS (etcd/Consul/ZooKeeper) renewed each loop_wait; the old primary self-demotes on losing DCS contact before its TTL expires.",
+        "It runs a phi-accrual detector inside the Postgres backend and promotes replicas directly on high phi.",
+        "It uses synchronous streaming replication alone, so two primaries can never both commit.",
+        "It relies on TCP keepalive between primary and replicas to detect and elect a new leader."
+      ],
+      "correctIndex": 0,
+      "explanation": "Postgres has no native membership, so Patroni holds a leader key with a TTL (default 30 s) in a DCS, renewed every loop_wait (10 s). If the primary cannot renew, the key vanishes and replicas elect a new leader; the old primary self-demotes on DCS loss before its TTL expires, avoiding two live primaries.",
+      "sourceAnchor": "6919-leases-sessions-and-fencing-zookeeper-etcd-and-patroni",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q27",
+      "prompt": "Why does a multi-second stop-the-world GC pause commonly cause false positives, and how is it mitigated?",
+      "options": [
+        "The pause freezes the heartbeat thread so a healthy node looks crashed; mitigate by setting the conviction threshold above the worst tolerable pause.",
+        "The pause corrupts heartbeat packets so peers reject them; mitigate with checksums.",
+        "The pause resets the monotonic clock; mitigate by switching to wall-clock time.",
+        "The pause is harmless because the JVM keeps sending heartbeats during collection."
+      ],
+      "correctIndex": 0,
+      "explanation": "A stop-the-world GC freezes every thread, including the heartbeat sender, so the node is indistinguishable from a crash, the pure slow case. If the conviction threshold is below the worst pause, healthy nodes get evicted on every collection; the fix is to set the threshold above the worst tolerable pause.",
+      "sourceAnchor": "6920-practical-concerns-flapping-gc-pauses-and-tuning",
+      "difficulty": "trap"
+    },
+    {
+      "id": "69-q28",
+      "prompt": "Why must timeout- and lease-based detectors measure time with a monotonic clock rather than wall-clock time?",
+      "options": [
+        "They measure elapsed intervals, and an NTP step in wall-clock time could instantly expire or extend every lease and heartbeat.",
+        "Monotonic clocks are more precise, giving nanosecond rather than millisecond resolution.",
+        "Wall-clock time is unavailable inside containers, so monotonic is the only option.",
+        "Monotonic clocks are automatically synchronized across all nodes, unlike wall-clock time."
+      ],
+      "correctIndex": 0,
+      "explanation": "Detectors track elapsed intervals (time since last heartbeat, lease TTL), not absolute instants. A wall-clock (NTP-steppable) source can jump forward or backward and instantly expire or extend everything; a monotonic clock never goes backward and ignores NTP corrections.",
+      "sourceAnchor": "6920-practical-concerns-flapping-gc-pauses-and-tuning",
+      "difficulty": "trap"
+    },
+    {
+      "id": "69-q29",
+      "prompt": "Which failure detector best fits a membership layer expected to reach tens of thousands of nodes, and why?",
+      "options": [
+        "SWIM/gossip, because its per-node load is O(1) and dissemination is O(log n), unlike O(n)-per-node heartbeating.",
+        "All-to-all heartbeating, because its simplicity outweighs its O(n^2) traffic at any scale.",
+        "A single central coordinator polling every node, because centralization removes false positives.",
+        "TCP keepalive on a full mesh of connections, because the kernel handles everything."
+      ],
+      "correctIndex": 0,
+      "explanation": "Gossip-based SWIM keeps each node's probe load constant regardless of cluster size and spreads updates in O(log n) rounds, whereas all-to-all heartbeating is O(n) per node and O(n^2) total, hitting a hard ceiling. This is why large membership layers are gossip-based.",
+      "sourceAnchor": "6921-putting-it-together-choosing-a-detector",
+      "difficulty": "application"
+    },
+    {
+      "id": "69-q30",
+      "prompt": "Why is acting directly on a bare failure-detector suspicion (evicting or promoting) unsafe?",
+      "options": [
+        "A mistaken suspicion could produce two live primaries; wrapping the suspicion in a lease/fencing token ensures even a wrong guess cannot cause split-brain.",
+        "The suspicion is always correct, so acting on it is safe but merely slow.",
+        "Bare suspicions consume too much memory to act on without a lease cache.",
+        "Detectors only work with synchronized clocks, so any action needs a clock first."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because a detector can be wrong, promoting on a bare suspicion risks two simultaneous primaries. A lease or fencing token with a deadline guarantees that even a mistaken suspicion cannot yield two live primaries, which is why leases beat raw detectors.",
+      "sourceAnchor": "common-traps",
+      "difficulty": "trap"
+    }
+  ]
+}

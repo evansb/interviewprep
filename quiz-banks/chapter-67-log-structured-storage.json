@@ -1,0 +1,481 @@
+{
+  "slug": "chapter-67-log-structured-storage",
+  "questions": [
+    {
+      "id": "67-q01",
+      "prompt": "What is the core problem an LSM tree is designed to solve?",
+      "options": [
+        "Turning the random in-place writes of an ordered structure into large sequential appends.",
+        "Eliminating the need for any index by keeping all keys sorted on disk.",
+        "Removing the write-ahead log so writes never touch the disk at all.",
+        "Guaranteeing that every point read touches exactly one file on disk."
+      ],
+      "correctIndex": 0,
+      "explanation": "By buffering writes in a memory memtable and flushing immutable sorted files, the LSM converts scattered random writes into big sequential appends, which wins on write-heavy workloads and on flash where sequential writes are far cheaper.",
+      "sourceAnchor": "671-motivation-turning-random-writes-into-sequential-writes",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q02",
+      "prompt": "Where does an LSM tree sit on the three axes of buffering, mutability, and ordering?",
+      "options": [
+        "Buffered, immutable (append-only), and ordered.",
+        "Unbuffered, in-place, and ordered.",
+        "Buffered, in-place, and unordered.",
+        "Unbuffered, immutable, and unordered."
+      ],
+      "correctIndex": 0,
+      "explanation": "The LSM shares ordering with the B-tree but flips the other two axes: it buffers writes in a memtable and appends immutable SSTables instead of mutating pages in place, which is the root of every performance difference between them.",
+      "sourceAnchor": "672-the-lsm-tree-structure-and-components",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q03",
+      "prompt": "Why is core PostgreSQL used as the contrast baseline rather than as an LSM example?",
+      "options": [
+        "Its heap is updated in place and its WAL is only a recovery log, not the primary queryable store.",
+        "It has no write-ahead log, so it cannot buffer writes before flushing them.",
+        "It stores all rows in a single append-only file that is never compacted.",
+        "It keeps every table fully in memory and never writes to disk during queries."
+      ],
+      "correctIndex": 0,
+      "explanation": "Postgres writes new tuple versions into heap pages in place, so it is the in-place baseline. Its WAL is genuinely log-structured but serves crash recovery; rows are never read from it in normal operation, so it is not a log-structured primary store.",
+      "sourceAnchor": "671-motivation-turning-random-writes-into-sequential-writes",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q04",
+      "prompt": "In the standard LSM write path, what is the correct order of operations?",
+      "options": [
+        "Append to the WAL and fsync per policy, insert into the memtable, then acknowledge.",
+        "Insert into the memtable, acknowledge, then lazily write the WAL later.",
+        "Write directly to an L0 SSTable, then update the memtable, then log to the WAL.",
+        "Acknowledge immediately, then batch both the WAL and memtable writes at flush time."
+      ],
+      "correctIndex": 0,
+      "explanation": "Durability requires logging the change before it is committed, so the WAL append comes first, then the in-memory sorted memtable insert, then the client ack. No SSTable is touched and no random disk write happens on the write path.",
+      "sourceAnchor": "674-the-write-path",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q05",
+      "prompt": "Why is a skip list the usual choice for an LSM memtable?",
+      "options": [
+        "It keeps keys sorted with O(log n) ops, needs no rotations, and supports concurrent readers with atomic splices.",
+        "It stores keys unsorted so inserts are O(1) and flushing needs no external sort.",
+        "It compresses keys automatically, halving the memory the memtable consumes.",
+        "It guarantees every lookup touches exactly one node regardless of key count."
+      ],
+      "correctIndex": 0,
+      "explanation": "A skip list maintains sorted order (so a flush yields a sorted SSTable directly and range scans work) with logarithmic operations and no tree rotations, and its pointer-splice inserts make single-writer/multi-reader or concurrent-writer access simple.",
+      "sourceAnchor": "673-the-memtable",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q06",
+      "prompt": "What does a single SSTable file contain?",
+      "options": [
+        "Sorted data blocks, a sparse index block, a Bloom filter block, and a footer with offsets.",
+        "An unsorted heap of records plus a full dense index of every byte offset.",
+        "Only key-value pairs, with the index and filter stored in a separate global catalog.",
+        "A mutable B-tree whose leaves are rewritten in place during compaction."
+      ],
+      "correctIndex": 0,
+      "explanation": "An SSTable is self-describing: compressed sorted data blocks, a sparse index with one entry per data block, a Bloom filter over its keys, and a fixed footer holding the index and metadata offsets plus a magic number. It is immutable once written.",
+      "sourceAnchor": "675-sstables-sorted-string-table-layout",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q07",
+      "prompt": "How does a point lookup use an SSTable's sparse index?",
+      "options": [
+        "Binary-search the index to find the one block that could hold the key, then read just that block.",
+        "Scan every data block in order until the key is found or the file ends.",
+        "Read the entire index into the memtable and merge it with pending writes.",
+        "Use the index to locate a byte offset for every individual key in the file."
+      ],
+      "correctIndex": 0,
+      "explanation": "The sparse index stores one entry per data block (its last key and offset), so a lookup binary-searches the index to identify the single candidate block and reads it with one I/O, then searches within it, rather than scanning the whole file.",
+      "sourceAnchor": "675-sstables-sorted-string-table-layout",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q08",
+      "prompt": "In an LSM tree, how is a delete implemented?",
+      "options": [
+        "By inserting a tombstone marker that shadows older values until compaction removes them.",
+        "By locating the key's SSTable and erasing its bytes in place immediately.",
+        "By decrementing a reference count so the key disappears once it reaches zero.",
+        "By removing the key from the memtable and every SSTable in one atomic pass."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because files are immutable, a delete is a write: it inserts a tombstone that records the key as deleted and shadows any older value on read. The old copies persist on disk until compaction reconciles and discards them.",
+      "sourceAnchor": "677-updates-and-deletes-tombstones",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q09",
+      "prompt": "Why is dropping a tombstone too early dangerous?",
+      "options": [
+        "An older shadowed value of the key can resurrect once nothing masks it anymore.",
+        "The memtable loses its sort order and future flushes produce corrupt SSTables.",
+        "The Bloom filter reports a false negative and skips the key permanently.",
+        "The write-ahead log can no longer be replayed after the next restart."
+      ],
+      "correctIndex": 0,
+      "explanation": "A tombstone must outlive every older copy of its key, typically until compaction reaches the bottommost level. If it is collected while an older value still exists in some SSTable, that value reappears, the classic deleted-data-comes-back bug (aggravated by replicas in Cassandra).",
+      "sourceAnchor": "677-updates-and-deletes-tombstones",
+      "difficulty": "trap"
+    },
+    {
+      "id": "67-q10",
+      "prompt": "Why can a range scan over a heavily deleted key range be expensive?",
+      "options": [
+        "The reader must traverse all the tombstones covering the range even though they yield no rows.",
+        "Each tombstone forces a full compaction of the level before the scan can continue.",
+        "Range scans rebuild the Bloom filter for every SSTable they open.",
+        "The scan must fsync the WAL once per deleted key to guarantee durability."
+      ],
+      "correctIndex": 0,
+      "explanation": "Tombstones are ordinary records that the merge must process; a scan over a range that was heavily deleted reads every tombstone it passes to return possibly zero output, which is the source of Cassandra's tombstone-overwhelming query failures.",
+      "sourceAnchor": "677-updates-and-deletes-tombstones",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q11",
+      "prompt": "Why must an LSM point lookup check L0 SSTables individually but only one file per lower level?",
+      "options": [
+        "L0 files come from independent memtable flushes and may overlap, while lower levels are kept non-overlapping.",
+        "L0 files are compressed differently, so each needs a separate decompression pass.",
+        "Lower levels have no Bloom filters, so only one file per level is ever consulted.",
+        "L0 files are stored in memory, so checking them all is free."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each L0 SSTable is an independent memtable snapshot and can share key ranges with the others, so a key could be in any of them. Leveled compaction keeps L1 and below non-overlapping, so at most one file per level can contain a given key.",
+      "sourceAnchor": "678-the-read-path-lookups-and-read-amplification",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q12",
+      "prompt": "What is read amplification in an LSM tree?",
+      "options": [
+        "The number of places (files or levels) a single logical read may have to consult.",
+        "The ratio of bytes written to disk versus bytes of data ingested.",
+        "The extra disk space consumed by obsolete versions and tombstones.",
+        "The number of hash functions used by each SSTable's Bloom filter."
+      ],
+      "correctIndex": 0,
+      "explanation": "A key's newest version can live in the memtable or any level, so a read may check many runs; that multi-run cost is read amplification and is the structural weakness of the LSM, the mirror image of its cheap writes.",
+      "sourceAnchor": "678-the-read-path-lookups-and-read-amplification",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q13",
+      "prompt": "How does a Bloom filter reduce LSM read cost?",
+      "options": [
+        "It lets a lookup skip an SSTable entirely when it reports the key is definitely absent.",
+        "It stores the exact block offset of every key so no index is needed.",
+        "It caches recently read values so repeated lookups avoid the disk.",
+        "It answers whether any key in a range exists, pruning range scans."
+      ],
+      "correctIndex": 0,
+      "explanation": "Each SSTable carries a Bloom filter over its keys with no false negatives, so a lookup consults it before any block read and skips the file when it says absent, eliminating roughly 99% of unnecessary SSTable probes at a false-positive tax.",
+      "sourceAnchor": "679-bloom-filters",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q14",
+      "prompt": "Roughly what false-positive rate does a Bloom filter at 10 bits per key with optimal hash functions give?",
+      "options": [
+        "About 1%.",
+        "About 25%.",
+        "About 0.001%.",
+        "Exactly 0%."
+      ],
+      "correctIndex": 0,
+      "explanation": "At around 10 bits per key with about 7 hash functions the false-positive probability is roughly 1%, which is RocksDB's default: about 1.25 bytes of RAM per key to eliminate nearly all wasted SSTable probes. A Bloom filter can never have zero false positives.",
+      "sourceAnchor": "679-bloom-filters",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q15",
+      "prompt": "Why can't a Bloom filter accelerate an arbitrary range scan?",
+      "options": [
+        "It answers point membership only, not whether any key within a range is present.",
+        "It has false negatives on ranges, so it might skip a file that holds matches.",
+        "It is stored on disk and reading it costs more than scanning the blocks.",
+        "It is discarded after the SSTable's first read to save memory."
+      ],
+      "correctIndex": 0,
+      "explanation": "A standard Bloom filter tests membership of a specific key and cannot say whether some key in an interval exists, so range scans must open and merge every overlapping run. Only prefix Bloom filters help specific prefix scans.",
+      "sourceAnchor": "679-bloom-filters",
+      "difficulty": "trap"
+    },
+    {
+      "id": "67-q16",
+      "prompt": "What data structure implements a k-way merge across sorted runs, and at what cost?",
+      "options": [
+        "A min-heap of one iterator per run, emitting N elements in O(N log k).",
+        "A hash table keyed on run id, emitting N elements in O(N).",
+        "A B-tree rebuilt over all runs, emitting N elements in O(N log N).",
+        "A single sorted array materializing all runs, using O(N) memory."
+      ],
+      "correctIndex": 0,
+      "explanation": "The merge keeps a min-heap holding the current head of each of the k runs, repeatedly popping the minimum and advancing that run's cursor. Each element is pushed and popped once, giving O(N log k) time and O(k) memory since only one element per run is buffered.",
+      "sourceAnchor": "6710-merge-iteration-across-sorted-runs",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q17",
+      "prompt": "When a merge finds several entries for the same key, how is the conflict resolved?",
+      "options": [
+        "Newest wins, determined by a sequence number or timestamp; a tombstone means the key is absent.",
+        "Oldest wins, since the earliest write established the canonical value.",
+        "The values are concatenated so no information is lost.",
+        "The entry from the lowest level wins, since deeper data is more compacted."
+      ],
+      "correctIndex": 0,
+      "explanation": "RocksDB orders equal user keys by descending sequence number so the newest is seen first; Cassandra uses timestamps (last-write-wins, vulnerable to clock skew). A tombstone as the newest version resolves to the key being absent.",
+      "sourceAnchor": "6711-reconciliation-newest-wins",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q18",
+      "prompt": "During compaction, when is it safe to physically drop an older version of a key?",
+      "options": [
+        "When it is older than the oldest live snapshot and a newer version supersedes it.",
+        "As soon as any newer version of the key is written to the memtable.",
+        "Only after the WAL segment containing it has been fsynced.",
+        "Never; every version written must be retained for the life of the table."
+      ],
+      "correctIndex": 0,
+      "explanation": "Compaction keeps only the newest version any live read could need. Older versions still visible to an open snapshot must be retained, so only versions older than the oldest live snapshot are safe to discard, the LSM analog of MVCC visibility.",
+      "sourceAnchor": "6711-reconciliation-newest-wins",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q19",
+      "prompt": "What is the central trade-off that compaction makes?",
+      "options": [
+        "It spends write amplification to reduce read and space amplification.",
+        "It spends memory to reduce both read and write amplification.",
+        "It reduces all three amplifications simultaneously at no cost.",
+        "It spends read amplification to reduce write and space amplification."
+      ],
+      "correctIndex": 0,
+      "explanation": "Compaction merges runs and discards obsolete data, rewriting large volumes (write amplification) in order to merge many runs into fewer non-overlapping ones (lower read amplification) and reclaim space (lower space amplification).",
+      "sourceAnchor": "6712-compaction-role-and-cost",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q20",
+      "prompt": "What invariant does leveled compaction maintain below L0, and what does it buy?",
+      "options": [
+        "SSTables in each level have disjoint key ranges, so a lookup checks at most one file per level.",
+        "Every level holds exactly one giant SSTable, so lookups check exactly one file total.",
+        "SSTables overlap freely, so writes never need to rewrite lower levels.",
+        "Each level is sorted only within blocks, so the index can be omitted."
+      ],
+      "correctIndex": 0,
+      "explanation": "Leveled compaction keeps L1 and below non-overlapping, so a point lookup consults at most one SSTable per level. This yields low read and space amplification (about 1.1x) at the cost of high write amplification, since each key is rewritten roughly T times per level.",
+      "sourceAnchor": "6713-leveled-compaction",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q21",
+      "prompt": "How does size-tiered compaction differ from leveled, and what is its amplification profile?",
+      "options": [
+        "It merges similarly-sized runs into larger ones, giving low write but high read and space amplification.",
+        "It keeps strict non-overlapping levels, giving low read but high write amplification.",
+        "It never merges anything, so all three amplifications stay minimal forever.",
+        "It merges across all tiers at once, giving low space but high write amplification."
+      ],
+      "correctIndex": 0,
+      "explanation": "Size-tiered compaction groups SSTables into size tiers and merges several same-size tables when enough accumulate. A key is rewritten only about log-f-N times (low write amplification), but multiple overlapping runs per tier raise read and space amplification (up to about 2x).",
+      "sourceAnchor": "6714-size-tiered-compaction",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q22",
+      "prompt": "Why is time-window compaction well suited to TTL-expiring time-series data?",
+      "options": [
+        "Windows are never merged together, so an entire expired window can be dropped whole without scanning tombstones.",
+        "It rewrites every window on each flush so expired rows are removed immediately.",
+        "It stores all windows in one SSTable so range scans never cross a boundary.",
+        "It disables tombstones entirely, relying on the Bloom filter to hide deletes."
+      ],
+      "correctIndex": 0,
+      "explanation": "Data is bucketed by time window and windows are compacted independently, so once every row in a window has expired the whole window's SSTables are dropped at once, avoiding tombstone scanning and avoiding rewriting live data to expire old data.",
+      "sourceAnchor": "6715-time-window-compaction-and-other-strategies",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q23",
+      "prompt": "Which definition of write amplification is correct?",
+      "options": [
+        "Bytes written to storage per byte of logical data ingested.",
+        "Files consulted per logical read after Bloom filtering.",
+        "Bytes stored on disk per byte of live logical data.",
+        "The number of levels a key traverses before expiring."
+      ],
+      "correctIndex": 0,
+      "explanation": "Write amplification counts total bytes written to storage (WAL plus flush plus compaction rewrites) per byte ingested; leveled compaction runs about 10 to 30x. It is the metric flash cares about because it drives device wear.",
+      "sourceAnchor": "6716-read-write-and-space-amplification-defined",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q24",
+      "prompt": "What does the RUM conjecture state?",
+      "options": [
+        "An access method can optimize at most two of Read, Update, and Memory overhead; the third must give.",
+        "Read, Update, and Memory overhead can all be minimized with enough compaction.",
+        "Any two of Read, Update, and Memory overhead are always equal in a balanced tree.",
+        "Reducing memory overhead automatically reduces read and update overhead."
+      ],
+      "correctIndex": 0,
+      "explanation": "The RUM conjecture says minimizing any two of Read, Update, and Memory (space) overhead forces the third up, so no structure is universally optimal. The LSM compaction strategy is the dial along this triangle, which is why several strategies coexist.",
+      "sourceAnchor": "6717-the-rum-conjecture",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q25",
+      "prompt": "In RUM terms, which corner does an LSM tree occupy and why?",
+      "options": [
+        "Update-optimized: buffering and appending make writes cheap, at the cost of read and space overhead.",
+        "Read-optimized: dense indexing makes reads cheap, at the cost of update overhead.",
+        "Memory-optimized: heavy compression makes space tiny, at the cost of read cost.",
+        "It optimizes all three corners simultaneously, unlike a B-tree."
+      ],
+      "correctIndex": 0,
+      "explanation": "The LSM minimizes update (write) overhead by buffering writes in the memtable and appending immutable runs; the price is reading across many runs (read amplification) and retaining obsolete copies until compaction (space amplification). Size-tiered is the extreme write-optimized corner.",
+      "sourceAnchor": "6717-the-rum-conjecture",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q26",
+      "prompt": "Comparing a B-tree and an LSM tree on reads, what is the structural difference?",
+      "options": [
+        "A B-tree reads one path to one leaf; an LSM may check many runs because a key can be in any level.",
+        "A B-tree checks every level; an LSM always reads exactly one file thanks to Bloom filters.",
+        "Both read one leaf, but the LSM additionally sorts the result at read time.",
+        "A B-tree merges k runs while an LSM descends a single path."
+      ],
+      "correctIndex": 0,
+      "explanation": "In a B-tree a key lives in exactly one leaf, so a read is one path. In an LSM the newest version could be in the memtable or any level, so reads are multi-run; Bloom filters and compaction narrow this but reads remain the LSM's weaker side.",
+      "sourceAnchor": "6718-lsm-trees-vs-b-trees",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q27",
+      "prompt": "Why are LSM reads over SSTables lock-free while B-tree reads need latches?",
+      "options": [
+        "SSTables are immutable, so their bytes never change during a read and need no coordination.",
+        "SSTables are always fully cached in RAM, so no locking is ever required.",
+        "LSM engines are single-threaded, so concurrency control is unnecessary.",
+        "B-trees store data in the WAL, which serializes all reads and writes."
+      ],
+      "correctIndex": 0,
+      "explanation": "Because compaction produces new files and retires old ones only when no reader references them, an SSTable's bytes are stable for its lifetime, so readers need no locks. Only the mutable memtable and manifest edits require synchronization, unlike in-place B-tree pages.",
+      "sourceAnchor": "6722-concurrency-in-lsm-trees",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q28",
+      "prompt": "How does an LSM engine provide consistent snapshots cheaply?",
+      "options": [
+        "A snapshot is a sequence number, and a read ignores any entry with a higher sequence number.",
+        "It copies the entire memtable and all SSTables at snapshot creation time.",
+        "It locks every SSTable for the duration of the snapshot's reads.",
+        "It disables compaction entirely while any snapshot is open."
+      ],
+      "correctIndex": 0,
+      "explanation": "Every write carries a monotonic sequence number and old versions persist until compaction, so a snapshot is just a sequence number and reads skip newer entries. Compaction must not drop a version still visible to the oldest live snapshot.",
+      "sourceAnchor": "6722-concurrency-in-lsm-trees",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q29",
+      "prompt": "What distinguishes Bitcask from a sorted LSM engine, and what does it cost?",
+      "options": [
+        "An in-RAM hash index over an append log gives single-seek reads but no range scans and caps keys by memory.",
+        "A sorted on-disk index gives fast range scans but requires all values to fit in RAM.",
+        "A B-tree over the log gives ordered iteration with no memory limit on keys.",
+        "A Bloom filter per log file gives single-seek reads and unlimited key counts."
+      ],
+      "correctIndex": 0,
+      "explanation": "Bitcask keeps an append-only log plus an in-memory keydir mapping every key to its file and offset, so a read is one hash lookup plus one seek. The trade-offs are that all keys must fit in RAM and there is no ordered iteration or range query.",
+      "sourceAnchor": "6720-unordered-lsm-storage-bitcask",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q30",
+      "prompt": "What does WiscKey's key-value separation optimize, and what does it sacrifice?",
+      "options": [
+        "It cuts compaction write amplification for large values but adds a read hop and scatters values, hurting range scans.",
+        "It cuts read amplification for point lookups but forces every value to be recompressed on read.",
+        "It eliminates the memtable, so writes go straight to the value log with no WAL.",
+        "It removes the need for Bloom filters by storing values in sorted order in the vLog."
+      ],
+      "correctIndex": 0,
+      "explanation": "By storing only key-to-pointer entries in the LSM and putting values in a separate append-only value log, compaction rewrites only keys and pointers, slashing write amplification for large values. The costs are an extra read dereference, random vLog reads on scans, and separate vLog garbage collection.",
+      "sourceAnchor": "6721-wisckey-key-value-separation",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q31",
+      "prompt": "Which compression choice reflects the standard production pattern in RocksDB?",
+      "options": [
+        "Fast light compression (LZ4/Snappy) on hot upper levels, stronger Zstd on the cold bottommost level.",
+        "Strong Zstd everywhere to minimize total disk space regardless of read latency.",
+        "No compression at all, since decompression cost always exceeds the I/O saved.",
+        "Gzip on upper levels and no compression on the bottommost level."
+      ],
+      "correctIndex": 0,
+      "explanation": "Upper levels churn fast and are latency-sensitive, so cheap fast codecs suit them; the bottommost level holds most bytes and is read rarely, so stronger Zstd buys space where it is cheap to spend CPU. The uncompressed block cache hides decompression on hot reads.",
+      "sourceAnchor": "6719-block-cache-compression-and-disk-access",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q32",
+      "prompt": "What is log-on-log write amplification?",
+      "options": [
+        "An LSM's appends sit atop a journaling filesystem and an SSD FTL that are each log-structured with their own garbage collection, multiplying total flash writes.",
+        "The LSM writes each record twice, once to the WAL and once to the memtable, doubling writes.",
+        "Compaction reads each SSTable twice, once for the index and once for the data.",
+        "The Bloom filter is rebuilt on every flush, adding a second write per SSTable."
+      ],
+      "correctIndex": 0,
+      "explanation": "The LSM, the filesystem journal, and the SSD's Flash Translation Layer are all log-structured and each garbage-collects independently, so their write amplifications multiply and the FTL's GC can even fight the LSM's compaction, wearing the flash faster.",
+      "sourceAnchor": "6723-log-stacking-lsm-on-flash-and-the-ftl",
+      "difficulty": "recall"
+    },
+    {
+      "id": "67-q33",
+      "prompt": "How do NVMe Zoned Namespaces (ZNS) reduce redundant work under an LSM tree?",
+      "options": [
+        "Zones are written sequentially and reset as a unit, so writing one SSTable per zone makes compaction serve as the device's garbage collection.",
+        "They add a second FTL that mirrors the first, doubling redundancy for safety.",
+        "They compress SSTables in hardware so the host never spends CPU on compression.",
+        "They keep the entire LSM tree in the drive's DRAM to avoid all disk reads."
+      ],
+      "correctIndex": 0,
+      "explanation": "ZNS surfaces the erase-block constraint as zones that must be written sequentially and reset wholesale. Mapping one SSTable per zone lets the host reset a zone when that SSTable is compacted away, eliminating the FTL's redundant garbage collection and driving device write amplification toward 1x.",
+      "sourceAnchor": "6724-mindful-stacking-removing-redundant-translation-layers",
+      "difficulty": "application"
+    },
+    {
+      "id": "67-q34",
+      "prompt": "What causes write stalls in an LSM engine?",
+      "options": [
+        "Flushes or compaction falling behind ingest, so pending memtables or L0 files accumulate past their thresholds.",
+        "The Bloom filter reaching its false-positive limit and blocking further inserts.",
+        "The block cache filling with dirty pages that cannot be evicted.",
+        "The WAL exceeding its size, forcing a full-tree rewrite before any new write."
+      ],
+      "correctIndex": 0,
+      "explanation": "When background flush and compaction cannot keep pace with writes, immutable memtables pile up or L0 accumulates files past the slowdown and stop triggers, so the engine throttles or blocks writes as back-pressure that bounds memory and read amplification.",
+      "sourceAnchor": "6712-compaction-role-and-cost",
+      "difficulty": "recall"
+    }
+  ]
+}
