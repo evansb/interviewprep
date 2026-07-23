@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Bypass deletes the interrupt, the `sk_buff`, protocol demux, the socket lock and queue, the wakeup, `copy_to_user`, and the syscall; what physics leaves behind is the NIC's own latency, the PCIe DMA, and the MMIO doorbell. The claim that only the syscall remains is the tempting one because the syscall is the most visible kernel artefact, but it is also the cheapest item on the list at 50–200 ns — the multi-microsecond costs were the interrupt and the wakeup. Nothing removes PCIe or the NIC's internal pipeline.",
-      "sourceAnchor": "471-kernel-bypass-motivation-and-trade-offs",
+      "sourceAnchor": "471-kernel-bypass-motivation-a-change-of-contract--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Bypass removes every scheduling decision from the data path, so the distribution collapses rather than merely shifting: median 5 µs / p99.9 50 µs becomes median 1 µs / p99.9 2–3 µs. The idea that mean and tail improve by the same factor is the seductive near-miss — it would be true if the removed costs were constant, but the wakeup and C-state exit are precisely the variable, occasional costs that build the tail. FPGA (~50–200 ns) is a further tier, not a prerequisite for tail improvement.",
-      "sourceAnchor": "471-kernel-bypass-motivation-and-trade-offs",
+      "sourceAnchor": "471-kernel-bypass-motivation-a-change-of-contract--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Isolation has to be re-sourced from hardware once the kernel is gone: an IOMMU gives a per-device address space, Solarflare's per-VI hardware filter table stops a process receiving traffic it never legitimately bound, and SR-IOV partitions the device — and `uio_pci_generic` deployments simply grant raw access and trust the process. The suggestion that the kernel still validates descriptors at doorbell time is exactly what bypass abolishes: the doorbell is a plain store to an `mmap`ed BAR, with no trap and no syscall. Root is needed at setup, not per operation.",
-      "sourceAnchor": "471-kernel-bypass-motivation-and-trade-offs",
+      "sourceAnchor": "471-kernel-bypass-motivation-a-change-of-contract--core",
       "difficulty": "application"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Co-location is the whole trick: header, headroom and payload live in a single preallocated mempool element, so allocation is a pop from a per-lcore cache (~5 ns, no lock, no atomic) and the metadata occupies 1–2 cache lines instead of 8–15. The description of a 128-byte header pointing at a separate fragment is the closest miss — it gets the header size right but keeps the pointer chase and an allocation, which is precisely the `sk_buff` cost being removed. Cloneability and refcounting are `sk_buff` traits; `rte_mbuf` has a refcount only for fan-out.",
-      "sourceAnchor": "472-dpdk-poll-mode-drivers",
+      "sourceAnchor": "476-dpdk-poll-mode-drivers-and-huge-page-memory--core",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Bursting exists to amortise the doorbell write across many packets and to let you prefetch packet i+1's payload while handling packet i — both throughput optimisations that a one-packet-at-a-time consumer cannot exploit, which is why ef_vi and TCPDirect are leaner for this shape of workload. The claim that `rx_burst` is a syscall inverts the entire premise of DPDK: it is a plain function call that reads a cache line and occasionally writes a doorbell. Burst size is a call argument, unrelated to the configured ring depth.",
-      "sourceAnchor": "472-dpdk-poll-mode-drivers",
+      "sourceAnchor": "476-dpdk-poll-mode-drivers-and-huge-page-memory--core",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Binding to `vfio-pci` detaches the kernel driver immediately, at bind time, and the interface disappears from `ip link`, `ethtool` and `tcpdump` — this is why the standing advice is to use a separate NIC or port from your management interface. The idea that traffic keeps flowing until an EAL process claims the port is the most plausible wrong answer, since DPDK's userspace side does happen later; the detach, however, is a kernel operation that completes the moment the driver override is written. Nothing about active sockets blocks a driver unbind.",
-      "sourceAnchor": "472-dpdk-poll-mode-drivers",
+      "sourceAnchor": "476-dpdk-poll-mode-drivers-and-huge-page-memory--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 3,
       "explanation": "The NIC DMAs to a bus address, so a 2 KB mbuf must not straddle into a discontiguous physical frame and the pages must be unswappable and unmigratable — a 1 GB `hugetlbfs` page satisfies contiguity and pinning at once, with `base_phys + offset` addressing. TLB coverage is the tempting single-cause answer because it is genuinely worth 50–150 ns per packet on a large pool, but it is a bonus rather than the requirement: a scattered, swappable pool is not merely slow, it is unusable for DMA. An IOMMU can map 4 KB pages perfectly well.",
-      "sourceAnchor": "473-dpdk-huge-page-memory",
+      "sourceAnchor": "476-dpdk-poll-mode-drivers-and-huge-page-memory--core",
       "difficulty": "recall"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A 1 GB page needs a gigabyte of contiguous physical memory, which only reliably exists early in boot — hence `default_hugepagesz=1G hugepagesz=1G hugepages=8` on the command line, and the characteristic signature of a silently short allocation followed by \"Cannot get hugepage information\". `RLIMIT_MEMLOCK` is the most tempting distractor because it is a real DPDK prerequisite, but its failure signature is different: `VFIO_IOMMU_MAP_DMA` returning `ENOMEM` despite free memory. THP is irrelevant here and should generally be off, since its compaction is itself a jitter source.",
-      "sourceAnchor": "473-dpdk-huge-page-memory",
+      "sourceAnchor": "476-dpdk-poll-mode-drivers-and-huge-page-memory--core",
       "difficulty": "trap"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`libonload.so` interposes `socket`, `connect`, `recv`, `epoll_wait` and friends; sockets on an accelerated Solarflare interface run entirely in user space over a VI, and anything else falls through to the real syscall — which is why acceleration costs a launcher change rather than a rewrite. The raw-rings-with-no-protocol description is ef_vi, the layer Onload is itself built on; conflating the two is the standard mix-up. Onload is a user-space library, not a kernel module, and it does not detach the kernel driver the way DPDK's `vfio` bind does.",
-      "sourceAnchor": "474-openonload",
+      "sourceAnchor": "477-user-space-stacks-and-product-families--reference",
       "difficulty": "recall"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Silent non-acceleration is Onload's classic failure mode: a socket bound to a non-Solarflare interface, or using raw sockets or an unsupported `setsockopt`/`SO_TIMESTAMPING` combination, quietly runs at kernel speed with no error anywhere, which is why `onload_stackdump lots` and `EF_LOG=all` are the habitual first check. The idea that Onload would refuse to start is the appealing wrong answer because it is what a well-behaved tool arguably should do — the transparent fallback is deliberate design, and it is exactly what makes the failure invisible. UDP multicast receive is in fact one of Onload's strongest paths.",
-      "sourceAnchor": "474-openonload",
+      "sourceAnchor": "477-user-space-stacks-and-product-families--reference",
       "difficulty": "trap"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 2,
       "explanation": "The NIC writes event descriptors into a separate event queue in host memory, each carrying a phase bit, so \"is there a packet?\" is one cache-line read with no device transition at all — this is why ef_vi's floor sits around 700–900 ns wire-to-application. Scanning descriptor DD bits is the tempting answer because that is how many ring designs work and how DPDK's PMD reads its ring, but the whole point of the separate event queue is to make the idle check a single fixed-cost read independent of ring depth. A PCIe read would cost hundreds of nanoseconds and is precisely what the design avoids.",
-      "sourceAnchor": "475-ef_vi",
+      "sourceAnchor": "477-user-space-stacks-and-product-families--reference",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Cut-Through Programmed I/O writes the frame directly into the transmit FIFO with PIO stores instead of letting the NIC DMA-fetch it, so the wire begins moving before the whole frame has been written — sub-100 ns TX initiation, and the mechanism behind sub-microsecond tick-to-trade on non-FPGA hardware. The event-merging description is a real ef_vi feature (`EF_VI_RX_EVENT_MERGE`) but it belongs to the receive path, which makes it the easiest confusion. CTPIO's cost is inefficient PCIe utilisation, which is why it is restricted to small frames.",
-      "sourceAnchor": "475-ef_vi",
+      "sourceAnchor": "477-user-space-stacks-and-product-families--reference",
       "difficulty": "recall"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 3,
       "explanation": "This hybrid is the idiomatic trading design: raw-frame ef_vi where you only parse UDP multicast and every nanosecond counts (~0.7–1.0 µs), a real TCP implementation where exchange interop and correctness matter, and the untouched kernel for management and everything non-critical. The TCPDirect-everywhere answer is tempting because TCPDirect genuinely does zero-copy receive and does handle UDP — but at ~0.8–1.2 µs it is not the lowest-latency receive path, ef_vi is. ef_vi supplies no protocol stack whatsoever, so it cannot cover order entry.",
-      "sourceAnchor": "475-ef_vi",
+      "sourceAnchor": "477-user-space-stacks-and-product-families--reference",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 1,
       "explanation": "TCPDirect discards POSIX compatibility precisely so it can avoid the copy that `recv()` is obliged to make: the `iovec` points straight at the packet buffer in the ring, and ownership returns only when you call `zft_zc_recv_done`. The copy-into-your-buffer description is what Onload does — that is exactly the difference the `zf` API exists to eliminate, and confusing the two tiers is the common error. There is no cloning or refcount extension here; holding the `iovec` across many packets starves the ring and produces receive drops under load.",
-      "sourceAnchor": "476-tcpdirect",
+      "sourceAnchor": "477-user-space-stacks-and-product-families--reference",
       "difficulty": "recall"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 3,
       "explanation": "`zf_reactor_perform` is the pump for the entire stack — receive, TCP timers, retransmission and ACK generation — so a thread that stops calling it stalls the connection, and this coupling between application compute time and TCP correctness is the number-one surprise for teams that build or adopt reactor-driven stacks. The transmit-only answer is the most plausible miss because a stalled loop obviously delays sends, but it understates the damage: the peer's view of your ACKs is what actually breaks. There is no hidden helper thread; a `zf_stack` is single-threaded by design.",
-      "sourceAnchor": "476-tcpdirect",
+      "sourceAnchor": "477-user-space-stacks-and-product-families--reference",
       "difficulty": "trap"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 2,
       "explanation": "That layering is the notable architectural point about VMA/XLIO: rather than a proprietary VI API, it allocates a raw-Ethernet QP, registers memory regions, installs flow steering, and polls a completion queue — the RDMA software stack reused for plain Ethernet. The one-sided-write description is the seductive one because the verbs dependency invites the assumption that RDMA semantics are in play; in fact only the queue-pair plumbing is borrowed, and the wire protocol is ordinary TCP/UDP over Ethernet. `LD_PRELOAD` interposition is plain dynamic-linker behaviour and needs no verbs support.",
-      "sourceAnchor": "477-vma",
+      "sourceAnchor": "477-user-space-stacks-and-product-families--reference",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "XDP is the earliest software hook in Linux — verified eBPF running inside the driver on the DMA'd buffer before allocation — which is what makes `XDP_DROP` cost only ~10–20 ns and scale to tens of Mpps per core for DDoS mitigation. The `netif_receive_skb` answer describes where `AF_PACKET` taps the path, and that is exactly the distinction between a tap and a pre-stack hook. Offloaded mode does run on a SmartNIC's cores, but it is one of three modes rather than the definition, and the verifier's loop restrictions apply regardless of mode.",
-      "sourceAnchor": "478-af_xdp-and-xdp",
+      "sourceAnchor": "475-linux-shared-ring-paths--core",
       "difficulty": "recall"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 1,
       "explanation": "2048 is the size of the initial fill, and that exact-count stall is the canonical signature: the FILL ring is how user space tells the driver \"these frames are empty\", and a program that never replenishes it leaves the driver with nowhere to put packets. The COMPLETION-ring answer is the closest miss because both rings are kernel-facing and both can stall you, but COMPLETION is the TX-side recycle path and does not gate receive. The verifier runs once at load time, not per invocation, and UMEM registration does not expire.",
-      "sourceAnchor": "478-af_xdp-and-xdp",
+      "sourceAnchor": "475-linux-shared-ring-paths--core",
       "difficulty": "trap"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 3,
       "explanation": "`AF_PACKET` taps the path at `netif_receive_skb`, so every kernel cost up to that point is still paid; `PACKET_MMAP` saves the copy and, once data is flowing, the syscalls — which is why it belongs on the capture and compliance path rather than the trading path. The answer that concedes it is not bypass but credits it with skipping `sk_buff` allocation is the sharpest trap: it reaches the right verdict through a false mechanism, and the skb is precisely what still gets built. `PACKET_QDISC_BYPASS` exists to skip the qdisc, so the transmit claim is wrong too.",
-      "sourceAnchor": "479-packet_mmap-and-af_packet",
+      "sourceAnchor": "475-linux-shared-ring-paths--core",
       "difficulty": "recall"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 2,
       "explanation": "`AF_PACKET` hands you a *copy* while the packet still reaches the normal stack, `PACKET_FANOUT` scales the capture across cores by hash or CPU, and `PACKET_TIMESTAMP` with the raw-hardware flag puts PHC timestamps in the ring metadata — a tap, which is what a capture must be. The AF_XDP answer is the tempting modern-sounding one, but `XDP_REDIRECT` is a diversion rather than a tap: redirected frames never reach the stack, so you would be stealing the trading path's traffic rather than observing it. Reposting capture buffers from the strategy thread would put capture work on the hot path.",
-      "sourceAnchor": "479-packet_mmap-and-af_packet",
+      "sourceAnchor": "475-linux-shared-ring-paths--core",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "TCP is where the correctness risk lives — timers coupled to your reactor, retention of sent data for retransmission, connection state on crash, and a decade of exchange interop testing you cannot replicate — while a UDP multicast receive path is single-direction and stateless. Building both is the tempting maximalist answer, and the locking complaint is even partly real, but it buys a few hundred nanoseconds in exchange for TCP bugs that manifest as silently duplicated or corrupted *orders*. Group membership and ARP are setup-time concerns handled by filters, not per-packet work you must reimplement.",
-      "sourceAnchor": "4710-user-space-tcpip-stacks",
+      "sourceAnchor": "477-user-space-stacks-and-product-families--reference",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Retransmission, delayed-ACK, keepalive and TIME_WAIT timers all have to be driven from the same loop that does strategy work, which couples application compute time directly to TCP correctness — the surprise being that a slow computation damages the *peer's* view of the connection, not just your own throughput. Sequence-space wrap is the most plausible-sounding distractor because 32-bit wrap is a genuine TCP concern, but it takes an enormous data rate to matter and an order-entry session is low-rate by construction. A user-space stack owns its handshake entirely; no syscall is involved.",
-      "sourceAnchor": "4710-user-space-tcpip-stacks",
+      "sourceAnchor": "477-user-space-stacks-and-product-families--reference",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The C-state point alone removes a 30–60 µs tail event, and a core that idles also drops frequency with a turbo ramp measured in tens of microseconds, loses its L1/L2 to whatever ran meanwhile, and re-enters through the scheduler. The DDIO answer is the most technically flavoured distractor: DDIO does place incoming data in the last-level cache, but that is a property of the platform's PCIe write policy and has nothing to do with whether your thread is spinning. Busy-polling confers no scheduling priority — that is what `SCHED_FIFO` is for.",
-      "sourceAnchor": "4711-busy-poll-nic-loops",
+      "sourceAnchor": "474-polling-batching-and-zero-copy--core",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 3,
       "explanation": "A `SCHED_FIFO` thread outranks everything, so a spin that never blocks starves kernel threads and your own shell on that core; the RT throttler configured by `sched_rt_runtime_us` is what keeps a mistake recoverable. The demotion story is the appealing wrong answer because it describes how a well-behaved system arguably ought to defend itself — Linux does not do this for `SCHED_FIFO`, which is precisely why the throttler exists as a separate mechanism. `sched_setaffinity` works normally for real-time threads, and `PAUSE` is a plain instruction hint unaffected by scheduling class.",
-      "sourceAnchor": "4711-busy-poll-nic-loops",
+      "sourceAnchor": "474-polling-batching-and-zero-copy--core",
       "difficulty": "trap"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 1,
       "explanation": "A copy reads 24 cache lines and writes 24 more, and under DDIO the source is already in L3, so the copy drags it into L1 and evicts a chunk of your order book — while parse-in-place touches only the lines you actually read, often just the first 64 bytes, and makes the first field available a serial pass earlier. Overstating the raw copy cost is the natural error: it is real but undramatic at 60–100 ns for a full frame. TLB shootdown belongs to `TCP_ZEROCOPY_RECEIVE`, whose per-receive `mmap`/`munmap` cost is exactly why it is useless for market data.",
-      "sourceAnchor": "4712-zero-copy-receive",
+      "sourceAnchor": "474-polling-batching-and-zero-copy--core",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Reposting hands ownership back to the device, and the next inbound frame overwrites the buffer while you are still walking it — corruption therefore appears only in the fields you had not yet read, only when traffic is dense enough to reuse the buffer quickly, and invisibly to ASan because the writer is a *device*. Holding buffers too long is the other genuine failure of this ownership contract and the most tempting answer, but its signature is drops with a rising hardware counter and no corruption at all. A missing doorbell fence hangs the queue silently rather than corrupting payloads.",
-      "sourceAnchor": "4712-zero-copy-receive",
+      "sourceAnchor": "474-polling-batching-and-zero-copy--core",
       "difficulty": "trap"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 3,
       "explanation": "With a phase bit, checking for work is \"read the next entry's cache line; if its phase matches the expected generation, it is new\" — one read, no PCIe transaction, no extra synchronisation, which is why `ef_eventq_poll` lands around 20 ns. The producer-index design is the closest miss because it is genuinely used (`io_uring`, AF_XDP) and is perfectly correct; it simply costs the device an extra cache line write and the poller an extra read on every check. Anything involving an MMIO or PCIe read on the idle path defeats the purpose entirely.",
-      "sourceAnchor": "4713-descriptor-ownership-and-completion-queues",
+      "sourceAnchor": "472-device-queues-descriptor-ownership-and-completions--core",
       "difficulty": "recall"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "TSO does order the descriptor stores among themselves, but the doorbell is typically mapped write-combining, and WC stores sit in a buffer with weak ordering — without an `SFENCE` (or a release fence) the write may not leave the CPU promptly or in the right order, and the failure mode is a silent hang with no error anywhere. The claim that TSO carves out an exception for MMIO addresses is the plausible-sounding inversion: the memory type, not the address being MMIO, is what relaxes the ordering. On ARM this is unconditional and a `DMB ISHST` or `DSB` is mandatory.",
-      "sourceAnchor": "4713-descriptor-ownership-and-completion-queues",
+      "sourceAnchor": "472-device-queues-descriptor-ownership-and-completions--core",
       "difficulty": "trap"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 3,
       "explanation": "RDMA's unreliable transports and various multi-queue paths genuinely complete out of order, so the work-request ID you chose at post time is the only reliable key; matching by position silently pairs a completion with the wrong buffer and produces a double free or corruption on the next reuse. Position-matching is tempting because a single RC queue pair usually does complete in order — the inference breaks because \"usually, on this transport\" is not a contract, and the code outlives the transport choice. The phase bit signals newness, not identity.",
-      "sourceAnchor": "4713-descriptor-ownership-and-completion-queues",
+      "sourceAnchor": "472-device-queues-descriptor-ownership-and-completions--core",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 3,
       "explanation": "There is simply no RDMA on the venue side, so it cannot shorten wire-to-strategy at all; on top of that, PFC/DCB or a subnet manager cannot be negotiated across an organisational boundary, and the `rkey` capability model assumes a trusted fabric. The latency objection is the most tempting because it sounds quantitative, but it inverts the real numbers — RDMA write latency is ~1–2 µs against roughly 15 µs for a kernel TCP round trip, so RDMA is fast; it is just inapplicable here. RDMA's proper home is internal replication and fan-out.",
-      "sourceAnchor": "4718-roce-and-infiniband",
+      "sourceAnchor": "4712-infiniband-and-roce--core",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Registration does three things at once — `get_user_pages` pinning charged against `RLIMIT_MEMLOCK`, MTT/MPT population so the NIC can translate a virtual address in a work request, and key issuance where `lkey` authorises local access and `rkey` is a remote capability — and the per-page work plus device command is why it costs tens to hundreds of microseconds and belongs at startup. The `MADV_DONTFORK` answer is a real mechanism but describes `ibv_fork_init()`, a separate call, and it omits pinning and translation entirely. No data is copied to the HCA.",
-      "sourceAnchor": "4714-memory-registration-and-pinning",
+      "sourceAnchor": "479-rdma-memory-registration-pinning-and-memory-regions--core",
       "difficulty": "recall"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "COW can hand the *child* the original physical page and give the parent a fresh copy, while the NIC keeps DMAing to the original physical address it recorded at registration time — silent DMA into the wrong process's memory. `ibv_fork_init()` fixes this by `madvise(MADV_DONTFORK)`ing registered regions, and it must be called before any registration, which is the part people get wrong. The `RLIMIT_MEMLOCK` answer names a real constraint but the wrong failure: exceeding the limit produces a clean `ENOMEM` at registration, not corruption of already-working buffers.",
-      "sourceAnchor": "4714-memory-registration-and-pinning",
+      "sourceAnchor": "479-rdma-memory-registration-pinning-and-memory-regions--core",
       "difficulty": "trap"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 3,
       "explanation": "ODP lets the NIC page-fault through the kernel instead of requiring pinning, which removes both the registration cost and the pinning limit — but a page fault on the hot path is exactly the unbounded stall a latency system exists to eliminate, so it is fine for bulk transfer and fatal here. The claim that ODP pre-faults at QP creation is the tempting one because it would make the feature free; the whole mechanism is that faults happen on demand, hence the name. Huge pages are an independent optimisation that reduce MTT entries, not an ODP prerequisite.",
-      "sourceAnchor": "4714-memory-registration-and-pinning",
+      "sourceAnchor": "479-rdma-memory-registration-pinning-and-memory-regions--core",
       "difficulty": "application"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 1,
       "explanation": "One-sided operations address remote memory through a connection's established context, which is why they need RC or UC; UD behaves like UDP — one queue pair talking to many peers, send/recv only, one MTU per message — and is used for multicast and discovery. \"UD supports WRITE but not READ\" is the sharpest distractor because the reasoning sounds right (a write is fire-and-forget), but UD supports neither. RC is the default choice precisely because it gives hardware ACKs, ordering, and the full operation set, at the cost of N² queue pairs at scale.",
-      "sourceAnchor": "4715-rdma-queue-pairs-and-completion-queues",
+      "sourceAnchor": "4710-rdma-queue-pairs-completion-queues-and-credits--core",
       "difficulty": "recall"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Without inlining, the NIC must issue a separate DMA read to fetch the payload after reading the WQE; embedding a small payload (device-specific, typically ≤64–256 bytes) removes that round trip for roughly 300–600 ns, which is exactly the message-size regime a trading system lives in. The bounce-buffer answer is tempting because early buffer reuse is a genuine side benefit of inlining, but it misdescribes the mechanism — the data goes into the work queue entry, not into HCA-side storage. Receive-WQE consumption is a property of SEND versus RDMA WRITE, unrelated to inlining.",
-      "sourceAnchor": "4715-rdma-queue-pairs-and-completion-queues",
+      "sourceAnchor": "4710-rdma-queue-pairs-completion-queues-and-credits--core",
       "difficulty": "application"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Completions are what let you reclaim send-queue WQEs, so suppressing all of them means the queue monotonically fills until posting fails — the standard practice is to signal every Nth send, often enough to keep the queue draining while still saving most of the CQ bandwidth and polling work. The CQ-overrun answer is the most plausible miss because CQ overrun is a real and worse failure (it transitions the QP to `IBV_QPS_ERR` with a cascade of `WR_FLUSH_ERR`), but unsignalled sends generate no CQ entries at all, so it cannot be the cause here.",
-      "sourceAnchor": "4715-rdma-queue-pairs-and-completion-queues",
+      "sourceAnchor": "4710-rdma-queue-pairs-completion-queues-and-credits--core",
       "difficulty": "trap"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 2,
       "explanation": "The `rkey` is a 32-bit capability token with no per-operation authorisation, no logging and no revocation, so possession plus a virtual address is total access to the region — which is exactly why the discipline is to register minimal, purpose-built regions per peer or to use type-2 memory windows that rebind cheaply on the fast path. The protection-domain answer is the most tempting because a PD *is* the local isolation boundary, grouping MRs and QPs that may be used together; it constrains your own objects, not what a remote holder of a valid `rkey` may touch.",
-      "sourceAnchor": "4716-rdma-memory-regions",
+      "sourceAnchor": "479-rdma-memory-registration-pinning-and-memory-regions--core",
       "difficulty": "application"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 3,
       "explanation": "A one-sided WRITE lands bytes in the target's memory with no completion, no interrupt and no thread on the receive side, so replication is genuinely free for the standby and failover finds the state already present. The SRQ answer is the strongest distractor because a shared receive queue really does reduce buffer pre-posting across many connections — but SEND/RECV is two-sided by definition: the standby must have posted receive WQEs and gets a completion for every message, which is precisely the CPU cost being eliminated. A READ fetches rather than pushes and costs a full round trip.",
-      "sourceAnchor": "4717-one-sided-and-two-sided-rdma",
+      "sourceAnchor": "4711-one-sided-and-two-sided-rdma--core",
       "difficulty": "application"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 1,
       "explanation": "RDMA orders operations against each other on the same RC queue pair, but it says nothing about the internal landing order of the bytes within one write, so an in-band trailing flag is not safe on all hardware. The safe constructions are two separate WRITEs on the same RC QP, `IBV_WR_RDMA_WRITE_WITH_IMM` (which consumes a receive WQE and delivers a 32-bit tag in a completion), or a seqlock-style version pair. The \"RC guarantees it\" answer is the standard trap: RC's reliability and ordering guarantees are real, but they operate between work requests, not within one.",
-      "sourceAnchor": "4717-one-sided-and-two-sided-rdma",
+      "sourceAnchor": "4711-one-sided-and-two-sided-rdma--core",
       "difficulty": "trap"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 3,
       "explanation": "RoCEv2 encapsulates the IB transport in UDP/IP over Ethernet, and that transport reacts to a drop with go-back-N retransmission, which at scale collapses throughput — so the fabric must be made artificially lossless with Priority Flow Control plus ECN/DCQCN, and PFC brings deadlock, congestion spreading and pause storms. The TCP answer describes iWARP, not RoCE, and is the easiest of the three to mistake for the truth. RoCEv2 is explicitly routable (UDP destination port 4791), and the subnet manager belongs to native InfiniBand.",
-      "sourceAnchor": "4718-roce-and-infiniband",
+      "sourceAnchor": "4712-infiniband-and-roce--core",
       "difficulty": "application"
     }
   ]

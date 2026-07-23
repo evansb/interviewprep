@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`-O3` is `-O2` plus size-increasing transforms, and the regression signature is front-end pressure: rising DSB misses and frontend-bound with binary growth and no latency gain. The tempting near-miss is blaming `-ffast-math`, which is a real hazard but belongs to `-Ofast`, not `-O3`; strict aliasing is on at `-O2` and above and `-O3` does not disable it.",
-      "sourceAnchor": "401-compiler-optimization-levels",
+      "sourceAnchor": "4011-flag-and-transformation-reference--reference",
       "difficulty": "application"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The FTZ/DAZ startup effect is what makes `-ffast-math` a whole-process semantic change rather than a per-TU optimization, and it is why it can break libraries built without it. Claiming it stays confined to its own TUs is tempting because that is true of most flags, but the MXCSR bits are set once for the entire process; `-ffinite-math-only` also lets comparisons against NaN be optimized away entirely.",
-      "sourceAnchor": "401-compiler-optimization-levels",
+      "sourceAnchor": "4011-flag-and-transformation-reference--reference",
       "difficulty": "trap"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "At `-O0` every load and store really happens, which accidentally hides data races and aliasing bugs, so \"works at `-O0`, breaks at `-O2`\" is nearly always UB in your code rather than a compiler bug. The assert answer is tempting because asserts genuinely can be load-bearing, but NDEBUG is orthogonal to optimization level — no `-O` flag defines it, it is a source-level change you make yourself.",
-      "sourceAnchor": "401-compiler-optimization-levels",
+      "sourceAnchor": "4011-flag-and-transformation-reference--reference",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The linker marks from roots — the entry symbol, `KEEP()` directives, `used`/`retain` attributes, exported dynamic symbols, `.init_array` entries — and a `dlsym`-only reference is invisible to that graph, so the section is collected. `--emit-relocs` is the tempting distractor because it is a real linker requirement, but it belongs to BOLT's post-link rewriting and has nothing to do with which sections survive GC.",
-      "sourceAnchor": "4020-section-garbage-collection",
+      "sourceAnchor": "409-interprocedural-optimization-lto-and-linker-passes--core",
       "difficulty": "application"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The two knobs are independent: `-march` decides the emittable instruction set and is what causes SIGILL on older parts, while `-mtune` only steers scheduling, unroll factors, alignment padding, and the cmov-versus-branch choice. Expecting SIGILL is the natural confusion, but nothing Skylake-specific can be emitted here because the ISA baseline stayed at plain `x86-64`.",
-      "sourceAnchor": "402-cpu-architecture-and-tuning-flags",
+      "sourceAnchor": "402-from-source-to-optimized-machine-code--core",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "License-based downclocking drops the core one or two frequency tiers for tens of microseconds, so a single stray 512-bit instruction emitted by autovectorization penalizes the whole thread including its scalar code; Ice Lake and later reduce but do not remove the effect. Code-size growth is the plausible distractor — encodings are longer, but that is not why shops cap the width, and `-mprefer-vector-width=256` deliberately keeps AVX-512 features such as masking.",
-      "sourceAnchor": "402-cpu-architecture-and-tuning-flags",
+      "sourceAnchor": "402-from-source-to-optimized-machine-code--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The summary-plus-index design is exactly what buys parallel, cacheable links (`--thinlto-cache-dir`) while landing within a few percent of monolithic quality, which is why it is the practical default for large binaries. Claiming ThinLTO drops devirtualization and IPA-CP is the tempting error: those passes still run, just driven by imported definitions rather than one merged module.",
-      "sourceAnchor": "403-link-time-optimization",
+      "sourceAnchor": "409-interprocedural-optimization-lto-and-linker-passes--core",
       "difficulty": "recall"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The bug predates LTO — it was always UB — and LTO merely stops tolerating it by merging whole-program IR, which is why LTO is an accidental ODR-violation detector (`-Wodr`). Blaming a linkage change is the tempting inversion: internal linkage would give each TU its own copy and would actually hide the problem rather than expose it.",
-      "sourceAnchor": "403-link-time-optimization",
+      "sourceAnchor": "409-interprocedural-optimization-lto-and-linker-passes--core",
       "difficulty": "trap"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "By default a shared library's global functions may be interposed at load time, so the compiler cannot inline them even within the same library; `-fno-semantic-interposition` plus `-fvisibility=hidden` recovers those inlines. `-fvisibility=default` is the tempting inversion — it is already the default, and exporting more symbols makes interposition more likely rather than less; visibility must be narrowed, not widened.",
-      "sourceAnchor": "403-link-time-optimization",
+      "sourceAnchor": "409-interprocedural-optimization-lto-and-linker-passes--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`inline` means \"multiple definitions permitted, ODR-merged\"; the actual decision is a bottom-up cost/benefit computation, and `[[gnu::always_inline]]` is the real request. Saying it merely sets `inlinehint-threshold` is the tempting half-truth — Clang does apply that threshold when `inline` is present, but the accompanying claim that linkage is unaffected is false, and linkage is the keyword's primary meaning.",
-      "sourceAnchor": "404-inlining-heuristics",
+      "sourceAnchor": "404-inlining-devirtualization-and-branch-layout--core",
       "difficulty": "recall"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Over-inlining blows the micro-op cache, so the loop body falls back to legacy decode — DSB misses up, DSB-to-MITE ratio down, frontend-bound up, binary growing with nothing to show for it. The branch-misprediction signature is the tempting alternative, but inlining generally removes branches rather than mispredicting more; misprediction points at a data-dependent branch, not at code growth.",
-      "sourceAnchor": "404-inlining-heuristics",
+      "sourceAnchor": "404-inlining-devirtualization-and-branch-layout--core",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The YAML records become useful only when produced alongside a PGO profile: opt-viewer then renders a per-line hotness column, so an un-vectorized loop running twice is noise while the same remark on a loop holding 40% of samples is the work item. The `-Rpass-missed` plus `-g` option is tempting because debug info does drive attribution elsewhere, but remark flags emit no sample counts — hotness comes from the profile.",
-      "sourceAnchor": "4021-optimization-remarks-and-missed-optimization-reports",
+      "sourceAnchor": "4010-optimization-evidence--core",
       "difficulty": "recall"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`noinline` plus `cold` keeps the hot function small and lets the linker or BOLT place the cold body in `.text.unlikely` far away, and `cold` additionally propagates unlikeliness to the branches that reach it. `flatten` is the tempting choice for someone who equates inlining with speed, but recursively inlining every callee is usually a code-size disaster and would drag the cold body straight into the hot I-cache footprint.",
-      "sourceAnchor": "405-forced-inline-and-noinline-attributes",
+      "sourceAnchor": "404-inlining-devirtualization-and-branch-layout--core",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The attribute constrains one specific transformation; interprocedural constant-propagation cloning is a separate pass, and `-fno-ipa-cp-clone` or `noclone` is what stops it. ICF is the tempting alternative because it genuinely does break function-pointer identity, but it is enabled by `-fipa-icf` or a linker `--icf` flag, not by `noinline`, which has no bearing on folding.",
-      "sourceAnchor": "405-forced-inline-and-noinline-attributes",
+      "sourceAnchor": "404-inlining-devirtualization-and-branch-layout--core",
       "difficulty": "trap"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The benefit is front-end and layout: a straight-line hot path with no taken branches, better I-cache and micro-op-cache density, plus optimization budget and register allocation favouring the likely side. The static-prediction-prefix answer is the classic wrong one — the old `2E`/`3E` prefixes are ignored by every current core, and the predictor learns real behaviour from execution regardless of the hint.",
-      "sourceAnchor": "406-branch-probability-hints",
+      "sourceAnchor": "404-inlining-devirtualization-and-branch-layout--core",
       "difficulty": "trap"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Mis-hinting relocates frequently executed code into `.text.unlikely` and inserts a taken branch on the common path — a real loss, which is why hints are only safe where the distribution is genuinely known. \"Nothing measurable\" is tempting because the predictor does learn the real behaviour, but that only addresses prediction accuracy; the layout damage is a front-end cost no predictor can undo.",
-      "sourceAnchor": "406-branch-probability-hints",
+      "sourceAnchor": "404-inlining-devirtualization-and-branch-layout--core",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because `out` may alias `a` or `b`, both compilers version the loop and branch on a pointer-range comparison; recognizing that duplicated-loop pattern in disassembly is a useful skill, and it costs code size, a versioning check per call, and an unpredictable-ish branch. The `const` answer is the classic misunderstanding: `const` on a pointee constrains this access path, it does not promise no other pointer writes that memory.",
-      "sourceAnchor": "407-restrict-and-alias-analysis",
+      "sourceAnchor": "405-aliasing-restrict-and-type-based-access--core",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`restrict` promises that within the scope, the object reached through this pointer is reached through no other, and it is one of the very few promises in C++ that nothing checks — hence correct results at `-O0` and silently wrong ones at `-O2`. \"Just a hint\" is the dangerous misreading: unlike `[[likely]]`, `restrict` is a contract the optimizer relies on, so violating it changes results rather than just layout.",
-      "sourceAnchor": "407-restrict-and-alias-analysis",
+      "sourceAnchor": "405-aliasing-restrict-and-type-based-access--core",
       "difficulty": "trap"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`-fstrict-aliasing` is on by default at `-O2` and above in GCC and Clang, so objects of unrelated types are assumed not to overlap and the value stays in a register — the load folds to `return 1`. The `-Ofast`-only claim is the tempting one: `-Ofast` changes floating-point semantics, but type-based alias analysis is already active at `-O2` and needs no additional flag.",
-      "sourceAnchor": "408-strict-aliasing-optimizations",
+      "sourceAnchor": "405-aliasing-restrict-and-type-based-access--core",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The wrong value is specifically a stale one — written through a differently-typed pointer and never reloaded — and since no sanitizer exists for strict aliasing, a differential build comparing outputs is the practical detector. The AddressSanitizer answer is tempting because ASan catches many memory bugs, but this is a type-based assumption rather than an out-of-bounds or lifetime error, so ASan sees nothing wrong.",
-      "sourceAnchor": "408-strict-aliasing-optimizations",
+      "sourceAnchor": "405-aliasing-restrict-and-type-based-access--core",
       "difficulty": "recall"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "When roughly 90% of calls through a vtable or function pointer reach one target, the compiler emits the inline-cache shape `if (target == F) F(...) else indirect(...)`, and the real payoff is that `F` can then be inlined. Cold-block placement is the strongest distractor because it is genuinely a large PGO benefit, but it is a layout win available to any front-end-bound binary rather than the specifically polymorphic-C++ one.",
-      "sourceAnchor": "409-profile-guided-optimization",
+      "sourceAnchor": "408-profiles-pgo-sample-profiles-and-post-link-layout--core",
       "difficulty": "recall"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Profile representativeness is everything: wrong probabilities lay out the wrong path straight-line and inline the wrong call sites, which is why the recommendation is captured production traffic replayed deterministically. The racy-counter option is the tempting near-miss — that hazard is real and is why `-fprofile-update=atomic` exists, but it undercounts hot paths rather than emptying the profile or breaking the link.",
-      "sourceAnchor": "409-profile-guided-optimization",
+      "sourceAnchor": "408-profiles-pgo-sample-profiles-and-post-link-layout--core",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The Last Branch Record is a hardware ring buffer of recent taken branches, and branch-level frequency data is what makes a sampled profile accurate enough to drive layout and inlining; without `-b`, AutoFDO quality degrades sharply. The skid answer is the tempting overstatement — LBR with `cycles:u` improves attribution, but skid is reduced by precise events (`:pp`, PEBS), not eliminated by LBR.",
-      "sourceAnchor": "4010-autofdo",
+      "sourceAnchor": "408-profiles-pgo-sample-profiles-and-post-link-layout--core",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "AutoFDO maps sampled addresses back to source through debug line tables, and without `-fdebug-info-for-profiling` the profile is blurred across multiple inlined copies of the same function. The frame-pointer answer is plausible because frame pointers matter for other profiling tasks, but the inline stack here comes from DWARF inlining records rather than from walking the runtime stack.",
-      "sourceAnchor": "4010-autofdo",
+      "sourceAnchor": "408-profiles-pgo-sample-profiles-and-post-link-layout--core",
       "difficulty": "recall"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "BOLT's mechanism is reduced I-cache misses, I-TLB misses, and taken branches, so the chapter states plainly that if those counters are low, BOLT will do nothing for you. The block-reordering distractor has a true premise — BOLT really does reorder blocks with ext-TSP — but the inference breaks because reordering changes code layout, not the data dependency chains that make a workload back-end bound.",
-      "sourceAnchor": "4011-bolt-post-link-optimization",
+      "sourceAnchor": "408-profiles-pgo-sample-profiles-and-post-link-layout--core",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Relocations must be preserved (`-Wl,--emit-relocs` or `-Wl,-q`) or BOLT refuses or works in a degraded mode, and the production stack is ThinLTO, then AutoFDO, then BOLT — LTO gives cross-TU inlining, PGO gives per-function decisions, BOLT gives whole-binary layout. \"Replaces PGO\" is tempting since both consume `perf` data, but BOLT lays out already-generated code and cannot revisit the compiler's inlining decisions.",
-      "sourceAnchor": "4011-bolt-post-link-optimization",
+      "sourceAnchor": "408-profiles-pgo-sample-profiles-and-post-link-layout--core",
       "difficulty": "recall"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "UB may be assumed not to occur, so the dereference establishes non-null, the comparison folds to false, and DCE removes the branch along with everything it guarded — the null-check-elimination family behind the Linux `tun` driver CVE. \"Hoisted above the dereference\" is the intuitive answer and is exactly what the compiler will not do; ordering the check before the use is the programmer's job, not the optimizer's.",
-      "sourceAnchor": "4012-dead-code-elimination",
+      "sourceAnchor": "403-scalar-transformations-and-escape-analysis--core",
       "difficulty": "trap"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An unobserved computation is dead, so the whole call vanishes and you time an empty loop; recognizing a suspiciously tiny per-iteration figure as a deleted benchmark is table stakes, and `DoNotOptimize`/`ClobberMemory` exist purely to force observation. The CSE explanation is the tempting alternative, but the arguments already differ each iteration so there is no redundant expression to reuse — the result is simply never used.",
-      "sourceAnchor": "4012-dead-code-elimination",
+      "sourceAnchor": "403-scalar-transformations-and-escape-analysis--core",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Division by a compile-time constant is lowered to a multiply-high by a magic reciprocal plus shifts — that particular constant is division by 100 — just as multiplication by a constant becomes shifts, adds, or an `LEA` chain. The hash-constant reading is tempting because large hexadecimal literals do appear in mixing functions, but the surrounding multiply-then-shift sequence with no divide is the signature of strength-reduced division.",
-      "sourceAnchor": "4013-constant-folding-and-propagation",
+      "sourceAnchor": "403-scalar-transformations-and-escape-analysis--core",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is correctness rather than stupidity: the compiler cannot prove `out` and `cfg` are disjoint, so a store into `out[i]` may change `cfg->scale`. Manual hoisting of a member load into a local before a loop is one of the highest-yield micro-optimizations in real C++. The `const Config*` fix is the intuitive one and fails — `const` on the access path says nothing about other pointers writing that memory, which is exactly why `restrict` exists.",
-      "sourceAnchor": "4014-common-subexpression-elimination",
+      "sourceAnchor": "403-scalar-transformations-and-escape-analysis--core",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An opaque call may write anything reachable, killing every cached load across it, and `pure`/`const` are the documented escape hatch that tells the compiler otherwise. The `inline` answer is tempting because actually inlining the callee genuinely would solve it, but `inline` is a linkage directive and does not make the body visible in another TU — that is what LTO is for.",
-      "sourceAnchor": "4014-common-subexpression-elimination",
+      "sourceAnchor": "403-scalar-transformations-and-escape-analysis--core",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The dependency-chain argument survives on modern cores: a serial `s += a[i]` is bound by one add latency per element, and independent accumulators let the chains issue in parallel for roughly a 4× gain. Overhead amortization is the textbook justification and is exactly the part that mostly no longer holds — and unrolling grows the body rather than shrinking it, so the micro-op-cache option has the effect backwards.",
-      "sourceAnchor": "4015-loop-unrolling",
+      "sourceAnchor": "406-loop-transformations-and-automatic-vectorization--core",
       "difficulty": "application"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Floating-point addition is not associative, so reassociating a reduction is a semantic change the compiler may only make under `-ffast-math`/`-fassociative-math`; for integer accumulators it will do the transformation. The \"bit-identical\" claim is the seductive one — the mathematical sum is the same, but rounding at each step makes the computed results genuinely differ, which is the entire reason the transformation is gated.",
-      "sourceAnchor": "4015-loop-unrolling",
+      "sourceAnchor": "406-loop-transformations-and-automatic-vectorization--core",
       "difficulty": "trap"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Non-inlined calls — including operator overloads across a TU boundary and anything behind `std::function` — head the list of real-world blockers, which is why a refactor that adds a call silently de-vectorizes a loop. The induction-variable option inverts the actual rule: signed overflow is UB, so signed counters are usually fine and it is `unsigned` wrapping that blocks some transformations. Simple `if` bodies become masked or blended operations.",
-      "sourceAnchor": "4016-automatic-vectorization",
+      "sourceAnchor": "406-loop-transformations-and-automatic-vectorization--core",
       "difficulty": "application"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`-Rpass-analysis` is specifically the flag that explains why a transformation did not happen, emitting messages such as \"cannot identify array bounds\". `-Rpass-missed` is the tempting choice and it is genuinely about failures, but it only tells you that the transformation did not fire, not what blocked it; `-Rpass` reports only successes.",
-      "sourceAnchor": "4016-automatic-vectorization",
+      "sourceAnchor": "406-loop-transformations-and-automatic-vectorization--core",
       "difficulty": "recall"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "SROA decomposes non-escaping aggregates into values that live in registers, which is the mechanism behind zero-cost abstraction — but only if the object is inlined and its address never escapes, and removing one escape often makes the whole frame disappear. Register spilling is the tempting alternative: it produces similar-looking stores, but it is a pressure symptom rather than an escape, and the fix is different.",
-      "sourceAnchor": "4017-escape-analysis",
+      "sourceAnchor": "403-scalar-transformations-and-escape-analysis--core",
       "difficulty": "application"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The framing that answers \"does C++ have escape analysis?\" well is that C++ uses it to decide whether an object needs memory at all — enabling SROA, register promotion, and even eliding `new`/`delete` pairs, which [expr.new] explicitly permits. The lock-elision option overstates: compilers can in theory remove a provably thread-local mutex, but the chapter notes they do this rarely, so \"never\" is false.",
-      "sourceAnchor": "4017-escape-analysis",
+      "sourceAnchor": "403-scalar-transformations-and-escape-analysis--core",
       "difficulty": "recall"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`final` on the class or method is described as the cheapest and most reliable lever precisely because it needs no LTO; the recommended order is `final` first, then CRTP or variant dispatch, then LTO+PGO for what you cannot restructure. `-fwhole-program-vtables` is the tempting answer because it does perform whole-program devirtualization, but the option's claim is wrong on the stated condition: it is a Clang flag that requires LTO.",
-      "sourceAnchor": "4018-interprocedural-optimization",
+      "sourceAnchor": "409-interprocedural-optimization-lto-and-linker-passes--core",
       "difficulty": "application"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 0,
       "explanation": "IPA-CP clones a copy specialized for known-constant arguments and names it `.constprop.N`, while IPA-SRA removes unused parameters or splits aggregates into scalars and names its copy `.isra.N`. The BOLT answer is the plausible distractor because BOLT genuinely does hot/cold splitting, but it names its pieces `.cold` and these suffixes appear in ordinary GCC builds with no post-link tool involved.",
-      "sourceAnchor": "4018-interprocedural-optimization",
+      "sourceAnchor": "409-interprocedural-optimization-lto-and-linker-passes--core",
       "difficulty": "recall"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 0,
       "explanation": "C++ requires distinct functions to have distinct addresses, and `--icf=all` ignores that rule, so pointer-identity dispatch checks, `std::function` target comparison, and address-as-type-token tricks silently misbehave. `--icf=safe` is the tempting inversion: it folds only functions whose addresses are provably never taken, using the `.llvm_addrsig` section, which is precisely what makes it safe here.",
-      "sourceAnchor": "4019-identical-code-folding",
+      "sourceAnchor": "409-interprocedural-optimization-lto-and-linker-passes--core",
       "difficulty": "trap"
     }
   ]

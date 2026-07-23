@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Undecodable dumps are the most common reason a crash you finally captured turns out to be useless. Layout sensitivity is the less obvious one: a change in link order or an inlining decision shifts branch-predictor and instruction-cache behaviour measurably, so same source with a different binary can genuinely mean a different tail latency.",
-      "sourceAnchor": "601-reproducible-deployment-artifacts",
+      "sourceAnchor": "602-immutable-artifacts-configuration-and-secrets--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The identifier is a hash of the linked output, so it is cryptographic rather than by name — the property that makes the pairing trustworthy. A revision hash cannot serve because the same revision can produce different binaries under different toolchains or flags, which is exactly the case that produces an undecodable dump.",
-      "sourceAnchor": "601-reproducible-deployment-artifacts",
+      "sourceAnchor": "602-immutable-artifacts-configuration-and-secrets--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A pinned digest gets you most of the way for far less investment than a hermetic build system, but it is not sufficient on its own. The specific fixes are a fixed source epoch, path prefix mapping, explicitly sorted source lists rather than globs, deterministic archive mode, and a fixed link-time partition count.",
-      "sourceAnchor": "601-reproducible-deployment-artifacts",
+      "sourceAnchor": "602-immutable-artifacts-configuration-and-secrets--core",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Stripping the deployed binary is correct and keeps it small; discarding the separated debug file is not. Keep the extracted debug data in a symbol store indexed by build identifier, alongside the log-site dictionary and a manifest recording the revision, toolchain hashes, and compile flags.",
-      "sourceAnchor": "601-reproducible-deployment-artifacts",
+      "sourceAnchor": "602-immutable-artifacts-configuration-and-secrets--core",
       "difficulty": "trap"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "In trading, divergent configuration is a financial and regulatory event rather than an inconvenience. The operational payoff is observability: with every process exporting its config version in heartbeats, the query for distinct versions running in the fleet must return exactly one row per intended cohort, so drift is caught in seconds.",
-      "sourceAnchor": "602-immutable-configuration",
+      "sourceAnchor": "602-immutable-artifacts-configuration-and-secrets--core",
       "difficulty": "recall"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Writing the resolved values with provenance into the log and to disk turns a debate during an incident into a lookup. It pairs with rejecting unknown keys and warning on overrides for keys that no longer exist, since both of those otherwise leave a setting you believe is applied silently unapplied.",
-      "sourceAnchor": "602-immutable-configuration",
+      "sourceAnchor": "602-immutable-artifacts-configuration-and-secrets--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Strict schema validation with unknown-key rejection is non-negotiable precisely because the failure is silent and looks like success. The same reasoning drives warning loudly on a host override for a key that no longer exists, which is dead configuration masquerading as an applied setting.",
-      "sourceAnchor": "602-immutable-configuration",
+      "sourceAnchor": "602-immutable-artifacts-configuration-and-secrets--core",
       "difficulty": "trap"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Configuration parsing is startup work; configuration reading is a load from a hot cache line. The hot path must never traverse a string-keyed container, never parse, and never allocate, which is why enumerations become integers and anything variable-length becomes a preallocated array at load time.",
-      "sourceAnchor": "602-immutable-configuration",
+      "sourceAnchor": "602-immutable-artifacts-configuration-and-secrets--core",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Its costs are a second consumer of the feed and the discipline to automate the decision-stream comparison rather than eyeball it. It catches exactly what offline testing misses: a message shape that only occurs during an auction, or a burst rate that only occurs at the open.",
-      "sourceAnchor": "603-staged-rollout-and-rollback",
+      "sourceAnchor": "606-staged-rollout-and-authority-transfer--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Staging is therefore about limiting blast radius and shortening time to detect, not about statistical comparison. That reframing is what motivates shadow mode, narrow first cohorts, and automated abort criteria keyed on latency, reject rate, drop counters, and decision-diff rate rather than on profit.",
-      "sourceAnchor": "603-staged-rollout-and-rollback",
+      "sourceAnchor": "606-staged-rollout-and-authority-transfer--core",
       "difficulty": "recall"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Time to rollback is the metric that matters: if reverting requires fetching and warming an artifact, you trade badly for the entire duration. Keeping the previous version resident and warm makes rollback a pointer flip. The wider point is that the safest rollout is still the one that happens between sessions.",
-      "sourceAnchor": "603-staged-rollout-and-rollback",
+      "sourceAnchor": "606-staged-rollout-and-authority-transfer--core",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "One variable at a time is the rule, and it applies equally to venue changes deployed alongside code. The related discipline is defining abort thresholds before the deploy rather than during: a rollout with no automated abort criterion is not staged, it is merely slow.",
-      "sourceAnchor": "603-staged-rollout-and-rollback",
+      "sourceAnchor": "606-staged-rollout-and-authority-transfer--core",
       "difficulty": "trap"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A flag read by a wedged loop is ignored by a wedged loop. Dropping the session is the most reliable kill available because it engages the exchange's own cancel-on-disconnect machinery, which does not depend on your process functioning at all.",
-      "sourceAnchor": "604-feature-and-venue-kill-switches",
+      "sourceAnchor": "609-incident-and-operational-state-machine--core",
       "difficulty": "recall"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Leaving exposure resting while the market moves is precisely the situation the switch exists to end, and possibly hedging flat belongs in the defined semantics too. The corollary is that an untested kill switch is a belief rather than a control, so it should be exercised in production on a schedule during quiet periods.",
-      "sourceAnchor": "604-feature-and-venue-kill-switches",
+      "sourceAnchor": "609-incident-and-operational-state-machine--core",
       "difficulty": "trap"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The cost is an L1 hit plus a predicted branch, roughly a cycle amortized. Relaxed ordering is the right choice: you need the new value to become visible promptly, not to order other memory, and on x86 a relaxed load is a plain move with visibility on the order of tens of nanoseconds anyway.",
-      "sourceAnchor": "604-feature-and-venue-kill-switches",
+      "sourceAnchor": "609-incident-and-operational-state-machine--core",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Fail-safe defaults have to be written into the code rather than into a runbook, because the runbook is not what executes at the moment of surprise. Re-enabling is then deliberately asymmetric: a human decision, a fresh risk check, and a warmup, since the process has been idle and its caches are cold.",
-      "sourceAnchor": "604-feature-and-venue-kill-switches",
+      "sourceAnchor": "609-incident-and-operational-state-machine--core",
       "difficulty": "trap"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Declarative ordering sequences start, not usability, and a dependency declared as a simple service counts as started the instant it forks. A readiness notification protocol communicates actual usability, but the consuming process still has to verify its own preconditions so it survives restarts of its dependencies.",
-      "sourceAnchor": "605-startup-dependency-ordering",
+      "sourceAnchor": "605-startup-readiness-and-traffic-enablement--core",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Any dependency satisfied by a sleep is a bug, and the signature is exactly this: it fails on faster hardware or after a startup optimization. The related failure modes are circular waits where two processes each wait for the other forever, and silent partial readiness where the process reports ready with three of four feeds connected.",
-      "sourceAnchor": "605-startup-dependency-ordering",
+      "sourceAnchor": "605-startup-readiness-and-traffic-enablement--core",
       "difficulty": "trap"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The internal snapshot cannot know about a fill that arrived after the last write or a cancel that was rejected, so the venue's view is the only authority. This sits alongside the other startup gates: time synchronization locked, reference data fresh, market data sequence-recovered, and warmup complete as an explicit condition rather than a hope.",
-      "sourceAnchor": "605-startup-dependency-ordering",
+      "sourceAnchor": "605-startup-readiness-and-traffic-enablement--core",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Checking the synchronization daemon's reported offset and the hardware clock's state before enabling trading is the concrete gate. The regulatory dimension makes it non-optional: high-frequency algorithmic trading carries an accuracy requirement measured in tens of microseconds against a traceable reference.",
-      "sourceAnchor": "605-startup-dependency-ordering",
+      "sourceAnchor": "605-startup-readiness-and-traffic-enablement--core",
       "difficulty": "trap"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Liveness must depend on nothing external — that single rule is what prevents cascading restarts, since an exchange outage should make you not ready and never not alive. A third state for startup and warming is worth having too, so deploy automation does not abort every rollout on a process that is legitimately still priming.",
-      "sourceAnchor": "606-readiness-versus-liveness",
+      "sourceAnchor": "605-startup-readiness-and-traffic-enablement--core",
       "difficulty": "recall"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The narrower signature of the same bug is a restart loop whose period equals the readiness timeout on a single host. The remedy is the rule that liveness asserts only internal progress, plus publishing a reason string alongside the state so an operator is not left searching during the incident.",
-      "sourceAnchor": "606-readiness-versus-liveness",
+      "sourceAnchor": "605-startup-readiness-and-traffic-enablement--core",
       "difficulty": "trap"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A bare boolean forces the operator to go looking, and the looking happens during the incident. Modelling the states explicitly — starting, warming, ready, degraded, draining, halted — and reporting which precondition failed makes a degraded process self-describing rather than merely unavailable.",
-      "sourceAnchor": "606-readiness-versus-liveness",
+      "sourceAnchor": "605-startup-readiness-and-traffic-enablement--core",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The characteristic report is that the first trade of the day takes fifty microseconds and the rest take three. Confirm it by sampling hardware counters over the early window: instruction-translation misses, branch misses, and page faults all sit well above steady-state levels for exactly the first few hundred samples.",
-      "sourceAnchor": "607-startup-warmup-and-cache-priming",
+      "sourceAnchor": "605-startup-readiness-and-traffic-enablement--core",
       "difficulty": "recall"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A lull, a lunch hour, or a quiet instrument leaves the next real message cold again. Pushing a synthetic message through the entire path every few hundred microseconds, dropped at the gateway, costs a fraction of a percent of a core and removes the largest single source of tail latency in a quiet market.",
-      "sourceAnchor": "607-startup-warmup-and-cache-priming",
+      "sourceAnchor": "605-startup-readiness-and-traffic-enablement--core",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The warmup traffic must be representative of the real branch mix, which in practice means replaying recorded market data rather than repeating one message. The rest of warmup is equally concrete: pre-touch every page since allocation reserves address space rather than physical pages, lock memory, resolve symbols eagerly, and complete the session handshake early.",
-      "sourceAnchor": "607-startup-warmup-and-cache-priming",
+      "sourceAnchor": "605-startup-readiness-and-traffic-enablement--core",
       "difficulty": "trap"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Allocation reserves address space; the fault happens on the first write, at roughly a microsecond or more each, and on the critical path. Locking the mappings then prevents reclaim later. Sizing the memory limit generously is necessary too, but on its own it does nothing about the initial faults.",
-      "sourceAnchor": "607-startup-warmup-and-cache-priming",
+      "sourceAnchor": "605-startup-readiness-and-traffic-enablement--core",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Having sent cancels is not the same as having orders cancelled: a cancel can be rejected because the order already filled, and a fill can arrive after the cancel was sent. The signature of getting this wrong is orders resting at the venue with no owning process, and drop-copy fills after your last log line — a reportable event.",
-      "sourceAnchor": "608-safe-shutdown-and-draining",
+      "sourceAnchor": "607-health-failure-drain-and-rollback--core",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Handlers are restricted to async-signal-safe calls, so formatting, allocation, and locks are all excluded. Routing the signal into the event loop through a signal or event descriptor avoids the whole class of safety bugs. Crucially the signal initiates the drain rather than the exit — exiting directly leaves orders resting.",
-      "sourceAnchor": "608-safe-shutdown-and-draining",
+      "sourceAnchor": "607-health-failure-drain-and-rollback--core",
       "difficulty": "trap"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The grace period must exceed the drain's worst case, and separately the drain needs its own internal timeout: if cancels are not acknowledged within a bounded time, escalate to deliberately dropping the session so exchange cancel-on-disconnect fires, and alert a human.",
-      "sourceAnchor": "608-safe-shutdown-and-draining",
+      "sourceAnchor": "607-health-failure-drain-and-rollback--core",
       "difficulty": "trap"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "It is the right backstop for a forcible kill, power loss, or a network partition, and knowing which venues you have it on and with what delay is part of the operational picture. Some venues cancel only day orders, some impose a delay of seconds, and some require explicit per-session enablement.",
-      "sourceAnchor": "608-safe-shutdown-and-draining",
+      "sourceAnchor": "607-health-failure-drain-and-rollback--core",
       "difficulty": "recall"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A tick size of one hundredth versus one ten-thousandth are both plausible values, so no absolute rule separates them; a hundredfold change from yesterday is unmistakable. That shape is exactly what a truncated file, a failed upstream job, or a units change produces. Refuse to start and require a recorded operator override.",
-      "sourceAnchor": "609-configuration-and-reference-data-validation",
+      "sourceAnchor": "603-validate-and-publish-configuration-safely--core",
       "difficulty": "application"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Never default silently and never fall back — reference data is the most common source of incidents in otherwise well-engineered trading systems precisely because a bad or absent value is accepted rather than rejected, so the system runs and does the wrong thing at full speed. Risk limits additionally warrant two-person review and an independent enforcement point.",
-      "sourceAnchor": "609-configuration-and-reference-data-validation",
+      "sourceAnchor": "603-validate-and-publish-configuration-safely--core",
       "difficulty": "trap"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A validator built from a different version proves nothing about what the deployed binary will accept, so the schema ships in the artifact and the binary validates with itself. Running it as an early-morning job means a bad file is caught hours before the open rather than by a trader at half past nine.",
-      "sourceAnchor": "609-configuration-and-reference-data-validation",
+      "sourceAnchor": "603-validate-and-publish-configuration-safely--core",
       "difficulty": "application"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The acquire and release pairing makes the fully constructed object visible before the pointer naming it, and the hot path pays one load of a resident cache line. Reclamation is the remaining problem, and for configuration the right default is simply never freeing the old object, which converts a hard concurrency problem into a trivial memory budget.",
-      "sourceAnchor": "6010-atomic-configuration-updates",
+      "sourceAnchor": "603-validate-and-publish-configuration-safely--core",
       "difficulty": "application"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A contended read-modify-write per read is precisely the cost the design set out to avoid, and it scales badly with the number of reading threads. Epoch-based reclamation is a legitimate alternative at about two relaxed stores per loop; hazard pointers usually cost too much because of the fence on every read.",
-      "sourceAnchor": "6010-atomic-configuration-updates",
+      "sourceAnchor": "603-validate-and-publish-configuration-safely--core",
       "difficulty": "trap"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Two independent recording paths will disagree, and the disagreement surfaces during an investigation — hence deriving the audit record from the same stream. The durability boundary must be chosen deliberately, since a write returns after reaching the page cache and a machine loss before the sync loses records. And an audit trail nobody has replayed is a hypothesis, so reconstruction must be tested.",
-      "sourceAnchor": "6011-audit-trails",
+      "sourceAnchor": "609-incident-and-operational-state-machine--core",
       "difficulty": "recall"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Descriptor exhaustion is the archetypal cascading failure because every other subsystem fails at once — you cannot open a log file, a core file, or a socket to the exchange, so the diagnostics fail alongside the service. The prevention is ownership discipline on every descriptor plus alerting on the count's upward trend rather than on the eventual failure.",
-      "sourceAnchor": "6012-resource-limits-and-descriptor-exhaustion",
+      "sourceAnchor": "6010-operational-runbook--skippable-reference",
       "difficulty": "application"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The structural fix is separate filesystems for logs, cores, state, and the operating system, so a full log volume cannot prevent a core dump or wedge the root. Reserve headroom or keep a deletable ballast file, and alert on fill rate with a projected time-to-full rather than on a percentage.",
-      "sourceAnchor": "6013-disk-and-log-retention-failures",
+      "sourceAnchor": "6010-operational-runbook--skippable-reference",
       "difficulty": "trap"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Latency degradation is a cliff rather than a slope: comfortable at seventy percent and catastrophic at ninety, while market-data rates spike by tens of times on news, at the open and close, and during auctions. The usual design point is around half of peak observed burst, not half of average.",
-      "sourceAnchor": "6014-capacity-headroom",
+      "sourceAnchor": "6010-operational-runbook--skippable-reference",
       "difficulty": "application"
     },
     {
@@ -572,7 +572,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the most common capacity-planning mistake, and the fix is to measure at the timescale the bursts occur on. The cheapest early-warning signal is queue high-water marks per interval: a maximum depth rising from a handful to hundreds moves well before latency does, and it costs one compare-and-store per enqueue.",
-      "sourceAnchor": "6014-capacity-headroom",
+      "sourceAnchor": "6010-operational-runbook--skippable-reference",
       "difficulty": "trap"
     },
     {
@@ -586,7 +586,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Never infer primacy from the other instance looking dead: a network partition is indistinguishable from a failure, and double-trading follows. The related capacity point is that the standby must be genuinely warm — same feed, same code path, keep-warm loop — or failover lands you on a cold process at the worst possible moment.",
-      "sourceAnchor": "6014-capacity-headroom",
+      "sourceAnchor": "6010-operational-runbook--skippable-reference",
       "difficulty": "application"
     }
   ]

@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Wire-to-wire is defined by two points on the wire at your rack boundary, and it is credible only when both are timestamped in one clock domain by a device with no probe effect. The in-process rdtsc span is application latency, not wire-to-wire, and it is the most tempting substitute because it is trivial to collect while silently omitting the NIC receive path, DMA, poll discovery, and the whole transmit path. The decode-to-decision span is decision latency, a strict subset, and venue-log reconstruction measures the exchange's view rather than yours.",
-      "sourceAnchor": "521-tick-to-trade-and-wire-to-wire-latency",
+      "sourceAnchor": "522-measurement-boundaries-and-latency-vocabulary",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Internal probes start when the application already sees the packet and stop when it hands the order to the NIC, so everything before visibility and everything after posting is excluded — and on a bypass path that residue is routinely microseconds. The switch-and-fibre answer is the most tempting miss, but a tap on the box observes both frames at the box's own ports, so no switch hop or cross-connect sits inside the measured span. Frame serialization of 100 B at 10 Gb/s is about 80 ns and dominates nothing.",
-      "sourceAnchor": "521-tick-to-trade-and-wire-to-wire-latency",
+      "sourceAnchor": "522-measurement-boundaries-and-latency-vocabulary",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is coordinated omission: a measurement that begins its clock at pickup defines away the waiting, so the stall registers as fewer samples rather than as slower ones. The claim that the message after the backlog carries the full 10 ms is the closest miss — it would be true if the clock started at arrival, but starting at pickup means that message reports only its own processing cost. Reporting the maximum does not help, because the maximum is drawn from the same censored sample set.",
-      "sourceAnchor": "521-tick-to-trade-and-wire-to-wire-latency",
+      "sourceAnchor": "522-measurement-boundaries-and-latency-vocabulary",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Sharding scales throughput while keeping the whole market-data-to-order path on one core with no queues, which is exactly the property that pipelining gives up. The pipelining answer states the throughput formula correctly but draws the wrong conclusion: it buys that throughput by adding 200–500 ns handoffs onto the latency path, which is the wrong trade here. A lock on the book destroys single-writer ownership, and unbounded draining of one source starves the order socket and the timers.",
-      "sourceAnchor": "522-market-data-strategy-and-order-gateway-pipeline",
+      "sourceAnchor": "525-single-writer-event-loops-sharding-and-pipelines",
       "difficulty": "application"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Co-locating correlated instruments keeps the cross-instrument view inside one thread's own state, which is why shard assignment is driven by what the strategies read rather than by evening out load. The cross-shard queue answer is tempting because the consumer really is polling anyway, but a handoff still costs a cache-line transfer plus discovery delay of 100–300 ns and puts it on the critical path. A shared mutex reintroduces contention and non-determinism that single-writer ownership exists to remove.",
-      "sourceAnchor": "522-market-data-strategy-and-order-gateway-pipeline",
+      "sourceAnchor": "525-single-writer-event-loops-sharding-and-pipelines",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Silence has no error representation: the socket is healthy, the ring is empty, and every counter reads zero, so only a timer that fires on elapsed time since the last message can distinguish a quiet market from a dead feed. The ring-overflow answer is the closest miss, but overflow moves a counter and produces latency that rises smoothly then cliffs rather than stopping dead. A gap and a decode failure both leave their own visible traces, which is precisely what is missing here.",
-      "sourceAnchor": "523-feed-handlers",
+      "sourceAnchor": "523-decomposition-and-state-ownership",
       "difficulty": "trap"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Two clean modes separated by one to two orders of magnitude is the signature of a conditional slow path: most messages take the fast branch, a few take a branch that allocates, logs, or throws. The poll-loop answer describes a real failure mode but the wrong shape — falling behind raises the whole distribution smoothly and then cliffs, and never produces a tight low mode alongside it. Remote NUMA placement shifts the entire distribution rather than splitting it, and a decode bug shows up as book divergence rather than as a timing mode.",
-      "sourceAnchor": "523-feed-handlers",
+      "sourceAnchor": "523-decomposition-and-state-ownership",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Order-by-order feeds carry per-order identity, so the builder can maintain the FIFO queue at each level and answer where your order sits in it — information that is simply absent when the venue publishes only net size per level. The cheaper-builder answer states the tradeoff backwards: order-by-order is strictly more information and strictly more work, requiring per-order state and a reference-number hash map. Gap-freedom comes from sequencing and arbitration, not from the feed's granularity.",
-      "sourceAnchor": "524-book-builders",
+      "sourceAnchor": "523-decomposition-and-state-ownership",
       "difficulty": "recall"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Direct indexing turns both lookup and insertion into arithmetic, which is why it is the fastest option where the price range is bounded; the price paid is that the range is a hard assumption that a limit move can invalidate, and a sparse book wastes cache. The memmove answer is the most tempting confusion — that cost belongs to the sorted array of levels, which is O(log n) to find and O(n) to insert. Memory scales with the price range, not with the number of active levels.",
-      "sourceAnchor": "524-book-builders",
+      "sourceAnchor": "523-decomposition-and-state-ownership",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The container is on the hottest lookup in the system, and node-based hashing adds a dependent load to a separately allocated node on every probe; a flat open-addressed map with a good hash costs one miss instead of two, which is the single largest line item in the builder. The determinism answer is the most tempting because iteration order really is a replay hazard in general, but the builder looks up by key rather than iterating, and the order does not vary run to run for the same insertion sequence. The contiguous-array description belongs to a flat map and is stated wrongly besides.",
-      "sourceAnchor": "524-book-builders",
+      "sourceAnchor": "523-decomposition-and-state-ownership",
       "difficulty": "trap"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Keeping both makes the gap between them a first-class observable, which is how a feed handler's health is monitored and how a slow venue is distinguished from a slow receiver. The fallback framing is the closest miss: the local timestamp is not a substitute for a missing exchange field but a second, independently meaningful measurement in your own clock domain. Ordering comes from sequence numbers and arbitration, not from comparing timestamps.",
-      "sourceAnchor": "525-market-data-normalization",
+      "sourceAnchor": "523-decomposition-and-state-ownership",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The whole point of a binary exchange protocol is fixed offsets and no dispatch, and a variant or virtual message hands all of that back in the name of generality — virtual calls, field lookups, and often an allocation per message. The quality-flags answer is the tempting one because carrying recovered/stale/implied status really is mandatory, but a field map could carry those flags perfectly well; the defect is cost, not expressiveness. Nothing about a polymorphic type forces floating-point prices or a second normalization pass.",
-      "sourceAnchor": "525-market-data-normalization",
+      "sourceAnchor": "523-decomposition-and-state-ownership",
       "difficulty": "trap"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Light in fibre travels at roughly 5 ns per metre, so 500 m is about 2.5 µs one way — on the same scale as a 4 µs software path that took years to tune, which is exactly why colocation is a precondition rather than an optimization. The 250 ns answer is off by a factor of ten and is the arithmetic slip to watch for. Equidistance guarantees cover cabinets within the exchange's own colocation hall, not arbitrary distance across a campus.",
-      "sourceAnchor": "526-colocation-and-cross-connects",
+      "sourceAnchor": "528-hot-warm-and-cold-paths",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Equidistant cabling deliberately removes the one variable a tenant cannot engineer around, which leaves the switch, the NIC, the CPU, and the code as the places where an advantage can still be built. The cabinet-position answer contradicts the premise it was given — that is precisely what coiling the fibre eliminates. Equalising cable length says nothing about how many hops sit inside your own network, and it certainly does not make the host stack irrelevant.",
-      "sourceAnchor": "526-colocation-and-cross-connects",
+      "sourceAnchor": "528-hot-warm-and-cold-paths",
       "difficulty": "recall"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Risk is a control, and a control that the system can outrun under load has already failed at the moment it matters most, so the latency is paid deliberately. The dependency-chain answer is the strongest distractor and its premise is genuinely true — the encoded order really does not read the check's result — but the inference fails because the check's purpose is to prevent the send, not to shape it. Putting a warm thread on a hot core's SMT sibling is separately harmful, since siblings contend for every front-end resource.",
-      "sourceAnchor": "527-hot-warm-and-cold-paths",
+      "sourceAnchor": "528-hot-warm-and-cold-paths",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "One remote read per second is enough to pull the line out of the writing core's cache, and the hot loop then pays a coherence transfer to get it back on its very next increment — the cost lands on the hot path, not on the monitor. The \"too rare to matter\" answer is the tempting one, and weakening the memory order does not help: a relaxed store to a shared line still moves the line. `volatile` forbids keeping the value in a register rather than permitting it, and an SMT sibling makes front-end contention worse.",
-      "sourceAnchor": "527-hot-warm-and-cold-paths",
+      "sourceAnchor": "528-hot-warm-and-cold-paths",
       "difficulty": "trap"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Single-writer removes the sharing problem rather than solving it: nobody else writes the line, so it never leaves the owner's cache and no ordering machinery is needed on the write path, which is also what makes replay deterministic. The description of removing blocking while leaving coherence traffic and adding reclamation belongs to lock-free structures and is the most tempting swap. Relaxed stores still generate coherence traffic, and readers on other cores still need a publication protocol such as a seqlock.",
-      "sourceAnchor": "528-single-writer-event-loops",
+      "sourceAnchor": "525-single-writer-event-loops-sharding-and-pipelines",
       "difficulty": "recall"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The asymmetry is the whole point: the writer bumps the counter to odd, stores the payload, bumps it to even, and is never blocked by any reader, while the retry cost falls entirely on readers who can afford it. The claim that readers never retry misses the mechanism — the even/odd protocol detects a race rather than preventing one. There is no lock and no read-modify-write anywhere in the scheme; plain stores and loads with fences are sufficient.",
-      "sourceAnchor": "528-single-writer-event-loops",
+      "sourceAnchor": "525-single-writer-event-loops-sharding-and-pipelines",
       "difficulty": "application"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Sharding keeps every writer single-writer and pushes the only cross-core work onto the reader, which is off the critical path, and that is why a per-shard position summed by a monitoring thread beats a shared atomic position. The relaxed-atomic answer is the most tempting: relaxing the memory order removes fences, not the coherence transfer, so the contended line still bounces between cores. A mutex adds unbounded futex tail latency exactly when both shards are busiest.",
-      "sourceAnchor": "528-single-writer-event-loops",
+      "sourceAnchor": "525-single-writer-event-loops-sharding-and-pipelines",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Throughput becomes one over the slowest stage, so 100 ns gives 10 M/s where the monolith's 400 ns gives 2.5 M/s; latency becomes the sum of the stages plus the sum of the handoffs, so 400 ns plus 600–1500 ns. The version claiming 10 M/s at unchanged latency is the tempting one — handoff cost is a cache-line transfer plus discovery delay on the message's own path, and no amount of concurrency removes it from that message's journey. Concurrency raises throughput, never the latency of an individual item.",
-      "sourceAnchor": "529-staged-pipeline-architectures",
+      "sourceAnchor": "525-single-writer-event-loops-sharding-and-pipelines",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A pipeline's latency depends on its slowest stage under load, so a transient slowdown converts into queueing for everything arriving behind it, while a monolith confines the same slowdown to the one message that triggered it. The claim that queues absorb the excess is the tempting one — a queue defers the work rather than removing it, and the deferral is exactly the added latency. Throughput is affected too, since the pipeline runs at the rate of its slowest stage.",
-      "sourceAnchor": "529-staged-pipeline-architectures",
+      "sourceAnchor": "525-single-writer-event-loops-sharding-and-pipelines",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The busy-polled figure is dominated by the coherence transfer of the payload line plus the index line and the consumer's discovery delay, and it is the number that prices every architectural boundary you draw. The 20 ns answer counts only the producer's store, which is essentially free because the line is already Modified in its cache — the cost lands on the consumer's load. Sleeping never wins: the wake path adds scheduler involvement and a tail that no busy-polled handoff has.",
-      "sourceAnchor": "5210-inter-stage-queue-costs",
+      "sourceAnchor": "526-queue-semantics-backpressure-and-failure-boundaries",
       "difficulty": "recall"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Separating the indices kills false sharing that can otherwise triple the per-operation cost, and caching the opposite index converts a per-item cross-core load into a rare one taken only near the boundary conditions. The shared-cache-line answer inverts both ideas exactly — colocating the indices is the false-sharing bug, and re-reading the opposite index every operation is the cost the cache exists to avoid. Sequential consistency on the index adds an `MFENCE` for nothing, and a non-power-of-two capacity reintroduces a division.",
-      "sourceAnchor": "5210-inter-stage-queue-costs",
+      "sourceAnchor": "526-queue-semantics-backpressure-and-failure-boundaries",
       "difficulty": "recall"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Moving a handle rather than a payload means the handoff touches one line instead of the several a full message spans, and giving the slab and ring the same size makes the ring's bound double as the recycling bound. The immediate-recycle answer inverts that guarantee: the slab entry must survive until the consumer is finished, which is exactly why the ring's capacity has to bound the in-flight set. Atomicity of a 32-bit store says nothing about publishing the payload written before it, so the release ordering is still required.",
-      "sourceAnchor": "5210-inter-stage-queue-costs",
+      "sourceAnchor": "526-queue-semantics-backpressure-and-failure-boundaries",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The measured 4.9 µs exceeds the 3.57 µs of instrumented time by about 1.3 µs, and time that appears end to end but in no stage is by definition happening somewhere nobody is looking. The \"percentiles do not add, so nothing to see\" answer is the tempting one, but non-additivity for independent stages pushes the total below the sum, not 37% above it. Blaming the largest stage confuses which stage dominates with where the unaccounted time went.",
-      "sourceAnchor": "5211-per-stage-latency-budgets",
+      "sourceAnchor": "529-building-a-latency-budget",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Percentiles are not additive: independence makes the joint bad case rare so the sum's p99 comes in under the arithmetic sum, while shared causes such as a cache-miss storm or a load burst hit both stages at once and can push it above. The \"at most 2 µs, always a safe bound\" answer is the most tempting because it holds under independence, but correlation is the normal case in a trading system and breaks the bound. That is exactly why summing p99s is a heuristic and the gap against a measured total is a finding.",
-      "sourceAnchor": "5211-per-stage-latency-budgets",
+      "sourceAnchor": "529-building-a-latency-budget",
       "difficulty": "trap"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Thirty cycles is about 10 ns at 3 GHz, so six probes cost about 60 ns on a 2 µs path, or 3% — small enough to accept, while twenty probes would approach 200 ns and start shaping the thing being measured. Adding stronger fences is the tempting fix and makes the problem worse, since the serialization is precisely what costs the cycles. The claim that `rdtscp` does not serialise is wrong on its face, and 600 ns overstates the six-probe cost by an order of magnitude.",
-      "sourceAnchor": "5211-per-stage-latency-budgets",
+      "sourceAnchor": "529-building-a-latency-budget",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Only work whose result the outgoing order depends on belongs before the wire event, so bookkeeping moves after it — but state that must be correct before the next event is processed still has to be updated before control returns to the poll loop. The \"move everything after the send\" answer is the closest miss and its premise about the poll loop is even true; the inference fails because position and risk must be right for the *next* decision, which is the very next loop iteration. Anything that could throw must also not sit after a send that has already committed you.",
-      "sourceAnchor": "5212-critical-path-analysis",
+      "sourceAnchor": "524-the-critical-path",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Critical-path analysis asks what the output depends on, and the deep levels fail that test — but they still evict cache lines and burn cycles on the same core, so they lengthen the path they are not part of. The \"off the chain therefore free\" answer is the tempting one and is exactly the distinction being drawn: dependency and resource are two separate chains. Deep-level maintenance never becomes a prerequisite of the BBO, which is tracked incrementally from the top of book.",
-      "sourceAnchor": "5212-critical-path-analysis",
+      "sourceAnchor": "524-the-critical-path",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The first execution after a quiet period pays 5–20 µs of cold L1i, dTLB, and branch-predictor cost, and that execution is precisely the event you most want to win, so the path is exercised through a flag that reproduces the instruction and data footprint without committing an order. The housekeeping-thread prefetch answer is the tempting one but warms the wrong core's caches and never trains the hot core's branch predictors. Idle periods absolutely do evict, which is the whole reason startup-only warming is insufficient.",
-      "sourceAnchor": "5212-critical-path-analysis",
+      "sourceAnchor": "524-the-critical-path",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Every beneficial batching mechanism — ring drain, `recvmmsg`, queue drain — operates on items that already arrived, so nothing is waited for and the fixed cost is simply amortised; every harmful one introduces waiting. The timer answer is the most tempting because a bound sounds like a safeguard, but a timer-based flush adds up to its full interval to messages that could have gone immediately, which is the exact defect that makes interrupt coalescing and Nagle unacceptable. Transmit-side batching such as `sendmmsg` is fine when the datagrams are already queued.",
-      "sourceAnchor": "5213-batching-trade-offs",
+      "sourceAnchor": "527-batching-and-the-throughputlatency-curve",
       "difficulty": "recall"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Coalescing is waiting by construction: the NIC deliberately withholds the notification for up to the timer interval, which is pure added delay when the receiver is busy-polling and does not care about interrupt cost. The full-ring-drain answer is the most tempting, but those packets have already arrived and would otherwise wait a whole extra poll iteration, so draining them is strictly better. `recvmmsg` returns whatever is available rather than blocking for the full count, and reading the producer index once per poll is the amortisation that makes the drain cheap.",
-      "sourceAnchor": "5213-batching-trade-offs",
+      "sourceAnchor": "527-batching-and-the-throughputlatency-curve",
       "difficulty": "application"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Deliberately trading latency for throughput under overload is a legitimate degradation strategy, but it must be a decision with a stated trigger and monitoring rather than something a queue does to you by accident. The blanket rejection is the tempting one because the batch-opportunistically rule really does forbid waiting on the normal path, yet the chapter explicitly allows adaptive batching as a designed overload response. A flush timer adds exactly its interval to messages that arrive early in the window, so it is not an exemption from the waiting cost.",
-      "sourceAnchor": "5213-batching-trade-offs",
+      "sourceAnchor": "527-batching-and-the-throughputlatency-curve",
       "difficulty": "trap"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The M/M/1 waiting time blows up as 1/(1−ρ), so even 50% already doubles queueing delay and 60% multiplies it by 2.5 — which is why low-latency systems are provisioned at utilizations that look wasteful. The \"below the knee\" answer is the tempting one because the curve does look flat when plotted, but there is no flat region: the multiplier is above one from the very start. Busy polling removes the scheduler, not the receive ring or the inter-stage queues where messages actually wait.",
-      "sourceAnchor": "5214-throughput-latency-curves",
+      "sourceAnchor": "527-batching-and-the-throughputlatency-curve",
       "difficulty": "recall"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Ten thousand entries drained at one million per second is ten milliseconds of backlog, and a market-data update ten milliseconds old cannot inform a decision — the depth you choose is literally the worst-case staleness you accept. The 10 µs answer is off by three orders of magnitude and is the arithmetic slip worth guarding against. Depth is not neutral: every entry ahead of a message in a FIFO is delay that message must serve before it is seen.",
-      "sourceAnchor": "5214-throughput-latency-curves",
+      "sourceAnchor": "527-batching-and-the-throughputlatency-curve",
       "difficulty": "application"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A stall does not just delay the message it hits — it lets a backlog build that every subsequent message must queue behind, so service-time variance drives waiting time independently of the mean. The \"identical because ρ is identical\" answer is the most tempting since utilization really is equal, but the M/M/1 intuition that only ρ matters assumes an exponential service distribution and does not survive a heavy-tailed one. Path B is also strictly worse in the real system, where the burst that raises arrivals is the same event that causes the stall.",
-      "sourceAnchor": "5214-throughput-latency-curves",
+      "sourceAnchor": "527-batching-and-the-throughputlatency-curve",
       "difficulty": "trap"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The asymmetry follows from what the messages mean: a newer book update supersedes an older one, so keeping the freshest is correct, while every order message carries information nothing else will repeat. The inverted pairing is the most tempting distractor, but overwriting order flow silently discards an instruction the exchange may already have acted on. Blocking is wrong on a hot path in either direction, since it propagates the stall to the NIC and converts it into unaccounted packet loss.",
-      "sourceAnchor": "5215-bounded-queues-and-backpressure",
+      "sourceAnchor": "526-queue-semantics-backpressure-and-failure-boundaries",
       "difficulty": "recall"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A healthy queue is empty almost all the time, so averages and spot samples both read near zero right up until the queue fails; the peak reached within each interval is what carries the trend. The average-depth answer is the tempting one because depth genuinely does rise with load, but it only rises visibly once the system is already in trouble. Drops are the definition of arriving too late — by then the data is gone and the incident has started.",
-      "sourceAnchor": "5215-bounded-queues-and-backpressure",
+      "sourceAnchor": "526-queue-semantics-backpressure-and-failure-boundaries",
       "difficulty": "application"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Conflation is valid only when a newer value fully supersedes an older one, which is true of a book snapshot and false of anything whose meaning is cumulative or unique. Deltas are the subtler half and the most tempting to allow: a delta describes a change rather than a level, so dropping one leaves the reconstructed book permanently wrong — you must apply the deltas and conflate the resulting state. A seqlock only makes each read tear-free; it cannot restore information the publisher already discarded.",
-      "sourceAnchor": "5216-overload-shedding",
+      "sourceAnchor": "5212-overload-and-graceful-degradation",
       "difficulty": "trap"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The ordering follows from what losing each item costs: dropped telemetry costs visibility, dropped non-traded market data costs nothing, and throttling new orders is better than having the exchange throttle you. The version that sheds cancels is the most dangerous inversion — cancels are prioritized above new orders, because failing to pull a working order in a fast market is precisely the exposure shedding is supposed to contain. Fills can never be shed at all, since losing them corrupts position and risk state outright.",
-      "sourceAnchor": "5216-overload-shedding",
+      "sourceAnchor": "5212-overload-and-graceful-degradation",
       "difficulty": "application"
     }
   ]

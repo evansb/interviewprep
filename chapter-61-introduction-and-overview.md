@@ -1,413 +1,1139 @@
-# Chapter 61 — Introduction and Overview
+# Chapter 61 — Storage Systems: Introduction and Overview
 
-*Interview-focused revision notes. The theme: a database is not one program but a stack of subsystems, and almost every design decision in the storage layer reduces to three axes — buffer or write through, mutate in place or append, keep data ordered or not. PostgreSQL is the reference implementation throughout, but the axes are universal; where Postgres sits at one end, we name who sits at the other.*
+Chapters 61–74 are an **optional specialization track**. They prepare readers
+for storage-engine, exchange-infrastructure, data-platform, and distributed-
+systems interviews. The first sixty chapters remain a complete low-latency C++
+and HFT systems path; this track does not restart the book or assume that every
+trading role needs database internals.
 
----
+The bridge is nevertheless useful. An exchange gateway journals events, a
+market-data platform stores ordered history, a risk service needs consistent
+state, and a recovery system replays a durable prefix. The same questions recur:
 
-## 61.1 What a Database Management System Is
+- What is the authoritative state?
+- Which access patterns must be cheap?
+- What is buffered, copied, indexed, or rewritten?
+- When is a change durable and visible?
+- What happens during a crash, concurrent update, or partial network failure?
 
-A **database management system** (DBMS) is application software that stores data durably and lets clients define, query, and modify it concurrently and safely. That one sentence hides an enormous amount of machinery: a wire protocol, a parser, an optimizer, an execution engine, a concurrency-control subsystem, a durability subsystem, and — the subject of Part I of this book — a **storage engine** that actually turns rows into bytes on a block device and back.
+This chapter supplies the comparison framework. Chapters 62–67 deepen local
+storage engines. Chapters 68–74 deepen distributed systems.
 
-It is worth fixing terminology, because interviews probe it. A **database** is a logical collection of data. A **DBMS** is the software managing it. A **database instance** (or *node*) is a single running process (or process group) of that software. People say "database" for all three; be precise when it matters.
+## Who should take this track — Core
 
-DBMSs are classified along several independent axes, and conflating them is a classic mistake:
+Read the full track if you expect to design or operate:
 
-| Axis | Ends | Postgres |
-|---|---|---|
-| Workload | OLTP (many small point read/writes) ↔ OLAP (few large scans/aggregations) ↔ HTAP (both) | OLTP-first, competent OLAP |
-| Data model | relational ↔ document ↔ key-value ↔ wide-column ↔ graph | relational (with JSONB, arrays) |
-| Storage medium | disk-based ↔ in-memory | disk-based (§61.4) |
-| Layout | row-oriented ↔ column-oriented | row-oriented (§61.6) |
-| Distribution | single-node ↔ distributed | single-node core (Part II covers distribution) |
+- time-series/history stores, journals, capture/replay systems, or reference-data
+  services;
+- exchange or broker infrastructure with durable transactional state;
+- database kernels, storage libraries, streaming platforms, or distributed
+  control planes;
+- replication, failover, partitioning, or consensus mechanisms.
 
-These are orthogonal. A relational database can be in-memory (VoltDB), column-oriented (ClickHouse speaks SQL), or distributed (CockroachDB). The relational model says nothing about the storage engine, and this book is almost entirely about the storage engine — the part the SQL standard deliberately does not specify.
+If your role is strictly latency-critical C++ on an established storage
+platform, this chapter is designed to be a coherent stopping point. Retain the
+framework and follow cross-references only when the role demands depth.
 
-**OLTP vs OLAP** is the workload distinction that drives storage layout. **OLTP** (Online Transaction Processing) is many short-lived transactions, each touching a handful of rows by key — an order insert, a balance update. **OLAP** (Online Analytical Processing) is few long-running queries, each scanning millions of rows over a few columns — "sum revenue by region for last quarter." **HTAP** (Hybrid Transactional/Analytical Processing) tries to serve both from one system. As we will see, OLTP wants rows and B-trees; OLAP wants columns and immutable sorted files; the tension between them is the reason so many storage engines exist.
+### The three-chapter bridge
 
----
+A general HFT reader can take a short route:
 
-## 61.2 DBMS Architecture: The Layers
+1. **Chapter 61:** pages, indexes, buffering, WAL, transactions, and the
+   local-to-distributed boundary.
+2. **Chapter 71:** replication modes and consistency guarantees.
+3. **Chapter 74:** consensus, quorum replication, commit, and snapshots.
 
-There is no universal DBMS architecture, but most systems can be decomposed into the same layers. Data flows down on the way in and up on the way out.
+That route covers the requested bridge from durable bytes to replicated
+agreement. Specialists continue sequentially:
 
-```
-              ┌─────────────────────────────────────────┐
-  client ───▶ │ Transport / wire protocol                │  connection, auth, session
-              ├─────────────────────────────────────────┤
-              │ Query processor                           │
-              │   ├─ parser        → parse tree           │  syntax + catalog lookup
-              │   ├─ analyzer/rewriter → query tree       │  semantics, views, rules
-              │   └─ optimizer     → execution plan        │  cost-based plan selection
-              ├─────────────────────────────────────────┤
-              │ Execution engine                          │  runs the plan: scans, joins,
-              │   (local ops, or remote for distributed) │  aggregates, sorts
-              ├─────────────────────────────────────────┤
-              │ Storage engine                            │ ◀── Part I of this book
-              │   ├─ transaction manager                  │  isolation, locking
-              │   ├─ lock manager                         │  row/table/predicate locks
-              │   ├─ access methods (B-tree, LSM, heap)   │  on-disk structures
-              │   ├─ buffer manager / page cache          │  RAM ↔ disk paging
-              │   └─ recovery manager (WAL)               │  durability, crash recovery
-              └─────────────────────────────────────────┘
-                              │
-                         block device
-```
+- **Chapters 62–67 — local storage:** B+trees, file/page formats, concurrent
+  trees, transactions/recovery, tree variants, and LSM storage.
+- **Chapters 68–74 — distributed state:** failure models, failure detection,
+  election/fencing, replication/consistency, anti-entropy, distributed
+  transactions, and consensus.
 
-The **query processor** is the *compiler*; the **execution engine** and **storage engine** are the *runtime*. This book lives below the plan: given "fetch the row with id = 42," how does the storage engine find it, and given "insert this row," how does it write it durably without corrupting concurrent readers?
+### Full-track roadmap
 
-The critical interface is between the execution engine and the storage engine. A well-factored DBMS defines this as a narrow API — roughly *open cursor, seek, get next, insert, update, delete, commit* — so that storage engines can be swapped. **MySQL** made this explicit and pluggable: InnoDB, MyISAM, and RocksDB (MyRocks) are interchangeable storage engines under one query processor. **MongoDB** swapped MMAPv1 for **WiredTiger**. **PostgreSQL** historically had one tightly-integrated engine, but since version 12 exposes a **table access method** API (`pluggable table AM`), which is how projects like Zheap and OrioleDB experiment with alternative storage under the same planner.
-
----
-
-## 61.3 The PostgreSQL Process Model
-
-Because Postgres is our reference, pin down how a running instance is actually organized — it differs from the thread-per-connection model most engineers assume.
-
-Postgres is **process-per-connection**, not thread-per-connection. A supervisor process, the **postmaster**, listens on the port. On each new connection it `fork`s (Ch. 31 §31.3) a dedicated **backend** process that runs that session's queries to completion. There is no thread pool; there is a *process* per client. This is why a naive Postgres deployment needs a connection pooler (PgBouncer) in front — each backend costs a process and its private memory, and thousands of idle connections are thousands of processes.
-
-```
-postmaster (listener, forks children, reaps them)
-   ├─ backend #1  ─┐
-   ├─ backend #2   │  each runs one session's SQL, attached to shared memory
-   ├─ backend #N  ─┘
-   ├─ background writer      (flushes dirty buffers ahead of checkpoints)
-   ├─ checkpointer           (writes checkpoints, §61.4 / Ch. 65)
-   ├─ WAL writer             (flushes the WAL buffers)
-   ├─ autovacuum launcher    (spawns vacuum workers, §61.14 / Ch. 65)
-   └─ background workers      (parallel query, logical replication, extensions)
-                 │
-        ┌────────┴─────────┐
-        │  shared memory   │  shared_buffers (the buffer pool), WAL buffers,
-        │  (System V / mmap)│  lock tables, proc array — all backends attach here
-        └──────────────────┘
-```
-
-The consequences that matter for the storage engine:
-
-- **`shared_buffers`** is the buffer pool (§61.15, Ch. 65), a fixed region of shared memory that every backend attaches to. A page read by one backend is visible to all. Default is small (128 MB); production tunes it to ~25% of RAM.
-- Because backends are separate processes, all coordination — buffer pins, lock tables, the list of live transactions — lives in **shared memory** with explicit latches and lightweight locks (`LWLock`), the database analogue of the primitives in Ch. 24.
-- A crashing backend can be isolated: the postmaster detects the death, and because shared memory could be corrupt, it forces a **crash-recovery restart** of the whole instance from the WAL rather than trusting the survivors.
-
-MySQL/InnoDB, by contrast, is **thread-per-connection** inside one server process. The trade-off is the classic one from Ch. 31: processes give isolation and simpler memory safety at the cost of heavier context switches and no shared address space beyond the explicit shared-memory segment.
-
----
-
-## 61.4 Memory- Versus Disk-Based DBMS
-
-The single biggest storage-architecture decision is where the **primary copy** of the data lives: on durable secondary storage (disk-based) or in main memory (in-memory).
-
-A **disk-based DBMS** — Postgres, MySQL, Oracle, SQLite — holds the authoritative data in files on a block device and uses RAM as a *cache* (the buffer pool). It is built around structures optimized for block devices: **B-trees** (Ch. 62–64) and **LSM trees** (Ch. 67), both of which minimize the number of block transfers because a block transfer is thousands of times slower than a memory access (Ch. 30's latency numbers are the whole justification).
-
-An **in-memory DBMS** — Redis, VoltDB, MemSQL/SingleStore, SAP HANA, Memcached — holds the authoritative data in RAM. Disk, if used at all, is only for durability (a log and periodic snapshots), never for serving reads. Because it is freed from the block-transfer constraint, it can use pointer-rich structures that would be catastrophic on disk: plain binary trees, skip lists, and hash tables with real pointers rather than page offsets.
-
-The reason the distinction is fundamental, not incidental:
-
-- **Access-time asymmetry.** A DRAM access is ~100 ns; a random NVMe read is ~50–100 µs; a random seek on spinning rust is ~10 ms (Ch. 30). That is 3–5 orders of magnitude. On-disk structures exist to *convert random I/O into sequential I/O and to touch as few blocks as possible*, because the block, not the byte, is the unit of transfer.
-- **Volatility.** RAM loses its contents on power failure. An in-memory DBMS is therefore *not automatically durable*; durability must be engineered on top (§61.5). A disk-based DBMS gets durability from the medium, but must engineer *performance* on top of a slow medium.
-- **Addressing.** In memory you dereference a pointer. On disk you cannot store a pointer — the file will be mapped at a different address next time, and pointers are meaningless across restarts. On-disk structures address data by **page id + offset**, not by memory address. This single fact shapes all of file formats (Ch. 63) and B-tree implementation (Ch. 64).
-
-**Cost and capacity** are the practical limiters: RAM is far more expensive per byte and bounded by what one machine can hold (single-terabyte territory), while disk is cheap and effectively unbounded. In-memory systems therefore either target datasets that fit in RAM or shard across many nodes (Part II).
-
-The line is blurring. Postgres with a buffer pool larger than the working set behaves nearly like an in-memory system for reads. Anti-caching and tiered designs keep hot data in RAM and evict cold data to disk. But the *authoritative-copy* question still decides the structures the engine is built from.
-
----
-
-## 61.5 Durability in Memory-Based Stores
-
-If RAM is volatile, how does an in-memory DBMS survive a crash? The same two mechanisms every durable system uses, which recur throughout Part I:
-
-1. **A write-ahead log (WAL).** Before acknowledging a write, append a record describing it to a sequential log on disk and `fsync` it. The log is append-only and sequential, so it is cheap even on slow media (sequential write ≫ random write). On restart, **replay** the log to reconstruct the in-memory state. This is exactly the mechanism a disk-based engine uses for crash recovery (Ch. 65) — the difference is only that the in-memory engine reconstructs *all* state from the log, not just the uncommitted tail.
-
-2. **Periodic snapshots (checkpoints).** The log grows without bound, and replaying all of history is slow. Periodically, write a full **snapshot** of in-memory state to disk and truncate the log ahead of it. Recovery then = load the latest snapshot + replay the log suffix after it. Redis's **RDB** files are snapshots; its **AOF** (append-only file) is the WAL; production Redis often runs both.
-
-The durability knob is *when the log is flushed*. `fsync` per write is fully durable but caps throughput at the device's sync rate (Ch. 34: a sync is tens to hundreds of microseconds). Batching many writes per `fsync` (**group commit**) trades a bounded window of potential loss for far higher throughput — the same trade every disk-based engine makes. Redis exposes this directly: `appendfsync always` (per write), `everysec` (batched, up to 1 s loss), or `no` (leave it to the OS page cache, Ch. 32).
-
-The interview point: **durability and medium are independent.** An in-memory store *can* be fully durable (WAL + `fsync`), and a disk-based store *can* lose data (if it `fsync`s lazily or lies about it). "In-memory" describes where reads are served from, not whether writes survive a crash.
-
----
-
-## 61.6 Row- Versus Column-Oriented Storage
-
-Given a table, in what order do its bytes hit the page? Two answers, and the choice is the strongest predictor of whether a system is good at OLTP or OLAP.
-
-```
-Table:  id | name  | age | city
-        1  | Alice | 30  | NYC
-        2  | Bob   | 25  | LA
-        3  | Cara  | 41  | SF
-
-Row-oriented on disk (Postgres):     each row's fields stored contiguously
-   [1,Alice,30,NYC] [2,Bob,25,LA] [3,Cara,41,SF]
-
-Column-oriented on disk (ClickHouse): each column stored contiguously
-   id:   [1,2,3]      name: [Alice,Bob,Cara]
-   age:  [30,25,41]   city: [NYC,LA,SF]
-```
-
-A **row store** keeps all of a row's columns together. Fetching one whole row ("get the order with id 42") reads one place. This is what OLTP wants: point reads and writes of complete records. Postgres, MySQL, Oracle, and SQL Server are all row stores by default.
-
-A **column store** keeps all values of one column together. Fetching one column across all rows ("average age") reads one contiguous run and skips the columns you did not ask for. This is what OLAP wants. ClickHouse, Vertica, Amazon Redshift, DuckDB, and Parquet-on-disk are column stores.
-
-The deep reasons a column store wins at analytics — and each recurs later:
-
-- **I/O proportional to columns touched, not rows.** A query over 3 of 50 columns reads ~6% of the data. A row store must read every row in full to get at those 3 fields.
-- **Compression is dramatically better.** Adjacent values in a column are the same type and highly similar, so run-length encoding, dictionary encoding, delta encoding, and frame-of-reference all work far better than on the heterogeneous bytes of a row (Ch. 63). 10× column compression is routine; it also multiplies effective I/O bandwidth.
-- **Vectorized execution.** A column is a dense array of one type, so the execution engine can process it in SIMD-friendly batches (Ch. 42) — one predicate applied to 1024 packed integers per loop, instead of one branchy row-at-a-time interpreter step.
-
-And the reasons a column store is bad at OLTP:
-
-- **Inserting or reading one row touches every column file.** A single-row insert becomes N separate appends; a single-row read gathers N scattered locations back into a tuple.
-- **Point updates are expensive**, which is why most column stores are append-mostly / immutable (Ch. 67) and batch their writes.
-
----
-
-## 61.7 Row-Oriented Data Layout: The Postgres Heap Tuple
-
-Make the row store concrete with Postgres's on-disk format, because it recurs in Ch. 63–65 and is a favorite interview target.
-
-A Postgres table is stored as a **heap**: a file (actually a set of 1 GB segment files) divided into fixed-size **pages**, 8 KB by default (`BLCKSZ`). A page holds rows in no particular order — "heap" here means *unordered pile*, not the priority-queue structure of Ch. 21. Each page is a **slotted page** (Ch. 63):
-
-```
-8 KB heap page
-┌──────────────────────────────────────────────────────────┐
-│ PageHeader (24 B): LSN, checksum, free-space pointers     │
-├──────────────────────────────────────────────────────────┤
-│ ItemId array (line pointers): (offset,length) per tuple → │
-│   [lp1][lp2][lp3]...            grows downward             │
-├───────────────────────────────────────┬──────────────────┤
-│              free space                │                  │
-├───────────────────────────────────────┴──────────────────┤
-│ ...tuple3  tuple2  tuple1              grows upward        │
-│ each tuple: HeapTupleHeader (23 B) + null bitmap + data   │
-└──────────────────────────────────────────────────────────┘
-```
-
-Two facts about the tuple header carry the whole MVCC story (Ch. 65):
-
-- **`xmin` / `xmax`** — the transaction ids that inserted and (if any) deleted this tuple version. Postgres never overwrites a row in place on update; it writes a **new tuple version** and marks the old one's `xmax`. Both versions coexist on disk; visibility rules pick the right one per transaction. This is **MVCC** (multi-version concurrency control), and it is why Postgres needs **VACUUM** (§61.14) to reclaim dead versions.
-- **`t_ctid`** — a pointer to the *next* version of this row, `(block number, item offset)`. Normally it points to itself; after an update it points forward to the successor version, forming an update chain.
-
-A tuple is addressed by its **TID** (tuple id, exposed as the system column `ctid`): the pair *(page number, line-pointer index)*. Note the **indirection**: an index does not point at a byte offset, it points at a **line pointer**, and the line pointer points at the tuple within the page. That extra hop lets the page be compacted (tuples slid around to reclaim space) without touching any index — only the line pointer moves. Hold onto that; it is the key to §61.14 and to HOT updates.
-
----
-
-## 61.8 Column-Oriented Data Layout in Practice
-
-A pure column store physically stores each column as its own sequence, typically split into **blocks / row-groups** of some number of rows (e.g. Parquet's default row-group is large, ~128 MB; ClickHouse uses granules of 8192 rows). Within a column block the engine applies type-specific encoding and compression, and stores per-block **min/max metadata** (a *zone map*) so that a query can skip entire blocks whose range cannot match a predicate (Ch. 63's sparse-index idea).
-
-```
-Parquet-style file
-  Row group 0
-    Column chunk: id    [pages: dictionary + RLE, min=1, max=8192]
-    Column chunk: age   [pages: delta-encoded,    min=18, max=99]
-    Column chunk: city  [pages: dictionary,       min=..., max=...]
-  Row group 1
-    ...
-  Footer: schema + per-column-chunk metadata (offsets, encodings, stats)
-```
-
-To reconstruct row *i* — needed whenever the query does return whole rows — the engine reads position *i* from each column chunk and stitches them; this is the **tuple reconstruction** cost, and it is why late materialization (delaying reconstruction until after filters cut the row count) is a core column-store optimization.
-
-**Where Postgres fits.** Core Postgres is a row store, full stop. Column orientation comes from outside the heap:
-
-- **Extensions**: Citus's `columnar` access method (formerly `cstore_fdw`) stores tables in a compressed columnar format inside Postgres, using the pluggable table-AM hook from §61.2.
-- **Foreign data / external engines**: query Parquet files via `parquet_fdw`, or pair Postgres with **DuckDB** (an embedded column-store OLAP engine) for analytics over the same data.
-- **Hybrid systems**: Some HTAP designs keep a row store for writes and asynchronously materialize a column store for scans.
-
-The takeaway for interviews: *Postgres is not a column store, and "just add an index" does not turn a row store into an analytics engine.* Column orientation is a physical-storage property, not an index you bolt on.
-
----
-
-## 61.9 Distinctions, Hybrids, and Vectorized Execution
-
-The row/column choice is not binary in modern systems, and the nuances distinguish a shallow answer from a deep one.
-
-- **PAX (Partition Attributes Across).** Store row groups, but *within* each group lay columns out contiguously. You get columnar compression and scan behavior within a group, while keeping a whole row's data on one page for locality. Parquet and ORC are essentially PAX; Postgres's own heap is *not* PAX (it is pure row within a page).
-- **Vectorized vs tuple-at-a-time execution** is a related but separate axis. Classic Postgres uses the **Volcano/iterator model**: each operator's `next()` returns one tuple, pulled up the plan tree — simple, but one virtual call per tuple per operator, murder on the branch predictor and instruction cache (Ch. 27). Column engines use **vectorized execution**: each `next()` returns a *batch* (a vector of, say, 1024 values), amortizing dispatch and enabling SIMD (Ch. 42). Some row stores (SQL Server batch mode, DuckDB) adopt vectorization independent of on-disk layout. **JIT-compiled execution** (Postgres uses LLVM JIT for expression evaluation on big queries) is a third answer to the same interpreter-overhead problem.
-- **HTAP** systems try to be both. Approaches: dual storage (row store + async column replica, e.g. SingleStore, TiDB's TiFlash), or a single format that compromises (fractured mirrors, delta+base designs). The hard part is keeping the analytical copy fresh without slowing the transactional path — a recurring theme once we reach replication in Part II.
-
-The mental model: **on-disk layout** (row / column / PAX) and **execution model** (tuple-at-a-time / vectorized / compiled) are independent knobs, and "column-oriented" loosely bundles both because they pay off together.
-
----
-
-## 61.10 Wide-Column Stores Are Not Column Stores
-
-A perennial source of confusion, and a favorite gotcha. **Wide-column stores** — Apache Cassandra, HBase, Google Bigtable, ScyllaDB — are *not* column-oriented in the §61.6 sense. The name refers to the **data model**, not the physical layout.
-
-A wide-column store is a **map of maps**: a row key maps to a set of **column families**, and within a family a possibly-huge and *per-row-variable* set of columns maps to values. Different rows can have entirely different columns — the "wide" and "sparse" part — which a rigid relational row cannot do.
-
-```
-Bigtable/Cassandra logical model:
-  row key ──▶ { column family A: { col1: v, col2: v, ... },
-               column family B: { colX: v, ... } }
-  another row key can have a completely different set of columns.
-```
-
-Physically, wide-column stores are usually **LSM-tree** engines (Ch. 67): writes append to sorted string tables, grouped *by column family*. So there is a grain of truth — data within a column family is stored together — but the model is a sparse, schema-flexible key-value map, and the physical engine is LSM, not the compressed columnar format of a Vertica or ClickHouse. Calling Cassandra a "column-oriented database" in an interview is the kind of imprecision that gets flagged. It is a **wide-column** store; ClickHouse is **column-oriented**; the two solve different problems.
-
----
-
-## 61.11 Data Files and Index Files
-
-Every disk-based engine splits its on-disk state into two kinds of file, and the relationship between them is the crux of Part I.
-
-- **Data files** hold the actual records. In Postgres these are the heap files (§61.7).
-- **Index files** hold structures that map a search key to a *location* in the data files, so you can find a record without scanning everything.
-
-The point of an index is to make lookups sublinear. A full **sequential scan** of a table is O(N) blocks — fine for OLAP, ruinous for a point lookup on a billion-row table. An index turns that into O(log N) block accesses (B-tree, Ch. 62) or an O(1)-ish hash probe. Without indexes a DBMS is a very expensive flat file.
-
-Indexes are classified along axes that recur constantly:
-
-| Axis | Meaning |
+| Chapter | Question it owns |
 |---|---|
-| **Primary vs secondary** | Primary index is built on the key by which data is physically organized; secondary indexes are all the others. |
-| **Clustered vs non-clustered** | Clustered: the data file *is* ordered by the index key (index and data are one structure). Non-clustered: the index is separate, pointing into an independently-ordered data file. |
-| **Dense vs sparse** | Dense: one index entry per record. Sparse: one entry per *block/page*, relying on within-block scan (Ch. 62–63). |
-| **Covering** | The index contains all columns a query needs, so the data file need not be touched at all (index-only scan). |
+| 61 | Which workload and guarantee drive storage/distribution choices? |
+| 62 | Why does B+tree fan-out produce shallow ordered indexes? |
+| 63 | How do pages become versioned, checksummed durable bytes? |
+| 64 | How does a concurrent B-tree remain searchable through splits? |
+| 65 | How do buffering, WAL, recovery, isolation, MVCC, and locks interact? |
+| 66 | Which tree variants move read/write/space/concurrency costs? |
+| 67 | How do memtables, runs, compaction, filters, and tombstones form an LSM? |
+| 68 | What changes with independent failures and no shared memory/clock? |
+| 69 | What can a failure detector suspect, with what error trade-off? |
+| 70 | How do terms, elections, leases, and fencing constrain authority? |
+| 71 | Which replication and consistency guarantee does a client observe? |
+| 72 | How are divergent replicas repaired and membership changes spread? |
+| 73 | Why do cross-partition transactions block, abort, or coordinate? |
+| 74 | How does a quorum-replicated log commit and compact agreed state? |
 
-These are the vocabulary of the next several chapters; §61.12–61.14 make them concrete in Postgres and its rivals.
+This order is a dependency path, not a requirement for every role. A storage-
+kernel candidate may stop after Chapter 67; an infrastructure candidate can
+skim 62–67 after this overview and focus on 68–74.
 
----
+## 90-second screen — Core
 
-## 61.12 Data Files: Heap-Organized vs Index-Organized
+1. Start with workload: point/range access, read/write mix, record size, working
+   set, durability point, concurrency, retention, and tail target.
+2. A DBMS layers query semantics over an execution engine, transaction/recovery
+   subsystem, indexes, buffer manager, and durable files. A storage engine is the
+   lower part, not a synonym for the full DBMS.
+3. Pages are transfer, caching, concurrency, and recovery units. Index fan-out,
+   page occupancy, cache residency, and device behavior—not “disk is slow”—drive
+   access cost.
+4. B+trees organize mutable ordered pages; LSM designs buffer writes and create
+   immutable sorted runs. Compare read, write, and space amplification plus
+   background work.
+5. Page-cache I/O, a private buffer pool, `mmap`, and direct I/O place caching and
+   faults differently. None is a universal latency winner.
+6. WAL and copy-on-write are recovery strategies, not durability by themselves.
+   Ordering, synchronization, checksums/commit markers, and recovery rules define
+   the durable prefix.
+7. Transactions combine atomicity, isolation, and durability policy. Latches
+   protect in-memory structures; locks/MVCC protect logical data semantics.
+8. Distribution adds partial failure and multiple copies. Replication is not
+   consensus, quorum arithmetic alone is not a consistency model, and retries
+   need identities/idempotence.
 
-How is the primary data file itself organized? Two dominant answers, and Postgres and MySQL sit at opposite ends — a comparison interviewers love.
+Two choices to defend:
 
-**Heap-organized (Postgres).** The data file is an unordered heap (§61.7); rows land wherever there is free space. There is **no clustered index** and no "primary" storage order. The primary key is simply a **unique B-tree index** like any other, whose entries point (via TID) into the heap. Consequences:
-
-- All indexes, including the primary key, are **secondary** in structure: they store a key and a **TID** into the heap. There is no "special" primary index that owns the rows.
-- A point lookup is: probe the index → get a TID → fetch the heap page → return the tuple. Two structures, at least two page reads.
-- The `CLUSTER` command physically reorders the heap to match one index's order *once*, but Postgres does **not** maintain that order as rows change — it decays immediately. Postgres has no self-maintaining clustered index.
-
-**Index-organized / clustered (MySQL InnoDB, Oracle IOT).** The table *is* a B-tree keyed on the primary key; the full row lives in the B-tree's leaf pages. There is no separate heap. Consequences:
-
-- A primary-key lookup finds the whole row in the leaf — one structure, no second hop.
-- **Secondary indexes store the primary key**, not a physical pointer, at their leaves. So a secondary-index lookup does two B-tree descents: secondary index → primary key → clustered index → row. This is why a large or randomly-generated primary key bloats every secondary index and why InnoDB advises small, monotonic primary keys.
-- Insert order matters: a random primary key causes page splits all over the clustered B-tree; a monotonic key (auto-increment) appends to the rightmost leaf.
-
-The trade-off in one line: **heap-organized decouples the primary key from physical layout (cheap secondary indexes, but every read is an index + heap hop); index-organized fuses them (fast primary-key reads, but fat secondary indexes and split-sensitive inserts).**
-
----
-
-## 61.13 Index Files: Primary, Secondary, Clustered, Non-Clustered
-
-Nail the four-way vocabulary from §61.11, because the terms are used inconsistently in the wild and an interviewer may be checking whether you can disentangle them.
-
-- A **primary index** is the index on the attribute that determines physical order. In an index-organized table it *is* the table. In heap-organized Postgres there is arguably no primary index in this strict sense — the primary-key index is just the unique index the DBA designated.
-- A **secondary index** is any additional index. It always needs a way to reach the row: a physical TID (Postgres) or the primary key (InnoDB clustered tables).
-- **Clustered** means index order = data order. There can be at most **one** clustered index per table, because data can only be sorted one way. InnoDB's primary key is clustered; Postgres has none maintained.
-- **Non-clustered** means the index is a separate structure whose order is independent of the data. You can have many.
-
-A **covering index** short-circuits the row fetch entirely: if every column the query references is present in the index, the engine does an **index-only scan** and never touches the heap. Postgres supports this and adds `INCLUDE` columns (stored only in the leaf, not part of the key) precisely to make more queries covering. The catch in Postgres: because visibility info lives in the heap (§61.7), an index-only scan still must consult the **visibility map** to confirm the page is all-visible; if not, it falls back to a heap fetch. That coupling of visibility to the heap is a direct consequence of MVCC and recurs in Ch. 65.
-
----
-
-## 61.14 The Primary Index as Indirection
-
-Here is the unifying idea the book highlights: **an index entry points at a record's *location*, and that location is deliberately an indirection, not a raw byte address.** The extra level of indirection is what makes the storage engine maintainable.
-
-In Postgres the chain is: index entry → **TID** *(page, line-pointer index)* → **line pointer** *(offset, length within page)* → tuple bytes. Two indirections. Why bother?
-
-- **Intra-page compaction.** When a page accumulates dead tuples, Postgres can slide the live tuples together to reclaim contiguous free space, updating only the **line pointers** — the TIDs the indexes hold still resolve correctly. No index needs updating for a page-internal move. Without the line-pointer level, every compaction would have to rewrite every index.
-- **Row versioning across pages.** When an update must place the new tuple version on a *different* page (the current page is full), the old tuple's `t_ctid` points forward to the new TID, and the indexes are updated to point at the new version. But when the new version fits on the **same page** and no indexed column changed, Postgres performs a **HOT** (Heap-Only Tuple) update: it chains the new version off the old via `t_ctid` and **does not touch any index at all**. Indexes still point at the original line pointer, which is redirected to the current version. HOT is one of Postgres's most important write optimizations, and it exists *only because of the indirection layer*.
-
-The cost of MVCC's copy-on-update is **dead tuples** — old versions no longer visible to any transaction. **VACUUM** reclaims them: it scans for dead tuples, removes their index entries, and frees their line pointers for reuse; **autovacuum** does this in the background. Neglected vacuuming causes **table bloat** (files far larger than live data) and, in the extreme, **transaction-ID wraparound**, the failure mode that has taken down production Postgres fleets. All of it traces back to §61.7's decision to keep multiple versions in the heap — a decision the indirection layer makes survivable.
-
-This same indirection idea appears everywhere: LSM trees indirect through levels and a memtable (Ch. 67); some engines add a **translation layer** (a logical-to-physical id map) so that background compaction can relocate data without rewriting references — the same trick, one level up.
+- B+tree, LSM, hash/log, or hybrid—from workload and amplification, not product
+  fashion.
+- Local commit, synchronous replication, or asynchronous replication—from the
+  acknowledged guarantee and failure model.
 
 ---
 
-## 61.15 Buffering, Immutability, and Ordering: The Three Axes
+## Workload and system layers
 
-The book's central organizing claim, and the one to be able to reproduce cold: nearly every storage structure is defined by its choice on three orthogonal axes. These three axes are the map for all of Chapters 62–67.
+## 61.1 From an HFT Service to a Storage Engine — Core
 
-**1. Buffering — do writes accumulate in memory before hitting disk?**
-- *Not buffered*: apply each change to the on-disk structure immediately. Simpler, but many small random writes.
-- *Buffered*: batch changes in a memory buffer and flush them together as larger, more sequential writes. LSM trees are built on buffering (the memtable); B-trees buffer implicitly via the page cache and some variants buffer explicitly.
-
-**2. Mutability (immutability) — are files updated in place or only appended?**
-- *In-place / mutable*: overwrite existing bytes. B-trees mutate pages in place. Efficient space use, but requires careful concurrency and crash handling (you can catch a page half-written — Ch. 63's torn-page problem).
-- *Immutable / append-only*: never overwrite; write new data and treat old as obsolete, reclaiming later via compaction. LSM SSTables are immutable. Immutability simplifies concurrency (readers never see a half-written record) and crash recovery, at the cost of space amplification and background compaction.
-
-**3. Ordering — are records kept sorted by key on disk?**
-- *Ordered*: records (or the index over them) are sorted by key, enabling range scans and binary search. B-trees keep keys ordered.
-- *Unordered*: records are stored in write/arrival order (a heap, or a hash-indexed log like Bitcask, Ch. 67), giving fast writes but requiring an index for any ordered access.
+An in-memory order map and a storage engine both map keys to values, but a
+storage engine must survive capacities and failures that invalidate ordinary
+container assumptions:
 
 ```
-                 Buffered?     In place vs append?   Ordered on disk?
-B-tree           mostly no     in place              ordered
-LSM tree         yes (memtbl)  append-only           ordered (per SSTable)
-Heap file        no            append (+ in-place    unordered
-                               reuse of free space)
-Hash log (Bitcask) no          append-only           unordered
+hot service state                    storage-engine state
+-----------------                    --------------------
+objects in one address space         records outlive one process
+pointer/reference identity           logical page/record identifiers
+cache lines as movement units        pages/blocks plus cache lines
+process crash may lose state         recovery reconstructs a valid state
+one owner can serialize updates      concurrent transactions need semantics
+local memory ordering                persistent and replicated ordering
 ```
 
-The reason these three axes matter more than any feature list: they *predict the performance profile*. Buffered + immutable + ordered (LSM) gives excellent write throughput and good range reads at the cost of read amplification and compaction (write amplification) — the **RUM conjecture** trade-off (Ch. 67) that you cannot minimize Read, Update, and Memory overhead all at once. In-place + ordered + unbuffered (B-tree) gives excellent point/range reads and read-modify-write, at the cost of random write I/O. **B-trees vs LSM trees is the headline rivalry of Part I, and it is entirely explained by these three axes** — which is why Chapters 62–66 develop the B-tree and Chapter 67 develops its immutable, buffered counterpart.
+The transition is not “replace `unordered_map` with a B-tree.” It introduces a
+file format, checksums/versioning, free-space management, a cache, recovery
+metadata, concurrency control, background maintenance, and operational tools.
+
+A **database** is an organized collection of data. A **database management
+system (DBMS)** provides definition, query, update, concurrency, recovery,
+security, and administration. A **storage engine** maps logical records/index
+operations to cached and durable bytes while preserving its transaction and
+recovery contract.
+
+Relational vocabulary remains useful even for non-relational engines:
+
+- a **schema** defines named objects and constraints;
+- a **table/relation** contains rows/tuples described by columns/attributes;
+- a **key** identifies or orders records;
+- a **primary key** is the chosen row identity; uniqueness is a logical
+  constraint, not merely an index property;
+- a **foreign key** constrains references between relations;
+- a **catalog** stores metadata about schemas, types, indexes, privileges, and
+  dependencies.
+
+Physical design may diverge sharply while preserving the same relational
+semantics. SQL does not require one page layout, index, MVCC scheme, or WAL
+algorithm.
+
+## 61.2 DBMS Layers and Query Flow — Core
+
+A useful decomposition is:
+
+```
+client/protocol
+      │ statement or prepared operation
+      ▼
+parse → semantic analysis/catalog lookup → rewrite
+      ▼
+planner/optimizer: logical alternatives → physical plan
+      ▼
+executor: scans, joins, sorts, aggregates, expression evaluation
+      ▼
+transaction + access methods + buffer manager + recovery
+      ▼
+files / page cache or direct I/O / storage device
+```
+
+The boundaries are conceptual; products combine or split components. A query
+processor owns language semantics and plan choice. The executor drives physical
+operators. Access methods implement heap, index, or log operations. The
+transaction subsystem defines visibility and conflicts. Recovery reconstructs a
+valid durable state after interruption.
+
+### Planning and execution in one table
+
+| Concern | Input | Decision/output | Failure or cost risk |
+|---|---|---|---|
+| Parse/analyze | Text/protocol values + catalog | Typed logical expression | Invalid names/types, catalog contention |
+| Rewrite | Views/rules/policies | Equivalent logical tree | Expansion and semantic surprises |
+| Optimize | Logical tree + statistics | Join order, scans, algorithms | Cardinality error chooses poor work |
+| Execute | Physical plan | Batches/tuples | Spills, branch/virtual overhead, skew |
+| Access method | Keys/predicates | Records or identifiers | Page reads, amplification, contention |
+| Transaction | Reads/writes | Visibility/conflict decisions | Blocking, aborts, anomalies |
+| Recovery | Log/pages/checkpoints | Recoverable state | Torn/corrupt writes, missing ordering |
+
+Statistics—row counts, distributions, most-common values, distinct counts, and
+correlations—feed cardinality estimates. Those estimates influence sequential,
+index, or bitmap scans; nested-loop, hash, or merge joins; and whether sort,
+aggregate, window, or materialization work fits memory. A cost estimate is a
+model in product-specific units, not a prediction of wall-clock nanoseconds.
+
+**Tuple-at-a-time** (Volcano-style pull) execution asks operators for one row at
+a time. **Vectorized** execution processes batches, amortizing dispatch and
+enabling cache/SIMD-friendly loops. This axis is independent of row versus column
+storage, though columnar batches often complement vectorization. JIT compilation
+can reduce expression interpretation after paying compilation cost; prepared
+statements can reuse analysis/plans but may face a generic-versus-parameter-
+specific plan trade-off. Parallel workers add setup, exchange, and skew costs.
+
+The chapter does not catalog optimizer algorithms. The interview model is:
+
+```
+estimated rows → physical choice → memory/I/O/concurrency consequences
+```
+
+Use product tools such as `EXPLAIN` and runtime instrumentation to compare
+estimated with observed rows and work. Exact node names, cost constants, and JIT
+or parallel thresholds are product/version/configuration details.
+
+## 61.3 Workload Before Product — Core
+
+Classify the workload before selecting structures.
+
+| Dimension | Questions |
+|---|---|
+| Access | Equality, ordered range, prefix, full scan, aggregation, latest value? |
+| Mutation | Insert, update-in-place semantics, append, delete, overwrite frequency? |
+| Mix | Read/write ratio, burst shape, skew, hot keys, concurrent writers? |
+| Size | Record/key size, working set, total/retained data, growth rate? |
+| Correctness | Atomic unit, isolation, uniqueness, constraints, acknowledged durability? |
+| Latency | p50/tail target for foreground work; allowed background interference? |
+| Operations | Backup, restore, schema evolution, compaction/vacuum, observability? |
+| Distribution | One failure domain, replicas, partitions, geographic latency, availability? |
+
+**OLTP** workloads perform many small transactional reads/writes, commonly by
+key. **OLAP** workloads scan and aggregate many rows while touching selected
+columns. **HTAP/mixed** systems attempt both; they often separate representations
+or replicas because one layout rarely serves both optimally.
+
+Do not infer storage from the label alone. An append-heavy event ledger is
+transactional but may favor a log/LSM path. A point lookup with strict range
+queries may favor a B+tree. An OLAP engine ingesting tiny updates may buffer them
+before producing columnar segments.
 
 ---
 
-## 61.16 The Life of a Query: An End-to-End Walkthrough
+## The storage-engine comparison framework
 
-Tie the layers together by tracing `SELECT * FROM orders WHERE id = 42;` through a warm Postgres, naming which chapter owns each step.
+The four headline comparisons operate at different layers:
 
-1. **Transport.** The client sends the query over the wire protocol; the backend process (§61.3) for this session receives it. Under the hood this is a TCP byte stream (Ch. 38) framed by Postgres's message protocol.
-2. **Parse.** The parser turns SQL text into a parse tree, resolving `orders` and `id` against the system catalogs (themselves ordinary tables).
-3. **Plan/optimize.** The optimizer estimates that a point lookup on the primary key `id` is cheapest via the `orders_pkey` B-tree index (an **Index Scan**), not a Seq Scan. This is cost-based and depends on statistics gathered by `ANALYZE`.
-4. **Execute — index descent.** The executor asks the B-tree access method for `id = 42`. The B-tree is walked root → internal → leaf (Ch. 62); each page is fetched through the **buffer manager** (§61.15, Ch. 65): if resident in `shared_buffers`, it is a memory hit; if not, a page read from the heap file (Ch. 34 I/O). The leaf yields a **TID** (§61.14).
-5. **Execute — heap fetch.** The executor fetches the heap page named by the TID (again via the buffer manager), follows the line pointer to the tuple, and applies **MVCC visibility** (§61.7, Ch. 65): is this tuple version visible to my transaction's snapshot? It follows the `t_ctid` update chain if needed to find the version I should see.
-6. **Return.** The visible tuple is projected and sent back up through the executor to the transport layer to the client.
+| Decision | Option A | Option B | Governing question |
+|---|---|---|---|
+| Index/update organization | B+tree | LSM/tree of sorted runs | Pay foreground page updates or background compaction? |
+| Cache/I/O control | OS page cache/`mmap` | Private buffers/direct I/O | Who owns residency, eviction, faults, and writeback? |
+| Crash recovery | WAL + later page write | Copy-on-write + root publication | Which ordered durable evidence selects committed state? |
+| Failure domain | Local state | Partitioned/replicated state | Which failures must acknowledged work survive? |
 
-Every subsystem this chapter introduced appears: process model (§61.3), buffer pool (§61.15), B-tree access method (§61.11), heap layout and TID indirection (§61.7, §61.14), MVCC (§61.7). The rest of Part I zooms into each: **how the B-tree in step 4 is structured (Ch. 62), how its pages are laid out on disk (Ch. 63), how it is actually implemented and kept balanced under concurrent writes (Ch. 64), how the transaction and durability machinery in step 5 works (Ch. 65), what variants trade off differently (Ch. 66), and what a fundamentally different, append-only engine looks like (Ch. 67).** Part II then asks what changes when the data — and these very mechanisms — are spread across many nodes.
+These are not bundles. A B+tree can be copy-on-write; an LSM still usually needs
+a log for unflushed memory; either can use buffered or direct I/O; either can sit
+behind replication. Treating “LSM + direct + distributed” as one product category
+hides the decisions the interview is testing.
+
+Three additional axes predict much of the behavior:
+
+- **buffering:** apply changes near their destination or accumulate/batch them;
+- **mutability:** update existing durable pages/runs or write new generations;
+- **ordering:** maintain key order, hash placement, or append order.
+
+Each optimization moves work. Buffering moves writes into flush; immutability
+moves reclamation into compaction; ordering makes ranges cheap but requires
+maintenance. Ask when the moved work runs, what bounds it, and whether it shares
+the foreground CPU, memory bandwidth, cache, and device queue.
+
+## 61.4 Rows, Columns, Memory, and Authority — Core
+
+### Row versus column layout
+
+A row layout places fields of one record together:
+
+```
+[id|symbol|price|qty] [id|symbol|price|qty] ...
+```
+
+A column layout groups one field across records:
+
+```
+[id id id ...] [symbol symbol ...] [price price ...] [qty qty ...]
+```
+
+Row layout favors operations that consume or update most of one record.
+Column layout favors scans over a subset of columns, compression of similar
+values, and vectorized operations. Columnar updates often accumulate in deltas
+or new segments instead of modifying a compressed value in place.
+
+“Wide-column” describes a data model associated with systems such as Bigtable-
+style stores; it does not imply the analytical columnar physical layout above.
+A wide-column product may use an LSM engine internally. Keep data model, physical
+layout, and execution model as separate axes.
+
+### In-memory versus storage-resident authority
+
+An in-memory engine treats RAM as the primary online representation; a
+storage-resident engine organizes durable pages/files and uses RAM as a cache.
+This does not decide durability. An in-memory engine can acknowledge only after
+a durable log/replica condition, while a storage-resident engine can acknowledge
+buffered writes before stable storage if configured that way.
+
+Ask:
+
+- Does the authoritative working set fit with headroom, indexes, versions, and
+  allocator overhead?
+- What is rebuilt after restart, from which log/snapshot, within what recovery
+  objective?
+- Does pointer-rich layout block portability or fast restart?
+- What happens when memory pressure exceeds assumptions?
+
+Device technology changes the gap but not the framework. NVMe reduces access
+latency and supports parallel queues compared with rotating media, so “random
+I/O is always catastrophic” is obsolete. Random access can still increase
+requests, queueing, metadata work, write amplification, and tail variability;
+sequential/batched access still improves locality and device efficiency under
+many workloads. Name the device and queue/load.
+
+## 61.5 Pages, Data Files, and Index Indirection — Core
+
+Storage engines group bytes into **pages** (or blocks). A page is commonly:
+
+- a unit read/written through the storage/cache layer;
+- a unit protected by an in-memory latch;
+- a unit carrying checksum/version/recovery metadata;
+- a unit managed for free space and eviction.
+
+The engine’s page size need not equal a device sector, filesystem block, virtual
+memory page, or CPU cache line. Correctness must account for the actual write
+atomicity and synchronization guarantees of the deployed stack.
+
+A **slotted page** keeps an array of stable slot/line identifiers and places
+variable-sized records elsewhere in the page:
+
+```
++---------------- page ----------------+
+| header | slot directory →            |
+|          free space                  |
+|                 ← record bytes       |
++--------------------------------------+
+```
+
+Compaction can move record bytes while updating slots, leaving external record
+identifiers such as `(page_id, slot_id)` stable. Chapter 63 owns format,
+checksums, endian/version handling, and crash assumptions.
+
+### Heap-organized versus index-organized
+
+A heap-organized table stores rows without maintaining primary-key order; indexes
+point to row identifiers. An index-organized/clustered design stores rows in the
+leaves of an ordering index, often the primary-key tree.
+
+| Choice | Advantage | Cost |
+|---|---|---|
+| Heap + secondary indexes | Stable row identifier can serve several indexes; cheap unordered append | Lookup may need index then heap; locality depends on heap organization |
+| Clustered/index-organized | Primary-key/range locality; one descent reaches row | Secondary indexes need a row locator/primary key; key moves/splits affect layout |
+
+“Primary,” “secondary,” “clustered,” and “unique” describe different properties.
+A primary key is logical identity; a unique index can enforce it. A secondary
+index is another access path. Clustering describes physical organization or a
+product-specific reordering feature, not universal SQL semantics.
+
+Indirection is deliberate:
+
+```
+secondary key → row ID or primary key → page/slot → record/version
+```
+
+It lets storage move records/pages or change versions without exposing raw
+addresses. The extra lookup is a read-amplification/locality cost. Product
+implementations choose different locators.
+
+## 61.6 Index Families and Amplification — Core
+
+An index trades write/space/maintenance cost for access.
+
+### B+tree
+
+A B+tree keeps separator keys in internal pages and ordered entries/records in
+linked leaf pages. High fan-out keeps height small. Equality lookup descends one
+root-to-leaf path; range scans descend once and traverse leaves.
+
+An approximate internal fan-out is:
+
+```
+fanout ≈ floor((page_bytes - header_bytes) / (separator_bytes + child_ref_bytes))
+```
+
+This is a capacity estimate, not an I/O count. Effective height also depends on
+occupancy, prefix/key compression, leaf capacity, root/internal cache residency,
+and concurrent structure changes. Chapter 62 derives it; Chapter 64 owns
+concurrent implementation.
+
+### Worked fan-out estimate
+
+Suppose an illustrative design uses 16,384-byte pages, reserves 128 bytes for
+page metadata, and needs 24 bytes per separator-plus-child entry. Its maximum
+internal fan-out estimate is:
+
+```
+usable bytes       = 16,384 - 128 = 16,256
+maximum fan-out    = floor(16,256 / 24) = 677
+planning fan-out   ≈ 677 × 0.70 ≈ 474
+```
+
+The 70% occupancy is a planning assumption, not a B+tree invariant. An engine
+may target different fill factors at bulk load, leave split room, compress
+prefixes, or experience skewed occupancy.
+
+If a leaf entry averages 40 bytes, the same page holds at most 406 entries and
+roughly 284 at the illustrative 70% occupancy. One billion entries would
+therefore occupy about:
+
+```
+ceil(1,000,000,000 / 284) ≈ 3.52 million leaf pages
+```
+
+Because \(474^2 = 224{,}676\) is too small to address that many leaves while
+\(474^3 = 106{,}496{,}424\) is ample, this simplified model needs three internal
+levels plus the leaf level. That is four logical page visits per point lookup.
+It is **not** a prediction of four physical device reads: the root and upper
+internal pages are small enough to be hot in many deployments, the leaf may
+already be cached, and one read can trigger readahead or queueing. Conversely, a
+visibility check or heap indirection may add another page. The useful habit is
+to separate logical structure depth from cache misses and device service time.
+
+B+trees update ordered pages in place conceptually, though buffer pools, WAL,
+copy-on-write variants, and storage devices transform the physical write path.
+Splits and page contention can create foreground tails. They provide natural
+ordered/range access and usually bounded lookup fan-out.
+
+### LSM tree
+
+An LSM design accepts writes into an in-memory ordered structure, records
+durability separately, and flushes immutable sorted files. Reads consult memory
+and one or more on-disk runs, aided by indexes/filters. Background compaction
+merges runs, discards overwritten/deleted versions when safe, and reorganizes
+levels.
+
+It converts many small updates into sequential/batched writes but pays:
+
+- **write amplification:** bytes rewritten during flush/compaction;
+- **read amplification:** structures/runs checked per query;
+- **space amplification:** obsolete/duplicate versions awaiting reclamation;
+- background CPU, bandwidth, and tail interference.
+
+Leveling, tiering, size ratios, filters, key distribution, update/delete mix, and
+compaction scheduling change those costs. “LSM is for writes, B+tree is for
+reads” is only a first approximation. Chapter 67 derives both paths.
+
+### Hash/log and hybrid choices
+
+A hash index can provide equality access without ordered ranges. An append-only
+log can make ingestion/recovery simple but needs indexes and reclamation.
+Fractal/buffered trees, copy-on-write trees, and separated value logs rearrange
+amplification. Chapter 66 compares representative variants; the selection method
+stays constant.
+
+### Comparison axes
+
+| Axis | Questions |
+|---|---|
+| Foreground reads | Structures/pages touched; cache residency; range behavior? |
+| Foreground writes | Pages/logs/metadata changed; split/flush probability? |
+| Background work | Compaction, vacuum, checkpoint, index build; throttle/control? |
+| Space | Indexes, free space, old versions, temporary rewrite headroom? |
+| Concurrency | Hot-page/key conflicts; latch/lock scope; snapshot cost? |
+| Recovery | WAL/COW/checkpoint; replay volume; corruption detection? |
+| Device/cache | Page cache, direct I/O, `mmap`; queue depth and locality? |
+| Operations | Backup, incremental restore, format evolution, observability? |
+
+### Work backward from the observable guarantee
+
+In a design interview, avoid beginning with component names. Begin with one
+operation and work backward:
+
+```
+client acknowledgement
+  ← commit/visibility rule
+  ← required durable log, page, or root state
+  ← buffer and device synchronization
+  ← index/data changes
+  ← logical transaction and access pattern
+```
+
+Then work forward through recovery. Ask what durable evidence exists after an
+interruption at every arrow and how recovery selects one valid outcome. This
+two-direction trace exposes missing assumptions. For example, “append to a log”
+does not say whether the index can lag, whether the log suffix can tear, or
+whether acknowledgement waits for synchronization. “Replicate to three nodes”
+does not say which nodes must acknowledge or who is allowed to accept a write
+after failover.
+
+Use three budgets rather than one average-latency number:
+
+- **foreground budget:** lookup, mutation, conflict handling, and commit work
+  before response;
+- **background budget:** writeback, checkpoint, vacuum/reclamation, compaction,
+  backup, and replica catch-up;
+- **recovery budget:** detection, replay/repair, leadership or fencing, and
+  service restoration.
+
+Background work consumes the same finite CPU, memory bandwidth, cache, and
+storage queues unless isolation is demonstrated. A design that meets steady
+state by accumulating unlimited maintenance debt is unstable, not fast. Record
+the overload action too: throttle ingestion, reject work, shed optional queries,
+increase lag, spill, or violate no acknowledged guarantee. An explicit degraded
+mode is safer than an accidental one.
+
+## 61.7 Buffer Managers and I/O Policy — Core
+
+A **buffer pool** maps logical page IDs to memory frames and tracks pin/use/dirty
+state. A miss chooses or obtains a frame, reads the page, validates it, and makes
+it available. Eviction must not remove a pinned/in-use frame; dirty eviction
+requires writeback consistent with recovery ordering.
+
+```
+page request
+  ├─ hit  → pin/latch/use/unpin
+  └─ miss → choose frame → write dirty victim if allowed
+                         → read/validate requested page → install
+```
+
+Replacement policy predicts future reuse imperfectly. Sequential scans can
+pollute a cache; hot indexes benefit from residency. Pinning everything prevents
+eviction but fails once working set or concurrent pins exceed capacity.
+
+On Linux, an engine may use:
+
+- buffered `read`/`write` through the OS page cache;
+- a private buffer pool on top of buffered I/O, accepting possible double
+  caching for control/portability;
+- `mmap`, shifting misses into page faults and using virtual-memory replacement;
+- direct I/O with aligned application buffers, managing cache/readahead itself.
+
+Chapter 34 owns the I/O mechanics. The storage decision depends on working set,
+access pattern, memory accounting, fault tolerance, concurrency, and operational
+control. `mmap` does not remove I/O; direct I/O does not imply durability; the
+page cache is not inherently unpredictable in every workload.
+
+### A page is a state machine
+
+A practical buffer manager cannot treat a cached page as merely present or
+absent. A frame moves through states such as:
+
+```
+absent → loading → clean → dirty → flushing → clean
+                    ↕       ↕
+                 pinned / latched
+```
+
+The arrows hide important rules. Concurrent missers should normally coordinate
+on one load rather than issue duplicate reads. A page can be dirty again while
+an older image is being written, so completion must not erase the newer dirty
+state. An eviction candidate must have no active pins, and its short structural
+latch is distinct from a transaction lock. A failed checksum or short read must
+not publish a valid-looking frame.
+
+Recovery adds an ordering constraint: before a dirty page containing change
+record \(L\) is written to its durable home, the required log prefix through
+\(L\) must already be durable. Replacement and checkpoint code therefore
+interact with WAL even though they solve different problems.
+
+Capacity is policy too. A large sequential scan can evict a small, valuable
+index working set, so engines may use scan rings, admission rules, or separate
+priorities. A private pool over the OS page cache can duplicate some bytes, but
+it can also provide explicit pinning, checksums, page identities, and recovery
+coordination. Measure useful residency and tail latency rather than condemning
+or endorsing “double caching” by slogan.
+
+## 61.8 WAL, Copy-on-Write, Checkpoints, and Durability — Core
+
+Crash recovery needs enough durable information to distinguish committed state
+and repair interrupted updates.
+
+### Write-ahead logging
+
+WAL records changes before corresponding modified data pages may reach stable
+storage:
+
+```
+change page in memory
+      │
+append log record L
+      │
+make required log prefix durable ──► transaction may acknowledge per policy
+      │
+data page can be written later, but never ahead of required WAL
+```
+
+The core ordering invariant is “log before data.” Commit durability additionally
+requires the commit record/prefix to reach the promised durable domain before
+acknowledgement. Group commit amortizes synchronization across transactions but
+adds waiting and coupling. Checkpoints bound recovery work by recording a point
+from which the system can reconstruct state; they do not necessarily flush every
+logical update or eliminate WAL.
+
+Recovery can need redo, undo, or version/visibility processing depending on
+steal/no-force and engine design. Chapter 65 owns those policies. Do not infer
+durability from a release store, page-cache visibility, or a successful ordinary
+write.
+
+### Copy-on-write
+
+A COW structure writes changed pages to new locations and eventually publishes a
+new root/metadata generation. Readers can retain an old immutable generation.
+However:
+
+```
+write child pages → synchronize required data
+                  → write/publish new root metadata
+                  → synchronize commit point
+```
+
+COW does not automatically make a transaction atomic or durable. The engine must
+define write ordering, torn-write detection, metadata redundancy/checksums, root
+selection, free-space reclamation, and recovery after interruption. It may trade
+WAL/replay complexity for rewrite/space amplification.
+
+### Durability is a contract
+
+State the acknowledged failure set:
+
+- process crash only;
+- kernel/host crash;
+- sudden power loss with specified device cache behavior;
+- storage-device loss;
+- availability-zone or site loss.
+
+Local synchronization cannot survive device loss. Replication can survive a
+failure domain only if the acknowledged replica state and fencing/consistency
+protocol provide that guarantee. Product settings can weaken or strengthen the
+contract; name version/configuration.
+
+## 61.9 Transactions and Concurrency — Core
+
+A transaction groups operations under stated atomicity, consistency, isolation,
+and durability semantics. “Consistency” in ACID means application/database
+invariants are preserved by valid transactions; it is not the distributed
+consistency-model term used later.
+
+Two kinds of synchronization are easy to confuse:
+
+- a **latch** protects an in-memory data structure/page during a short critical
+  section;
+- a **lock** or MVCC conflict rule protects logical records/ranges and
+  transaction isolation, potentially across waits.
+
+MVCC retains versions so readers can observe a snapshot while writers create new
+versions. It reduces some read/write blocking but adds visibility checks, old-
+version space, cleanup, and write-conflict rules. Locking can enforce serial
+access but risks waits/deadlocks. Optimistic schemes validate before commit and
+may abort under contention. No label alone specifies anomalies: state the
+isolation level and engine behavior.
+
+Common anomalies—dirty/nonrepeatable reads, lost update, write skew, phantoms—
+depend on transaction histories. Serializable execution preserves an equivalent
+serial ordering, but implementations use locking, validation, SSI-like
+techniques, or combinations, each with abort/wait costs. Chapter 65 owns the
+histories and recovery interaction.
+
+### Worked crash timeline: one transfer
+
+Consider a transaction that debits account \(A\) and credits account \(B\).
+Assume the engine uses WAL and promises that an acknowledged commit survives a
+host crash. The logical invariant is that the sum is unchanged; the physical
+problem is that the two data pages and the log can reach storage at different
+times.
+
+1. The transaction obtains whatever logical concurrency protection its
+   isolation design requires.
+2. It creates the debit and credit changes in memory and appends the
+   corresponding log information.
+3. The buffer manager might write a changed data page before the transaction
+   commits. A **steal** policy allows this and therefore needs a way to undo or
+   hide an uncommitted effect during recovery.
+4. At commit, the engine makes the required log prefix, including the commit
+   decision, durable before acknowledging under this contract.
+5. The changed data pages may remain dirty after acknowledgement. A
+   **no-force** policy allows this and therefore needs redo or an equivalent way
+   to reconstruct committed state.
+
+Now stop the host at three points:
+
+| Crash point | Required recovery outcome |
+|---|---|
+| Before a durable commit decision | Transfer is not committed; neither half may become visible as committed |
+| Commit decision durable, neither data page durable | Redo/reconstruction produces both committed effects |
+| Commit decision durable, one data page durable | Recovery completes the missing effect without applying the other twice |
+
+The exact log records may contain physical byte changes, logical operations,
+page images, compensation information, or version metadata. The invariant is
+more general than any one format: acknowledgement, replay, and visibility must
+agree on a single transaction outcome.
+
+This example also separates **isolation** from **durability**. A perfect recovery
+algorithm does not prevent two concurrent transfers from losing an update.
+Likewise, serializable execution before a crash does not ensure committed bytes
+survive it. Storage systems must compose both properties, then prove the
+composition under their stated failure model.
 
 ---
 
-## Summary
+## Concrete reference and distributed bridge
 
-- A DBMS is a stack: transport → query processor (parse, optimize) → execution engine → **storage engine** (transactions, locks, access methods, buffer pool, recovery). Part I is the storage engine; the SQL standard deliberately leaves it unspecified.
-- Postgres is **process-per-connection** around a shared-memory **buffer pool** (`shared_buffers`), with background processes for checkpointing, WAL, and autovacuum.
-- The **disk vs memory** decision is about where the *authoritative copy* lives and is driven by the 3–5-order-of-magnitude access-time gap; durability is independent of the medium (in-memory stores get it from WAL + snapshots).
-- **Row vs column** layout predicts OLTP vs OLAP fitness; **wide-column** stores (Cassandra) are a *data model*, not the columnar physical layout of a ClickHouse.
-- Postgres is **heap-organized** (rows in an unordered heap; all indexes secondary, pointing via **TID**); InnoDB is **index-organized** (clustered PK B-tree; secondary indexes store the PK).
-- The **primary index as indirection** (index → TID → line pointer → tuple) is what makes intra-page compaction, HOT updates, and VACUUM possible — all consequences of MVCC keeping multiple versions in the heap.
-- Nearly every storage structure is defined by three axes — **buffering, immutability, ordering** — and B-trees vs LSM trees is that choice made two opposite ways.
+## 61.10 PostgreSQL as a Reference, Not the Definition — Role-specific
+
+PostgreSQL is useful because its architecture exposes the general layers, but
+product details are not universal storage rules.
+
+At a high level, supported PostgreSQL releases use a server process that accepts
+connections and creates backend processes, plus auxiliary/background processes.
+Backends share memory containing the buffer pool and coordination structures,
+while retaining local execution memory. Memory contexts group allocations for
+bulk cleanup; resource-owner machinery tracks resources that must be released on
+error. Background roles participate in WAL, checkpointing, writeback, vacuum,
+statistics, and replication. Exact process names/responsibilities evolve by
+release and configuration.
+
+The following is an **implementation map**, not a portable DBMS specification:
+
+```
+client
+  │ frontend/backend protocol
+  ▼
+server process (historically “postmaster”)
+  ├─ backend process for a client session
+  │    parse/rewrite/plan/execute
+  │    local memory contexts + access to shared buffers/catalog state
+  ├─ parallel workers using coordinated shared/dynamic-shared state
+  └─ auxiliary/background processes
+       WAL writing, checkpointing, buffer writeback, vacuum, replication, ...
+```
+
+| PostgreSQL concept | Role and boundary |
+|---|---|
+| Simple query protocol | Sends a query string as one protocol operation; do not equate “simple” with cheap execution |
+| Extended query protocol | Separates parse, bind, optional describe, execute, and synchronization operations; enables parameters and prepared execution |
+| Shared memory | Cross-process buffers, locks, and coordination state established by the server |
+| Local memory/context | Backend-owned allocations grouped by lifetime so an error path can discard a whole context |
+| Dynamic shared memory | Runtime-created cross-process regions used by features such as parallel query; not ordinary session-local memory |
+| Resource owner | Tracks releasable resources across normal and error cleanup; complementary to allocation lifetime |
+| System catalog and OID | Catalog rows describe database objects; object identifiers and dependency records support lookup and lifecycle operations |
+| Relation and physical file identity | A logical relation is not a permanent pathname; physical relation identifiers can change during rewrite-like operations |
+| Tablespace and storage fork | Tablespaces influence physical placement; a relation can have separate main, free-space, visibility, or initialization storage according to relation kind |
+
+This indirection matters operationally. Code that treats an object identifier as
+a forever-stable external ID, or a current relation filename as logical identity,
+crosses an implementation boundary. Likewise, dynamic shared memory does not
+turn PostgreSQL into a thread-per-query engine: cooperating processes still need
+explicit shared representations and synchronization.
+
+Core PostgreSQL tables are heap-organized. B-tree indexes store heap tuple
+identifiers rather than full rows. MVCC updates generally create new tuple
+versions; vacuum reclaims versions no longer visible to any relevant snapshot.
+Same-page heap-only update optimizations and visibility maps reduce particular
+index/heap work under conditions owned by later chapters. These are PostgreSQL
+choices, not definitions of MVCC or a relational DBMS.
+
+### A query walkthrough
+
+Trace a parameterized point query:
+
+```sql
+SELECT account_id, status
+FROM orders
+WHERE order_id = $1;
+```
+
+1. The protocol/backend identifies a statement and parameters.
+2. Parsing and semantic analysis resolve names/types against catalogs; rewrite
+   expands relevant rules/views/policies.
+3. The planner estimates rows and compares paths such as sequential or index
+   scan, using statistics and parameter information.
+4. The executor drives the chosen operators.
+5. A B-tree index path descends cached/read pages and yields a heap identifier.
+6. The heap page is fetched through the buffer manager; MVCC determines which
+   tuple version is visible to the transaction snapshot.
+7. Projection produces result fields and the protocol returns them.
+
+A covering/index-only path may avoid heap data fetches only when the engine can
+establish visibility from maintained metadata; this is product/state-dependent.
+Prepared statements may use custom or generic plans depending on product logic
+and execution history. `EXPLAIN ANALYZE` executes the query and adds
+instrumentation, so its timing is evidence with overhead, not a transparent
+production measurement.
+
+Use this walkthrough to locate a problem:
+
+```
+wrong rows estimate? → statistics/planner
+right plan, many page misses? → index/layout/buffer working set
+page hit, transaction waits? → concurrency/lock conflict
+fast execution, slow response? → queue/protocol/client
+commit tail? → WAL/sync/device/replication
+```
+
+PostgreSQL-specific catalogs, file forks, tuple headers, optimizer search,
+autovacuum, and access-method details belong in role-specific study and later
+chapters. Verify all product behavior against the deployed major version and
+configuration.
+
+## 61.11 From Local Storage to Distributed State — Core
+
+A local storage engine assumes one recovery authority over its files and memory.
+Distribution removes that simplicity:
+
+| Local concept | Distributed extension |
+|---|---|
+| Page/record identifier | Partition/shard key plus replica placement |
+| WAL sequence | Per-replica log plus agreement/order protocol |
+| Process crash | Partial failure: some nodes/links fail while others run |
+| Local durable commit | Which replicas acknowledged, under which failure domains? |
+| Lock/transaction | Coordination across shards; blocking/abort recovery |
+| Checkpoint/backup | Consistent snapshot across changing replicas |
+| One clock/ordering context | No shared memory or perfectly shared global time |
+
+**Partitioning** decides where data and transactions live. Good keys distribute
+load and co-locate operations that need atomicity; bad keys create hotspots or
+cross-partition coordination.
+
+**Replication** maintains multiple copies. Synchronous replication delays
+acknowledgement until a specified replica condition; asynchronous replication
+can acknowledge locally and catch up later, admitting a loss/staleness window.
+Leader-based and leaderless designs make different ordering, failover, and repair
+choices.
+
+A **consistency model** specifies allowed observations—linearizable, sequential,
+causal, session, eventual, or another contract. It is not inferred from the word
+“replicated.” Quorum intersection (`R + W > N`) is insufficient by itself for
+linearizability without a protocol that orders versions, handles incomplete and
+concurrent writes, and reads the correct state.
+
+**Consensus** lets participants agree on ordered decisions despite stated
+failures under stated timing/liveness assumptions. It can replicate a log and
+support leader terms/commit, but does not decide schema, partition key, client
+idempotence, or every distributed transaction automatically.
+
+Retries are ambiguous: a timeout does not prove the operation failed. Carry
+stable request identities and define idempotence/deduplication. Fencing prevents
+a delayed former leader from continuing to mutate an external resource.
+Chapters 68–74 develop these boundaries.
 
 ---
 
-## Key Interview Questions
+## Worked choice and reference
 
-1. **What are the layers of a DBMS, top to bottom?** — Transport/wire protocol → query processor (parser, analyzer/rewriter, cost-based optimizer) → execution engine → storage engine (transaction manager, lock manager, access methods, buffer manager, recovery/WAL) → block device. The optimizer is the compiler; the execution and storage engines are the runtime.
-2. **What is a storage engine, and why is it a separate concept from the DBMS?** — The subsystem that turns rows into durable bytes and back: access methods, buffer pool, transactions, recovery. It is swappable behind the execution engine's cursor API (MySQL's InnoDB/RocksDB, MongoDB's WiredTiger, Postgres's table-AM), and the SQL standard deliberately does not specify it.
-3. **How is a running PostgreSQL instance structured?** — Process-per-connection: a postmaster forks a backend process per client, plus background processes (checkpointer, WAL writer, background writer, autovacuum). All attach to a shared-memory region containing the buffer pool (`shared_buffers`), WAL buffers, and lock tables. This is why Postgres needs a connection pooler at scale.
-4. **Disk-based vs in-memory DBMS — what actually differs?** — Where the authoritative copy lives. Disk-based (Postgres) uses RAM as a cache and on-disk structures (B-trees/LSM) that minimize block transfers; in-memory (Redis, VoltDB) holds the primary copy in RAM and can use pointer-rich structures. Driven by the ~100 ns vs ~50–100 µs vs ~10 ms access-time gap between DRAM, NVMe, and disk.
-5. **If RAM is volatile, how is an in-memory database durable?** — A write-ahead log (append + `fsync` before ack) plus periodic snapshots/checkpoints; recovery loads the latest snapshot and replays the log suffix. Redis: AOF is the WAL, RDB is the snapshot. Durability is a knob (`fsync` per write vs group commit vs OS-deferred), independent of the storage medium.
-6. **Row-oriented vs column-oriented storage — when does each win?** — Row stores keep a whole row contiguous: great for OLTP point read/writes. Column stores keep each column contiguous: great for OLAP because I/O is proportional to columns touched, compression is far better (similar adjacent values), and execution can be vectorized/SIMD. Column stores are bad at single-row insert/update.
-7. **Is PostgreSQL a column store, and how would you do columnar analytics with it?** — No, core Postgres is a row store. Columnar comes from extensions (Citus `columnar` table-AM), foreign data wrappers over Parquet, or pairing with an embedded column engine like DuckDB. You cannot turn a row store columnar by adding an index.
-8. **Why are wide-column stores like Cassandra not "column-oriented"?** — "Wide-column" names the *data model* (a sparse, per-row-variable map of maps grouped into column families), not the physical layout. Cassandra/HBase/Bigtable are usually LSM-tree engines; they are not the compressed columnar format of ClickHouse/Vertica.
-9. **What is a Postgres heap, and how is a tuple addressed?** — A heap is the unordered table file split into 8 KB slotted pages. A tuple is addressed by TID = (page number, line-pointer index), exposed as `ctid`. Indexes point at the TID/line pointer, not at raw bytes.
-10. **Heap-organized vs index-organized tables?** — Heap-organized (Postgres): rows in an unordered heap, all indexes secondary and pointing via TID, no maintained clustered index. Index-organized/clustered (InnoDB, Oracle IOT): the table is a PK B-tree with full rows in the leaves, and secondary indexes store the PK, so a secondary lookup does two descents.
-11. **In InnoDB, why do secondary indexes store the primary key instead of a row pointer, and what's the cost?** — Because the row lives in the clustered PK B-tree and can move on page splits; storing the PK keeps secondary indexes valid across moves. Cost: every secondary lookup does an extra PK B-tree descent, and a large PK bloats every secondary index — hence the advice to use small, monotonic primary keys.
-12. **What does "primary index as indirection" mean and why does it matter?** — An index points at a *location* (TID → line pointer → tuple), not a byte address. The indirection lets Postgres compact a page (moving tuples, updating only line pointers) and perform HOT updates without touching any index. Without it, every relocation would rewrite every index.
-13. **What is a HOT update?** — Heap-Only Tuple update: when an update fits on the same page and changes no indexed column, Postgres chains the new version off the old via `t_ctid` and updates no index. It relies entirely on the line-pointer indirection and greatly reduces index write amplification.
-14. **Why does Postgres need VACUUM?** — MVCC writes a new tuple version on every update/delete and leaves the old ones as dead tuples in the heap. VACUUM reclaims dead tuples and their index entries; autovacuum runs it in the background. Neglect causes table bloat and, in the extreme, transaction-ID wraparound.
-15. **What are the three axes that define a storage structure?** — Buffering (batch writes in memory or not), mutability (update pages in place vs append-only immutable files), and ordering (keep records sorted by key on disk or not). B-trees are unbuffered/in-place/ordered; LSM trees are buffered/immutable/ordered.
-16. **Explain the B-tree vs LSM-tree trade-off in terms of those axes.** — B-tree: in-place, ordered, largely unbuffered → excellent point/range reads and read-modify-write, but random write I/O. LSM: buffered (memtable) + immutable (SSTables) + ordered → excellent write throughput and good range reads, at the cost of read amplification and compaction (write amplification). It is the RUM-conjecture trade (Ch. 67).
-17. **What is a covering / index-only scan, and Postgres's caveat?** — If an index contains every column a query needs, the engine answers from the index and skips the data file. Postgres supports it (with `INCLUDE` columns) but must still check the visibility map, because MVCC visibility lives in the heap; a not-all-visible page forces a heap fetch anyway.
-18. **Walk a point-lookup `SELECT ... WHERE id = 42` through Postgres.** — Backend receives it → parse and catalog-resolve → optimizer picks an Index Scan → B-tree descent (pages via buffer pool) yields a TID → fetch the heap page, follow the line pointer, apply MVCC visibility (follow the `t_ctid` chain if needed) → project and return.
-19. **Dense vs sparse index?** — Dense: one index entry per record. Sparse: one entry per block/page, relying on a scan within the located block; requires the data to be ordered so the block boundaries are meaningful. Sparse indexes are smaller and are how B-tree internal levels and column-store zone maps work.
-20. **OLTP vs OLAP vs HTAP, and how does it map to storage layout?** — OLTP = many small key-based read/writes → row store + B-tree. OLAP = few large scans/aggregations over a few columns → column store + immutable sorted files + vectorized execution. HTAP tries to serve both, usually via dual storage (a row store plus an async column replica), whose challenge is keeping the analytical copy fresh without slowing writes.
-21. **Vectorized vs tuple-at-a-time execution — is it the same as column storage?** — No, it's an independent axis. Volcano/iterator execution returns one tuple per `next()` (a virtual call per tuple per operator); vectorized execution returns a batch (enabling SIMD). Column layout and vectorization pay off together, so the terms get bundled, but row stores can vectorize (SQL Server batch mode, DuckDB) and Postgres JIT-compiles expressions to attack the same interpreter overhead.
-22. **Why can't a single storage structure be optimal for reads, writes, and space at once?** — The RUM conjecture: optimizing any two of Read overhead, Update overhead, and Memory (space) overhead sacrifices the third. B-trees favor reads; LSM trees favor writes and pay in read/space amplification; heavy compression favors space and pays in update cost. The three axes of §61.15 are how you pick your two.
+## 61.12 Worked Choice: Exchange Event History — Core
 
----
+Design a store for an immutable exchange-event history with these **illustrative
+assumptions**, not universal market rates:
 
-## Common Traps
+- sustained ingest `r = 100,000` records/s;
+- encoded record `s = 96` bytes before indexes/metadata;
+- primary access: append and replay by sequence range;
+- secondary access: recent events by order ID;
+- analytics scans a few fields over long intervals;
+- acknowledgement requires a durable local prefix;
+- seven days of online retention; later data moves to colder storage.
 
-- **Calling Cassandra/HBase "column-oriented."** They are *wide-column* (a data-model term); physically they are LSM engines, not the compressed columnar layout of ClickHouse/Vertica.
-- **Assuming "in-memory" means "not durable" (or that disk-based means safe).** Durability is a WAL/`fsync` decision independent of medium; an in-memory store can be fully durable and a disk store can lose data with lazy `fsync`.
-- **Thinking Postgres has a clustered/primary-storage index.** Postgres is heap-organized; the primary key is just a unique B-tree pointing via TID, and `CLUSTER` reorders once and then decays.
-- **Believing an index-only scan in Postgres never touches the heap.** It still consults the visibility map, because MVCC visibility lives in the heap; a not-all-visible page triggers a heap fetch.
-- **Confusing row/column *storage* with vectorized/tuple-at-a-time *execution*.** They are independent knobs that happen to pay off together.
-- **Expecting `SELECT count(*)` or wide-column analytics to be fast on a row store.** Row stores read whole rows; analytics over a few columns of a big table want columnar storage, not another index.
-- **Forgetting that MVCC updates create dead tuples.** Without adequate (auto)vacuuming, tables bloat and transaction-ID wraparound eventually forces the database read-only.
-- **Assuming a large or random primary key is harmless in InnoDB.** It is copied into every secondary index and causes clustered-B-tree page splits; small monotonic keys are strongly preferred.
-- **Treating an index pointer as a byte offset.** It is an indirection (TID → line pointer); that layer is exactly what enables page compaction and HOT updates.
+### Step 1: calculate the unavoidable data rate
+
+```
+payload rate = r × s
+             = 100,000/s × 96 bytes
+             = 9.6 MB/s        (decimal)
+
+payload/day = 9.6 MB/s × 86,400 s
+            = 829.44 GB/day
+```
+
+Seven payload days are about 5.81 TB before page slack, WAL, indexes, checksums,
+replication, temporary compaction/COW space, and filesystem overhead. The first
+design correction is capacity: a “small record” workload is a multi-terabyte
+retention system.
+
+If a secondary index adds `i` bytes per record and total write amplification is
+`WA`, an initial bandwidth model is:
+
+```
+physical write rate ≈ r × (s + i) × WA
+```
+
+`WA` is measured/configuration-dependent. It must include compaction/page
+rewrite and WAL as defined by the accounting boundary; do not mix logical data
+and device-write metrics without labels.
+
+### Step 2: choose representations by access
+
+The authoritative sequence is append-only and range-replayed. A segmented log
+with sparse sequence-to-offset metadata is simpler than forcing every event into
+a mutable primary-key tree. Segment headers/footers, checksums, versioning, and a
+commit/durable-prefix rule are required.
+
+Order-ID lookup is a separate access path. Options:
+
+- a B+tree/hash index updated per event;
+- a buffered/LSM secondary index, accepting compaction/read amplification;
+- an in-memory recent-window index rebuilt from the authoritative log, if older
+  lookup latency and restart time meet requirements.
+
+Analytics over selected fields favors columnar derived segments or a downstream
+analytical replica. Making the ingestion record columnar in place could
+complicate append/recovery and point reconstruction. One system can legitimately
+use a row-like event log, a key index, and columnar derived data.
+
+### Step 3: compare B+tree and LSM for the secondary index
+
+The obvious claim “writes are high, therefore use an LSM” is incomplete.
+
+| Question | B+tree consequence | LSM consequence |
+|---|---|---|
+| Keys mostly append/random? | Random IDs may split/touch scattered leaves | Memtable absorbs order; compaction later |
+| Recent lookups dominate? | Hot upper/leaf pages may cache well | Memory/recent runs may answer cheaply |
+| Range by ID needed? | Natural ordered leaves | Natural per-run order, merged across runs |
+| Tail budget under maintenance? | Splits/checkpoint/writeback | Flush/compaction interference |
+| Storage headroom | Page slack + indexes | Runs + obsolete versions + compaction workspace |
+| Recovery | WAL + dirty-page recovery | WAL/memtable replay + manifest/run recovery |
+
+Prototype both with the actual key distribution, retention deletes, cache budget,
+device, compaction/checkpoint policy, and concurrent analytics. NVMe makes random
+page I/O more viable than HDD folklore suggests, but does not eliminate page
+splits, queueing, write amplification, or cache residency.
+
+### Step 4: select I/O and durability
+
+Buffered I/O may provide effective write coalescing and operational simplicity.
+Direct I/O may give the engine tighter cache/writeback control if it can satisfy
+alignment, buffer, and queue-depth requirements. `mmap` may suit read-only
+segments but exposes page-fault placement and truncation/corruption behavior.
+Benchmark end-to-end acknowledgement and replay, not only sequential bandwidth.
+
+For durable-local acknowledgement:
+
+1. encode a versioned/checksummed record;
+2. append it to the current segment and/or WAL design;
+3. synchronize the promised prefix according to batching policy;
+4. advance a recoverable commit marker/metadata rule;
+5. acknowledge only at the documented durable point.
+
+Group synchronization trades acknowledgement delay for amortized barriers. A
+power-failure/recovery test must demonstrate that scanning selects exactly a
+valid prefix and rejects torn/corrupt suffix data.
+
+### Step 5: make distribution a separate decision
+
+If local-device loss must not lose acknowledged events, local durability is
+insufficient. Add a replica acknowledgement condition and fencing/failover
+protocol, then restate latency and availability during partition. Asynchronous
+replication supports local latency with a loss window; synchronous replication
+adds network/remote storage to the acknowledgement path. Chapter 71 defines the
+consistency/replication choice and Chapter 74 the agreement mechanism.
+
+### Step 6: success measures and rollback
+
+Measure:
+
+- acknowledgement p50/tail under sustained/bursty ingest;
+- physical bytes written per logical byte;
+- replay and point-lookup latency with cold/warm cache;
+- compaction/checkpoint overlap tails;
+- recovery time and valid-prefix correctness after injected interruption;
+- disk-space high-water, including maintenance workspace;
+- replica lag and acknowledged-loss behavior if distributed.
+
+Keep segment/index format versioned and the reference replay path available.
+Rollback must not require reading new files with an old binary unless
+compatibility was designed and tested.
+
+## 61.13 Comparison Checklist — Reference
+
+### Workload
+
+- [ ] Point, range, scan, aggregation, and latest-value access are quantified.
+- [ ] Read/write/delete mix includes bursts, skew, hot keys, and concurrency.
+- [ ] Working set, retained size, record/key size, and growth are calculated.
+- [ ] Foreground tail and background maintenance budgets are separate.
+
+### Storage
+
+- [ ] Logical record identity is independent of raw address.
+- [ ] Page/segment size, occupancy, checksum, version, and atomicity assumptions
+  are explicit.
+- [ ] Read/write/space amplification accounting boundaries are named.
+- [ ] Buffer/page-cache/direct/`mmap` choice includes fault and memory accounting.
+- [ ] Maintenance workspace and overload throttling are sized.
+
+### Transactions and recovery
+
+- [ ] Atomic unit, isolation level, and conflict behavior are stated.
+- [ ] WAL or COW ordering and acknowledged durable point are explicit.
+- [ ] Checkpoint/replay duration meets recovery objectives.
+- [ ] Torn/corrupt writes and synchronization failures are tested.
+- [ ] Visibility is not confused with durability.
+
+### Distribution
+
+- [ ] Partition key co-locates required transactions and avoids hotspots.
+- [ ] Replica acknowledgement and tolerated failure domains are stated.
+- [ ] Read consistency/staleness and failover behavior are stated.
+- [ ] Retry identity, deduplication, fencing, and reconciliation exist.
+- [ ] Product/version/configuration claims are verified against deployment.
+
+## 61.14 Labels and Product Cautions — Reference
+
+Keep claims in four categories:
+
+| Label | Meaning |
+|---|---|
+| **Mechanism** | General storage idea: page, WAL ordering, MVCC, compaction |
+| **Implementation** | One engine’s design: heap locator, clustered primary tree, process model |
+| **Product/version** | Behavior/configuration in a named release |
+| **Measured** | Result on named data, cache state, hardware, and maintenance load |
+
+Avoid product generalization:
+
+- PostgreSQL heap/MVCC/vacuum behavior does not define every row store.
+- InnoDB-style clustered primary organization does not define every B+tree.
+- One LSM product’s compaction or tombstone policy does not define LSM semantics.
+- An embedded in-process engine and a network DBMS have different queueing and
+  failure surfaces even if both use B+trees.
+- Cloud-service durability/consistency names require current service,
+  region/topology, and configuration documentation.
+
+### Common traps
+
+- Selecting a product before quantifying access and durability.
+- Treating a successful buffered write as durable.
+- Treating COW root publication as atomic without ordering and recovery metadata.
+- Counting only logical payload while ignoring WAL, indexes, versions, and
+  maintenance workspace.
+- Calling wide-column data “columnar analytics.”
+- Assuming NVMe makes layout/amplification irrelevant or preserves HDD ratios.
+- Equating primary key, primary index, unique index, and clustered storage.
+- Confusing latches with transaction locks or ACID consistency with distributed
+  consistency.
+- Assuming MVCC means reads never block or transactions never abort.
+- Assuming replication implies linearizability or that quorum arithmetic alone
+  proves it.
+- Benchmarking warm point reads and extrapolating to cold recovery or compaction
+  tails.
+
+## Recall Card — Core
+
+- Chapters 61–74 are optional storage/distributed specialization. The short
+  bridge is 61 → 71 → 74.
+- Workload precedes structure: access, mutation, size, correctness, latency,
+  operations, distribution.
+- DBMS layers are query processing, execution, transactions/access methods,
+  buffering, recovery, and durable files.
+- Pages provide I/O/cache/latch/recovery units; stable page/slot identifiers add
+  relocation indirection.
+- B+trees maintain ordered mutable pages; LSMs buffer into immutable sorted runs.
+  Compare all amplification and maintenance.
+- Row/column, memory/storage authority, execution model, and data model are
+  independent axes.
+- Page cache, private buffers, `mmap`, and direct I/O move control and costs; none
+  defines durability.
+- WAL requires log-before-data and an explicit durable commit point. COW requires
+  ordered data/root publication and recovery rules.
+- Transactions define isolation/conflict/atomicity; latches protect structures.
+- Distribution adds partitions, replicas, ambiguous timeouts, consistency
+  contracts, fencing, and agreement.
+
+## Questions — Core
+
+1. Trace a point query from parse through index, buffer manager, MVCC visibility,
+   and result. Where can queueing, I/O, or contention enter?
+2. Given page/header/key/reference sizes and occupancy, estimate B+tree fan-out.
+   Why does fan-out not directly equal physical reads?
+3. Compare B+tree and LSM choices for point reads, ranges, random updates,
+   retention deletes, and maintenance tails.
+4. When would row storage plus vectorized execution beat a column store, and when
+   would columnar layout dominate?
+5. Explain how an in-memory engine can be durable and how a storage-resident
+   engine can still lose acknowledged writes.
+6. Compare WAL and COW recovery. What ordering/commit metadata does each still
+   need?
+7. Distinguish a buffer latch, transaction lock, MVCC visibility check, and
+   distributed lease/fencing token.
+8. Why does `R + W > N` not by itself guarantee a linearizable replicated store?
+9. Recalculate the exchange-history example after doubling retention and adding
+   a 32-byte secondary entry with measured write amplification. Which capacity
+   or bandwidth limit fails first?
+10. Which readers should stop after this chapter, and what does the 61 → 71 → 74
+    bridge add to an HFT systems interview?
+
+## Code-Reading Puzzle — Core
+
+```cpp
+struct PageHeader {
+    std::uint32_t magic;
+    std::uint16_t version;
+    std::uint16_t count;
+    std::uint64_t committed_sequence;
+};
+
+void commit(PageHeader* mapped, std::uint64_t seq) {
+    mapped->committed_sequence = seq;
+    std::atomic_thread_fence(std::memory_order_release);
+    acknowledge(seq);
+}
+```
+
+Explain why this does not establish crash durability. Separate C++ memory
+ordering from persistent ordering, page-cache writeback, device caches, torn
+writes, checksum/commit-record coverage, and recovery selection. State what a
+real contract must add before acknowledgement.
+
+## Implementation Exercise — Core
+
+Choose a storage design for one workload:
+
+- exchange event history;
+- reference-data service with point/range queries and rare updates;
+- intraday analytical store scanning selected fields;
+- replicated risk-limit state.
+
+Produce:
+
+1. workload and capacity arithmetic;
+2. row/column and memory/storage-authority choices;
+3. primary data organization plus every index;
+4. page/cache/I/O policy;
+5. B+tree/LSM/log/hybrid comparison with amplification;
+6. transaction/isolation and WAL/COW acknowledged point;
+7. background maintenance and overload policy;
+8. recovery test and format/version rollback;
+9. optional partition/replication/consistency extension.
+
+Include one alternative rejected by evidence, not preference.
+
+## Prerequisite for Chapter 62 — Core
+
+Chapter 62 assumes you can define pages, keys, row identifiers, point/range
+access, occupancy, and buffer hits/misses; estimate fan-out from page and entry
+sizes; and explain why device/cache behavior and workload determine the value of
+an ordered high-fan-out tree.

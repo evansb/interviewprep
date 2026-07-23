@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Incremental encoding buys its bandwidth advantage by making the receiver stateful and history-dependent, so a single misapplied message corrupts the replica permanently and silently. The tempting answer is the one crediting the sequence check with catching it: sequence numbers prove that messages arrived in order, not that they were applied correctly, so a semantic misapplication passes every sequence test. Nor does a delta feed restate levels — that is precisely what a snapshot does and an incremental does not.",
-      "sourceAnchor": "531-incremental-market-data-feeds",
+      "sourceAnchor": "531-identity-ordering-and-state-invariants",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Level indices are positional and relative: a missed insert means every later index is applied one level off, and the result is a perfectly well-formed book that is simply not the exchange's book. The most tempting distractor is the 'correct except at level 2' answer, whose premise — that the message carries a price — is true, but the index is still relative, so the damage propagates downward rather than staying local. This absence of any self-check is exactly why price-level feeds carry a per-instrument `RptSeq` that must be validated.",
-      "sourceAnchor": "531-incremental-market-data-feeds",
+      "sourceAnchor": "531-identity-ordering-and-state-invariants",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The self-checking property is real and asymmetric: an order-by-order handler that receives a Delete or Execute for a reference it has never seen has proof of prior loss, whereas a price-level handler applying a shifted index has nothing to complain about. The `RptSeq` answer has a true premise — those feeds do carry one — but the conclusion inverts the point: `RptSeq` is mandatory precisely because the message content provides no protection on its own. The 'order-by-order is more fragile' option states the detection mechanism backwards; an unresolvable reference is the signal, not a blind spot.",
-      "sourceAnchor": "531-incremental-market-data-feeds",
+      "sourceAnchor": "531-identity-ordering-and-state-invariants",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Absolute-versus-delta is the classic normalization bug: the error accumulates on every update, so quantities either march toward zero or grow without bound at a rate proportional to instrument activity, and the exchange checksum catches it almost immediately. The 'exact until the first Delete' answer is tempting because a size error does eventually surface as an impossible removal, but the divergence begins with the very first Change, long before any Delete. Replace is not the only action carrying quantity, and waiting for a closing snapshot would mean trading a wrong book all day.",
-      "sourceAnchor": "531-incremental-market-data-feeds",
+      "sourceAnchor": "531-identity-ordering-and-state-invariants",
       "difficulty": "application"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The anchor (`LastMsgSeqNumProcessed`, or a per-instrument `RptSeq`) is what lets the receiver split its buffer into 'already included' and 'still to apply'; without it there is no defensible way to compose snapshot and deltas. The checksum answer is the closest miss — integrity and sequence anchoring are different properties, and a body that is byte-perfect is still unusable if you cannot place it in time. Instrument identity and level ordering come from the snapshot's own fields, not from the sequence number.",
-      "sourceAnchor": "532-snapshot-feeds",
+      "sourceAnchor": "534-snapshot-plus-delta-recovery",
       "difficulty": "recall"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A cyclic snapshot channel is a passive multicast subscription: one publisher, one stream, so a thousand recoverers cost the exchange no more than one, and recovery time is bounded by the cycle. The 'unicast TCP is more reliable' answer has a true premise — TCP does retransmit — but the conclusion ignores that the request/reply service is a rate-limited shared resource that is overwhelmed by exactly the mass-recovery event in question. Multicast fan-out is done in the network, so extra joiners do not multiply the publisher's work.",
-      "sourceAnchor": "532-snapshot-feeds",
+      "sourceAnchor": "534-snapshot-plus-delta-recovery",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A truncated snapshot leaves you with a partial book, and the honest representation is that depth beyond the published limit is unknown, so downstream logic can refuse to use it rather than reason on a fiction. The 'treat deeper as empty, it is conservative' option is the tempting one: understating liquidity is not a safe error — a strategy that believes the book is thin will size and price differently, and the mistake is invisible. Keeping stale pre-gap depth is worse still, since that content is precisely what the gap made untrustworthy, and truncation has nothing to do with whether the anchor is valid.",
-      "sourceAnchor": "532-snapshot-feeds",
+      "sourceAnchor": "534-snapshot-plus-delta-recovery",
       "difficulty": "trap"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The rule is X >= F − 1; here X = 4,998 and F − 1 = 5,000, so two messages exist that the snapshot does not cover and the buffer never captured — installing it would create a permanent silent hole. The 'cannot double-count' answer is the most seductive because its premise is true: an early snapshot really does avoid overlap. But the failure mode being guarded against is the opposite one, a hole rather than an overlap. Discarding the buffer instead would throw away valid post-snapshot updates and still leave the hole.",
-      "sourceAnchor": "533-snapshot-plus-delta-recovery",
+      "sourceAnchor": "534-snapshot-plus-delta-recovery",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "X = F − 1 is the ideal case: the snapshot covers everything strictly before the buffer and the buffer covers everything from F on, with neither hole nor overlap. The X >= F variant is the classic off-by-one and the most tempting wrong answer — it rejects perfectly good snapshots and costs a whole extra recovery cycle every time. Requesting retransmission of 8,400 asks for a message already in hand, and treating the anchor as exclusive would discard 8,400 and open a one-message hole.",
-      "sourceAnchor": "533-snapshot-plus-delta-recovery",
+      "sourceAnchor": "534-snapshot-plus-delta-recovery",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Reversing the order creates a race with no detector: the window between the snapshot's cut-off and the start of buffering is simply missing, and because both the snapshot and the later buffer look internally consistent, the resulting book is confidently wrong. The 'costs one extra cycle' answer is the tempting understatement — it treats a silent correctness hole as a mere latency penalty. The arbitration window is derived from measured inter-feed skew and has nothing to do with F.",
-      "sourceAnchor": "533-snapshot-plus-delta-recovery",
+      "sourceAnchor": "534-snapshot-plus-delta-recovery",
       "difficulty": "recall"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Overflow means this recovery attempt cannot complete correctly, so the honest response is to restart it from a new F and count the occurrence — correct, explicit, and observable. The 'grow without limit' answer is the strongest distractor because its premise is a real rule of gap recovery, but an unbounded buffer under a 5 s cycle at 50 k msg/s is an unbounded memory commitment, and the rule against discarding applies within an attempt, not across a failed one. Evicting the oldest entries silently reintroduces the very hole the buffer exists to prevent, and applying deltas to a book known to be wrong compounds the corruption.",
-      "sourceAnchor": "533-snapshot-plus-delta-recovery",
+      "sourceAnchor": "534-snapshot-plus-delta-recovery",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the partial-overlap case: the packet straddles `expected_`, so the only correct granularity is per message, which requires deriving each message's own sequence from the packet sequence plus its index. Dropping it wholesale is the most common error and re-creates the very gap the packet would have filled. Processing it whole double-applies four messages, and book updates are emphatically not idempotent — a repeated Execute reduces size twice.",
-      "sourceAnchor": "534-feed-sequence-gap-recovery",
+      "sourceAnchor": "533-gap-detection-and-bounded-retransmission",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Climbing `rx_missed_errors` correlated with a rate spike identifies the loss as your own receive ring overflowing, not the network, and a retransmission request would add inbound traffic to a host that is already dropping packets. The 'retransmission is always faster' answer is the tempting one: it is true for small gaps on a healthy host, but the premise fails here because the bottleneck is your own ingress, and a snapshot resync is a passive subscription that costs no extra request traffic. Waiting on B is no help when the overflow is host-side and both rings are under the same burst.",
-      "sourceAnchor": "534-feed-sequence-gap-recovery",
+      "sourceAnchor": "533-gap-detection-and-bounded-retransmission",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A and B traverse disjoint paths, so identical sequence loss on both cannot be a path event by construction — it must predate the split, which leaves the publisher or a shared upstream segment, and retransmission or snapshot is the only recovery. The receive-ring answer is the plausible near-miss: ring overflow is a real cause of correlated loss across ports on one host, but it does not produce byte-identical sequence ranges the way a publisher drop does, and it would show up in `rx_missed_errors`. A/B feeds share one sequence space by design, which is what makes arbitration possible at all.",
-      "sourceAnchor": "534-feed-sequence-gap-recovery",
+      "sourceAnchor": "533-gap-detection-and-bounded-retransmission",
       "difficulty": "recall"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Post-gap messages are perfectly good data; the recovery algorithm consumes them at step 4, applying everything above the snapshot's anchor. The 'only a latency cost' answer is the tempting one, and it is wrong on its own terms: without the buffer the snapshot can never abut anything, so every attempt fails the X >= F − 1 test and recovery degrades from a small buffered fill into repeated full cycles. A snapshot does restate the book, but only as of its anchor — everything after it still has to come from the buffer.",
-      "sourceAnchor": "534-feed-sequence-gap-recovery",
+      "sourceAnchor": "533-gap-detection-and-bounded-retransmission",
       "difficulty": "trap"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "On a two-feed setup the second copy of every message is a duplicate, so dedup-before-decode removes about half the decode work — roughly a third more feed-handler throughput for a single integer comparison. The hashing answer is the closest miss: content hashing does need the raw bytes, but sequence-based suppression is the correct default and needs only the packet header, so the argument for ordering rests on cost rather than on hash inputs. Decoding neither mutates the wire sequence nor requires reentrancy here.",
-      "sourceAnchor": "535-market-data-packet-duplicate-suppression",
+      "sourceAnchor": "532-redundant-ab-arbitration-and-duplicate-suppression",
       "difficulty": "recall"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Content hashing costs a hash and a lookup per message, bounds its window arbitrarily, and is exact in neither direction: a collision drops a real message, and two legitimately identical trade prints are indistinguishable from one duplicated print. The 'unnecessary, identical prints cannot occur' option states the failure backwards — repeated identical prints are exactly the case that breaks the scheme. Widening the hash reduces collision probability without making the technique exact, so the equivalence claim fails; the correct conclusion is that a protocol lacking sequence numbers is itself the defect.",
-      "sourceAnchor": "535-market-data-packet-duplicate-suppression",
+      "sourceAnchor": "532-redundant-ab-arbitration-and-duplicate-suppression",
       "difficulty": "trap"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Each channel numbers its own stream from its own origin, so comparing a packet from channel 7 against a counter last advanced by channel 3 is a comparison between unrelated integers: some genuine messages are silently dropped as 'old' and some real duplicates pass through. The contention answer is tempting but false on its premise — the arbitrator is single-writer with both feeds polled by one thread, so there is no contention to speak of, and the defect is correctness rather than speed. A and B of one pair do share a sequence space, which is a different fact from channels sharing one.",
-      "sourceAnchor": "535-market-data-packet-duplicate-suppression",
+      "sourceAnchor": "532-redundant-ab-arbitration-and-duplicate-suppression",
       "difficulty": "application"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "That symptom pair — many requests, nearly all responses discarded — is the signature of declaring a gap before the arbitration window has elapsed: the slower feed delivers the missing packet, `expected_` advances, and the response you asked for arrives already stale. The 'window is too long' option is the most tempting because its premise is a genuine failure mode, but it produces the opposite signature, namely late detection and undetected staleness rather than a storm of redundant requests. Path-level duplication would inflate the duplicate count without driving the request rate at all.",
-      "sourceAnchor": "536-redundant-ab-feed-arbitration",
+      "sourceAnchor": "532-redundant-ab-arbitration-and-duplicate-suppression",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because path latencies differ by hundreds of nanoseconds to a few microseconds and the winner varies packet by packet, taking first arrival is a free latency improvement on top of the reliability gain, and it needs no failover state machine to flap. The 'B may not carry the same stream' answer inverts the premise of arbitration — the two groups carry identical message streams over disjoint paths, which is exactly why the merge works. They also share one sequence space, so the independent-numbering claim is false as well.",
-      "sourceAnchor": "536-redundant-ab-feed-arbitration",
+      "sourceAnchor": "532-redundant-ab-arbitration-and-duplicate-suppression",
       "difficulty": "recall"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Arbitration works because losses are path-specific and therefore independent, so anything that happens upstream of the split — a publisher drop, a shared segment — is present in neither copy and must be recovered by retransmission or snapshot. Congested ports, single-port ring overflows, and a bad optic are all path-local and are precisely the cases arbitration eliminates at zero recovery latency, which is why offering any of them here is the natural mistake. Identical gaps on both feeds at identical sequences are the diagnostic fingerprint of the upstream case.",
-      "sourceAnchor": "536-redundant-ab-feed-arbitration",
+      "sourceAnchor": "532-redundant-ab-arbitration-and-duplicate-suppression",
       "difficulty": "trap"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Win rate — how often each feed delivers a message first — is a continuous measure of relative path latency, so a collapse from parity to a few percent means A has acquired persistent extra delay, and that shows up long before the path starts losing packets. The 'promote B to primary' answer is tempting because it reacts to real evidence, but the correct arbitration design never designates a primary; the merge already ignores the slow feed automatically, and the useful action is to fix the path. Win rate is derived from actual arrival order, not from which ring is polled first, and it is unaffected by timestamp calibration.",
-      "sourceAnchor": "536-redundant-ab-feed-arbitration",
+      "sourceAnchor": "532-redundant-ab-arbitration-and-duplicate-suppression",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Every tie must have a defined winner drawn from the data itself; the standard comparator falls through sequence, then exchange timestamp, then channel, then instrument, which makes the merge a pure function of its inputs. The 'record the arrival order into the output' option is the subtle one — recording a timing decision as an input is a legitimate technique for unavoidable real-time behaviour, but here an explicit data key exists, so admitting arrival order at all makes the primary and its hot standby diverge. A rule keyed on messages-processed-so-far depends on upstream arrival history and is therefore not stable either.",
-      "sourceAnchor": "537-deterministic-feed-merge-rules",
+      "sourceAnchor": "536-deterministic-merge-and-replay",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is a genuine non-determinism that unit tests never catch, because a single process comparing against itself is self-consistent; it surfaces only when a primary and a hot standby are compared and their books disagree despite identical inputs. The 'deterministic for a given binary' option is the most tempting: the hash function is fixed per build, but bucket order also depends on the insertion sequence and on rehash history, both of which differ between two instances that took different paths through the day. The fix is an ordered structure or an explicit sorted index for anything observable.",
-      "sourceAnchor": "537-deterministic-feed-merge-rules",
+      "sourceAnchor": "536-deterministic-merge-and-replay",
       "difficulty": "trap"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Both schemes detect that a divergence happened; only the per-message hash tells you where, and the difference between 'the build changed something' and 'message 4,118,203 changed something' is the difference between a red test and a fixed bug. The compensating-errors answer is the most tempting because such cancellation is conceivable, but a per-message hash is not the only way to detect divergence — a final hash catches the overwhelming majority — so the claim overstates its case. Hash locality and quiescence are not real constraints on a canonical state hash.",
-      "sourceAnchor": "537-deterministic-feed-merge-rules",
+      "sourceAnchor": "536-deterministic-merge-and-replay",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Silence is not an error condition: an illiquid option quiet for an hour and an IGMP join that expired ten minutes ago produce byte-identical evidence at the instrument level, which is why detection has to be layered from channel heartbeats, per-instrument activity baselines, cross-feed corroboration, and exchange-versus-local timestamp skew. The socket-error answer is the tempting one and is exactly backwards — the socket stays open and healthy when a multicast join lapses or a publisher stalls, which is what makes the failure silent. Instruments do carry exchange timestamps; the problem is that no message means no timestamp.",
-      "sourceAnchor": "538-stale-market-detection",
+      "sourceAnchor": "535-staleness-semantic-failure-and-publication",
       "difficulty": "recall"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Within one venue a crossed book cannot exist — the engine would have matched — so the assertion `best_bid >= best_ask` is proof of a defect in your own state and is the cheapest correctness check in the whole system. The 'locked market' answer misstates the definition: locked is bid equal to ask, whereas bid above ask is crossed, and neither is something a continuous single-venue book resolves on its own. There is no lazy-removal semantics that would justify a stale executed order sitting at the top of book.",
-      "sourceAnchor": "538-stale-market-detection",
+      "sourceAnchor": "535-staleness-semantic-failure-and-publication",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The legitimate exceptions are consolidated cross-venue books, auction and halt states, and venues that publish implied prices crossing the outright book; these must be enumerated explicitly rather than used as an excuse to weaken the assertion. The 'engine has not caught up' option is the most persuasive distractor because it sounds like a plausible race, but the venue publishes book state as of the engine's own processing, so what it publishes is never crossed. A half-rebuilt book is likewise not an exception — a crossed state during resync is exactly the wrong book the check exists to catch.",
-      "sourceAnchor": "538-stale-market-detection",
+      "sourceAnchor": "535-staleness-semantic-failure-and-publication",
       "difficulty": "trap"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The design idea of this section is making 'I do not know the state of this instrument' a first-class representable state that the strategy reads and obeys, which is why recovery is modelled as LIVE / SUSPECT / RECOVERING / DISABLED per instrument. The 'stop publishing' answer is the canonical antipattern: an absent update is indistinguishable from a quiet market, so the strategy carries on quoting a book it believes is current. Widening quotes still means quoting a book known to be wrong, and a global channel halt discards the whole point of per-instrument `RptSeq` recovery.",
-      "sourceAnchor": "538-stale-market-detection",
+      "sourceAnchor": "535-staleness-semantic-failure-and-publication",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The raw byte stream is the only artifact with lasting value: it is the actual input to the system under test, so a fixed decoder can be re-run against it and a suspected decode bug can be reproduced exactly. The timestamp answer is the closest miss — normalized records commonly do carry the hardware timestamp alongside the host one, so the argument does not turn on timestamps at all but on the fact that decoded records have already passed through the component you are trying to test. Compression economics and injection mechanics are secondary at best.",
-      "sourceAnchor": "539-deterministic-market-data-replay",
+      "sourceAnchor": "536-deterministic-merge-and-replay",
       "difficulty": "recall"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Latency is dominated by queueing and burst structure, so the measurement is only meaningful when inter-packet deltas are reproduced; as-fast-as-possible replay is for regression and book validation, where only the final state matters. The accelerated-by-a-factor option is the tempting near-miss: proportional compression is right for load testing, but scaling the intervals changes the queue occupancy at every stage, so absolute latencies are not preserved. Wire injection still needs a pacing decision — the injecting host chooses the rate.",
-      "sourceAnchor": "539-deterministic-market-data-replay",
+      "sourceAnchor": "536-deterministic-merge-and-replay",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Wire-level injection is the only mode that exercises everything below the application — the NIC, the driver or kernel-bypass library, the ring, and the poll loop — so it is the only way to reproduce ring overflow or a hardware-timestamping fault. The book-shift, hash-iteration, and off-by-one defects are all decisions made above the transport on already-received messages, which is why an application-level harness reproduces them perfectly well and offering one of them here is the natural mistake. Choosing wire injection for those cases buys fidelity you do not need at a large cost in setup.",
-      "sourceAnchor": "539-deterministic-market-data-replay",
+      "sourceAnchor": "536-deterministic-merge-and-replay",
       "difficulty": "application"
     }
   ]

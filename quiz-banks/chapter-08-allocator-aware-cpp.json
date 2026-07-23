@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`allocator_traits` defaults `pointer`, `size_type`, `rebind_alloc`, `construct`, `destroy`, `max_size`, the propagation traits, and `is_always_equal` — but it cannot synthesize storage, a rebinding conversion, or an equality relation, so those five stay on you. The 'equality and the converting constructor come from `allocator_traits`' answer is the tempting near-miss: `allocator_traits` genuinely defaults almost everything, but it has no way to invent `operator==` (equality is a semantic claim about which memory each can free) or the converting constructor that rebinding depends on. The `pointer`/`size_type`/`rebind`/`construct`/`destroy` answer is the C++98 requirement list, which is exactly the historical baggage traits removed.",
-      "sourceAnchor": "81-c-allocator-requirements",
+      "sourceAnchor": "89-classic-allocator-requirements-and-allocator_traits--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`std::list<T,A>` never allocates `T`; it allocates an internal node type, obtained via `allocator_traits<A>::rebind_alloc<Node>`, whose default definition rewrites `A<T, Args...>` into `A<Node, Args...>` — impossible for a non-template class. The '`std::list` allocates `int` elements' answer is the classic misreading: only `std::vector` really allocates `T[]`, and `list`/`map`/`set` all rebind. There is no silent heap fallback either — containers have no path that bypasses their own allocator.",
-      "sourceAnchor": "81-c-allocator-requirements",
+      "sourceAnchor": "89-classic-allocator-requirements-and-allocator_traits--deep-dive",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 2,
       "explanation": "`malloc` promises suitable alignment for any type with fundamental alignment only, so an `alignas(64)` type gets storage that may be 16-byte aligned, and nothing diagnoses it. C++17's `std::allocator` routes over-aligned requests through the aligned `operator new` overload and gets this right, which is why hand-rolling the allocator is a regression. The glibc option is the seductive one — glibc typically gives 16 bytes on x86-64, not 64 — and containers never check for a null return, which is why `allocate` must throw rather than return null.",
-      "sourceAnchor": "81-c-allocator-requirements",
+      "sourceAnchor": "89-classic-allocator-requirements-and-allocator_traits--deep-dive",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 1,
       "explanation": "The standard requires `deallocate(p, n)` to receive exactly the `n` given to the matching `allocate`, which is the allocator model's built-in sized deallocation and a genuine advantage over `malloc` — it eliminates the per-block header entirely. The 'at least as large' option is the tempting corruption of the rule: passing a mismatched `n` is undefined behavior, not a tolerated approximation. `n` is an object count, not a byte count, which is why `allocate` returns `T*`.",
-      "sourceAnchor": "81-c-allocator-requirements",
+      "sourceAnchor": "89-classic-allocator-requirements-and-allocator_traits--deep-dive",
       "difficulty": "application"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A request for 100 `int`s served from a 512-byte size class actually yields 128 usable slots, and before C++23 that slack was invisible and wasted; `allocate_at_least` reports the real count back. The `count <= n` option inverts the whole point — under-delivering would be useless to a container that asked for a specific capacity. Returning null is still forbidden for allocators generally, since containers do not check.",
-      "sourceAnchor": "81-c-allocator-requirements",
+      "sourceAnchor": "89-classic-allocator-requirements-and-allocator_traits--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 2,
       "explanation": "`std::function`'s allocator constructors shipped in C++11 and were ripped out in C++17 because they could not be implemented correctly — a favourite trivia question. `std::array` and `std::inplace_vector` are the two containers that are *not* allocator-aware, precisely because their capacity is in the type and nothing is ever allocated. `std::string` is fully allocator-aware; SSO just means the allocator goes unused below the threshold.",
-      "sourceAnchor": "82-allocator-aware-containers",
+      "sourceAnchor": "81-why-containers-separate-allocation-from-construction--core",
       "difficulty": "recall"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Because the allocator is baked into the container's type, `vector<int>` and `vector<int, ArenaAlloc<int>>` are as unrelated as `vector<int>` and `vector<double>` — the caller must template `process` or commit to one allocator. This type-infection is the design flaw that `std::pmr` exists to fix, by moving the strategy behind a runtime pointer so every `pmr::vector<int>` is one type. No implicit conversion exists; not even `operator==` is declared across differing allocator types.",
-      "sourceAnchor": "82-allocator-aware-containers",
+      "sourceAnchor": "81-why-containers-separate-allocation-from-construction--core",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`unordered_map` is the two-allocation container: one rebound node per element, plus a bucket array that is reallocated whenever a rehash occurs. `std::map` has nodes but no bucket array — rebalancing is pointer surgery on existing nodes, allocating nothing. `deque` is the closest trap: it does keep a map of block pointers, but it allocates fixed-size *blocks*, not one node per element.",
-      "sourceAnchor": "82-allocator-aware-containers",
+      "sourceAnchor": "81-why-containers-separate-allocation-from-construction--core",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 2,
       "explanation": "`vector` reallocation uses `move_if_noexcept`, which falls back to the copy constructor when the move can throw, because a half-moved range cannot be rolled back to preserve the strong exception guarantee. This is independent of the allocator and is the other half of 'why is my vector slow'. The 'it moves the elements anyway' answer states the rule backwards: the `noexcept` specification is what *selects* the operation, not merely a consequence of it.",
-      "sourceAnchor": "82-allocator-aware-containers",
+      "sourceAnchor": "81-why-containers-separate-allocation-from-construction--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Allocator equality is a claim about interchangeability of deallocation — two arena allocators over the same arena are equal, two over different arenas are not — and every propagation rule in §8.3 hangs off it. The 'copies of one another' answer is the intuitive but wrong one: two independently constructed handles onto the same resource compare equal without either being a copy, and a copy of a stateful allocator pointing elsewhere would not be. Statelessness makes equality trivially true but is not what equality *means*.",
-      "sourceAnchor": "83-allocator-propagation-and-equality",
+      "sourceAnchor": "83-propagation-equality-move-and-swap--core",
       "difficulty": "recall"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`propagate_on_container_copy_assignment`, `_move_assignment`, and `_swap` all default to `false_type`, meaning a container keeps its own allocator through every one of those operations unless the allocator opts in. SOCCC is the near-miss: it is a real fourth customization point covering copy construction, but it is a *function* returning an allocator, not a boolean propagation trait, and its default is identity rather than `false`.",
-      "sourceAnchor": "83-allocator-propagation-and-equality",
+      "sourceAnchor": "83-propagation-equality-move-and-swap--core",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 3,
       "explanation": "`polymorphic_allocator` sets POCMA to `false` and the two resources are unequal, so `a` cannot take `b`'s pointer — it could never free it — and falls back to element-wise move into freshly allocated storage. The 'steal but keep `arena1`' option is exactly the bug the rule exists to prevent, and it is not deferred UB: the standard mandates the O(n) path instead. UB is the *swap* answer, not the move-assign answer.",
-      "sourceAnchor": "83-allocator-propagation-and-equality",
+      "sourceAnchor": "83-propagation-equality-move-and-swap--core",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "POCS is `false` for `polymorphic_allocator`, and the standard says that swapping containers whose non-propagating allocators compare unequal is undefined behavior — not slow, not a fallback, UB, and nothing warns you. The O(n)-fallback answer is the tempting one because that *is* what unequal allocators cause for move assignment; swap deliberately refuses to pay it and hands you UB instead. This is arguably the sharpest edge in the standard library.",
-      "sourceAnchor": "83-allocator-propagation-and-equality",
+      "sourceAnchor": "83-propagation-equality-move-and-swap--core",
       "difficulty": "trap"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 2,
       "explanation": "`std::allocator` is stateless, so `is_always_equal` is `true`, the unequal branch is deleted at compile time, and the move can only ever be a pointer steal — hence `noexcept`. `polymorphic_allocator` carries a resource pointer, so the comparison is a runtime check whose failing branch allocates and can throw. The POCMA option gets the direction wrong: POCMA is `false` for `pmr`, and propagation would actually make the move unconditionally O(1).",
-      "sourceAnchor": "83-allocator-propagation-and-equality",
+      "sourceAnchor": "83-propagation-equality-move-and-swap--core",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 3,
       "explanation": "`polymorphic_allocator` overrides `select_on_container_copy_construction` to return a *default-constructed* allocator, so a copy lands on `get_default_resource()` rather than inheriting the arena — deliberate, since a copy has its own lifetime and inheriting an arena about to be released would dangle. The 'SOCCC returns the source allocator unchanged' answer is the generic `std::allocator` behaviour (SOCCC's default really is identity), which makes it the most tempting wrong answer. Write `std::pmr::vector<int> b{a, &arena};` when you want the arena.",
-      "sourceAnchor": "83-allocator-propagation-and-equality",
+      "sourceAnchor": "83-propagation-equality-move-and-swap--core",
       "difficulty": "trap"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Allocator-aware containers do not propagate their allocator into their elements: the vector's element array is in the arena, but each `pmr::string` default-constructs its allocator to the default resource and puts its buffer on the global heap. This is worse than doing nothing because it looks correct. The code compiles fine — `scoped_allocator_adaptor` is what fixes the behaviour, not what makes it legal — and there is no first-element special case.",
-      "sourceAnchor": "84-scoped_allocator_adaptor",
+      "sourceAnchor": "84-nested-allocation-and-uses-allocator-construction--core",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`uses_allocator_v<T,A>` gates the whole protocol, then the leading form `T(std::allocator_arg, a, args...)` is tried before the trailing form `T(args..., a)`; `pmr` containers take the allocator as a trailing argument. The tagless `T(a, args...)` option is the reason `allocator_arg` exists at all: without a tag, a leading allocator would be ambiguous with a genuine first constructor argument, so that form is not part of the protocol.",
-      "sourceAnchor": "84-scoped_allocator_adaptor",
+      "sourceAnchor": "84-nested-allocation-and-uses-allocator-construction--core",
       "difficulty": "recall"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 2,
       "explanation": "`uses_allocator_v` is a property of `allocator_type` alone, so it stays `true` while the actual copy path has no allocator-taking overload to select — the copy either fails to compile or silently uses the plain copy constructor, putting the members back on the default resource. That silent fallback is why the '`uses_allocator_v` becomes `false`' answer is tempting: the fallback happens, but it is a bug, not a clean answer, and it is not driven by `uses_allocator_v` flipping. Nothing synthesizes extended constructors for you; you write them.",
-      "sourceAnchor": "84-scoped_allocator_adaptor",
+      "sourceAnchor": "84-nested-allocation-and-uses-allocator-construction--core",
       "difficulty": "trap"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "It is the non-virtual interface idiom: the public functions are stable and can add default arguments (alignment defaults to `alignof(max_align_t)`) and preconditions, while the customization points are private pure virtuals. The 'public pure virtual `allocate`' answer is the natural guess for anyone who has only seen the class from the caller's side, but overriding a public `allocate` is exactly what the design forbids. `is_equal` is a member, not a free function, and it means far more than address comparison.",
-      "sourceAnchor": "85-polymorphic-memory-resources",
+      "sourceAnchor": "85-monotonic-and-pool-resources--core",
       "difficulty": "recall"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`std::pmr::vector<T>` is an alias for `std::vector<T, polymorphic_allocator<T>>`, so the resource is a runtime value carried in a pointer and the type never changes — you can swap arena for pool for heap without touching a single call site. The 'statically bound and fully inlinable' answer inverts the trade-off: static binding and inlining are what the *template* model gives you, and giving them up is exactly what `pmr` costs. `polymorphic_allocator` holds a resource pointer, so `pmr::vector` is 32 bytes rather than 24.",
-      "sourceAnchor": "85-polymorphic-memory-resources",
+      "sourceAnchor": "85-monotonic-and-pool-resources--core",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 1,
       "explanation": "The indirect call is roughly 2-5 ns plus a possible branch-target miss, which is a 2-3x overhead on a 2 ns bump allocation but pure noise against `malloc`'s ~20 ns — so the virtual call is only a real problem for arenas. The per-element-construction option is a common confusion: `construct` goes through `allocator_traits` and placement-new, with no virtual dispatch at all. Devirtualization needs the resource type statically known, which is precisely what `pmr` gives up.",
-      "sourceAnchor": "85-polymorphic-memory-resources",
+      "sourceAnchor": "85-monotonic-and-pool-resources--core",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Locals are destroyed in reverse declaration order, so declaring the resource *after* its container kills the resource first and leaves the vector's destructor calling a virtual function through a dangling `memory_resource*`. The no-op option is the seductive one: `do_deallocate` on a monotonic resource does nothing, but you still make a virtual call on a destroyed object, which is UB regardless of what the function body would have done. The rule is simply: declare the resource before the containers that use it.",
-      "sourceAnchor": "85-polymorphic-memory-resources",
+      "sourceAnchor": "85-monotonic-and-pool-resources--core",
       "difficulty": "trap"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`null_memory_resource` throws — that is what makes it useful as an upstream: it converts a silent heap fallback from an exhausted arena into a loud, immediate failure. It cannot return null, because allocators are forbidden from doing so. `set_default_resource` mutates one process-wide global and the setter is not thread-safe against concurrent allocation, which is why a library that calls it changes behaviour for the entire program; set it once at startup or not at all.",
-      "sourceAnchor": "85-polymorphic-memory-resources",
+      "sourceAnchor": "85-monotonic-and-pool-resources--core",
       "difficulty": "recall"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 1,
       "explanation": "It is the standard bump allocator: pointer advance in, nothing at all on the way out, with everything reclaimed in O(1) by `release()` or the destructor. The cursor-unwinding option describes a *stack* allocator — a real design, but not this one, and assuming it explains a whole class of overflow surprises. `release()` frees memory only; if objects with non-trivial destructors were placement-new'd into the buffer, their destructors are simply never run.",
-      "sourceAnchor": "86-monotonic-memory-resources",
+      "sourceAnchor": "85-monotonic-and-pool-resources--core",
       "difficulty": "recall"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Nothing a monotonic resource is given ever comes back before `release()`, so each iteration's allocations chain new geometrically-growing upstream blocks and the process climbs until it dies. Both 'flat' options assume some form of reclamation, which is exactly the mental model the resource does not implement — the fix is calling `release()` per iteration, not relying on container destruction. The `bad_alloc` cap only applies with `null_memory_resource` upstream, which this resource does not have.",
-      "sourceAnchor": "86-monotonic-memory-resources",
+      "sourceAnchor": "85-monotonic-and-pool-resources--core",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Cache and TLB residency usually beats the raw allocation speed: resetting a cursor over the same warm, prefaulted buffer means no cold pages, no first-touch faults, and hot lines already in L2 — that is the point to make in an interview, not 'bump allocation is 2 ns'. Returning pages to the OS would destroy the effect by forcing them to fault back in. `release()` frees memory without running any destructors, and it is O(1), not an amortized walk.",
-      "sourceAnchor": "86-monotonic-memory-resources",
+      "sourceAnchor": "85-monotonic-and-pool-resources--core",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The two resources are structurally identical — per-size-class pools over upstream chunks, with oversized requests passing straight upstream — and differ solely in internal synchronization, which is why you keep one `unsynchronized_pool_resource` per thread off the hot path rather than paying the lock. Neither returns memory to upstream before destruction, so the reclamation option is false for both; RSS is high-water-mark shaped either way.",
-      "sourceAnchor": "87-pool-memory-resources",
+      "sourceAnchor": "85-monotonic-and-pool-resources--core",
       "difficulty": "recall"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Pool resources exist to make *individual* deallocation cheap; when the whole phase dies at once, that machinery — size-class lookup and free-list bookkeeping — is pure overhead against a cursor bump plus one `release()`. The 'varying node sizes' claim is false: a monotonic resource honours any size and alignment by advancing the cursor. Pools also do not return chunks to upstream before destruction, so they buy nothing on the RSS front either.",
-      "sourceAnchor": "87-pool-memory-resources",
+      "sourceAnchor": "85-monotonic-and-pool-resources--core",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The pool recycles same-size nodes into chunks it carved from the arena, the arena's backing is one contiguous preallocated buffer, and `null_memory_resource` upstream means an overrun throws `bad_alloc` rather than quietly reaching the heap — loud failure is the whole point. The 'transparent fallback' option is the exact opposite of what the null upstream is for. `unsynchronized_pool_resource` is not thread-safe, and releasing an arena never runs destructors.",
-      "sourceAnchor": "87-pool-memory-resources",
+      "sourceAnchor": "85-monotonic-and-pool-resources--core",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`std::function`'s small-buffer optimization is unspecified and small — around 16 bytes in libstdc++ — so a `shared_ptr` (16 bytes on its own) plus two pointers spills to the heap at construction. The C++17 option is fabricated: the standard never guaranteed SBO for arbitrary callables, which is exactly why `std::function` is on the hidden-allocator list beside `std::any`, exceptions, coroutine frames, and `std::thread`. Copying a `shared_ptr` bumps a refcount; it does not build a new control block.",
-      "sourceAnchor": "88-allocation-free-hot-paths",
+      "sourceAnchor": "87-proving-allocation-behavior--core",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`clear()` destroys the elements and leaves `capacity()` untouched, which is exactly the reuse-don't-recreate discipline a hot path needs; `v = {}` move-assigns an empty vector over it and you lose the buffer you carefully preallocated at startup. The swap idiom is the classic *capacity-shrinking* trick — it hands `v` the temporary's empty buffer — so it is the deliberate opposite of what is wanted here, and `shrink_to_fit` is only one of several ways capacity can go.",
-      "sourceAnchor": "88-allocation-free-hot-paths",
+      "sourceAnchor": "87-proving-allocation-behavior--core",
       "difficulty": "trap"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 1,
       "explanation": "A trapping global `operator new` gated on a thread-local scope flag catches everything, including library internals you did not know allocated, and a zero page-fault count under `perf stat` during a steady-state soak proves it stayed that way. The debugger answer is the tempting near-miss: it misses `mmap`-direct large allocations and, more importantly, is not continuous verification. Disabling exceptions and RTTI removes neither `std::function` spills nor iostream buffers, and a monotonic resource still allocates — it just does so cheaply.",
-      "sourceAnchor": "88-allocation-free-hot-paths",
+      "sourceAnchor": "87-proving-allocation-behavior--core",
       "difficulty": "application"
     }
   ]

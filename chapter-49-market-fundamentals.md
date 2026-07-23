@@ -1,648 +1,811 @@
 # Chapter 49 — Market Fundamentals
 
-*Interview-focused revision notes. The theme: a market is a distributed system with unusual invariants — this chapter defines the vocabulary precisely and shows which parts of it are data-structure constraints, which are protocol state machines, and which are the source of your worst production bugs.*
+## Why this matters
 
----
+A financial market is a mechanism for bringing buying and selling interest together under published rules. For an engineer, the essential objects are instruments, venues, sessions, orders, quotes, trades, books, and reference data. The essential discipline is to know which facts are definitions and which belong to a particular jurisdiction, venue, protocol version, or trading day.
 
-## 49.1 Bid, Ask and Spread
+This chapter supplies the vocabulary used in Chapters 50–54. It is engineering context, not trading advice. It deliberately avoids a catalog of exchanges and products: venue rules change, instrument parameters have effective dates, and the same word can have different protocol meanings.
 
-An **order** is an instruction to buy or sell a specified quantity of an instrument. A **limit order** carries a price limit: a buy limit at 100 will not execute above 100; a sell limit at 101 will not execute below 101 (Ch. 50 §50.2). Resting limit orders are collected in the **limit order book** (§50.13).
+Use this label on every market claim:
 
-Definitions, in the order they depend on each other:
-
-- **Bid** — a resting buy order, or the price of one. The **best bid** (also *inside bid*, *top of book bid*, *BB*) is the **highest** price anyone is currently willing to buy at.
-- **Ask** / **Offer** — a resting sell order, or its price. The **best ask** is the **lowest** price anyone is willing to sell at.
-- **BBO** — Best Bid and Offer: the pair (best bid price, best bid size, best ask price, best ask size). In the US equities context, the **NBBO** (National Best Bid and Offer) is the best bid and ask across *all* exchanges.
-- **Spread** — best ask minus best bid. Always ≥ 0 in a well-formed book (§49.14 covers when it isn't).
-- **Mid** — (best bid + best ask) / 2. Note this is not necessarily a tradeable price and may fall between ticks (§49.7).
-- **Touch** / **top of book** — the best bid and best ask levels.
-- **Last** — the price of the most recent trade. Distinct from mid and from either side of the touch; conflating "last" with "current price" is a beginner's error.
-
-```
-        BOOK for XYZ                     spread = 100.03 - 100.01 = 0.02
-  BIDS (buy)          ASKS (sell)        mid    = 100.02
-  ─────────────────────────────────
-  qty   price   │   price   qty
-  1200  100.01  │  100.03   800          ← the TOUCH / BBO
-   500  100.00  │  100.04   300
-  2000   99.99  │  100.05  1500
-   700   99.98  │  100.07   400
-        ↑ descending          ↑ ascending
-```
-
-**Structural invariants** an implementation must maintain:
-
-1. Bids are sorted **descending** by price; asks **ascending**. Both are "best first."
-2. `best_bid < best_ask` during continuous trading (§49.11). Equality is a **locked** market, inversion is a **crossed** market (§49.14) — normally impossible within a single matching engine because incoming orders that would cross are matched instead of rested (§50.18).
-3. Spread is bounded below by one **tick** (§49.7).
-
-**Why the spread exists.** A resting limit order is a free option granted to the rest of the market: it can be executed at your price whenever someone else wants it, including when they know something you don't. The spread is compensation for that risk plus the cost of holding inventory and the venue's fees. This is descriptive microstructure, not a trading recommendation — the engineering consequence is what matters: spread width is the single most-watched signal for feed health (§53.8), because a suddenly enormous or inverted spread almost always means *your book is wrong*, not that the market moved.
-
-**Sides and directions — the terminology that trips engineers up.** "Buy side of the book" means the bids. Someone who **hits the bid** is *selling* into a resting buy order. Someone who **lifts the offer** (or *takes the ask*) is *buying* from a resting sell order. **Aggressor**/**taker** is the incoming order that executes immediately; **passive**/**maker** is the resting order it executed against. Getting the aggressor side wrong flips the sign of every fee, every rebate, and every inferred trade direction in your analytics (§49.6).
-
-**Representation.** Prices are never floating point (Ch. 2 §2.5, Ch. 23 §23.10). Store them as scaled integers — an `int64_t` in the instrument's minimum price increment, or in a fixed scale like 10⁻⁹. `100.01` becomes `10001` at scale 10⁻². Comparisons are then exact, which is a hard requirement: price-time priority (§49.4) depends on exact equality tests, and `0.1 + 0.2 != 0.3` in binary floating point makes an order book non-deterministic.
-
----
-
-## 49.2 Market Depth and Liquidity
-
-**Depth** (or *market depth*, *depth of book*) is the resting quantity available at each price level, beyond just the touch. **Market by price (MBP)** aggregates all orders at a price into one total; **market by order (MBO)** exposes each individual order.
-
-| | Market by price (MBP / aggregated) | Market by order (MBO / full depth) |
+| Label | Example | Where truth comes from |
 |---|---|---|
-| Unit of the feed | Price level with total quantity | Individual order with an order ID |
-| Typical feed name | "Level 2", "depth of book", "price book" | "Level 3", "order book", "full order depth" |
-| Message rate | Lower | Much higher (every order add/cancel) |
-| Lets you compute queue position (§49.3) | No | Yes |
-| Book data structure | Map price → aggregate qty | Map price → intrusive FIFO of orders (§50.15) |
-| Example venue feeds | CME MBP-10, most equity depth feeds | Nasdaq ITCH, CME MBO |
+| General mechanism | a limit order sets a worst acceptable price | market-model definition |
+| Jurisdiction rule | which quotes receive protection | current regulation and scope |
+| Venue rule | allocation, auction tie-break, modification priority | current venue rulebook |
+| Protocol fact | field encoding, status code, sequence behavior | exact feed/order-entry specification |
+| Reference datum | tick, multiplier, session calendar, symbol mapping | versioned, effective-dated source |
+| Observation | spread, depth, fill rate, latency | a named data set and measurement method |
 
-**"Level 1 / 2 / 3"** is loose and venue-dependent vocabulary — Level 1 is the touch plus last trade, Level 2 is aggregated depth, Level 3 is per-order. Say what you mean (MBP vs MBO) in an interview; using the numbered terms imprecisely is a tell.
+“Equities use FIFO,” “futures use pro-rata,” “the close is at 16:00,” and “one contract is worth 100 units” are not safe general statements. Some may describe a particular product on a particular venue today. None is a definition.
 
-**Liquidity** is not one number. It has at least four measurable dimensions, and a strong candidate names them:
+## The 90-second screen — Core
 
-1. **Tightness** — the spread. Cost of an immediate round trip in zero size.
-2. **Depth** — quantity available at or near the touch.
-3. **Resilience** — how fast the book refills after being consumed.
-4. **Immediacy** — how quickly a given size can be executed at all.
+Given a market event or an unfamiliar feed, answer these questions before interpreting prices:
 
-**Consuming depth — the walk.** An aggressive order larger than the top level executes against successive levels. Given asks `100.03 × 800`, `100.04 × 300`, `100.05 × 1500`, a buy of 1500 fills:
+1. **What exactly is the instrument?** Include venue-native ID, listing/contract, currency, expiry, option terms or legs, and effective trading date.
+2. **Which venue and market segment?** Exchange order book, dealer market, bilateral venue, auction facility, dark pool, or another mechanism?
+3. **What session state is active?** Pre-open, auction call, continuous matching, halt, volatility interruption, post-close, or closed?
+4. **What view does the data provide?** Best quote, market by price (MBP), market by order (MBO), trades, indicative auction data, or consolidated data?
+5. **What are the units?** Price scale, tick table, quantity increment, lot convention, contract multiplier, and currency.
+6. **Which ordering and allocation rules apply?** Price-time, pro-rata, a hybrid, hidden/display priority, or another documented algorithm?
+7. **Which costs apply?** Venue fees/rebates, clearing and regulatory charges, commissions, financing, and market impact—each with its own scope.
+8. **Is the state trustworthy?** Check sequence continuity, instrument definitions, session status, and cross/lock rules before acting on a suspicious book.
 
-```
- 800 @ 100.03
- 300 @ 100.04
- 400 @ 100.05
- ─────────────
- VWAP = (800×100.03 + 300×100.04 + 400×100.05) / 1500 = 100.0385
- slippage vs best ask = 100.0385 - 100.03 = 0.0085
-```
+The compact market picture is:
 
-**VWAP** = volume-weighted average price. **Slippage** here is the difference between the achieved average and the reference price you expected. Implementing this walk correctly — iterating levels in price order, decrementing, handling partial fills and exhaustion — is a very common coding-round exercise; the traps are integer overflow in the weighted sum (use `__int128` or scale carefully, Ch. 23 §23.12) and forgetting that a limit price may stop the walk mid-level.
-
-**Book imbalance** is the standard derived statistic: `(bid_qty − ask_qty) / (bid_qty + ask_qty)` at the touch or over N levels. It is a signal input, and computing it cheaply is a hot-path concern: maintain running per-level totals incrementally rather than summing on demand (§50.14).
-
-**The critical engineering caveat: displayed depth is not available depth.** Sources of divergence:
-
-- **Hidden and iceberg orders.** An **iceberg** (or *reserve*) order displays only part of its quantity; when the displayed part fills, more is replenished — usually losing time priority on the replenished portion (§49.4). Fully **hidden** orders display nothing at all. Both mean you can execute more than the book shows.
-- **Latency.** By the time you act, other participants have already acted on the same information. Your book is always a snapshot of the past (Ch. 53 §53.8).
-- **Fragmentation.** In equities, liquidity is split across many venues plus off-exchange venues; one venue's depth is a fraction of the whole.
-- **Fleeting orders.** A large fraction of resting quantity is cancelled within milliseconds and was never realistically available.
-
----
-
-## 49.3 Queue Position
-
-**Queue position** is where a specific resting order sits in the ordered list of orders at its price level. Under price-time priority (§49.4), the level is a FIFO: position 1 executes first.
-
-```
-Level 100.01 (bid), FIFO front → back:
-  [A: 500] [B: 300] [YOU: 200] [C: 900]
-   ↑ executes first
-  Quantity ahead of you = 800.  A sell of 900 fills A(500), B(300), and 100 of YOU.
+```text
+issuer / borrower / hedger / investor / dealer / arbitrageur
+                         |
+                 broker or direct member
+                         |
+       +-----------------+------------------+
+       |                 |                  |
+  exchange book      dealer/OTC        auction or other
+       |                 venue              mechanism
+       +-----------------+------------------+
+                         |
+          orders -> matching -> executions
+                         |
+       quotes / depth / trades / status / reference data
+                         |
+           feeds, clearing, positions, risk, reporting
 ```
 
-**Why it is the most important derived quantity in passive trading.** Whether your order fills before the price moves against you depends almost entirely on how much quantity is ahead of you. Two orders at the same price with the same size can have completely different outcomes.
+Roles overlap. A firm may be an investor in one trade, liquidity provider in another, broker for a client, and clearing member operationally. Do not infer legal responsibility or economic intent from a packet field called “trader.”
 
-**Computing it requires MBO data** (§49.2). With aggregated MBP data you know only the level total, and cannot tell where in it you are. This is a primary reason venues' per-order feeds are worth their bandwidth.
+## 49.1 Participants, venues, and instruments — Core
 
-**Maintaining it incrementally** — the mechanics an engineer must get right:
+### Participants and infrastructure
 
-| Event ahead of you at your price | Effect on quantity ahead |
-|---|---|
-| New order added at your price | None (it joins behind you) |
-| Order ahead cancelled | Decreases by that order's remaining qty |
-| Order ahead fully executed | Decreases |
-| Order ahead partially executed | Decreases by the executed amount |
-| Order ahead *modified* to increase quantity | Usually loses priority → goes behind you (§50.10) |
-| Order ahead modified to decrease quantity | Usually keeps priority; decreases by the delta |
-| New price level created inside the spread | Your level is no longer the touch; position unchanged but now further from the market |
-| Your own order is cancel/replaced at a new price | You go to the **back** of the new level |
+A **buyer** acquires an instrument; a **seller** disposes of it. That describes one transaction, not a permanent class of firm. A participant may submit orders directly as a venue member or indirectly through a broker. Common roles include:
 
-That last row is the operationally decisive one: **any price change forfeits queue position.** Improving your price by one tick puts you at the front of a new level, but any move — including moving away and back — loses your place at the original level.
+- **asset owner or investor**, allocating capital;
+- **hedger**, reducing exposure to another price or cash flow;
+- **speculator**, accepting price risk;
+- **market maker or liquidity provider**, repeatedly quoting interest under a commercial or venue arrangement;
+- **broker or agency algorithm**, handling another party’s order;
+- **dealer**, trading as principal with customers or other dealers;
+- **arbitrageur**, trading related instruments or venues;
+- **exchange/venue operator**, applying entry, priority, matching, and publication rules;
+- **clearing organization and clearing member**, managing obligations after execution;
+- **market-data vendor/consolidator**, normalizing or combining venue data;
+- **regulator or self-regulatory body**, defining and enforcing rules within a jurisdiction.
 
-**The ambiguity problem with aggregated feeds.** If you only see "level 100.01 dropped from 2000 to 1700," you cannot tell whether the 300 came from ahead of you or behind you. Conservative estimators assume the worst (all from behind, so your position didn't improve) and produce a *pessimistic* bound; optimistic ones assume the reverse. Real implementations track both and treat the gap as uncertainty. Note trade messages help: an execution consumes from the *front*, so quantity removed by trades definitively reduces the amount ahead of you, while cancels are ambiguous. Distinguishing trade-driven from cancel-driven decrements is the whole trick.
+These are functional descriptions. Registration categories and duties are jurisdiction-specific and time-sensitive.
 
-**Priority-preserving vs priority-losing modifications** vary by venue and must be read from the venue specification, never assumed. Typical rule: quantity *decrease* keeps priority; quantity *increase* or price change loses it. Some venues implement a decrease as cancel/replace internally and lose priority anyway. Encoding this per-venue in your order-state machine (§50.9) is required for correct queue-position modelling.
+A **venue** is a place or system in which trading interest interacts. An order-driven exchange commonly maintains a central limit order book. A quote-driven dealer market exposes dealer prices. Some systems match bilaterally, periodically, conditionally, or without publicly displayed orders. A **lit** venue publishes specified pre-trade interest; a **dark** mechanism withholds some or all of it under its applicable rules. “Exchange,” “market,” “venue,” and “matching engine” are not interchangeable.
 
----
+An **instrument** is the legal/economic object being traded. Major families include cash equities, debt, funds, currencies, commodities, futures, options, swaps, and multi-leg strategies. The same economic exposure can appear in several instruments with different settlement, expiry, margin, currency, trading hours, and contract sizes.
 
-## 49.4 Price-Time Priority
+An **underlying** is the asset or reference from which a derivative derives value. A futures instrument normally has an expiry and contract specification. An option additionally has a strike, call/put kind, exercise style, and expiry. A spread or strategy instrument may have legs and ratios but still receive its own venue-native ID and order book. Never synthesize identity from a display symbol alone.
 
-**Price-time priority** (also FIFO allocation) is the allocation rule: among resting orders, execute in order of (1) best price, then (2) earliest time of arrival at that price.
+Several adjacent distinctions prevent category errors:
 
-```
-Incoming SELL 600 @ market.  Bids:
-  100.01: [A t=10, 500] [B t=25, 300]
-  100.00: [C t=05, 900]              ← older than A and B, but WORSE PRICE
-Result: A gets 500, B gets 100.  C gets nothing — price beats time, always.
-```
-
-**The two keys.** Priority is a lexicographic ordering on `(price, time)` where price uses side-dependent direction (descending for bids, ascending for asks) and time is ascending. The time key is normally a monotonically increasing sequence number assigned by the matching engine at the moment the order becomes *resting*, not the client's send time — otherwise priority would depend on clock synchronization across participants, which is unachievable (Ch. 48 §48.11).
-
-**What resets time priority** (the discriminating detail):
-
-| Action | Time priority |
-|---|---|
-| Order rests for the first time | Assigned |
-| Partial execution | **Retained** — the remainder keeps its place |
-| Quantity decrease (typical rule) | Retained |
-| Quantity increase | **Lost** — goes to the back |
-| Price change | **Lost** |
-| Cancel then new order | Lost (obviously) |
-| Iceberg display replenishment | **Lost** for the replenished tranche |
-
-**Why partial fills retain priority** is worth understanding: otherwise a large resting order would be perpetually pushed to the back by small aggressors, and no one would post size.
-
-**Implementation.** The natural structure is `price → FIFO queue of orders` (§50.14, §50.15). Insertion at a level is O(1) at the tail; matching pops from the head. Critically, **you never sort by time** — arrival order *is* time order, so a linked list or ring gives you priority for free. Any design that stores a timestamp and sorts is both slower and wrong (ties would be resolved arbitrarily).
-
-**Consequences for system design.** Under strict FIFO, being one microsecond earlier can mean being ahead of thousands of shares. This is the direct economic driver behind everything in Chapters 47, 48, 52 and 55 — the entire latency arms race exists because the allocation rule is a race. Venues that use pro-rata (§49.5) or that deliberately randomize (speed bumps, frequent batch auctions) change that incentive; stating this connection between allocation rule and system architecture is exactly the kind of synthesis interviewers are probing for.
-
-**Variants you should recognize:**
-
-- **Price-display-time**: displayed orders get priority over hidden orders at the same price, then time. Common in equities.
-- **Price-broker-time**: some venues give priority to orders from the same broker (internalization) before time.
-- **Size-priority / price-size-time**: larger orders first at a price. Rare.
-- **Top-of-book / market-maker priority**: the first order to establish a new best price gets a preferential allocation (see §49.5).
-
----
-
-## 49.5 Pro-Rata Allocation
-
-**Pro-rata** allocation distributes an incoming aggressive quantity across all resting orders at a price level *in proportion to their size*, ignoring time. It is standard on many futures markets, particularly short-term interest-rate contracts where books are extremely deep and thousands of lots rest at a single tick.
-
-```
-Level 100.01 (bid):  A=6000, B=3000, C=1000   (total 10000)
-Incoming SELL 1000 @ 100.01
-
-Pure pro-rata:  A = 1000 × 6000/10000 = 600
-                B = 1000 × 3000/10000 = 300
-                C = 1000 × 1000/10000 = 100
-```
-
-**Time priority is irrelevant** here — which changes the incentive completely. Under FIFO you race to be first; under pro-rata you post *size*, because your fill share is your share of the level.
-
-**The mechanics that make it hard to implement.** Real venues use a multi-step algorithm, and the steps are the interview content:
-
-1. **Top-order / priority allocation.** The order that first established the best price (or a designated market maker) receives an allocation first — a fixed percentage of the incoming quantity, capped at its size. This exists to reward price improvement, which pure pro-rata otherwise fails to incentivize.
-2. **Pro-rata pass.** The remaining quantity is distributed in proportion, with a **minimum allocation threshold** (e.g. an order must be entitled to at least 1 lot, or 2 lots, to receive anything). Orders below the threshold get zero in this pass.
-3. **Rounding.** Fractional entitlements are truncated (floor), not rounded, so the sum is less than the incoming quantity.
-4. **Leftover / residual pass.** The undistributed remainder from truncation is allocated FIFO by time among eligible orders, or by largest-fractional-remainder. This is venue-specific and must be read from the spec.
-
-```
-Incoming SELL 1000, level = A(t1)=6000, B(t2)=3000, C(t3)=1000, D(t4)=150
-Total 10150.  Suppose top-order allocation = 0, min allocation = 1 lot, floor rounding:
-  A: floor(1000 × 6000/10150) = 591
-  B: floor(1000 × 3000/10150) = 295
-  C: floor(1000 × 1000/10150) =  98
-  D: floor(1000 ×  150/10150) =  14
-  sum = 998 → 2 lots residual → allocated FIFO: A gets 1, B gets 1
-```
-
-**Determinism is mandatory.** Two implementations of the same venue's algorithm must produce identical allocations from identical inputs, or your fill simulation and your reconciliation both break. The failure modes are all in the arithmetic: integer division order (`q * size / total`, never `q * (size/total)`), overflow in `q * size` (use 128-bit, Ch. 23 §23.12), and the residual rule. A candidate who says "just multiply by the fraction" without addressing rounding and residual has not implemented one.
-
-**FIFO vs pro-rata, compared:**
-
-| | Price-time (FIFO) | Pro-rata |
+| Term | Meaning | Engineering consequence |
 |---|---|---|
-| Determines fill | Arrival order | Order size |
-| Rewards | Speed | Displayed size |
-| Latency sensitivity | Extreme | Lower for allocation; still matters for reacting |
-| Typical books | Thin, many price levels | Very deep, few active levels |
-| Typical venues | Equities, most futures | Short-term rates futures, some options |
-| Implementation | FIFO list per level | Sum + proportional pass + residual rule |
-| Queue position (§49.3) | Meaningful and critical | Meaningless; *size share* is the analogue |
+| Primary market | creation or issuance of a security or claim | workflow and pricing can differ from secondary trading |
+| Secondary market | transfer among holders after issuance | the familiar order/quote/trade vocabulary applies here |
+| Listing | admission of an instrument to a venue or segment | one security can have several listings or trading lines |
+| Spot/cash | transaction for the market’s standard near settlement | settlement date and calendar remain product-specific |
+| Forward/future | obligation referenced to a future date | expiry, settlement, and multiplier are part of identity |
+| Fungible interest | positions can satisfy the same delivery obligation | do not infer fungibility from economic similarity |
+| Outright | one instrument traded directly | contrast with a spread/strategy of several legs |
+| Position | accumulated signed holdings after executions | distinct from live orders and displayed depth |
 
-**Hybrid ("split") allocation** is very common in practice: a configured percentage of each incoming order is allocated FIFO and the rest pro-rata, per instrument. Your engine must read this from reference data (§49.10), not hard-code it.
+An **execution** creates contractual obligations; **clearing** determines and manages obligations between clearing participants; **settlement** completes delivery/payment under the product’s rules. A trade can be final for matching purposes while still subject to correction, cancellation, clearing rejection, or settlement-failure processes. Market-data consumers should not invent post-trade finality from a trade print.
 
----
+### Instrument identity
 
-## 49.6 Maker-Taker Fees and Rebates
+A production identity should distinguish at least:
 
-**Maker** = the resting order that provided liquidity. **Taker** = the incoming order that removed it (§49.1). A **maker-taker** fee schedule charges the taker a fee and pays the maker a **rebate**; **taker-maker** (or "inverted") does the reverse; **flat fee** schedules charge both sides the same.
-
-```
-Trade of 100 shares @ $100 on a maker-taker venue:
-  taker fee   = $0.0030/share × 100 = $0.30   (paid by aggressor)
-  maker rebate= $0.0020/share × 100 = $0.20   (received by resting order)
-  venue keeps $0.10
+```text
+(venue or market segment, venue-native instrument ID, definition version/session)
 ```
 
-**Why an engineer must care.** Fees are typically an order of magnitude smaller than a tick, but they are comparable to or larger than the *edge* on many trades, so any profit-and-loss calculation, backtest, or fill simulator that ignores them is wrong by more than the thing it is measuring. Correct fee attribution requires knowing, per fill: the venue, the liquidity flag (maker/taker/auction/routed), the instrument's fee tier, and your firm's volume tier.
+Human-readable symbols are labels, not durable primary keys. The same ticker can trade on multiple venues, be reused over time, or refer to different currencies or listings. Global identifiers can identify a security without identifying a specific venue listing. Derivative display codes often encode expiry, but encoding conventions and rollover rules vary.
 
-**The liquidity flag is data you must capture.** Execution reports carry it (FIX tag 851 `LastLiquidityInd`, or venue-specific codes, Ch. 51 §51.2). Do not infer it — inference fails for auctions, for orders that partially rest then get taken, and for the important case of an aggressive order that *adds* liquidity because it improved the price without crossing. Store the exchange's flag verbatim in your fill record and derive everything from it (Ch. 54 §54.15).
+The hot path normally maps a compact protocol identifier to prevalidated instrument state. The cold path maintains symbols, alternate identifiers, descriptions, calendars, and history. A feed’s numeric ID may be stable, session-scoped, or definition-version-scoped; that is a protocol/venue fact.
 
-**Fee structure complications:**
+## 49.2 Sessions and market states — Core
 
-- **Tiered pricing.** Rates depend on monthly volume, computed across the firm. So the marginal fee on a fill is not knowable at fill time — attribution must be reconciled at month end against the venue's invoice (Ch. 54 §54.15).
-- **Per-share vs per-trade vs basis points vs per-contract.** Equities are typically per-share, futures per-contract, options per-contract with different rates by class, and some venues charge basis points of notional. Your fee engine needs all four formulas.
-- **Caps and floors.** Some schedules cap the fee per trade for low-priced securities.
-- **Regulatory fees** (e.g. transaction fees on sales, clearing fees, exchange membership) are separate line items with their own rules.
-- **Rebates can be negative-sum for you** in an inverted venue where taking is cheap and posting costs.
+A **trading session** is a venue-defined interval and state machine, not merely a wall-clock range. A common conceptual lifecycle is:
 
-**Engineering implications, not strategy:**
+```text
+CLOSED
+  -> PRE_OPEN / AUCTION_CALL
+  -> OPENING_UNCROSS
+  -> CONTINUOUS
+  -> CLOSING_CALL
+  -> CLOSING_UNCROSS
+  -> POST_CLOSE
+  -> CLOSED
 
-1. **Fee schedules are reference data** (§49.10) with effective dates, and they change on published notice. Hard-coding them causes silent mis-attribution that surfaces at month-end reconciliation as a mismatch against the invoice — the diagnostic signature is a P&L discrepancy that is exactly proportional to volume on one venue.
-2. **Post-only orders exist because of fees** (§50.5): if an order would take liquidity and pay the taker fee, the participant may prefer it be rejected or repriced. That is a protocol feature you must implement correctly.
-3. **Fee-aware simulation** requires modelling *both* the fill and its liquidity flag, which means your simulator must model queue position (§49.3), because whether you were the maker depends on whether you were resting.
-
----
-
-## 49.7 Tick Sizes
-
-The **tick size** (minimum price increment, MPI) is the smallest permitted difference between two valid prices for an instrument. A price not on the tick grid is invalid and will be rejected.
-
-```
-Tick = 0.01:   100.00, 100.01, 100.02 valid;  100.005 rejected
-Tick = 0.25:   4300.00, 4300.25, 4300.50 valid (e.g. an index future)
-Tick = 1/32:   bond futures quoted 110'16 = 110 + 16/32 = 110.50
+CONTINUOUS -> HALT or VOLATILITY_CALL -> REOPENING_UNCROSS -> CONTINUOUS
 ```
 
-**Consequences that show up in code:**
+This is a model, not a universal transition diagram. Venues may have several daytime auctions, order-entry-only states, cancel-only windows, maintenance states, instrument-specific interruptions, or sessions crossing midnight. A venue status message should normally drive state; a calendar and clock predict expected state and detect missing messages, but should not fabricate an opening.
 
-- **The spread is bounded below by one tick.** A one-tick spread is a "tight" or "locked-tight" market; you cannot quote inside it.
-- **Mid-price may not be a valid price.** With a one-tick spread, mid falls on a half-tick. Any code that computes a mid and then submits it as an order price must round to the tick grid, and must round in a side-aware direction (round a buy price *down*, a sell price *up*, so you never accidentally cross).
-- **Tick is a per-instrument, per-time reference datum**, not a constant.
+**Continuous trading** is the phase in which eligible incoming interest can interact immediately under the venue's matching rules, rather than waiting for a scheduled call auction. It does not imply uninterrupted matching: instrument halts, volatility interruptions, price controls, technical states, and closed sub-sessions remain venue-specific.
 
-**Variable tick regimes** — the detail that catches people:
+State changes what is valid:
 
-| Regime | Description | Example |
-|---|---|---|
-| Fixed | One tick for all prices | Most US equities ≥ $1.00: $0.01 |
-| Price-banded | Tick depends on price level | US equities < $1.00: $0.0001 |
-| Tick tables | Tick depends on price *and* liquidity band | MiFID II RTS 11 tick-size regime for EU equities |
-| Fractional | Tick expressed as a fraction | Treasury futures: 1/32, 1/64, 1/128 |
-| Reduced tick at touch | Tighter increment only for the front month or at the BBO | Some futures spreads |
-
-The MiFID II regime is the one worth naming: tick size is a function of (price band × average daily number of transactions band), read from a published table. Your reference data must carry the table, and a price validation function must consult it. Hard-coding "tick = 0.01" is a guaranteed production reject storm on European instruments.
-
-**Implementation.** Represent prices as integers *in ticks* where possible, or in a fine fixed scale with a tick-multiple validation:
-
-```cpp
-// price stored as int64 in units of 1e-9 (or venue scale); tick likewise
-constexpr bool on_tick_grid(int64_t px, int64_t tick, int64_t base = 0) {
-    return tick > 0 && (px - base) % tick == 0;   // note: base matters for grids not anchored at 0
-}
-// side-aware rounding toward passive (never crossing)
-int64_t round_passive(int64_t px, int64_t tick, bool is_buy) {
-    int64_t r = px % tick;                 // careful with negatives (Ch. 2 §2.3)
-    if (r == 0) return px;
-    return is_buy ? px - r : px + (tick - r);
-}
-```
-Watch the sign behavior of `%` for negative prices — negative prices are real (some energy and spread instruments trade below zero), and C++'s truncation-toward-zero `%` gives a negative remainder, which breaks naive grid checks. Use a floor-division helper.
-
-**Tick size and spread interact economically:** a tick that is large relative to the instrument's natural spread forces the spread wide and makes queue position (§49.3) extremely valuable, because everyone is at the same price and only time separates them. A tick that is very small lets participants gain priority by improving price by a trivially small amount, so queues are shallow and priority is cheap to buy. This is the standard explanation for why tick size determines whether a market is queue-driven or price-driven — and it is a microstructure fact, not advice.
-
----
-
-## 49.8 Lot Sizes and Contract Multipliers
-
-**Lot size** terminology, defined precisely because the words are used loosely:
-
-- **Round lot** — the standard trading unit. US equities: 100 shares, historically; many venues now permit odd lots and some high-priced names use smaller round lots.
-- **Odd lot** — a quantity less than one round lot. Historically odd-lot quotes were not part of the NBBO and odd-lot trades were not reported to the consolidated tape — a real source of "invisible" volume; rules have changed and continue to.
-- **Mixed lot** — a quantity greater than a round lot but not a multiple of it.
-- **Lot size / minimum quantity increment** — orders must be a multiple of this. For futures this is 1 contract; for some FX and crypto venues it is a fractional quantity with its own scale.
-- **Minimum order quantity** — smallest acceptable order, may exceed the increment.
-- **Block size** — threshold above which special rules (reporting delays, separate venues) apply.
-
-**Contract multiplier** (also *contract size*, *point value*) converts a quoted price into a monetary notional. This is where sign and scale errors become expensive:
-
-```
-notional = price × multiplier × quantity
-
-E-mini S&P 500 future:  multiplier = $50 per index point
-   price 4300.25, qty 3  →  4300.25 × 50 × 3 = $645,037.50
-Equity option (US):     multiplier = 100 shares per contract
-   premium 2.35, qty 10 →  2.35 × 100 × 10 = $2,350
-Treasury future:        $100,000 face, quoted in 32nds
-   110'16 → 110.50 → 110.50/100 × 100,000 = $110,500 per contract
-```
-
-**Tick value** is the monetary value of one tick: `tick_size × multiplier`. For the E-mini, `0.25 × 50 = $12.50` per contract per tick. Risk limits (Ch. 56 §56.14–§56.16) are expressed in notional or tick value, so a wrong multiplier silently scales every limit by the same factor — the diagnostic signature is risk checks that never fire, or that fire on everything, uniformly across one product family.
-
-**Fixed-point arithmetic is mandatory** (Ch. 23 §23.10). The multiplication chain `price × multiplier × quantity` must be done in integers with an explicit scale, and the intermediate can overflow 64 bits: a price scaled to 10⁻⁹ times a multiplier of 100,000 times a quantity of 10,000 is ~10²¹, past `int64_t`'s ~9.2×10¹⁸. Use `__int128` for the intermediate and reduce scale before narrowing.
-
-**Quantity representation.** Prefer an integer count of the instrument's minimum increment, with the increment itself in reference data. Some venues (FX, crypto) require fractional quantities; represent those as scaled integers too, never as `double`. A `double` quantity introduces the possibility of a residual of 10⁻¹⁵ units remaining on an order that should be fully filled, which then sits in your book forever and never matches — a genuinely nasty failure mode whose signature is orders stuck in a partially-filled state with an absurdly small leaves quantity.
-
-**Related quantities in the order state machine** (§50.9): `order_qty` (original), `cum_qty` (filled so far), `leaves_qty` (remaining live). The invariant `order_qty = cum_qty + leaves_qty + cancelled_qty` must hold at all times and is the single best assertion to put in your order manager.
-
----
-
-## 49.9 Instrument Symbology
-
-**Symbology** is the set of identifier schemes used to name instruments, and the mappings between them. It is the most under-appreciated source of production incidents in trading systems.
-
-**Identifier families:**
-
-| Scheme | Scope | Example | Notes |
+| Property | Continuous book | Auction call | Halt/interruption |
 |---|---|---|---|
-| Exchange ticker / symbol | One venue | `AAPL`, `ESZ5` | **Not globally unique**; reused across venues and over time |
-| ISIN | Global, 12 chars | `US0378331005` | Identifies the security, not the venue or currency |
-| CUSIP | North America, 9 chars | `037833100` | Licensed data |
-| SEDOL | UK-assigned, 7 chars | `2046251` | Per venue/country listing |
-| RIC (Refinitiv) | Vendor | `AAPL.O` | Vendor-licensed |
-| Bloomberg / FIGI | Vendor / open | `BBG000B9XRY4` | FIGI is openly licensed |
-| MIC (ISO 10383) | The *venue* | `XNAS`, `XNYS` | Operating MIC vs segment MIC |
-| Exchange numeric ID | One venue's protocol | `security_id = 12345` | What the binary feed actually carries |
+| Matching | typically immediate when eligible interest crosses | interest accumulates until uncross | suspended or restricted |
+| Crossed indicative interest | may violate continuous-book rules | often meaningful and expected | venue-specific |
+| Accepted instructions | normal venue set | special/limited set | cancel, entry, and modification rules vary |
+| Published data | book, quotes, trades, status | indicative price/volume/imbalance plus status | status and possibly frozen/purged/auction data |
+| Existing orders | matched/cancelled normally | may participate subject to rule | retained, purged, suspended, or migrated by rule |
 
-**The key engineering point: binary feeds identify instruments by a compact numeric ID, not a string.** ITCH uses a stock locate code; CME MDP uses `SecurityID`; SBE-based protocols carry an integer (Ch. 51 §51.6). Your hot path must key off that integer with an O(1) array lookup — a direct-indexed array of instrument state, sized to the venue's ID space, is the standard design (Ch. 52 §52.3). String symbol lookup on the hot path is an immediate red flag.
+Session status is commonly per instrument or trading segment. One instrument can halt while others continue. Engineering systems should gate order intent by the exact venue state, preserve status sequence, reconcile resting orders after exceptional transitions, and distinguish “no messages” from an explicit halt.
+
+**Venue-specific example, versioned:** Nasdaq’s U.S. equity Opening and Closing Crosses publish imbalance information and accept defined cross order types on published schedules. Those names, cutoffs, eligibility rules, and tie-breaks are Nasdaq rules, not generic auction definitions. Read the current rule and protocol documents before implementation.
+
+## 49.3 Orders, quotes, and trades — Core
+
+An **order** expresses an instruction to buy or sell. Its essential fields include instrument, side, quantity, and constraints. A **limit order** sets a worst acceptable execution price: a buy limit may execute at its limit or lower; a sell limit at its limit or higher. A **market order** seeks immediate execution under venue rules but does not guarantee a price. Exact order types and time-in-force constraints belong to Chapter 50 and the venue specification.
+
+A **bid** is buy interest or its price. An **offer** or **ask** is sell interest or its price. In a book:
+
+- the **best bid** is the highest-priced eligible displayed bid;
+- the **best ask** is the lowest-priced eligible displayed offer;
+- the **BBO** is the venue’s best bid and offer, normally with sizes;
+- the **touch** or **top of book** is those best levels;
+- the **last price** is the price of a selected most recent trade, under a stated trade-eligibility definition.
+
+“Buy side” and “sell side” are overloaded. In an order-book discussion they mean bids and asks. In industry organization, “buy side” and “sell side” describe firm categories. State which meaning you intend.
+
+An incoming order that immediately executes against resting interest is often called the **aggressor** or **taker**; the resting order is passive and often called the **maker**. To **hit the bid** is to sell into a bid. To **lift/take the offer** is to buy from an offer. These terms describe interaction with displayed/resting interest; a venue’s liquidity indicator is authoritative for fees.
+
+A **quote** is published trading interest or an indicative price, depending on data context. A **trade**, **fill**, or **execution** reports that quantity changed hands at a price. One aggressing order can generate several executions. A trade message is not necessarily an order deletion, and a quote update is not necessarily a trade. Market-data feeds can publish them on different channels or with different sequence domains.
+
+### Order-intent vocabulary
+
+Order names describe constraints, not guaranteed outcomes. Chapter 50 develops their lifecycle, but the vocabulary is needed here:
+
+| Intent | Generic meaning | Why the venue specification still matters |
+|---|---|---|
+| Market | seek immediate execution without a stated limit price | protection bands, conversions, rejection, and remainder handling vary |
+| Limit | execute only at the limit or better | may take immediately, rest, partially fill, or expire |
+| Immediate-or-cancel | execute eligible quantity now, cancel remainder | “now,” eligible liquidity, and auction availability are venue-defined |
+| Fill-or-kill | execute the required quantity immediately or none | pre-check scope and supported sessions vary |
+| Post-only | avoid taking liquidity under a specified rule | venue may reject, cancel, or reprice a marketable instruction |
+| Pegged | derive price from a named reference plus constraints | reference, rounding, update priority, and protection vary |
+| Stop/triggered | activate after a defined trigger | trigger source, side, session, and resulting order differ |
+| Auction-specific | participate in an opening, close, or other call | cutoffs, imbalance effect, and rollover are venue rules |
+
+A limit is a price constraint, not a statement that the order is passive. A buy limit above the current ask can remove liquidity. A market order is not a promise of immediate complete execution: available liquidity, controls, state, and venue behavior determine the result.
+
+### Bid, ask, mid, and spreads
+
+For best bid \(b\), best ask \(a\), and positive sizes:
+
+\[
+\text{quoted spread}=a-b,\qquad
+\text{mid}=\frac{a+b}{2}
+\]
+
+The mid is a reference, not necessarily an executable or tick-valid price. When one side is absent, neither spread nor mid is normally defined. Avoid sentinel arithmetic such as subtracting “no ask” from a real bid.
+
+For an execution price \(p\), quantity \(q\), and side sign \(s=+1\) for a buyer and \(-1\) for a seller, one common transaction-cost convention is:
+
+\[
+\text{signed cost per unit}=s(p-m)
+\]
+
+\[
+\text{effective spread}=2s(p-m)
+\]
+
+where \(m\) is a clearly timestamped reference midpoint, commonly at order receipt or execution in a specified analysis. Definitions used for regulatory reports may prescribe the reference, exclusions, and timestamp; do not substitute this generic formula blindly.
+
+A **realized spread** compares the execution with a later midpoint to separate short-horizon price movement from the immediate execution concession. Its horizon and sign convention must be stated. A **markout** is a related signed change after a selected horizon. None is meaningful without clock alignment, data source, and side.
+
+### Worked spread and execution cost
+
+Suppose this illustrative book is denominated in dollars and the tick is $0.01:
+
+```text
+                 quantity   price
+bids                 700    100.00
+                   1,200     99.99
+
+asks                 200    100.02
+                     500    100.03
+                   1,000    100.05
+```
+
+The quoted spread is \(100.02-100.00=\$0.02\), and the midpoint is $100.01. An immediate buy of 600 units walks the asks:
+
+```text
+200 @ 100.02 = 20,004
+400 @ 100.03 = 40,012
+total cost    = 60,016
+VWAP          = 60,016 / 600 = 100.026666...
+```
+
+The arrival-price slippage relative to the best ask is about $0.006667 per unit, or $4 total. Signed cost relative to the initial midpoint is about $0.016667 per unit, or $10 total. The effective-spread convention gives about $0.033333 per unit. These answer different questions; calling all three “spread cost” creates reconciliation errors.
+
+If this buyer later sells 600 at $100.04 and pays $0.30 total entry fees plus $0.30 exit fees:
+
+\[
+\text{cash P\&L}=600(100.04)-60{,}016-0.60=\$7.40
+\]
+
+This is a deliberately simple cash calculation. A derivative may require a multiplier; a cross-currency trade needs FX translation; positions held across time may incur financing, margin, settlement, and corporate-action effects.
+
+## 49.4 Limit-order books, levels, and liquidity — Core
+
+A **limit-order book** organizes currently active eligible interest by price. A **price level** contains all interest at one price. Bids sort from highest to lowest; asks sort from lowest to highest:
+
+```text
+             BIDS                         ASKS
+price       quantity                price       quantity
+100.00          700   <- best       100.02          200 <- best
+ 99.99        1,200                100.03          500
+ 99.98          300                100.05        1,000
+```
+
+**Market by price (MBP)** publishes aggregate quantity at each level. **Market by order (MBO)** publishes individual orders or order-like entries with identifiers. These names are clearer than “Level 2/Level 3,” whose usage varies. A feed can be depth-limited, omit hidden interest, conflate order types, or publish implied/synthetic entries. “Full depth” must be defined by the feed specification.
+
+**Depth** is available displayed quantity at specified price levels in the observed view. **Liquidity** is broader:
+
+- **tightness:** quoted or effective spread;
+- **depth:** displayed/executable size near relevant prices;
+- **immediacy:** ability to transact a desired quantity promptly;
+- **resilience:** how quickly prices and depth recover after consumption;
+- **breadth/fragmentation:** where substitutable liquidity exists;
+- **stability:** how long displayed interest remains available.
+
+Displayed depth is not a promise of execution. It may change before an order arrives. Hidden or reserve interest may make actual execution larger than display. Another participant may consume it first. A consolidated view can be older than a direct venue view. A price may be indicative, protected, firm, non-firm, or executable only for certain participants or quantities under the applicable rules.
+
+Distinguish these frequently conflated quantities:
+
+| Quantity | What it answers | What it omits |
+|---|---|---|
+| displayed size | what this feed currently publishes at a price | hidden interest and later changes |
+| executable size | what a particular order could interact with under current rules | latency before arrival and market response |
+| order quantity | what a participant requested | fills, cancels, and venue adjustments after submission |
+| leaves quantity | live unexecuted remainder according to an order state | executions not yet received or reconciled locally |
+| traded volume | qualifying executions accumulated over an interval | live liquidity and cancelled interest |
+| open interest | outstanding derivative contracts under its reporting definition | intraday order-book depth |
+
+Volume is a flow; depth is a state. A market can report high daily volume and have little displayed depth at a particular instant. Conversely, a deep book can trade little if interest never crosses.
+
+The **VWAP** of a book walk is:
+
+\[
+\operatorname{VWAP}=\frac{\sum_i p_iq_i}{\sum_iq_i}
+\]
+
+Use fixed-point/integer units and a widened intermediate. Stop at the order’s limit price, desired quantity, or exhausted eligible liquidity. The book snapshot is only a counterfactual: submitting the order can change the market, and the observed depth can disappear.
+
+A common descriptive imbalance is:
+
+\[
+I=\frac{Q_b-Q_a}{Q_b+Q_a}
+\]
+
+for defined bid and ask quantities \(Q_b,Q_a\), perhaps at the touch or over \(N\) levels. It is undefined when the denominator is zero. Level count, weighting, hidden-interest treatment, and sampling timestamp must accompany the value. It is a measurement, not a universal predictor.
+
+## 49.5 Ticks, quantities, lots, and multipliers — Core
+
+The **tick size** or minimum price increment is the permitted price step under the applicable rule. A **price scale** says how an encoded integer maps to a quoted price. They are not the same:
+
+```text
+protocol integer 1000234 with scale 10^-4 -> quoted 100.0234
+tick 0.0050                               -> valid prices differ by 50 encoded units
+```
+
+A tick can be fixed, depend on price bands, depend on an instrument classification, or change on an effective date. Some instruments use fractional display conventions while protocols still encode integers. A grid may have a nonzero base. The order-entry rule may also distinguish display increment from execution increment.
+
+**Jurisdiction example, versioned:** European equity tick regimes under MiFID-related technical standards use prescribed tables and liquidity/price inputs. **Venue/product example:** some derivatives use product-specific fixed or fractional increments. Neither supports hard-coding “all stocks tick by one cent.”
+
+Use fixed-point integers:
 
 ```cpp
-// Hot path: dense integer id → contiguous array. No hashing, no strings.
-struct InstrumentState { /* book, params, risk limits ... */ };
-std::vector<InstrumentState> by_id;          // indexed by venue security_id
-// Cold path only: symbol strings → id, built at startup from reference data
-std::unordered_map<std::string, uint32_t> by_symbol;
-```
-If the venue's ID space is sparse or huge, use a perfect hash or a two-level table built at startup — still no runtime string work.
+#include <cstdint>
+#include <optional>
 
-**Derivatives symbology** adds structure. A futures contract is (root, expiry): `ES` + `Z5` = E-mini S&P December 2025, using month codes `F G H J K M N Q U V X Z` for January–December. An option is (root, expiry, strike, call/put), sometimes encoded in an OCC-style 21-character symbol. Spreads and combinations have their own composite identifiers and often their own outright books.
+struct Grid {
+    std::int64_t base;
+    std::int64_t tick;
+};
 
-**Failure modes with diagnostic signatures:**
-
-- **Ticker reuse after a delisting.** A ticker freed by one company can be reassigned to another. Your historical data now silently splices two unrelated instruments; the signature is an impossible price gap on a specific date.
-- **Same ticker, different venue, different instrument.** Cross-listed and dual-listed names; keying by ticker alone merges two books. Signature: crossed or nonsensical spreads (§49.14) on a specific symbol.
-- **ISIN is not a venue.** One ISIN trades on many venues in many currencies. An ISIN-keyed book is a category error.
-- **ID reassignment across sessions.** Some venues reassign numeric security IDs daily. Caching yesterday's ID map and using it today points every message at the wrong instrument — the signature is a whole feed that parses cleanly and produces uniformly wrong books, which is far more dangerous than a parse error.
-
-The rule that prevents most of this: **the internal key is (venue, venue-native instrument id, trading session)**, everything else is a mapping maintained in cold-path reference data, and the map is rebuilt from the venue's own definition messages at session start (§49.10).
-
----
-
-## 49.10 Reference-Data Changes
-
-**Reference data** (static data, instrument definitions) is the per-instrument configuration a trading system needs but does not receive in the real-time price stream: tick size, lot size, multiplier, currency, expiry, price bands, trading hours, allocation algorithm, fee schedule, and the symbology mappings of §49.9.
-
-**Sources.** Venues publish it as (a) downloadable files before the session, (b) definition messages on the market-data feed itself (CME sends `SecurityDefinition` messages on a dedicated channel, replayed periodically), or (c) an API. Production systems normally load a file at startup and then apply intraday definition messages.
-
-**Change classes and their handling:**
-
-| Change | When | Handling |
-|---|---|---|
-| New instrument listed | Session start, or intraday | Must be added without restart if the venue allows intraday listing |
-| Instrument delisted / expired | Session boundary | Retire, but keep history keyed by the old ID |
-| Tick-size table change | Effective date, often quarterly (MiFID II) | Reject orders under the *new* rule from the effective session |
-| Corporate action: split, dividend, merger | Overnight, effective at open | Historical prices and quantities must be adjusted; open orders are typically cancelled or adjusted by rule |
-| Symbol change | Overnight | ID mapping updated; the numeric ID may or may not persist |
-| Price-band / limit update | Intraday, dynamically (§49.13) | Must be consumed from the real-time feed |
-| Fee schedule change | Effective date | Reload; affects attribution only |
-| Contract roll (futures) | Scheduled | Front month changes; anything keyed on "the front month" must follow |
-
-**Corporate actions are the classic trap.** A 4-for-1 split multiplies share count by 4 and divides price by 4 overnight. Consequences: your historical time series is discontinuous unless adjusted; your position and risk limits are wrong by 4× until updated; open GTC orders (§50.8) are handled by venue-specific rules (typically cancelled, sometimes adjusted); and your backtest silently shows a −75% return on the split date if unadjusted. The diagnostic signature is unmistakable — a clean 4× or 0.25× discontinuity on one date in one symbol.
-
-**Engineering rules:**
-
-1. **Validate reference data before the session, and fail closed.** A missing tick size must prevent trading that instrument, not default to a guess (Ch. 60 §60.9). Every default is a silent wrong answer.
-2. **Reference data is versioned and immutable at runtime.** Publish a new immutable snapshot and swap the pointer atomically (Ch. 60 §60.10); never mutate a live table under a reader. The hot path reads it with no lock (Ch. 26 §26.14 for RCU-style publication).
-3. **Diff and alarm.** Compare today's load to yesterday's and report every change. Most incidents are caught here, by a human looking at "3,412 tick sizes changed" and asking why.
-4. **Never derive reference data from market data.** Inferring tick size from observed price differences works until it doesn't — a wide-spread illiquid instrument gives you a wrong tick and a reject storm.
-5. **Keep the mapping bidirectional and historical.** Post-trade reconciliation (Ch. 54 §54.15) needs to resolve yesterday's IDs.
-
----
-
-## 49.11 Continuous Trading
-
-**Continuous trading** (continuous double auction) is the normal state of an order-driven market: orders arrive at arbitrary times and are matched immediately against the resting book when they cross (§50.18). "Continuous" contrasts with **call auctions** (§49.12), where orders accumulate and match at a single point in time at a single price.
-
-**The session state machine** — every venue has one, and your gateway must model it:
-
-```
-   PRE_OPEN ──► OPENING_AUCTION ──► CONTINUOUS ──► CLOSING_AUCTION ──► POST_CLOSE
-   (orders     (uncross at a       (immediate     (uncross)           (order
-    accepted,   single price)       matching)                          cleanup)
-    no match)          │                 │
-                       │                 ├──► HALT ──► (re-opening auction) ──► CONTINUOUS
-                       │                 └──► VOLATILITY_AUCTION ──┘
-```
-
-**What changes between states:**
-
-| Property | Continuous | Auction / pre-open |
-|---|---|---|
-| Matching | Immediate on cross | Only at the uncross instant |
-| Book may be crossed | No | **Yes** — bids above asks is normal and expected |
-| Indicative price published | No | Yes (indicative uncross price and imbalance) |
-| Which order types accepted | All | Restricted (market-on-open, limit; IOC/FOK usually rejected) |
-| Trade messages | Continuous | One burst at the uncross |
-
-**The crossed-book point is the one that breaks naive implementations.** During a pre-open or auction call phase, the book legitimately contains bids above asks — that is precisely what the auction will resolve. A book builder that asserts `best_bid < best_ask` will fire that assertion every single morning. The correct behaviour is to make the invariant conditional on session state (§49.14).
-
-**Session-state sources.** Venues signal state via dedicated market-data messages (trading status / security status messages), and sometimes only implicitly by scheduled time. **Never drive session state purely from a wall clock.** Openings are delayed, halts are unscheduled, and a system that resumes quoting at 09:30:00.000 by the clock while the instrument is still halted will send orders into a rejecting or, worse, accepting venue. The correct design is event-driven from the venue's status messages, with the clock used only as a sanity check that raises an alarm on divergence.
-
-**Auxiliary continuous-session mechanics worth naming:**
-
-- **Trading pauses at open**: instruments open in staggered batches, not simultaneously; your "market is open" flag must be per-instrument.
-- **Reopening after halt** goes through an auction, not straight into continuous (§49.13).
-- **Intraday auctions** exist on some venues (e.g. a scheduled midday auction), which briefly suspend continuous trading.
-- **Late/extended sessions** may have different tick rules, different order types, and much thinner books.
-
-**Diagnostic signature of a session-state bug:** a burst of rejects with venue reason codes like "invalid state for order type" concentrated at exactly the same time each day, or orders that rest but never trade because they were submitted into a call phase.
-
----
-
-## 49.12 Opening and Closing Auctions
-
-A **call auction** (or *uncross*, *fixing*, *match*) collects orders over a call period and executes them all at a single **auction price** at one instant. Opening and closing auctions are the largest single liquidity events of the day on most equity venues — the closing auction in particular concentrates enormous volume because index funds must trade at the official close.
-
-**The uncross algorithm.** Given all eligible orders, choose the price that maximizes executable volume; break ties by successive criteria. The standard cascade (Xetra, Euronext, Nasdaq and most others differ only in details):
-
-1. **Maximum executable volume.** For each candidate price p, `executable(p) = min(cumulative buy qty at ≥ p, cumulative sell qty at ≤ p)`. Choose p maximizing this.
-2. **Minimum surplus (imbalance).** If several prices tie, choose the one with the smallest `|buy − sell|` remaining unfilled.
-3. **Surplus side.** If still tied, and the surplus is all on the buy side choose the highest such price; if all on the sell side choose the lowest.
-4. **Reference price.** If still tied, choose the price closest to a reference (previous close, or last traded price).
-
-```
-Buy orders                Sell orders
-qty  limit                limit  qty
-200  ≥101                  ≤ 99  150
-300  ≥100                  ≤100  250
-400  ≥ 99                  ≤101  300
-
-Cumulative buy at price p (buyers willing to pay ≥ p):
-  p=101: 200      p=100: 500      p=99: 900
-Cumulative sell at price p (sellers willing to accept ≤ p):
-  p=99: 150       p=100: 400      p=101: 700
-
-executable(99)  = min(900,150) = 150
-executable(100) = min(500,400) = 400   ← maximum
-executable(101) = min(200,700) = 200
-→ auction price = 100, volume = 400.  Surplus = 100 on the buy side (unfilled).
-```
-
-**Allocation at the auction price** then follows the venue's priority rules (§49.4/§49.5), and — importantly — **all trades print at the single auction price**, including orders that were willing to pay far more. An order with limit 101 that fills at 100 received price improvement of 1.
-
-**Order types specific to auctions:** market-on-open (MOO) / market-on-close (MOC) execute at the auction price regardless of level; limit-on-open/close (LOO/LOC) participate only within their limit; imbalance-only orders participate only to offset an imbalance. Venues impose cutoff times after which MOC orders cannot be entered or cancelled — a hard deadline your gateway must respect and alarm on.
-
-**Indicative data during the call.** Venues disseminate an *indicative auction price*, *indicative volume*, and *imbalance* (side and quantity) at intervals during the call period. Consuming these requires a separate message handler and a separate state model — they are not book updates and must not be fed into your continuous book.
-
-**Engineering implications:**
-
-- **A crossed book is normal during the call** (§49.11, §49.14).
-- **The uncross produces a burst** — thousands of executions in microseconds, plus a book that transitions instantly to a completely different state. Your gateway, risk system, and position tracker must absorb the burst without queueing collapse (Ch. 52 §52.16). Auction bursts are the standard capacity-planning worst case (Ch. 56 §56.10).
-- **The official closing price** used for settlement, index calculation, and marking positions is the auction price, not the last continuous trade. Systems that mark to "last trade" produce a different P&L than everyone else, and the discrepancy appears only on days with a large auction.
-- **Implementing the uncross is a common interview exercise.** Do it with cumulative sums over the sorted price levels in one pass in each direction, O(L) in the number of levels, not by trying every price against every order.
-
----
-
-## 49.13 Trading Halts and Price Bands
-
-A **halt** suspends trading in an instrument. A **price band** (limit, collar) restricts the prices at which trading may occur. Both are venue-enforced circuit breakers, and both change your system's legal actions.
-
-**Halt types:**
-
-| Type | Trigger | Typical resolution |
-|---|---|---|
-| **Regulatory / news pending** | Pending material announcement | Resumes after dissemination, via auction |
-| **Volatility halt (LULD, single-stock circuit breaker)** | Price moves beyond a band for a sustained interval | Short pause (e.g. 5 min) then a reopening auction |
-| **Market-wide circuit breaker (MWCB)** | Index falls by 7% / 13% / 20% | 15-minute halt; 20% halts for the day |
-| **Operational halt** | Venue technical issue | Indeterminate |
-| **Limit up / limit down (futures)** | Price reaches a daily limit | Trading may continue *within* the limit, or halt |
-
-**LULD (limit up-limit down)** is the US equity mechanism worth knowing concretely: a reference price (rolling 5-minute average of trades) defines a band (a percentage varying by price and tier). Quotes outside the band are not executable; if the market's best bid or offer sits at the band edge for 15 continuous seconds, a **limit state** becomes a 5-minute **trading pause**, which is exited via a reopening auction.
-
-**Price bands versus rejection.** Two distinct venue behaviours you must distinguish:
-
-- **Price banding on entry** — an order priced outside the band is *rejected* at the gateway. Signature: rejects clustering at extreme prices during volatile periods.
-- **Execution banding** — the order is accepted but cannot execute outside the band; it may rest silently. Signature: an order that never fills despite an apparently crossing price.
-
-**Futures banding** works differently again: CME applies dynamic price banding around a reference price to reject fat-finger orders (Ch. 56 §56.13), separate from daily price limits which halt or bound trading.
-
-**Engineering rules:**
-
-1. **A halt is not "no data."** You continue to receive status messages, and the book may be purged or frozen depending on venue. Know which — a frozen book that you treat as live produces stale-price trading on resumption (Ch. 53 §53.8).
-2. **Open orders during a halt** may be retained, cancelled by the venue, or cancelled at the reopen — per venue rules. Assume nothing; the reconciliation after a halt is a mandatory step, and "cancel on disconnect" semantics (Ch. 54 §54.13) do not cover halts.
-3. **Reopening is an auction**, so your first post-halt fills come as an auction burst at a single price (§49.12), not as continuous trades.
-4. **Your own price collars are still required.** Venue bands are a backstop, not your risk control. Pre-trade price collars (Ch. 56 §56.13) must reject an order whose price is implausible relative to your own book before it ever reaches the wire, because a venue that *accepts* a bad price is the expensive case.
-5. **Halt state must be per-instrument and event-driven**, and must gate quoting. The classic incident: a halted instrument's stale book looks enormously attractive, and a strategy that does not check halt state fires orders into the reopening auction at yesterday's prices.
-
----
-
-## 49.14 Locked and Crossed Markets
-
-Two precisely defined abnormal states:
-
-- **Locked market** — best bid **equals** best ask. Spread = 0.
-- **Crossed market** — best bid is **greater than** best ask. Spread < 0.
-
-```
-Normal:   bid 100.01  |  ask 100.03      spread = +0.02
-Locked:   bid 100.02  |  ask 100.02      spread =  0.00
-Crossed:  bid 100.04  |  ask 100.02      spread = -0.02
-```
-
-**Within a single matching engine, neither can occur during continuous trading**, because an incoming order that would lock or cross is matched against the resting side instead of resting (§50.18). Therefore, if your book for one venue shows a lock or a cross during continuous trading, **the most likely explanation is a bug in your book**, not a market event. This inversion of instinct is the single most useful diagnostic heuristic in feed-handler work.
-
-**Legitimate causes of a lock or cross:**
-
-| Cause | Context |
-|---|---|
-| Auction / pre-open call phase | Normal and expected (§49.11–§49.12) |
-| **Cross-venue** NBBO | Venue A's bid can exceed venue B's ask; this is a real, common, and regulated condition |
-| Halted instrument | A frozen book can be crossed against another venue |
-| Odd-lot or hidden liquidity | Prices not subject to the same protections |
-| Different instrument versions | Two instruments merged by a symbology error (§49.9) — *this is a bug wearing a costume* |
-
-**Bug causes, ranked by frequency — the real value of this section:**
-
-1. **Missed or misapplied delete/cancel message.** A resting order that was cancelled but not removed leaves a phantom level, most visibly at the touch. Signature: the cross persists until the level is touched again.
-2. **Sequence gap silently ignored** (Ch. 53 §53.4). You dropped messages and your book diverged. Signature: cross appears abruptly and never self-heals; the gap is visible in sequence-number accounting if you look.
-3. **A/B feed arbitration bug** (Ch. 53 §53.6) — applying the same update twice, or applying B's update out of order relative to A's.
-4. **Snapshot/delta race** (Ch. 53 §53.3) — applying deltas that predate the snapshot, or failing to discard deltas already reflected in it.
-5. **Signed/unsigned or endianness error in price parsing** (Ch. 3 §3.9, Ch. 51 §51.10) — a negative price parsed as huge unsigned, or a byte-swapped price. Signature: absurd values, not merely inverted ones.
-6. **Implied/synthetic prices mixed into the outright book** — futures venues publish implied prices derived from spreads; mixing them into the outright book without marking them creates apparent crosses.
-
-**Required system behaviour:**
-
-```cpp
-// After every book update, in continuous session state:
-if (session == Session::Continuous && book.has_both_sides()
-    && book.best_bid_px() >= book.best_ask_px()) {
-    metrics.crossed_book_events++;
-    mark_instrument_unusable(id);          // fail closed: stop quoting THIS instrument
-    request_recovery(id);                  // snapshot re-sync (Ch. 53 §53.3)
+std::optional<bool> on_tick_grid(std::int64_t price, Grid g) {
+    if (g.tick <= 0) {
+        return std::nullopt;
+    }
+    auto price_remainder = price % g.tick;
+    auto base_remainder = g.base % g.tick;
+    if (price_remainder < 0) price_remainder += g.tick;
+    if (base_remainder < 0) base_remainder += g.tick;
+    return price_remainder == base_remainder;
 }
 ```
 
-**Fail closed, per instrument.** A crossed book means your state is untrustworthy; continuing to quote against it is how firms lose money quickly. Stopping the world entirely is usually the wrong response — halt the affected instrument, recover it, and let the rest of the system continue (Ch. 56 §56.12).
+This validates membership without overflowing `price - base`; rounding is a separate, side- and intent-sensitive policy. Negative prices are possible for some instruments, and C++ remainder truncates toward zero, which is why both remainders are normalized.
 
-**Regulatory dimension (US equities).** Reg NMS Rule 610 prohibits displaying quotations that lock or cross another venue's protected quotation, which is why routing systems must check the NBBO before posting; and Rule 611 (the order protection / trade-through rule) prohibits executing at a price inferior to a protected quotation on another venue. You do not need the rule numbers memorized, but you should know that *cross-venue locks are actively prevented by rule*, which is why an unexpected cross in a consolidated view is again more likely to be your data than the market.
+Quantity concepts also differ:
 
----
+- **quantity increment:** smallest allowed quantity step;
+- **minimum order quantity:** smallest accepted instruction;
+- **round lot:** jurisdiction/venue-defined standard unit for specified purposes;
+- **odd lot:** a quantity outside that round-lot convention;
+- **contract multiplier/point value:** converts a quoted price movement into monetary value;
+- **tick value:** tick size multiplied by the applicable contract multiplier and, where appropriate, currency conversion.
 
-## Key Interview Questions
+For a linear illustrative contract:
 
-1. **Define bid, ask, spread, and mid — and say which of them is always a tradeable price.** — Best bid is the highest resting buy, best ask the lowest resting sell, spread their difference, mid their average; mid is frequently *not* on the tick grid and therefore not tradeable.
-2. **What does "hitting the bid" mean, and who is the aggressor?** — Selling into a resting buy order; the incoming seller is the aggressor/taker, the resting buyer is the maker.
-3. **Why must prices be integers, not doubles?** — Priority and matching require exact equality and exact tick-grid arithmetic; binary floating point makes the book non-deterministic and produces unmatchable residual quantities.
-4. **MBP vs MBO — what can you compute with one but not the other?** — Queue position; aggregated feeds give a level total with no information about your place in it.
-5. **What are the dimensions of liquidity?** — Tightness (spread), depth (size), resilience (refill speed), immediacy; plus the caveat that displayed depth overstates available depth because of hidden/iceberg orders, fragmentation and fleeting quotes.
-6. **How do you maintain queue position from an MBO feed?** — Track quantity ahead; executions consume from the front (unambiguously reduce it), cancels are ambiguous with aggregated data, quantity increases and price changes send an order to the back.
-7. **Under price-time priority, what preserves and what destroys time priority?** — Partial fills and (usually) quantity decreases preserve it; quantity increases, price changes, and iceberg replenishment destroy it.
-8. **Why is arrival order sufficient — why not sort by timestamp?** — Insertion order at a level *is* time order, so a FIFO gives priority for free; storing and sorting timestamps is slower and resolves ties arbitrarily.
-9. **How does pro-rata allocation change system incentives versus FIFO?** — Fill share depends on displayed size rather than arrival time, so latency matters less for allocation (though still for reacting), and queue position is replaced by size share.
-10. **What are the hard parts of implementing pro-rata correctly?** — Top-order allocation, minimum-allocation thresholds, floor rounding, the residual pass, integer division order, and 128-bit intermediates — determinism is mandatory or fill simulation and reconciliation both break.
-11. **Maker vs taker, and why can't you infer the liquidity flag?** — Maker rests, taker aggresses; auctions, routed orders and partially-resting orders break inference, so you must persist the venue's own flag from the execution report.
-12. **How does tick size shape a market's microstructure?** — A large tick relative to natural spread forces wide spreads and makes queue position valuable; a small tick makes priority cheap to buy by price improvement and produces shallow queues.
-13. **What is a contract multiplier and where does it bite?** — Price-to-notional conversion; a wrong multiplier uniformly scales every risk limit for a product family, and the price×multiplier×quantity chain overflows 64 bits without a 128-bit intermediate.
-14. **Why is a numeric security ID better than a symbol on the hot path?** — Binary feeds carry it natively and it indexes a dense array in O(1); string lookup on the hot path is a design error. Internal key should be (venue, native id, session).
-15. **Name three symbology failure modes and their signatures.** — Ticker reuse after delisting (impossible price gap on one date), same ticker on different venues (crossed/nonsense spreads), daily ID reassignment (a whole feed parsing cleanly into uniformly wrong books).
-16. **How should reference data be updated at runtime?** — Immutable versioned snapshot with an atomic pointer swap, validated and failed-closed before the session, diffed and alarmed against yesterday, never inferred from market data.
-17. **Describe the auction uncross algorithm.** — Maximize executable volume = min(cumulative buy ≥ p, cumulative sell ≤ p); tie-break on minimum surplus, then surplus side, then nearest reference price; all trades print at that single price.
-18. **Why will a naive book builder assert every morning?** — Because a crossed book (bids above asks) is legitimate during the pre-open call phase; the no-cross invariant is conditional on continuous session state.
-19. **Your single-venue book shows bid > ask during continuous trading. What is it?** — Almost certainly your bug: a missed delete, an ignored sequence gap, an A/B arbitration error, a snapshot/delta race, or a price parsing error. Fail closed on that instrument and re-sync.
-20. **What does LULD do and how does trading resume?** — A band around a rolling reference price; 15 seconds at the band edge triggers a pause, and the instrument reopens via an auction, not straight into continuous trading.
+\[
+\text{notional}=p\times M\times q,\qquad
+\text{tick P\&L}=\Delta\text{ticks}\times \text{tick value}\times q
+\]
 
----
+If tick size is 0.25 currency units and multiplier is 40 currency units per price point, tick value is 10 currency units per contract. A three-contract move of five ticks changes value by \(5\times10\times3=150\) currency units. Whether “notional” is the right risk measure depends on the instrument; options and nonlinear products require more than this linear formula.
 
-## Common Traps
+Price, scale, multiplier, currency, and quantity must be effective-dated reference data. Use a widened integer/rational or decimal representation for intermediate monetary arithmetic, and define rounding at accounting boundaries.
 
-- **Floating-point prices or quantities** — non-deterministic priority, and residual leaves-quantity of 10⁻¹⁵ that never fills.
-- **Assuming `best_bid < best_ask` unconditionally** — false during pre-open, auctions, and across venues.
-- **Treating a crossed single-venue book as a market event** — it is a bug until proven otherwise.
-- **Inferring the liquidity flag** instead of persisting the venue's — breaks on auctions and partially-resting orders.
-- **Inferring tick size from observed prices** — wrong on illiquid instruments, causes reject storms.
-- **Hard-coding tick size, lot size, multipliers or fees** — MiFID II tick tables and tiered fees are data, with effective dates.
-- **Ignoring negative prices** — C++ `%` truncates toward zero, breaking naive tick-grid checks below zero.
-- **Overflow in `price × multiplier × quantity`** — needs `__int128` intermediates.
-- **Keying instruments by ticker or ISIN** — not unique across venues, currencies, or time.
-- **Caching a venue security-ID map across sessions** when the venue reassigns IDs daily — the feed parses perfectly and is entirely wrong.
-- **Driving session state from a wall clock** rather than venue status messages — openings are delayed and halts are unscheduled.
-- **Assuming the closing price is the last continuous trade** — it is the closing auction price.
-- **Failing to size for the auction burst** — the uncross is the day's capacity worst case.
-- **Assuming displayed depth is available depth** — hidden and iceberg quantity, fragmentation, fleeting quotes.
-- **Assuming a price change keeps queue position** — it never does.
-- **Assuming a quantity decrease keeps priority on every venue** — usually yes, but some implement it as cancel/replace.
-- **Naive pro-rata (`qty * (size/total)`)** — integer division order destroys the allocation; rounding must floor with an explicit residual rule.
-- **Treating a halt as "no data"** — status messages continue, and open-order handling during a halt is venue-specific.
-- **Relying on venue price bands as your risk control** — you need your own pre-trade collars.
-- **Mixing implied/synthetic prices into the outright book** — manufactures apparent crosses.
-- **Unadjusted corporate actions** — a clean 4× discontinuity in history and risk limits wrong by the split ratio.
+## 49.6 Matching priority and queue position — Core
 
----
+When an incoming instruction can execute against several resting orders at the same eligible price, the venue needs an **allocation rule**. Price usually constrains which level is eligible; the within-level allocation can be price-time/FIFO, pro-rata, size/time, participant priority, displayed-before-hidden, a hybrid, or another published algorithm.
 
-## Compact Recall Summary
+Under **price-time priority**, better price wins, then earlier venue priority within a price:
 
-**Touch and spread.** Best bid = highest resting buy, best ask = lowest resting sell, spread = ask − bid, mid = average (often off the tick grid, so not tradeable). Bids sort descending, asks ascending, best first. Aggressor/taker crosses; maker rests. Hitting the bid is selling. Prices are scaled integers, always.
+```text
+resting bids
+100.00: A 300 (first), B 500 (second)
+ 99.99: C 900 (older in wall-clock time than A)
 
-**Depth and liquidity.** MBP aggregates a level; MBO exposes each order and is the only way to compute queue position. Liquidity = tightness + depth + resilience + immediacy. Walking the book gives VWAP and slippage; watch overflow in the weighted sum. Displayed depth overstates reality — icebergs, hidden orders, fragmentation, fleeting quotes.
+incoming eligible sell quantity 600
+-> A fills 300
+-> B fills 300
+-> C fills 0 because price outranks time
+```
 
-**Queue position.** Quantity ahead of you in the level FIFO. Executions consume from the front (unambiguous); cancels from an aggregated feed are ambiguous, so track optimistic and pessimistic bounds. Price change always loses priority; quantity increase usually does; partial fill and quantity decrease usually don't.
+The matching engine’s accepted event order—not a client timestamp—defines venue priority. A natural representation is an ordered price map with a FIFO-like structure per level, but the protocol may expose less information than the venue internally uses.
 
-**Priority rules.** Price-time is lexicographic (side-directed price, then arrival sequence assigned by the engine — never client time). Implement as `price → FIFO`, never sort. Pro-rata allocates by size share with top-order allocation, minimum thresholds, floor rounding, and a venue-specific residual pass — determinism is mandatory. Hybrids split a configured percentage FIFO/pro-rata per instrument. The allocation rule is what makes latency economically valuable.
+**Queue position** is an order’s place under an ordering rule, often summarized as quantity ahead. If the MBO view shows:
 
-**Fees.** Maker-taker pays the resting side and charges the aggressor; inverted venues reverse it. Persist the venue's liquidity flag; never infer it. Tiered, per-share/per-contract/bps, with effective dates — it's reference data, and mis-attribution shows up as a volume-proportional discrepancy at month-end invoice reconciliation.
+```text
+100.00 bid, front -> [A 300] [B 500] [YOU 200] [D 100]
+quantity ahead of YOU = 800
+```
 
-**Ticks and lots.** Tick = minimum price increment, bounds the spread below, and may be a table function of price and liquidity band (MiFID II RTS 11). Round order prices toward passive. Lot size, minimum quantity, and contract multiplier convert quantity and price into notional; tick value = tick × multiplier. Use `__int128` intermediates.
+an eligible sell execution of 850 would consume A and B, then 50 of YOU, assuming strict FIFO and no other event intervenes.
 
-**Symbology.** Venue ticker (not unique), ISIN/CUSIP/SEDOL/FIGI (security, not venue), MIC (venue), and the venue's numeric security ID — which is what the binary feed carries and what the hot path must index directly. Internal key = (venue, native id, session). Watch ticker reuse, cross-listing, and daily ID reassignment.
+MBO can support deterministic queue reconstruction only when it exposes all priority-relevant events and identifiers. MBP generally cannot locate a particular order within a level. If an MBP level falls by 200, the decrease might be ahead of or behind the order. Separate trade data can reduce uncertainty if the venue rules make executions consume the visible FIFO, but hidden/reserve behavior and feed semantics still matter.
 
-**Reference data.** Tick, lot, multiplier, bands, hours, allocation algorithm, fees, mappings. Load and validate pre-session, fail closed on anything missing, apply intraday definition messages, publish immutable snapshots with atomic pointer swap, diff-and-alarm daily, never infer from market data. Corporate actions produce clean N× discontinuities.
+Modification priority is a venue rule:
 
-**Sessions.** Pre-open → opening auction → continuous → closing auction → post-close, with halts and volatility auctions branching off. Crossed books are legal in call phases. Drive state from venue status messages, per instrument, never from a clock.
+| Action | Common FIFO treatment | Safe engineering stance |
+|---|---|---|
+| partial execution | remainder often retains priority | confirm venue rule |
+| quantity decrease | often retains priority | confirm order type/venue |
+| quantity increase | often loses priority | model exact replace semantics |
+| price change | normally receives priority at new price | use venue acknowledgment/event |
+| reserve replenishment | priority treatment varies | consume product specification |
 
-**Auctions.** Uncross at the price maximizing executable volume = min(cumulative buy ≥ p, cumulative sell ≤ p); tie-break minimum surplus, then surplus side, then reference price. Single print price for all fills. Closing auction sets the official close and is the day's capacity worst case.
+Avoid “always” here. Even apparently ordinary changes can be represented as cancel/new by a protocol or receive special treatment by an order type.
 
-**Halts and bands.** Regulatory, volatility (LULD: band → 15 s limit state → 5 min pause → reopening auction), market-wide, operational, and futures daily limits. Entry banding rejects; execution banding silently prevents fills. Open-order treatment is venue-specific; reopening is always an auction; your own collars remain mandatory.
+## 49.7 Pro-rata and hybrid allocation — Core
 
-**Locked and crossed.** Locked = bid equals ask; crossed = bid above ask. Impossible within one engine in continuous trading, so on a single-venue book it means a missed delete, an ignored sequence gap, an A/B arbitration bug, a snapshot/delta race, or a parse error. Fail closed on that instrument, re-sync, and continue everything else. Cross-venue locks are real but rule-restricted (Reg NMS 610/611).
+Under a basic **pro-rata** model, first define eligible incoming quantity \(E=\min(Q,\sum_jq_j)\). Each resting order then receives a floor share proportional to its eligible displayed size:
+
+\[
+a_i=\left\lfloor E\frac{q_i}{\sum_j q_j}\right\rfloor
+\]
+
+For incoming quantity \(Q=100\) and resting sizes 60, 30, and 10, the exact shares are 60, 30, and 10. For \(Q=17\), floors yield 10, 5, and 1: one unit remains.
+
+That residual proves why “pro-rata” is not a complete specification. A venue must define eligibility, minimum allocations, rounding, residual order, top-order or market-maker priority, displayed/hidden treatment, and whether earlier passes reduce the denominator. Hybrids may allocate part FIFO and part pro-rata.
+
+Consider resting quantities `A=5`, `B=3`, `C=2`, with A, B, C also in arrival order, and incoming quantity 6. A floor pass gives:
+
+```text
+A: floor(6 * 5 / 10) = 3
+B: floor(6 * 3 / 10) = 1
+C: floor(6 * 2 / 10) = 1
+allocated = 5; residual = 1
+```
+
+If the rule assigns residual FIFO, A receives the last unit and the result is `(4, 1, 1)`. If it assigns the largest fractional remainder, B’s fractional entitlement of 0.8 is largest and the result is `(3, 2, 1)`. Both conserve quantity and look “pro-rata”; only one can match a given venue rule. A minimum-allocation threshold or top-order pass can change the eligible set before these calculations.
+
+An implementation should assert:
+
+\[
+0\le a_i\le q_i,\qquad
+\sum_i a_i=\min(Q,\sum_i q_i)
+\]
+
+and apply each venue stage in a documented deterministic order. Property tests can verify conservation and bounds, but they cannot discover the venue’s intended residual rule.
+
+**Venue-specific example, versioned:** CME Globex documents several product-assigned matching algorithms, including FIFO, pro-rata variants, and split algorithms. The algorithm can differ by product and can change by notice. “CME is pro-rata” is therefore wrong.
+
+A deterministic integer calculation should widen before multiplication:
+
+```cpp
+#include <cstdint>
+#include <optional>
+
+std::optional<std::int64_t> floor_share(std::int64_t incoming,
+                                        std::int64_t resting,
+                                        std::int64_t total) {
+    if (incoming < 0 || resting < 0 || total <= 0 || resting > total) {
+        return std::nullopt;
+    }
+    const auto eligible = incoming < total ? incoming : total;
+    const __int128 numerator =
+        static_cast<__int128>(eligible) * resting;
+    return static_cast<std::int64_t>(numerator / total);
+}
+```
+
+This function only performs the floor share. It intentionally does not invent the residual rule. A simulator that matches the formula but not the exact venue stages can predict the wrong fills while preserving total quantity.
+
+`__int128` is a GCC/Clang extension, not standard C++. A portable system needs a checked widened-integer, decimal, rational, or multiprecision alternative with explicit overflow behavior.
+
+Allocation rules shape engineering incentives without determining them alone. FIFO makes earlier accepted priority valuable. Pro-rata makes displayed size relevant to allocation. Latency still affects reaction, cancellation, price selection, and whether an order is present at all. Product behavior should be measured rather than deduced from the algorithm name.
+
+## 49.8 Fees, rebates, and P&L — Core
+
+A venue may charge fees or pay rebates based on instrument, participant tier, order type, liquidity role, execution price/quantity, auction participation, routing, and effective date. **Maker-taker** commonly means charging liquidity removers and rebating providers; **inverted** or taker-maker pricing reverses that direction. Other schedules are flat, asymmetric, percentage-of-notional, per-contract, per-share/unit, capped, or bundled.
+
+These labels do not determine a fill’s fee. Persist the venue’s execution/liquidity code and the schedule version. Do not infer “maker” merely because an order was a limit order: a marketable limit can remove liquidity, an order can rest before a later fill, and auctions use their own classifications.
+
+For a simple linear trade:
+
+\[
+\text{gross cash P\&L}
+=q(p_{\text{sell}}-p_{\text{buy}})M
+\]
+
+\[
+\text{net P\&L}
+=\text{gross P\&L}
+-\text{fees}
++\text{rebates}
+-\text{other costs}
+\]
+
+Signs should be explicit in storage. One robust ledger represents every cash movement as a signed amount rather than encoding “negative fee means rebate” inconsistently across reports.
+
+Worked example: buy two contracts at 50.25 and sell at 50.75, with multiplier 20 currency units per point. Gross P&L is:
+
+\[
+2(50.75-50.25)20=20
+\]
+
+If total venue/clearing fees are 3.20, net is 16.80 before other costs. If the buys occurred at two prices, use actual fills, not an unweighted average. If the position remains open, a mark-to-market value is not realized cash P&L and must name its mark source.
+
+Fee schedules are often tiered or reconciled after the fact, so an estimated real-time fee and final booked fee may legitimately differ. Store the inputs needed to reproduce both. A volume-proportional reconciliation difference isolated to one venue often indicates a wrong schedule version, unit, tier, liquidity code, or currency.
+
+### Price, value, and return are different
+
+For a signed position \(Q\), linear mark \(m\), and average entry \(e\), an unrealized mark-to-market expression is \(Q(m-e)M\). The sign of \(Q\) handles long versus short. But the mark could be midpoint, bid/ask liquidation value, official settlement, closing auction, last eligible trade, or a valuation model. Those choices serve different purposes.
+
+**Return** normalizes a gain or loss by a stated capital, notional, price, or risk base. **P&L** is a monetary amount. **Notional** is an exposure scale and may not equal cash paid or maximum loss. **Market value** depends on position and mark. **Margin** is collateral required under a rule/model. Mixing them produces dashboards that appear numerically plausible but answer different questions.
+
+## 49.9 Auctions, halts, and price bands — Core
+
+In a **continuous double auction**, eligible incoming interest normally matches immediately against compatible resting interest. In a **call auction**, interest accumulates and is crossed at a designated event. An auction commonly chooses a single uncross price using objectives such as maximum executable volume, then venue-specific tie-breaks.
+
+For candidate price \(p\):
+
+\[
+B(p)=\text{eligible buy quantity priced at or above }p
+\]
+
+\[
+S(p)=\text{eligible sell quantity priced at or below }p
+\]
+
+\[
+V(p)=\min(B(p),S(p))
+\]
+
+Maximum \(V(p)\) identifies volume-maximizing candidates. It does not finish the algorithm. Imbalance, market-order treatment, reference prices, collars, order-type priority, and tie-break order are venue rules.
+
+### Worked auction snapshot
+
+Illustrative call interest:
+
+```text
+buys                              sells
+300 @ 101 or better              100 @  99 or better
+400 @ 100 or better              500 @ 100 or better
+200 @  99 or better              500 @ 101 or better
+```
+
+Cumulative candidates:
+
+| Candidate | Buy quantity at/above | Sell quantity at/below | Executable |
+|---:|---:|---:|---:|
+| 99 | 900 | 100 | 100 |
+| 100 | 700 | 600 | 600 |
+| 101 | 300 | 1,100 | 300 |
+
+Price 100 uniquely maximizes volume at 600, so no tie-break is needed. All auction executions normally use the selected uncross price under the assumed model. Real venue eligibility and tie-breaks can produce a different result from a naive cumulative table.
+
+Venues may disseminate an **indicative match price**, paired volume, and buy/sell imbalance during a call. These values can revise as orders arrive and should not be applied as ordinary continuous-book executions. The uncross can produce a burst of trades and book/status changes, so consumers must size for event rate rather than daily average.
+
+A **halt** or suspension stops or restricts matching. Causes can include news, volatility controls, venue operations, regulatory action, or market-wide rules. A **price band**, collar, or limit restricts order entry, display, or execution prices according to its own rule. “Outside the band” can mean reject, reprice, rest without execution, trigger an auction, or another state transition.
+
+Do not memorize one jurisdiction’s thresholds as the definition. On a halt:
+
+1. accept explicit status as data;
+2. stop actions forbidden by the new state;
+3. determine documented treatment of live orders;
+4. continue sequence/recovery processing;
+5. consume reopening-auction data separately;
+6. reconcile orders and book state before resuming strategy actions.
+
+A venue price band is not a participant’s risk control. It may be wider, use a different reference, or fail in a way the participant must handle.
+
+The official opening, closing, or settlement price is a defined output, not necessarily “the first trade,” “the last trade,” or the auction price in every case. When an auction does not occur or fails validation, a venue may use a fallback rule. Store the price type and source alongside the number. Historical bars that label one field `close` can conceal materially different definitions across venues and instruments.
+
+## 49.10 Fragmentation, locks, crosses, and data views — Core
+
+An instrument or equivalent exposure can trade on several venues. **Fragmentation** means no single venue view necessarily contains all accessible liquidity. A **consolidated** view combines selected quotes/trades under a defined eligibility and timing policy. In U.S. equities, terms such as NBBO, protected quotation, round lot, and trade-through have regulatory definitions with changing implementation dates; do not treat “best across my feeds” as a regulatory NBBO.
+
+For one observed view:
+
+- **normal/positive spread:** best bid \(<\) best ask;
+- **locked:** best bid \(=\) best ask;
+- **crossed:** best bid \(>\) best ask.
+
+These arithmetic definitions are general. Whether a state is permitted or expected depends on view and session. Crossed auction interest can be normal before an uncross. Independent venue quotes can temporarily form a locked or crossed consolidated view because of propagation, eligibility, or rule interactions. Some feeds include implied or non-firm prices with different semantics.
+
+Within a continuous central book whose rules immediately match marketable interest, a persistent crossed reconstructed book is suspicious. It is not proof of one particular bug. Investigate:
+
+- sequence gap or packet loss;
+- snapshot/incremental handoff error;
+- duplicate or out-of-order application;
+- wrong instrument/session mapping;
+- stale status or mixed auction/continuous state;
+- price-scale, sign, or endian error;
+- hidden/implied/order-type semantics;
+- protocol-version mismatch;
+- a legitimate venue rule or administrative event.
+
+Fail closed at the smallest safe scope while recovering. “A cross is always a feed bug” is too strong; “keep trading because markets sometimes cross” is unsafe.
+
+### Market data is a view, not the matching engine
+
+The matching engine serializes events under venue rules. A market-data publisher transforms that internal state into one or more products. A recipient sees packets later:
+
+```text
+participant order
+ -> venue gateway validation
+ -> matching-engine event order
+ -> executions/book changes
+ -> publisher encoding and channels
+ -> network delivery/recovery
+ -> local reconstructed view
+```
+
+Order-entry acknowledgments and public market data can have different identifiers, timestamps, ordering domains, and publication policies. “My order is acknowledged” does not imply every public feed has published it. “I saw a trade” does not identify the aggressor unless the feed explicitly supplies or permits deriving that fact.
+
+Common data products answer different questions:
+
+| Product | Typical content | Cannot safely establish alone |
+|---|---|---|
+| instrument definitions | identifiers, scales, product/session parameters | current book or session state |
+| status events | trading phase, halt, auction state | complete order book |
+| top of book | best published prices and sizes | deeper liquidity or queue position |
+| MBP depth | aggregate price levels | individual-order priority |
+| MBO depth | order-level events under feed rules | hidden internal state not published |
+| trades | reported executions and corrections | current resting depth |
+| imbalance/indicative | auction estimate and paired/imbalance data | final uncross price |
+| consolidated feed | eligible multi-venue data under its policy | fastest direct state at every venue |
+
+Normalize only after preserving the native fields needed to explain behavior. A unified `price` field that discards whether it was indicative, executable, settlement, or trade data makes downstream errors unavoidable.
+
+Chapter 51 covers protocols, Chapter 52 hot-path architecture, Chapter 53 market-data reconstruction, and Chapter 54 order gateways. This chapter owns the vocabulary that keeps those layers from being conflated.
+
+## 49.11 Worked market-event reasoning — Core
+
+At 09:29:59.900, an engineer’s book shows:
+
+```text
+session status: OPENING_CALL
+best displayed bid: 100.05
+best displayed ask: 100.01
+indicative match: 100.03, paired quantity 80,000
+```
+
+At 09:30:00.020, the feed emits:
+
+```text
+auction execution burst at 100.03
+session transition to CONTINUOUS
+new BBO 100.02 x 100.04
+```
+
+At 09:30:00.025, an application records a long-position mark changing from yesterday’s close of 99.80 to 100.03.
+
+Reason through it:
+
+1. The pre-event negative arithmetic spread is not by itself a corrupted continuous book; session state says auction call.
+2. The indicative 100.03 is neither guaranteed nor yet a trade. It is a venue-defined estimate.
+3. The execution burst at one price is consistent with an uncross. Its capacity profile differs from continuous flow.
+4. The new continuous BBO restores the continuous-book invariant for this venue model.
+5. The mark change is 0.23 per unit relative to yesterday’s close, but it is not trading P&L unless position, multiplier, currency, costs, and mark policy are applied.
+6. If the status transition packet were lost, a clock-based application might wrongly remain in call state. If the application instead forced continuous state at 09:30:00.000, it could reject valid late auction data. Status sequencing and recovery matter.
+
+Now change one observation: the crossed book first appears at 10:17 during explicit continuous status and persists while the direct venue feed’s sequence number has a gap. That is a reconstruction incident until recovered, not an auction. Stop using the affected instrument view, obtain the venue-defined recovery/snapshot, and reconcile rather than trying to “uncross” locally by deleting a side.
+
+This is the core engineering skill: combine arithmetic with instrument identity, state, data provenance, and venue rules.
+
+## 49.12 Reference data and symbology — Reference
+
+This section is skippable on a first pass, but production correctness depends on it.
+
+Reference data includes:
+
+| Domain | Typical fields |
+|---|---|
+| Identity | venue ID, market segment, native instrument ID, symbol, alternate IDs |
+| Economics | currency, multiplier, face/contract value, settlement method |
+| Price | encoding scale, tick/table, price limits, display convention |
+| Quantity | encoding scale, increment, minimum, lot convention |
+| Derivative | expiry, strike, option kind/style, underlying, legs and ratios |
+| Trading | calendar, session group, permitted order types, allocation algorithm |
+| Operations | feed channel, partition, protocol/template version |
+| Fees | schedule/version inputs and liquidity-code mapping |
+| Lifecycle | activation, expiration, suspension, corporate action, replacement |
+
+Every record needs provenance and validity:
+
+```text
+source + source version + received/published time
++ effective-from + effective-to + trading-date interpretation
+```
+
+A reference-data change is an event, not an overwrite. New listings, expiries, symbol changes, corporate actions, tick-table changes, multiplier changes, session exceptions, and venue migrations can affect books, risk, orders, P&L, and historical joins differently.
+
+Safe publication pattern:
+
+1. load a candidate snapshot off the hot path;
+2. validate uniqueness, scales, positive increments, referential integrity, ranges, and effective dates;
+3. diff it against the active snapshot and alarm on unexpected breadth;
+4. precompute hot-path forms such as native-ID indexing and integer tick parameters;
+5. publish an immutable version at an explicit boundary;
+6. retain the version used for each decision and fill;
+7. fail closed for instruments missing mandatory fields.
+
+Do not infer tick size from observed prices, multiplier from P&L, or session hours from yesterday’s traffic. Sparse markets and exceptional days make those guesses appear to work until the expensive case.
+
+### Corporate actions and contract lifecycle
+
+A split, merger, dividend, redenomination, option adjustment, expiry, or futures roll can change interpretation without changing every identifier. Treatment of positions, open orders, historical series, strikes, multipliers, and settlement is rule-specific. An exact ratio discontinuity can be evidence of an unhandled corporate action, but it can also expose a bad adjustment applied twice.
+
+Preserve raw data and apply named adjustment versions for analytics. Trading state should consume the official effective definition, not an adjusted historical display series.
+
+## 49.13 Common traps — Core
+
+- Using a ticker as a globally unique, timeless instrument key.
+- Treating a wall-clock schedule as authoritative session status.
+- Assuming a crossed book is always invalid, including during auction calls.
+- Accepting a persistent continuous-book cross without recovery.
+- Calling last trade, midpoint, official close, mark, and fair value “the price.”
+- Treating displayed depth as guaranteed executable quantity.
+- Using floating point for priority-critical price or quantity equality.
+- Confusing protocol price scale with tick size.
+- Hard-coding lot, multiplier, tick, fees, or allocation from a product example.
+- Inferring maker/taker from limit versus market order.
+- Assuming MBO necessarily exposes every priority-relevant fact.
+- Claiming MBP reveals exact queue position.
+- Implementing pro-rata without eligibility, rounding, and residual rules.
+- Applying continuous book invariants to auction data.
+- Treating an indicative auction price as an execution.
+- Assuming a halt means no messages or that all live orders were cancelled.
+- Calling a locally consolidated best quote the jurisdiction’s official/protected quote.
+- Computing P&L without multiplier, currency, fee signs, and mark provenance.
+- Joining current reference data to historical events without versioning.
+
+## 49.14 Recall card — Core
+
+```text
+IDENTITY
+(venue/segment, native instrument ID, definition version/session)
+Symbol is a label, not a primary key.
+
+BOOK
+bid = buy interest; ask/offer = sell interest
+best bid = highest; best ask = lowest
+quoted spread = ask - bid; mid = (ask + bid)/2
+last trade and mid are not automatically executable prices
+
+DATA
+MBP = aggregate price levels
+MBO = order-level view as defined by the feed
+quote != trade; acknowledgment != public feed event
+
+LIQUIDITY
+tightness + depth + immediacy + resilience + stability
+displayed depth is a stale, partial view—not a fill promise
+
+UNITS
+price scale != tick
+quantity increment != round lot
+tick value = tick x multiplier for a linear contract
+use fixed-point and widened intermediates
+
+ALLOCATION
+price-time: better price, then venue priority
+pro-rata: proportional share plus venue-specific stages/residual
+modification priority and hidden treatment are venue rules
+
+SESSIONS
+status messages drive state; calendars predict/check
+auction call may be crossed; indicative price is not a trade
+halt/order treatment and reopening are venue-specific
+
+ECONOMICS
+cash P&L = signed fill cash flows - fees + rebates
+state multiplier, currency, mark, horizon, and fee version
+
+LABEL EVERY FACT
+general | jurisdiction | venue | protocol | reference data | measured
+```
+
+## 49.15 Questions — Core
+
+1. Distinguish instrument, listing, venue, market segment, session, order, quote, and trade.
+2. Given a BBO and a multi-level execution, calculate quoted spread, midpoint, VWAP, slippage, and effective spread. Which inputs require timestamps?
+3. Why can MBO support queue reconstruction while MBP usually supports only bounds? When might even MBO be insufficient?
+4. Compare price-time and pro-rata. Which additional rules are required to make each deterministic?
+5. Explain the difference among price scale, tick size, quantity increment, round lot, multiplier, and tick value.
+6. Why is a crossed book normal in one state and a recovery trigger in another?
+7. Walk through an opening auction from call interest to indicative values, uncross, execution burst, and continuous state.
+8. How would you version and publish an intraday reference-data change without mutating hot-path state under readers?
+9. A fee reconciliation is wrong by a constant amount per contract on one venue. Which stored fields and versions do you inspect?
+10. For each statement—“the close is 16:00,” “size decreases preserve priority,” and “the best quote is protected”—name the required label and authority.
+
+## 49.16 Puzzle and exercise — Core
+
+### Puzzle: profitable or not?
+
+An execution report says:
+
+```text
+BUY 3 contracts @ 125.10
+later SELL 3 contracts @ 125.14
+price tick = 0.01
+contract multiplier = 25 currency units per price point
+total fees = 4.00 currency units
+```
+
+A dashboard reports gross P&L of 12 and net P&L of 8. Is it correct?
+
+No. The price move is 0.04, or four ticks. Gross P&L is:
+
+\[
+3\times0.04\times25=3
+\]
+
+and net P&L is \(3-4=-1\) currency unit. The dashboard likely treated ticks as currency units or used a wrong multiplier. If the two fills use different currencies or the product is nonlinear, even this corrected calculation is incomplete.
+
+### Exercise: annotate a market day
+
+Create a small event log containing:
+
+1. instrument definition;
+2. pre-open status;
+3. three auction orders and two indicative updates;
+4. an uncross;
+5. continuous MBP updates and trades;
+6. a volatility interruption;
+7. a reference-data tick change effective at the reopening;
+8. a reopening auction;
+9. a fee-bearing fill.
+
+For every event, record its venue sequence, local receive time, instrument-definition version, session before/after, and whether it is reference, status, quote, order, or trade data. Then compute the book, indicative auction quantities, one VWAP, queue-position bounds from MBP, and fill P&L.
+
+Deliberately remove one status event and one market-data event. Define which invariants detect each omission, the smallest scope to fail closed, and the recovery data required. If the recovery logic relies on the wall clock or invents a missing allocation rule, revise it.
+
+## Prerequisite for Chapter 50
+
+You are ready for orders and matching when you can identify an instrument and session unambiguously; distinguish orders, quotes, and executions; compute spreads and book walks in correct units; explain price-time versus pro-rata without assuming a venue; and recognize that order acceptance, priority, modification, allocation, fees, and auction behavior come from effective venue rules and protocol state.

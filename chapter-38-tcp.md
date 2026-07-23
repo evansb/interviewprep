@@ -1,1112 +1,767 @@
 # Chapter 38 — TCP
 
-*Interview-focused revision notes. The theme: TCP buys reliability and fairness with buffering, timers, and state — every one of which is a latency cost, which is why it is banned from the market-data path and unavoidable on the order-entry path.*
+## Why this matters — Core
+
+TCP turns an unreliable packet service into an ordered byte stream by maintaining state at both endpoints: sequence numbers, acknowledgements, receive and congestion windows, retransmission state, and timers. Those mechanisms provide a strong transport abstraction, but they also create queueing, recovery delay, and failure ambiguity that the application must handle.
+
+The durable way to reason about TCP is to ask three questions:
+
+1. Which byte sequence ranges has each endpoint sent, received, and acknowledged?
+2. Which limit currently prevents another byte from being sent: application demand, receiver window, congestion window, or a local queue?
+3. If progress stops, which event can restart it: an ACK, a window update, a loss-recovery signal, a timer, or an application action?
+
+The core wire protocol is standardized, principally by RFC 9293 and related RFCs. Congestion algorithms, delayed-ACK policy, timer bounds, socket options, counters, and defaults are implementation behavior. Linux examples below are labeled and must be checked against the deployed kernel. Chapter 45 owns socket calls and option-setting code.
+
+## 90-second screen — Core
+
+- TCP presents a **reliable, ordered byte stream**, not messages. One write may require many reads; many writes may arrive in one read. Applications must frame.
+- Sequence numbers identify bytes. An acknowledgement `ACK=N` cumulatively confirms every byte before `N`; SYN and FIN each consume one sequence number.
+- A connection is state at two endpoints identified by an address/port tuple. The ordinary handshake costs one RTT before the server can receive post-handshake application data; data on the third ACK is ordinary TCP, while data on the initial SYN requires an extension such as TCP Fast Open.
+- Reliability is not bounded latency. A hole blocks later bytes from the receiving application until recovery, even if those later bytes arrived correctly.
+- Flow control protects the receiver through `rwnd`; congestion control protects the network through `cwnd`. Roughly, `in_flight <= min(rwnd, cwnd)`.
+- A successful write only means the local stack accepted bytes. A transport ACK means the peer TCP stack received them, not that the peer application processed or durably recorded them.
+- Nagle, delayed ACK, RTO minima, keepalive intervals, and modern loss detection are not universal constants. Diagnose the actual packet trace and implementation.
+- For a latency decision, calculate bandwidth-delay product, queued bytes divided by drain rate, and the recovery event available for the missing segment.
 
 ---
 
-## 38.1 TCP Byte-Stream Semantics
+## 38.1 The Byte Stream and Connection Identity — Core
 
-**TCP** (Transmission Control Protocol, RFC 793, updated by RFC 9293) provides a **reliable, ordered, connection-oriented byte stream** between exactly two endpoints, identified by the 4-tuple `(src IP, src port, dst IP, dst port)`.
+TCP connects two endpoints. Each endpoint consists of an IP address and TCP port; a conventional connection is distinguished by:
 
-The defining property, and the source of most application bugs: **TCP has no message boundaries.** It is a stream of bytes, not a sequence of messages.
-
-```
- Application writes:   send("ABCDE")  send("FGHIJ")  send("KLMNO")
-
- Possible receives:    recv() → "ABCDEFGHIJKLMNO"      (one call, coalesced)
-                       recv() → "ABC"  "DEFGHIJKL"  "MNO"   (arbitrary splits)
-                       recv() → "ABCDE" "FGHIJ" "KLMNO"     (coincidence, not a guarantee)
+```text
+(local address, local port, remote address, remote port)
 ```
 
-Every one of these is conforming. A `send` of N bytes may be split across many segments (by MSS, by Nagle, by the congestion window) and multiple `send`s may be coalesced into one segment. Therefore **the application must impose its own framing** (§38.20). Code that assumes one `recv` returns one message works in testing on a loopback with small messages and fails in production under load — a classic, and one interviewers deliberately probe.
+The same listening endpoint can therefore support many simultaneous connections whose remote endpoint differs. A socket descriptor is an operating-system handle to endpoint/connection state, not the connection itself; descriptor lifecycle and partial I/O belong to Chapter 45.
 
-### The TCP header
+### No message boundaries
 
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-┌───────────────────────────────┬───────────────────────────────┐
-│        Source Port (16)       │      Destination Port (16)    │
-├───────────────────────────────┴───────────────────────────────┤
-│                    Sequence Number (32)                       │
-├───────────────────────────────────────────────────────────────┤
-│                 Acknowledgement Number (32)                   │
-├───────┬───────────┬───┬───┬───┬───┬───┬───┬───────────────────┤
-│ Data  │ Reserved  │C│E│U│A│P│R│S│F│                           │
-│Offset │           │W│C│R│C│S│S│Y│I│      Window Size (16)     │
-│ (4)   │    (4)    │R│E│G│K│H│T│N│N│                           │
-├───────┴───────────┴─┴─┴─┴─┴─┴─┴─┴─┴───────────────────────────┤
-│          Checksum (16)        │     Urgent Pointer (16)       │
-├───────────────────────────────┴───────────────────────────────┤
-│                  Options (0–40 bytes) + padding               │
-└───────────────────────────────────────────────────────────────┘
-   Minimum 20 bytes; Data Offset counts 32-bit words (5..15 → 20..60 B)
+TCP numbers and delivers bytes. Segmentation is an internal transport decision and does not preserve application write calls:
+
+```text
+Application writes:   [ABCD] [EF] [GHIJK]
+
+Possible reads:       [ABCDEFGHIJK]
+                      [A] [BCDEF] [GHI] [JK]
+                      [ABCD] [EF] [GHIJK]   ← coincidence, not a contract
 ```
 
-| Flag | Meaning |
+The sender may split a write because of the maximum segment size, available window, offload, or local scheduling. A receiver may coalesce several segments or return only the currently available prefix. Packet boundaries observed in a capture are therefore not application records.
+
+TCP's delivery contract is:
+
+| TCP provides while the connection succeeds | TCP does not provide |
 |---|---|
-| **SYN** | Synchronize sequence numbers — connection setup |
-| **ACK** | The Acknowledgement Number field is valid (set on every segment after the first SYN) |
-| **FIN** | No more data from this sender (graceful, half-close) |
-| **RST** | Abort immediately — no graceful teardown, no guarantee about buffered data |
-| **PSH** | Push buffered data to the application (largely advisory today) |
-| **URG** + Urgent Pointer | Out-of-band data. Ambiguously specified, inconsistently implemented, **never use it** |
-| **ECE / CWR** | Explicit Congestion Notification signalling (§38.19) |
+| Ordered delivery of the byte sequence | Application message boundaries |
+| Duplicate suppression in delivered bytes | A bounded delivery time |
+| Retransmission after detected loss | Proof that the peer application acted |
+| Per-connection flow control | Recovery of application state after either process crashes |
+| A checksum over header and data | Cryptographic integrity or detection of every possible corruption |
 
-### Options that matter
+"Reliable" means the receiver gets the ordered bytes or the connection eventually reports failure. It does not mean exactly-once business processing. If a client submits a request and the connection fails before an application response, the request may have been lost, queued, processed, or processed with its response lost. Transactional protocols need identifiers, idempotency, and application acknowledgements.
 
-Options live in the 0–40 byte area and are negotiated on the SYN:
+### Sequence-space mental model
 
-| Option | Kind | Size | Purpose |
-|---|---|---|---|
-| MSS | 2 | 4 B | Max segment size this side will accept (§38.2) |
-| Window Scale | 3 | 3 B | Shifts the 16-bit window up to 30 bits (§38.5) |
-| SACK Permitted | 4 | 2 B | Enables selective ACK (§38.11) |
-| SACK blocks | 5 | 10–34 B | The actual received ranges |
-| Timestamps | 8 | 10 B | RTT measurement and PAWS (§38.10) |
+Each direction has an independent 32-bit modular sequence space. At any instant, a sender conceptually divides it into:
 
-Timestamps and SACK together consume **12 bytes** of every data segment (10 for timestamps plus 2 of padding/NOP alignment), reducing the usable payload from 1460 to **1448** at MTU 1500.
-
-### What TCP guarantees — and what it does not
-
-| Guaranteed | Not guaranteed |
-|---|---|
-| Bytes delivered in order, exactly once, or the connection fails | Message boundaries |
-| Detection of most corruption (weak 16-bit checksum) | Bounded latency |
-| Flow control — the sender never overruns the receiver | That data was *processed*, only that it was received into a buffer |
-| Congestion response | Delivery after a crash — a successful `send()` means "copied to the kernel buffer," nothing more |
-
-That last row is the one to state in an interview: **`send()` returning N does not mean the peer got N bytes, let alone acted on them.** It means the kernel accepted them. Application-level acknowledgement is a separate, necessary layer for anything transactional (Ch. 54 §54.9).
-
----
-
-## 38.2 TCP Three-Way Handshake
-
-Connection establishment synchronizes initial sequence numbers in both directions and negotiates options.
-
-```
-   Client                                              Server
-     │                                            (LISTEN)
-     │ ── SYN, seq=x, MSS, WS, SACK-perm, TS ──────────►│
-     │                                        (SYN_RECEIVED)
-     │ ◄── SYN+ACK, seq=y, ack=x+1, MSS, WS, SACK, TS ──│
- (SYN_SENT→ESTABLISHED)                                 │
-     │ ── ACK, seq=x+1, ack=y+1 ──────────────────────►│
-     │                                       (ESTABLISHED)
-     │ ── [data may ride on this third packet] ────────►│
+```text
+already ACKed | sent but unacknowledged | allowed but unsent | outside window
+              SND.UNA                  SND.NXT
 ```
 
-**Cost: one full RTT before any application data can flow** (the client may append data to the third packet, so it is 1 RTT, not 1.5, from the client's perspective). Over a 100 µs LAN that is 100 µs; over an 80 ms transatlantic link it is 80 ms — before TLS, which adds another 1–2 RTTs (TLS 1.3: 1 RTT, or 0 with resumption).
+The receiver tracks the next contiguous byte expected, `RCV.NXT`, and buffers implementation-dependent amounts of out-of-order data. These state variables, rather than packet count, explain the rest of TCP.
 
-### Why three packets and not two
-
-The handshake must synchronize sequence numbers **in both directions** and prove each side can both send and receive. A two-way exchange would leave the server unsure the client received its ISN. The third ACK is what moves the server out of `SYN_RECEIVED`.
-
-**Initial sequence numbers are randomized** (RFC 6528: a keyed hash of the 4-tuple plus a clock) to prevent off-path attackers guessing sequence numbers and injecting data, and to prevent old duplicate segments from a previous incarnation of the same 4-tuple being accepted.
-
-### Option negotiation rules
-
-Options are only negotiated on the SYN and SYN+ACK. Consequences:
-
-- **MSS is announced, not negotiated.** Each side states the largest segment it is willing to *receive*; the sender uses `min(peer's advertised MSS, own path MTU − 40)`. There is no single "the MSS."
-- **Window scaling requires both sides to send the option.** If either omits it, scaling is off for both directions and the window is capped at 65535 bytes — which caps throughput at `65535/RTT` (§38.18). A middlebox stripping the option is a real cause of mysteriously slow long-distance transfers.
-- SACK and timestamps are similarly all-or-nothing.
-
-### Backlog, SYN queue, and accept queue
-
-The kernel maintains **two** queues on a listening socket:
-
-```
- SYN arrives ──► [SYN queue / half-open]  ──(3rd ACK)──► [accept queue] ──► accept()
-                 net.ipv4.tcp_max_syn_backlog          backlog arg to listen(),
-                                                       capped by net.core.somaxconn
-```
-
-| Overflow | Behaviour | Counter |
-|---|---|---|
-| SYN queue full | New SYNs dropped (or SYN cookies engaged) | `netstat -s`: "SYNs to LISTEN sockets dropped" |
-| Accept queue full | New completed connections dropped silently; the client believes it is connected until it times out | `netstat -s`: "times the listen queue of a socket overflowed"; `ss -lnt` `Recv-Q` vs `Send-Q` |
-
-`ss -lnt` on a listening socket shows the **current accept-queue depth in `Recv-Q` and its limit in `Send-Q`** — a non-obvious and very useful piece of knowledge. A persistently non-zero `Recv-Q` means the application is not calling `accept()` fast enough.
-
-**SYN cookies** (`net.ipv4.tcp_syncookies`) encode the connection state into the ISN so no SYN-queue entry is needed, defeating SYN-flood attacks. The cost is that options which do not fit in the encoded cookie (historically window scale and SACK, though modern Linux preserves them via timestamps) can be lost, degrading the connection. Enabling cookies globally on a low-latency server is a tradeoff, not a free win.
-
-### Failure signatures
-
-| Symptom | Cause |
-|---|---|
-| `ECONNREFUSED` immediately | RST returned — nothing listening on that port |
-| `ETIMEDOUT` after ~2 min (`tcp_syn_retries`=6: 1+2+4+8+16+32 s) | SYN silently dropped — firewall DROP rule, blackhole route, wrong address |
-| Connection "succeeds" then nothing happens | Accept queue overflow, or the server accepted but is stuck |
-| Slow connects, retried SYNs | Packet loss on the path, or SYN-queue overflow |
-
-`tcpdump -i any 'tcp[tcpflags] & (tcp-syn|tcp-rst) != 0'` isolates handshake behaviour cleanly.
-
----
-
-## 38.3 TCP Connection Teardown
-
-Teardown is **independent per direction** — TCP connections are full-duplex and each side closes its own sending half.
-
-```
-   Initiator (active close)                        Peer (passive close)
-        │ (ESTABLISHED)                              (ESTABLISHED)
-        │ ── FIN, seq=u ────────────────────────────────►│
-   (FIN_WAIT_1)                                    (CLOSE_WAIT)
-        │ ◄── ACK, ack=u+1 ─────────────────────────────│
-   (FIN_WAIT_2)          ← peer may still send data! →
-        │ ◄── FIN, seq=v ───────────────────────────────│
-        │                                          (LAST_ACK)
-        │ ── ACK, ack=v+1 ─────────────────────────────►│
-   (TIME_WAIT: 2×MSL)                                (CLOSED)
-        │
-   (CLOSED)
-```
-
-Four packets, though the peer's ACK and FIN frequently combine into three when it has nothing more to send.
-
-### The state machine, compactly
-
-| State | Meaning | Who |
-|---|---|---|
-| `LISTEN` | Awaiting SYNs | Server |
-| `SYN_SENT` | Sent SYN, awaiting SYN+ACK | Client |
-| `SYN_RECEIVED` | Sent SYN+ACK, awaiting final ACK | Server |
-| `ESTABLISHED` | Data transfer | Both |
-| `FIN_WAIT_1` | Sent FIN, awaiting its ACK | Active closer |
-| `FIN_WAIT_2` | FIN ACKed, awaiting peer's FIN | Active closer |
-| `CLOSE_WAIT` | Received FIN, **application has not called `close()` yet** | Passive closer |
-| `LAST_ACK` | Sent own FIN, awaiting its ACK | Passive closer |
-| `TIME_WAIT` | Waiting 2×MSL before reuse (§38.17) | Active closer |
-| `CLOSING` | Simultaneous close | Both |
-
-**`CLOSE_WAIT` accumulating is always an application bug**, never a network problem: the peer closed, the kernel delivered EOF, and your code never called `close()`. It leaks a file descriptor per occurrence and ends in `EMFILE`. `ss -tan state close-wait` counts them; a rising count is one of the highest-signal diagnostics in this chapter because the conclusion is unambiguous.
-
-### FIN vs RST
-
-| | FIN (graceful) | RST (abortive) |
-|---|---|---|
-| Sends queued data first | **Yes** | **No** — discards send and receive buffers |
-| Peer sees | EOF (`recv` returns 0) | `ECONNRESET` on read/write |
-| Leaves TIME_WAIT | Yes, on the active closer | **No** |
-| Triggered by | `close()`, `shutdown(SHUT_WR)` | `SO_LINGER` with timeout 0, writing to a closed peer, data arriving for a nonexistent connection, some firewall/OS timeouts |
-
-An RST is generated whenever a segment arrives for a connection that does not exist — including a connection the peer rebooted out from under you. Its second arrival pattern is important: **write to a peer that has closed and you get an RST back; the *first* write succeeds locally and the *second* fails with `EPIPE`/`SIGPIPE`.** That one-write delay in error detection surprises people and matters for order-entry error handling.
-
-`SO_LINGER` with `l_onoff=1, l_linger=0` makes `close()` send an RST instead of a FIN. This avoids TIME_WAIT and is occasionally used to reclaim ports on a client with huge connection churn — but it **discards unsent data**, so it is wrong for any session where the last messages matter. On an order-entry gateway, that could mean discarding a cancel.
-
-### Trading relevance
-
-An exchange session disconnect is a risk event, not a network event. What matters is the observable difference between a graceful FIN (the venue is shutting the session down; state is likely consistent) and an RST or a silent blackhole (state is unknown; orders may be live). Sane gateways treat any unexpected disconnect as "position unknown until reconciled," rely on cancel-on-disconnect where the venue provides it, and reconcile via drop copy (Ch. 54 §54.13, §54.15).
-
----
-
-## 38.4 TCP Sequence and Acknowledgement Numbers
-
-The **sequence number** is the byte offset, in a 32-bit modular space, of the first data byte in the segment. The **acknowledgement number** is the next byte the receiver expects — an ACK is **cumulative**: `ack=N` means "I have all bytes up to N−1."
-
-```
-   Sender writes 3000 bytes, MSS 1460, ISN 1000 (so first data byte is 1001):
-
-   seg1: seq=1001  len=1460      covers bytes 1001..2460
-   seg2: seq=2461  len=1460      covers bytes 2461..3920
-   seg3: seq=3921  len=80        covers bytes 3921..4000
-
-   receiver ACKs:  ack=2461  (got seg1)
-                   ack=3921  (got seg2)
-                   ack=4001  (got seg3, all data received)
-```
-
-### The details that matter
-
-- **SYN and FIN each consume one sequence number** even though they carry no data. This is why the handshake ACKs `x+1`, and it is what makes them reliably retransmittable.
-- **A cumulative ACK loses information.** If segments 1, 3, 4, 5 arrive and 2 is lost, the receiver can only keep saying `ack=2461`. Everything after the hole is invisible to the sender without SACK (§38.11) — which is precisely why SACK was added.
-- **Sequence space wraps at 2³².** At 10 Gbit/s the space wraps in about 3.4 seconds, well inside the maximum segment lifetime. **PAWS** (Protection Against Wrapped Sequences) uses the timestamp option to disambiguate; this is a concrete reason timestamps are not optional on fast links.
-- **Wrap-safe comparison** is mandatory throughout the implementation:
-  ```cpp
-  inline bool seq_lt(uint32_t a, uint32_t b) { return int32_t(a - b) < 0; }
-  ```
-  The same trick appears in application sequence handling (Ch. 37 §37.4) and is worth being able to write from memory.
-- **`tcpdump` shows relative sequence numbers by default**, subtracting the ISN so the first data byte appears as 1. Use `-S` for absolute values. Reading a capture and reporting "the sequence number is 1" without knowing this is a tell.
-
-### Duplicate ACKs
-
-When an out-of-order segment arrives, the receiver immediately re-sends the same cumulative ACK. Repeated identical ACKs are therefore the sender's only pre-timeout evidence that something is wrong — and the ambiguity is fundamental: **duplicate ACKs mean either loss or reordering.** Three duplicates is the heuristic threshold for declaring loss (§38.8), chosen to tolerate modest reordering.
-
-### Retransmission ambiguity
-
-If a segment is retransmitted and an ACK arrives, the sender cannot tell whether the ACK was for the original or the retransmission — **Karn's algorithm** (§38.10) resolves this by refusing to sample RTT from retransmitted segments. The timestamp option removes the ambiguity entirely by echoing the exact timestamp, which is a cleaner solution and another reason timestamps are standard.
-
----
-
-## 38.5 TCP Flow Control
-
-**Flow control prevents a fast sender from overrunning a slow receiver.** It is entirely distinct from congestion control (§38.6), which protects the *network*. Confusing the two is one of the most common interview failures, and the distinction is worth stating explicitly.
-
-| | Flow control | Congestion control |
-|---|---|---|
-| Protects | The **receiver's buffer** | The **network's** capacity |
-| Signal | Advertised window (explicit, in every ACK) | Loss, delay, or ECN (inferred) |
-| Sender variable | `rwnd` (told to it) | `cwnd` (computed by it) |
-| Failure if absent | Receiver drops data it already accepted | Congestion collapse |
-
-The sender is bounded by both: **`in_flight ≤ min(rwnd, cwnd)`**.
-
-### The advertised window
-
-Every ACK carries a 16-bit **Window Size** — the free space remaining in the receiver's buffer. 16 bits caps it at 65535 bytes, which caps throughput at `65535 / RTT`:
-
-| RTT | Max throughput without scaling |
-|---|---|
-| 0.1 ms (LAN) | 5.2 Gbit/s |
-| 1 ms | 524 Mbit/s |
-| 10 ms | 52 Mbit/s |
-| 80 ms (transatlantic) | 6.5 Mbit/s |
-
-**Window scaling** (RFC 7323, option kind 3) fixes this: a shift count 0–14 negotiated on the SYN multiplies the advertised window by `2^shift`, allowing up to 1 GB. It must be offered by **both** sides on the SYN or it is disabled in both directions. A middlebox that strips or rewrites the option produces a connection that works but is inexplicably capped — and the signature is throughput exactly equal to `65535/RTT`. That is a satisfying diagnosis to be able to deliver.
-
-### Zero window and the persist timer
-
-If the receiver's buffer fills, it advertises **window 0** and the sender stops. The deadlock hazard: the window-update ACK that reopens the window is a pure ACK, and pure ACKs are not retransmitted. If it is lost, both sides wait forever.
-
-The **persist timer** solves it: the sender periodically transmits a 1-byte **window probe**, forcing the receiver to respond with its current window. Backoff is exponential up to ~60 s.
-
-A related pathology is **silly window syndrome** — a receiver that frees one byte at a time advertises 1-byte windows, and the sender emits 41-byte packets carrying 1 byte of payload. Fixes exist on both sides: the receiver (RFC 1122) does not advertise a window smaller than one MSS or half the buffer, and the sender (Nagle, §38.12) refuses to send small segments while data is unacknowledged.
-
-### Buffer sizing on Linux
-
-```
-net.ipv4.tcp_rmem = 4096 131072 6291456     # min, default, max (auto-tuned)
-net.ipv4.tcp_wmem = 4096 16384 4194304
-net.ipv4.tcp_moderate_rcvbuf = 1            # autotuning on
-```
-Autotuning grows the buffer toward the measured bandwidth-delay product (§38.18). **Setting `SO_RCVBUF` or `SO_SNDBUF` explicitly disables autotuning for that socket** — a very common own-goal: a hand-tuned 256 KB buffer that seemed generous becomes a hard cap on a high-BDP path. Note also that Linux doubles the requested value to account for bookkeeping overhead, so `getsockopt` returns twice what you set.
-
-**For latency, smaller send buffers are often better**: a large `SO_SNDBUF` lets the application queue megabytes of data in the kernel, and a message written at the back of that queue waits for everything ahead of it. On an order-entry socket you want the buffer just large enough to never block, so that queueing delay is visible as backpressure rather than hidden as latency. `TCP_NOTSENT_LOWAT` gives finer control: it limits *unsent* bytes in the kernel while keeping enough in flight to fill the pipe, and is the right tool for latency-sensitive writers.
-
----
-
-## 38.6 TCP Congestion Control
-
-**Congestion control** limits the sender's in-flight data to what the *network* can carry. It exists because of the 1986 **congestion collapse** on the NSFNET, where throughput fell by three orders of magnitude as retransmissions of already-queued packets consumed all capacity.
-
-### Core state
-
-| Variable | Meaning |
-|---|---|
-| **`cwnd`** | Congestion window — sender's estimate of what the network can hold |
-| **`ssthresh`** | Slow-start threshold — the boundary between exponential and linear growth |
-| **`rwnd`** | Receiver's advertised window (§38.5) |
-| **`flight_size`** | Bytes sent but not yet ACKed |
-
-The governing rule: `flight_size ≤ min(cwnd, rwnd)`.
-
-### The self-clocking insight
-
-TCP is **ACK-clocked**: each arriving ACK indicates a packet left the network, so a new one may enter. This means the sender's transmission rate naturally matches the bottleneck's drain rate without any explicit rate calculation. It also means **the ACK path's timing matters** — ACK compression or aggregation in the network makes transmission bursty, which is why modern Linux uses **pacing** (`fq` qdisc) to spread transmissions rather than relying purely on ACK arrivals.
-
-### The four classic phases (RFC 5681)
-
-```
- cwnd
-   │                      ╱╲            ╱╲
-   │            ╱─────────╯  ╲────────╯   ╲      ← congestion avoidance (+1 MSS/RTT)
-   │          ╱                ↓ loss        ↓
-   │        ╱  ← ssthresh
-   │      ╱
-   │    ╱  ← slow start (×2 per RTT)
-   │  ╱
-   │╱________________________________________ time
-       ↑ start        ↑ fast recovery (halve)   ↑ RTO → cwnd=1, slow start again
-```
-
-1. **Slow start** — exponential growth; probe quickly for available capacity (§38.7).
-2. **Congestion avoidance** — linear growth; probe gently (§38.7).
-3. **Fast retransmit / fast recovery** — respond to 3 duplicate ACKs by retransmitting and halving, without draining the pipe (§38.8).
-4. **Timeout (RTO)** — the catastrophic case: `cwnd` collapses to 1 MSS and slow start restarts (§38.10).
-
-The asymmetry between cases 3 and 4 is the whole game. **A loss detected by duplicate ACKs costs you half your window; a loss detected by timeout costs you everything plus an RTO of at least 200 ms.** All of SACK, fast recovery, tail loss probe, and RACK exist to keep losses in category 3.
-
-### Why this is fatal on a hot path
-
-Congestion control means **your latency depends on other people's traffic and on your own history of loss**. A single dropped packet can:
-
-- halve your throughput for many RTTs (fast recovery), or
-- stall you for ≥ 200 ms (RTO), during which every subsequent byte queues behind the missing one (§38.15).
-
-For market data that is unacceptable, and it is *the* structural reason UDP multicast is used (Ch. 37 §37.1). For order entry you accept it, and you engineer around it: small messages, `TCP_NODELAY`, warm connections, short paths, and no bulk traffic sharing the socket.
-
----
-
-## 38.7 Slow Start and Congestion Avoidance
-
-### Slow start
-
-Despite the name, slow start is the **fastest-growing** phase — "slow" refers to starting from a small window rather than blasting at line rate. On each ACK, `cwnd += MSS`, which doubles `cwnd` every RTT.
-
-```
- RTT 0:  cwnd = 10 MSS   (RFC 6928 initial window; was 1, then 2–4)
- RTT 1:  cwnd = 20
- RTT 2:  cwnd = 40
- RTT 3:  cwnd = 80
- ...
- exits when cwnd ≥ ssthresh, or on loss
-```
-
-**Initial window (IW) = 10 MSS ≈ 14.6 KB** on modern Linux (RFC 6928). This matters concretely: a 20 KB response does not fit in the first window, so it takes **2 RTTs** instead of 1. Bytes deliverable in the first N round trips: 14.6 KB, 43.8 KB, 102 KB, 219 KB. Any short-lived connection — an HTTP request, a small order-entry burst on a fresh socket — is spending its entire life in slow start and is dominated by RTT, not bandwidth.
-
-**Slow start also restarts after an idle period** (`net.ipv4.tcp_slow_start_after_idle`, default 1): a connection idle for longer than one RTO resets `cwnd` to the initial window. On an order-entry session that is quiet between bursts, this means **your first burst after a lull is throttled** — an entirely avoidable, and frequently overlooked, source of latency. Setting `tcp_slow_start_after_idle=0` is standard practice on trading hosts, and mentioning it unprompted is a strong signal.
-
-### Congestion avoidance
-
-Above `ssthresh`, growth becomes linear — approximately **+1 MSS per RTT**, implemented per-ACK as `cwnd += MSS × MSS / cwnd`. This is the **AIMD** (Additive Increase, Multiplicative Decrease) rule: increase by a constant, decrease by a factor. AIMD is what makes TCP converge to fairness — Chiu and Jain showed that additive increase with multiplicative decrease drives competing flows toward an equal share, while additive decrease does not.
-
-### The consequence for high-BDP paths
-
-Recovering a large window with +1 MSS/RTT is glacial. To reach 10 Gbit/s at 100 ms RTT you need a window of 125 MB ≈ 85 000 segments; recovering from a single halving takes ~42 500 RTTs ≈ **71 minutes**. This is exactly why Reno was replaced (§38.9) — CUBIC's cubic growth function recovers a large window in seconds rather than hours, and it is why "long fat networks" needed a new algorithm at all.
-
-### Where each phase shows up in practice
-
-| Situation | Phase | Latency consequence |
-|---|---|---|
-| New connection, small request | Slow start, IW=10 | 1–2 RTTs; bandwidth irrelevant |
-| Bulk transfer, steady state | Congestion avoidance | Bandwidth-bound |
-| After idle | Slow start again | First burst is throttled — disable it |
-| After a loss | Fast recovery, then avoidance | Half the window, recovered slowly |
-| After a timeout | `cwnd = 1`, slow start | ≥ 200 ms stall plus a rebuild |
-
-Diagnostics: `ss -tin` prints `cwnd`, `ssthresh`, `rtt`, `retrans`, `bytes_retrans`, and the congestion-control algorithm per socket. It is the single most useful TCP command and knowing what its fields mean is directly testable.
-
----
-
-## 38.8 Fast Retransmit and Recovery
-
-**Fast retransmit** avoids waiting for a timeout. When the sender receives **three duplicate ACKs** for the same sequence number, it infers loss and retransmits immediately, without waiting for the RTO.
-
-```
- sent:  1  2  3  4  5  6            (segment 2 is lost)
- ACKs:      ack=2        ← for seg 1
-            ack=2 (dup1) ← seg 3 arrived out of order
-            ack=2 (dup2) ← seg 4
-            ack=2 (dup3) ← seg 5   → FAST RETRANSMIT seg 2 now
-            ack=7        ← seg 2 arrives, cumulative ACK jumps
-```
-
-**Why three?** One or two duplicate ACKs are readily explained by mild reordering; three makes reordering unlikely enough to act on. It is a heuristic, and it is why networks that reorder heavily (some ECMP configurations, Ch. 39 §39.9) cause spurious retransmissions and needless window reductions. RACK (below) replaces the counting heuristic with time.
-
-### Fast recovery
-
-Retransmitting alone is not enough — naively re-entering slow start would drain the pipe unnecessarily, since the duplicate ACKs prove data is still flowing. Fast recovery (RFC 5681) keeps the pipe full:
-
-```
- ssthresh = max(flight_size / 2, 2·MSS)
- cwnd     = ssthresh + 3·MSS         ← the 3 accounts for the 3 segments that LEFT the network
- for each further dup ACK: cwnd += MSS      ← "window inflation"; keep sending new data
- on the recovery ACK:      cwnd = ssthresh  ← "deflation"; resume congestion avoidance
-```
-
-The inflation/deflation dance exists because during recovery the sender's normal `flight_size` accounting is wrong: each duplicate ACK is evidence that one more packet has left the network, so one more may be sent.
-
-### The variants worth naming
-
-| Mechanism | Problem solved |
-|---|---|
-| **NewReno** (RFC 6582) | Multiple losses in one window: a partial ACK during recovery triggers the next retransmission rather than exiting recovery, so N losses take N RTTs instead of an RTO |
-| **SACK-based recovery** (RFC 6675) | With SACK the sender knows exactly which segments are missing and retransmits all of them in one RTT (§38.11) |
-| **Limited Transmit** (RFC 3042) | On the 1st and 2nd dup ACK, send a *new* segment to keep ACKs flowing — essential when the window is too small to ever generate three dup ACKs |
-| **Tail Loss Probe** (TLP) | The last segment of a burst has nothing behind it to generate dup ACKs, so its loss can only be found by RTO. TLP sends a probe after ~2×RTT to elicit an ACK |
-| **RACK-TLP** (RFC 8985) | Replaces dup-ACK counting with **time-based** loss detection: a segment is lost if a later-sent segment was ACKed and more than an RTT+reordering-window has passed. Now the Linux default |
-| **F-RTO / Eifel** | Detect that a timeout was *spurious* (the data was merely delayed) and undo the window reduction |
-
-**The tail-loss case is the one that matters most for trading.** Request/response order entry sends small bursts and then goes quiet. If the last message of a burst is lost, there is no subsequent data to trigger duplicate ACKs, so classical TCP can only recover it by RTO — **a 200 ms+ stall for a single lost order message**. TLP reduces that to roughly 2 RTTs, and RACK further. Verifying that TLP and RACK are enabled (`net.ipv4.tcp_early_retrans`, `tcp_recovery`) on an order-entry host is a legitimate, concrete tuning action.
-
-`ss -tin` exposes `retrans`, `lost`, `sacked`, and `reordering`; `netstat -s | grep -i retrans` gives system-wide counts, and `TCPLostRetransmit`, `TCPSpuriousRTOs`, and `TCPDSACKRecv` in `nstat` distinguish real loss from spurious detection.
-
----
-
-## 38.9 Reno, CUBIC, and BBR
-
-| | **Reno / NewReno** | **CUBIC** | **BBR** |
-|---|---|---|---|
-| Signal | Loss | Loss | **Delivery rate + min RTT** (delay-and-rate-based) |
-| Growth | Linear, +1 MSS/RTT | **Cubic function of time since last loss** | Probes rate directly; no window growth curve |
-| Reduction on loss | ×0.5 | ×0.7 | Does not react to loss per se |
-| RTT fairness | Poor — short-RTT flows dominate | **Good** — growth depends on wall time, not RTT | Good |
-| High-BDP recovery | Hours (see §38.7) | Seconds | Immediate |
-| Bufferbloat behaviour | Fills buffers | **Fills buffers** | **Drains them** (§38.19) |
-| Behaviour with random loss (wireless) | Collapses | Collapses | Tolerant |
-| Default in | Historical | **Linux since 2.6.19** | Google (YouTube, GCP), opt-in elsewhere |
-
-### CUBIC in one paragraph
-
-`W(t) = C(t − K)³ + W_max`, where `W_max` is the window at the last loss, `K` is the time to return to it, and `C` is a scaling constant. The shape is the point: growth is **fast when far below `W_max`** (aggressive recovery), **flat near `W_max`** (careful probing where the loss occurred), and **fast again above it** (aggressive exploration of new capacity). Because `t` is wall-clock time rather than RTT counts, flows with different RTTs grow at comparable rates — fixing Reno's systematic bias against long-RTT flows.
-
-### BBR in one paragraph
-
-BBR (Bottleneck Bandwidth and Round-trip propagation time) models the path explicitly: it continuously estimates the **maximum delivery rate** and the **minimum RTT**, and sets `BDP = BtlBw × RTprop`, pacing at the bottleneck rate with about one BDP in flight. It periodically probes up (×1.25 for one RTT) and drains down (×0.75). Because it targets the BDP rather than "as much as fits before loss," it **keeps queues nearly empty** — dramatically lower latency on bloated paths. Criticisms: BBRv1 could be unfair to CUBIC flows and could sustain persistent queues with many flows; BBRv2/v3 add loss and ECN response to address this.
-
-### Which to use
-
-- **Order entry inside a colo:** the algorithm barely matters — RTT is tens of microseconds, windows are tiny, and you are never bandwidth-limited. Message size, Nagle, and interrupt handling dominate by orders of magnitude. Claiming a congestion-control change will meaningfully improve colo order-entry latency is a red flag.
-- **WAN links between sites** (replication, cross-region market data, backhaul): here it matters, and **BBR is usually the better choice** for latency-sensitive traffic because it does not fill intermediate buffers.
-- **Random loss (wireless, lossy long-haul):** loss-based algorithms misinterpret corruption as congestion and collapse; BBR does not.
-
-```
-sysctl net.ipv4.tcp_available_congestion_control
-sysctl -w net.ipv4.tcp_congestion_control=bbr
-setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, "bbr", 3);   # per socket
-```
-BBR should be paired with the `fq` qdisc (`tc qdisc add dev eth0 root fq`) because it relies on pacing.
-
-**DCTCP** deserves a mention: a datacentre algorithm using ECN marks proportionally rather than as a binary signal, achieving very shallow queues within a single administrative domain. It requires ECN support on every switch in the path, which is feasible in a private fabric and not on the internet.
-
----
-
-## 38.10 RTT Estimation and Retransmission Timeout
-
-The **RTO** is the sender's fallback: if no ACK arrives within it, retransmit and treat the loss as severe. Setting it correctly is a balance — too short causes spurious retransmissions that worsen congestion, too long causes long stalls.
-
-### The estimator (RFC 6298)
-
-```
- On each RTT sample R:
-   if first sample:  SRTT = R                 RTTVAR = R/2
-   else:             RTTVAR = (1−β)·RTTVAR + β·|SRTT − R|      β = 1/4
-                     SRTT   = (1−α)·SRTT   + α·R               α = 1/8
-   RTO = SRTT + max(G, 4·RTTVAR)              G = clock granularity
-   RTO = clamp(RTO, 1 s, 60 s)                ← RFC minimum is 1 s
-```
-
-Two exponentially-weighted moving averages: **SRTT** tracks the mean, **RTTVAR** tracks the deviation, and the RTO is mean + 4 deviations. The `4·RTTVAR` term is what makes the estimator robust to jitter rather than merely to the mean.
-
-**Linux uses a minimum RTO of 200 ms** (`TCP_RTO_MIN`), not the RFC's 1 second. This single constant is the most-quoted number in TCP latency discussions: **a timeout-detected loss costs at least 200 ms**, which on a colo LAN with a 50 µs RTT is four thousand times the round trip. It can be lowered per-route:
-
-```
-ip route change 10.0.0.0/24 dev eth0 rto_min 5ms
-```
-This is a real tuning knob for a datacentre order-entry path — but lowering it too far causes spurious retransmissions that make things worse, so it is done with measurement, not by default.
-
-### Exponential backoff
-
-Each successive timeout for the same segment doubles the RTO: 200 ms, 400 ms, 800 ms, … up to `tcp_retries2` (default 15), giving a total of roughly **13–30 minutes** before the connection is declared dead. That is far too long for a trading session to notice a dead peer — hence application heartbeats (Ch. 54 §54.2), which detect a dead session in seconds. `TCP_USER_TIMEOUT` caps the total time unacknowledged data may remain outstanding and is the correct socket-level mechanism:
+Modular comparison is valid only when relevant values are less than half the 32-bit space apart. A portable half-range helper makes that precondition explicit:
 
 ```cpp
-unsigned ms = 5000;
-setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &ms, sizeof ms);   // fail fast
-```
+#include <cstdint>
 
-### Karn's algorithm and timestamps
-
-**Karn's algorithm**: do not take an RTT sample from a retransmitted segment, because you cannot tell whether the ACK acknowledges the original or the retransmission — sampling wrongly would corrupt SRTT in whichever direction the guess was wrong. Backoff is retained across the ambiguity and cleared only on an unambiguous sample.
-
-**The timestamp option (kind 8, 10 bytes)** removes the ambiguity: the sender writes `TSval`, the receiver echoes it in `TSecr`, and the sender computes the exact RTT for that segment — including for retransmissions. Timestamps also enable **PAWS** (§38.4) and give one sample per ACK rather than one per RTT, producing a much better-conditioned estimator. The cost is 12 bytes per segment (10 plus alignment padding). On a high-rate small-message path that overhead is real but rarely decisive.
-
-Measure with `ss -ti` (`rtt:<srtt>/<rttvar>` in milliseconds), and note it is the *kernel's* estimate, not an independent measurement — for true one-way latency you need hardware timestamping (Ch. 48 §48.4).
-
----
-
-## 38.11 Selective Acknowledgements
-
-**SACK** (RFC 2018) lets the receiver tell the sender exactly which non-contiguous ranges it has received, instead of only the cumulative point.
-
-```
- sent:     1    2    3    4    5    6    7    8
- lost:          ✗              ✗
- arrived:  1         3    4         6    7    8
-
- without SACK:  ack=2 repeatedly.  Sender knows only "2 is missing";
-                it must guess about 5, or discover it an RTT later (NewReno),
-                or retransmit everything from 2 (Go-Back-N behaviour).
-
- with SACK:     ack=2, SACK blocks: [3–5), [6–9)
-                → sender knows precisely that 2 and 5 are missing
-                → retransmits exactly those two, in ONE round trip.
-```
-
-### Encoding
-
-A SACK option carries up to **4 blocks** (each a 32-bit left and right edge = 8 bytes), plus a 2-byte header: `2 + 4×8 = 34` bytes, which is why 4 is the maximum — 40 bytes of option space, minus the 10 bytes usually consumed by timestamps, leaves room for **only 3 blocks** on a typical connection. This is a nice, concrete detail: SACK capacity is limited by the interaction of two options competing for a 40-byte budget.
-
-The first block always reports the most recently received segment; older blocks follow. **SACK is advisory** — the receiver may later discard SACKed data (the cumulative ACK is the only binding promise), so the sender must retain SACKed segments until they are cumulatively acknowledged.
-
-### D-SACK
-
-**D-SACK** (RFC 2883) uses the same encoding to report a *duplicate* segment. It tells the sender "I received this twice," which lets it distinguish:
-
-- a spurious retransmission caused by an RTO that fired too early (→ undo the window reduction),
-- reordering rather than loss (→ increase the reordering threshold rather than retransmit sooner),
-- ACK loss on the return path.
-
-`nstat` counters `TcpExtTCPDSACKRecv` / `TcpExtTCPDSACKOfoRecv` are how you detect a network that reorders, and a high D-SACK rate with low real loss is the signature of an ECMP or LAG path that is spraying a flow across members (Ch. 39 §39.8).
-
-### Why it matters
-
-Without SACK, multiple losses in one window cost one RTT each (NewReno) or a full Go-Back-N retransmission. With SACK they cost one RTT total. On a high-BDP path with a large window, that is the difference between a hiccup and a collapse.
-
-```
-sysctl net.ipv4.tcp_sack        # 1
-sysctl net.ipv4.tcp_dsack       # 1
-ss -tin                          # shows 'sack' and the 'sacked' segment count
-```
-
-Historical caveat worth knowing: SACK processing has been a source of CPU-exhaustion CVEs (SACK Panic, CVE-2019-11477/11478) because a crafted sequence of SACK blocks could fragment the retransmission queue pathologically. It was patched, not removed — SACK is not optional in practice.
-
----
-
-## 38.12 Nagle's Algorithm
-
-**Nagle's algorithm** (RFC 896) reduces the number of tiny packets on the network. Its rule is a single sentence:
-
-> If there is unacknowledged data outstanding, buffer any new small (< MSS) data until either an ACK arrives or a full MSS accumulates.
-
-```
- Without Nagle:  "A" → packet (41 bytes: 40 header + 1 payload)
-                 "B" → packet (41 bytes)
-                 "C" → packet (41 bytes)      98 % overhead
-
- With Nagle:     "A" → packet (41 bytes), now unACKed data exists
-                 "B" → buffered
-                 "C" → buffered
-                 ACK arrives → "BC" → one packet
-```
-
-The motivating problem was the "tinygram" flood from character-at-a-time telnet over 1980s links, where each keystroke produced a 41-byte packet and the network drowned in headers.
-
-### Why it is wrong for trading
-
-Nagle deliberately introduces **delay in exchange for efficiency**, and on an order-entry socket the exchange rate is terrible: you are trading microseconds of latency, which is the entire product, for bytes of bandwidth on a link that is 1 % utilized.
-
-More precisely: a request/response protocol that writes a small order message and then waits for the exchange's ACK will have its message sent immediately if nothing is outstanding — but the moment there is *any* unacknowledged data (a pipelined second order, a partially-ACKed previous write), the next small message is held. The result is intermittent, load-dependent latency spikes that appear only under pipelining, which makes them maddening to reproduce.
-
-**Turn it off on every latency-sensitive socket:**
-```cpp
-int one = 1;
-setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-```
-
-### The write-pattern issue Nagle exposes
-
-Nagle interacts badly with applications that build a message with multiple small `write()` calls (header, then body). Even with `TCP_NODELAY`, multiple writes mean multiple segments, extra syscalls, and extra header bytes. **The correct fix is not only `TCP_NODELAY` but writing the whole message in one call** — `writev`/`sendmsg` scatter-gather (Ch. 45 §45.4, Ch. 34 §34.12) or serialize into a single contiguous buffer. Interviewers like this because it shows you understand that the socket option treats a symptom whose cause is the write pattern.
-
-The deadly combination is Nagle plus delayed ACK (§38.13) — worth understanding as a unit, because neither alone produces the 40 ms stall.
-
----
-
-## 38.13 Delayed Acknowledgements
-
-**Delayed ACK** (RFC 1122) makes the receiver wait briefly before acknowledging, hoping to (a) piggyback the ACK on outgoing data or (b) cover two segments with one ACK.
-
-| Rule | Value |
-|---|---|
-| Maximum delay | 500 ms (RFC), **~40 ms on Linux** (`TCP_DELACK_MIN`), 200 ms on many others |
-| Must ACK immediately | On every **second** full-size segment |
-| Must ACK immediately | On out-of-order data (to trigger fast retransmit) |
-| Must ACK immediately | When the receive window must be updated |
-
-Delayed ACK is generally beneficial: it halves ACK traffic on bulk transfers and lets request/response protocols piggyback. Its pathology only emerges in combination with Nagle.
-
-### The Nagle + delayed-ACK deadlock
-
-This is the single most-asked TCP interaction question, and it must be explained mechanically, not as folklore.
-
-```
- Sender has Nagle ON. Receiver has delayed ACK ON.
- Sender's message is 1.5 MSS: one full segment plus a small remainder.
-
-  t=0     sender: send segment 1 (full MSS)        → unACKed data now exists
-  t=0     sender: segment 2 is small (< MSS) and data is unACKed
-                  → Nagle BUFFERS it
-  t=0     receiver: got 1 segment, not two, and has no data to send
-                  → delayed ACK WAITS
-  ...
-  t=40ms  receiver's delayed-ACK timer fires → ACK
-  t=40ms  sender: ACK received, no unACKed data → sends segment 2
-  t=40ms  receiver: finally has the complete message → can respond
-```
-
-**Each side is waiting for the other, and only a 40 ms timer breaks the deadlock.** The signature is unmistakable: latency quantized at multiples of ~40 ms (or ~200 ms on other stacks), appearing only for messages whose size is not a multiple of the MSS, and vanishing entirely on loopback or under continuous load. If a candidate can produce "40 ms is the delayed-ACK timer interacting with Nagle" from a latency histogram showing a spike at 40 ms, that is a very strong signal.
-
-The fix is `TCP_NODELAY` on the sender. It is a sender-side fix for a two-sided interaction, which is worth noting: you cannot generally control the receiver's ACK policy, so you remove your own contribution.
-
-### Delayed ACK's cost in an RPC pattern
-
-Even without Nagle, delayed ACK adds latency to strict request/response protocols with an odd number of segments, and it delays the *sender's* congestion-window growth because `cwnd` advances per ACK, not per byte. On a short-lived connection in slow start, delayed ACK effectively halves the growth rate — one of the reasons `TCP_QUICKACK` exists (§38.14).
-
----
-
-## 38.14 TCP_NODELAY, TCP_QUICKACK, and TCP_CORK
-
-Three socket options that control the batching-versus-latency tradeoff. They are frequently confused; the table is the answer.
-
-| Option | Side | Effect | Persistence |
-|---|---|---|---|
-| **`TCP_NODELAY`** | Sender | **Disables Nagle** — send small segments immediately | Sticky until changed |
-| **`TCP_QUICKACK`** | Receiver | **Disables delayed ACK** — ACK immediately | **Not sticky** — Linux resets it after some ACKs; must be re-armed |
-| **`TCP_CORK`** | Sender | **Opposite of NODELAY**: hold data until a full segment accumulates or 200 ms elapses | Until uncorked |
-
-### `TCP_NODELAY`
-
-```cpp
-int one = 1;
-setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-```
-**Set it on every latency-sensitive socket**, both client and server, immediately after `accept`/`connect`. It costs bandwidth efficiency for small messages; on a colo order-entry link that is a non-issue. Note it must be set on *both* ends if both send small messages — a common oversight is setting it on the client only.
-
-### `TCP_QUICKACK`
-
-```cpp
-int one = 1;
-setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof one);   // re-arm periodically!
-```
-The **non-stickiness is the key non-obvious detail**. Linux enters "quickack mode" for a limited number of ACKs and then reverts to the normal delayed-ACK heuristic. Code that sets it once at connection setup and assumes it persists is subtly wrong; correct usage re-arms it after each read (or accepts the heuristic). Being able to state this distinguishes someone who has actually used it from someone who has read a list of socket options.
-
-### `TCP_CORK`
-
-```cpp
-int one = 1;
-setsockopt(fd, IPPROTO_TCP, TCP_CORK, &one, sizeof one);
-write(fd, header, hlen);  write(fd, body, blen);      // both held
-int zero = 0;
-setsockopt(fd, IPPROTO_TCP, TCP_CORK, &zero, sizeof zero);   // uncork → one segment
-```
-Cork is for **throughput**: it guarantees full-size segments when you are assembling a response from multiple writes, and it is what `sendfile`-based servers use to avoid a small header segment followed by a large body. It caps the hold at 200 ms. On a latency path, cork is precisely what you do not want; `MSG_MORE` on `send()` gives the same effect per-call without the socket-level state.
-
-**`TCP_CORK` and `TCP_NODELAY` on the same socket:** Linux gives cork precedence while corked. Setting both is a code smell indicating confusion about intent.
-
-### Related options worth knowing
-
-| Option | Purpose |
-|---|---|
-| `TCP_NOTSENT_LOWAT` | Limit *unsent* bytes in the kernel send buffer — keeps the pipe full without hiding queueing delay in the socket |
-| `TCP_USER_TIMEOUT` | Cap total time unacknowledged data may remain outstanding before the connection fails (§38.10) |
-| `TCP_DEFER_ACCEPT` | Do not return from `accept()` until data arrives — saves a wakeup |
-| `TCP_FASTOPEN` | Carry data in the SYN, saving one RTT on reconnect using a cached cookie |
-| `TCP_INFO` | Read the full kernel state block (`cwnd`, `rtt`, `retrans`, …) — what `ss -i` prints |
-| `SO_BUSY_POLL` | Busy-poll the NIC in the socket call, cutting wakeup latency (Ch. 45 §45.8) |
-
-**The standard trading configuration:** `TCP_NODELAY` on, `tcp_slow_start_after_idle` off, `TCP_USER_TIMEOUT` set to a few seconds, send buffers sized for backpressure rather than hoarding, quickack re-armed or accepted, connections established and warmed before the open.
-
----
-
-## 38.15 TCP Head-of-Line Blocking
-
-**Head-of-line (HOL) blocking** is the delivery of correctly-received data being withheld because an *earlier* byte is missing. It is the direct, unavoidable consequence of TCP's in-order delivery guarantee.
-
-```
- Wire order:   [msg 1][msg 2][msg 3][msg 4][msg 5]
- Lost:                 ✗
- Arrived:      1              3      4      5
-
- Receiver's kernel buffer holds 3, 4, 5 — complete, verified, correct data.
- The application receives NOTHING until msg 2 is retransmitted and arrives.
-
- Delay to the application for msgs 3–5 = detection + 1 RTT (fast retransmit)
-                                       or ≥ 200 ms (RTO)
-```
-
-### The cost quantified
-
-| Detection mechanism | Added delay to everything behind the hole |
-|---|---|
-| Fast retransmit (3 dup ACKs) | ~1 RTT after the 3rd duplicate |
-| SACK-based recovery | ~1 RTT, and multiple holes in that same RTT |
-| Tail loss probe | ~2×RTT |
-| **RTO** | **≥ 200 ms on Linux** |
-
-On a colo link with a 50 µs RTT, a fast-retransmit recovery costs perhaps 150 µs — survivable. An RTO costs 200 ms, which is **four thousand RTTs** and an eternity in trading terms. The distribution is what kills you: the mean is fine, the tail is catastrophic (Ch. 43 §43.2).
-
-### Why this is the reason market data is not TCP
-
-A price update that is 200 ms late is not merely late — it is *actively harmful*, because the receiver may act on it believing it is current. UDP's behaviour under the same loss is to deliver messages 3, 4, 5 immediately and let the application decide what to do about the hole (Ch. 37 §37.3). **The application, not the transport, is the only layer that knows whether stale data is worth waiting for**, and TCP takes that decision away.
-
-### Multiplexing makes it worse
-
-Running multiple logical streams over one TCP connection means a loss affecting one stream stalls all of them. This is exactly the flaw HTTP/2 hit: it multiplexed requests over one connection, solving HTTP/1.1's application-layer HOL blocking but inheriting TCP's transport-layer version. **QUIC** fixes it by implementing streams above UDP with per-stream sequencing, so a loss in stream A does not block stream B. The same reasoning applies to any in-house multiplexed session protocol: if you put N independent order flows on one TCP connection, one lost packet delays all N.
-
-### Mitigations when you must use TCP
-
-- **Separate connections for independent flows** — restores per-flow independence at the cost of more sockets, more handshakes, and more state.
-- **Keep messages small and connections warm**, so recovery is fast-retransmit rather than RTO.
-- **Ensure TLP/RACK are enabled** — the tail-loss case (§38.8) is precisely the one that becomes an RTO.
-- **Lower `rto_min` per route** on a measured, clean datacentre path.
-- **Eliminate loss** rather than tolerating it: provision the fabric, watch microbursts and shallow buffers (Ch. 39 §39.5, §39.6). Loss on a well-engineered colo path should be essentially zero, and a nonzero retransmit counter is a defect to investigate, not a fact of life.
-
----
-
-## 38.16 TCP Keepalive
-
-**TCP keepalive** detects dead peers on idle connections by sending a probe segment with a sequence number one less than the current one, forcing an ACK.
-
-```
-net.ipv4.tcp_keepalive_time   = 7200    # idle seconds before the first probe (2 HOURS)
-net.ipv4.tcp_keepalive_intvl  = 75      # seconds between probes
-net.ipv4.tcp_keepalive_probes = 9       # probes before declaring the connection dead
-```
-Defaults therefore detect a dead peer after **7200 + 9×75 ≈ 2 hours 11 minutes** — useless for any trading purpose, and the reason "just enable keepalive" is not an answer.
-
-```cpp
-int on = 1, idle = 5, intvl = 1, cnt = 3;
-setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE,  &on,    sizeof on);
-setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof idle);
-setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
-setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof cnt);
-// detection in ~5 + 3×1 = 8 seconds
-```
-
-### What keepalive actually solves
-
-1. **Detecting a peer that vanished without a FIN** — power loss, kernel panic, cable pull. Without probes, the connection sits in `ESTABLISHED` forever on both sides; nothing on an idle TCP connection generates traffic.
-2. **Refreshing NAT and stateful-firewall mappings**, which expire after minutes of idleness (Ch. 36 §36.17). This is often the real reason keepalive is enabled: not to detect death, but to prevent a middlebox from silently killing the session.
-3. **Reclaiming resources** from half-open connections on a server.
-
-### Why applications use their own heartbeats anyway
-
-Every serious trading session protocol (FIX heartbeats, ITCH/OUCH session-level messages, in-house protocols) implements **application-level heartbeats**, and the reasons are substantive rather than stylistic:
-
-| TCP keepalive | Application heartbeat |
-|---|---|
-| Proves the **kernel** is alive | Proves the **application** is alive and processing |
-| Cannot detect a hung, deadlocked, or GC-stalled process | Detects it — the peer stops responding |
-| Granularity limited by kernel timers, per-socket config | Arbitrary interval, per-session negotiation |
-| No sequence-number context | Can carry sequence state, enabling gap detection at the same time |
-| Not portable across stacks | Fully controlled |
-
-**A process stuck in an infinite loop still answers TCP keepalives**, because the kernel generates them. This is the decisive argument, and it is exactly what FIX's `Heartbeat`/`TestRequest` pair exists for (Ch. 54 §54.2). The correct production configuration is *both*: aggressive TCP keepalive or `TCP_USER_TIMEOUT` for transport-level death, plus application heartbeats for liveness.
-
-`TCP_USER_TIMEOUT` is frequently the better transport-level tool because it bounds the time *unacknowledged data* may remain outstanding — covering the active-transmission case that keepalive (which only probes idle connections) does not.
-
----
-
-## 38.17 TIME_WAIT
-
-After an active close, the closing side holds the 4-tuple in **`TIME_WAIT`** for **2×MSL** (Maximum Segment Lifetime) — **60 seconds on Linux** (a fixed `TCP_TIMEWAIT_LEN`, not tunable via sysctl).
-
-### The two reasons it exists
-
-1. **Absorb delayed duplicates.** A segment from this connection could still be wandering the network. If the same 4-tuple were immediately reused, that old segment could be accepted into the new connection and corrupt its data stream. Waiting 2×MSL guarantees every old segment has expired.
-2. **Guarantee the final ACK is delivered.** If the active closer's last ACK is lost, the peer retransmits its FIN. Only a socket still in `TIME_WAIT` can respond with the ACK again; a fully closed socket would respond with an RST, which the peer would report as an error on an otherwise clean shutdown.
-
-Reason 2 is the one people forget, and stating it distinguishes a real understanding from "it's for old packets."
-
-### Why it hurts
-
-`TIME_WAIT` sockets occupy a 4-tuple. A client making many short-lived outbound connections to the same server exhausts the **ephemeral port range** (`net.ipv4.ip_local_port_range`, typically 32768–60999, so ~28 000 ports). At 60 seconds each, that caps sustained connection rate at roughly **470 connections/second to a single destination `(dst IP, dst port)`** — a real limit that surprises people, and one that only applies per-destination since the 4-tuple includes the remote address.
-
-### The remedies, ranked
-
-| Approach | Verdict |
-|---|---|
-| **Persistent connections** | **The correct fix.** Establish once, keep it up, reuse. Trading sessions do this anyway |
-| `SO_REUSEADDR` | Lets a *listener* bind a port with `TIME_WAIT` sockets present. Standard and safe on servers; does not reduce client-side exhaustion |
-| `net.ipv4.tcp_tw_reuse=1` | Allows reusing a `TIME_WAIT` socket for a **new outbound** connection when timestamps show the old one is older. Safe with timestamps enabled; the standard client-side answer |
-| Widen `ip_local_port_range` | Helps linearly; cheap; do it |
-| `tcp_max_tw_buckets` | Caps the number of `TIME_WAIT` sockets by *destroying* the excess — trades correctness for resource limits; a blunt instrument |
-| `SO_LINGER(1, 0)` to force RST | Avoids `TIME_WAIT` **by discarding unsent data**. Correct only when you genuinely do not care about the tail of the stream |
-| `net.ipv4.tcp_tw_recycle` | **Removed from Linux in 4.12.** It broke catastrophically behind NAT by rejecting connections from clients whose timestamps appeared to go backwards. Recommending it is a red flag |
-
-That last row is a genuine discriminator: `tcp_tw_recycle` appears in countless stale tuning guides, and knowing it was removed for correctness reasons — and *why* — is a strong signal.
-
-### Which side pays
-
-**The side that closes first pays.** Design accordingly: for a server handling many short connections, having the *client* close first moves `TIME_WAIT` to the client, where 28 000 ports per destination is usually ample. HTTP servers do this deliberately with connection-close semantics. `ss -tan state time-wait | wc -l` counts them.
-
-For trading, the topic is mostly moot on the session path — order-entry connections are long-lived by design — but it matters for reconnect storms after a mass disconnect, where hundreds of sessions try to re-establish simultaneously and hit port and `TIME_WAIT` limits precisely when recovery is urgent.
-
----
-
-## 38.18 Bandwidth-Delay Product
-
-The **bandwidth-delay product** is the amount of data "in flight" on a path at full utilization:
-
-```
- BDP (bytes) = bandwidth (bytes/s) × RTT (s)
-```
-
-It is the minimum window required to keep the pipe full. If `min(cwnd, rwnd) < BDP`, the sender stalls waiting for ACKs and throughput is `window / RTT`, independent of the link's capacity.
-
-| Path | Bandwidth | RTT | BDP |
-|---|---|---|---|
-| Colo LAN | 10 Gbit/s | 50 µs | **62.5 KB** |
-| Same metro | 10 Gbit/s | 1 ms | 1.25 MB |
-| Chicago–NY | 10 Gbit/s | 9 ms | 11.25 MB |
-| Transatlantic | 1 Gbit/s | 80 ms | 10 MB |
-| Satellite (GEO) | 100 Mbit/s | 600 ms | 7.5 MB |
-
-**Throughput = min(window, BDP) / RTT.** Two immediate corollaries:
-
-- Without window scaling, the window is capped at 65535 bytes, so a transatlantic 80 ms path is capped at **6.5 Mbit/s** regardless of a 10 Gbit/s link. This is the classic "why is my long-distance transfer so slow" diagnosis (§38.5).
-- Buffers must be sized to at least the BDP for full throughput, which is what Linux's autotuning is estimating — and what a manual `SO_RCVBUF` setting overrides and freezes.
-
-### The trading interpretation
-
-Inside a colo the BDP is tiny — 62.5 KB, and for a 50-byte order message it is irrelevant. **On a colo path you are never bandwidth-limited; you are latency-limited and per-message-cost-limited.** This is why congestion-control tuning does essentially nothing for colo order entry (§38.9) and why the productive optimizations are syscall count, interrupt handling, and message size.
-
-Where BDP matters in a trading firm: cross-site replication, historical data transfer, and remote market-data backhaul. There, size buffers to the BDP, enable window scaling, and consider BBR.
-
-### Related quantity: the pipe in packets
-
-`BDP / MSS` gives the number of segments in flight. For the colo case: `62500 / 1460 ≈ 43` segments. For the transatlantic case: `10 MB / 1460 ≈ 7200` segments — which is also roughly how many RTTs a Reno flow needs to recover from one loss (§38.7), making the high-BDP fragility concrete.
-
----
-
-## 38.19 Bufferbloat
-
-**Bufferbloat** is excessive latency caused by oversized, unmanaged buffers in network devices. Its mechanism is a direct consequence of loss-based congestion control.
-
-```
- Loss-based CC increases cwnd until it sees loss.
- Loss occurs only when a buffer OVERFLOWS.
- ⇒ TCP deliberately fills every buffer on the path before it backs off.
- ⇒ A 1 GB buffer on a 10 Mbit/s link means TCP fills it,
-   and every packet then waits behind ~800 seconds of queued data.
-```
-
-Queueing delay = `queue_bytes / drain_rate`:
-
-| Buffer | Link rate | Added latency |
-|---|---|---|
-| 64 KB | 10 Gbit/s | 51 µs |
-| 1 MB | 10 Gbit/s | 800 µs |
-| 1 MB | 1 Gbit/s | 8 ms |
-| 100 MB | 1 Gbit/s | 800 ms |
-
-The pathology is the **interaction**: a single bulk transfer fills the bottleneck buffer, and then every latency-sensitive packet — an order message, a heartbeat, an ACK — queues behind hundreds of milliseconds of bulk data. Interactive traffic collapses while throughput looks perfect. The classic home-network symptom (a large upload makes voice calls unusable) is the same phenomenon that makes a shared uplink unusable for trading traffic.
-
-### Why buffers got big
-
-Memory became cheap, "more buffer means fewer drops" was intuitive, and vendors competed on buffer size as a spec-sheet number. The correct queue size is roughly the BDP (or `BDP/√n` for n flows, the Appenzeller result), not "as much as fits."
-
-### The fixes
-
-| Technique | Mechanism |
-|---|---|
-| **AQM: CoDel** | Drops packets when the *minimum* queueing delay over a window exceeds a target (5 ms), which distinguishes a persistent standing queue from a transient burst |
-| **fq_codel** | CoDel plus per-flow fair queueing — isolates a bulk flow from an interactive one, so one flow cannot build a queue in front of another |
-| **CAKE** | fq_codel plus shaping and better classification |
-| **BBR** | Sender-side: targets the BDP rather than buffer overflow, so it does not fill queues at all (§38.9) |
-| **ECN** | Mark instead of drop: the router sets CE (`11`) in the IP ECN bits, the receiver echoes ECE, the sender reduces `cwnd` **without any loss or retransmission** |
-| **Right-size buffers** | The structural fix, applicable in a private fabric |
-
-```
-tc qdisc add dev eth0 root fq_codel      # or fq for BBR pacing
-tc -s qdisc show dev eth0                # backlog and drop statistics
-```
-
-### ECN, precisely
-
-Two bits in the IP header (Ch. 36 §36.13) plus two TCP flags:
-
-```
- IP ECN bits:  00 not-ECT   01/10 ECT (capable)   11 CE (congestion experienced)
- Router experiencing congestion rewrites ECT → CE instead of dropping.
- Receiver sets ECE in ACKs; sender reduces cwnd and sets CWR to confirm.
-```
-The benefit is congestion signalling **without loss**, which removes the retransmission and the head-of-line blocking that a drop would cause. ECN is negotiated on the SYN; historically some middleboxes dropped ECN-marked SYNs, which is why deployment lagged. **DCTCP** uses ECN marks proportionally to hold datacentre queues at a few packets — the right answer inside a controlled fabric.
-
-### Trading relevance
-
-In a properly provisioned colo fabric there should be no persistent queueing at all — the design goal is zero standing queue, and the enemy is **microbursts** rather than sustained congestion (Ch. 39 §39.5). Bufferbloat matters on shared WAN uplinks and on any link where bulk traffic (backups, replay, market-data recording) shares a path with latency-sensitive traffic. The two structural answers are **physical separation** (dedicated links or NICs for bulk) and **fq_codel plus shaping** where separation is impossible. Deep switch buffers on a trading path are a liability, not a feature — a point Ch. 39 §39.6 develops.
-
----
-
-## 38.20 TCP Message Framing
-
-Because TCP is a byte stream (§38.1), the application must define message boundaries. This is not optional and it is where a large fraction of real protocol bugs live.
-
-### The three schemes
-
-| Scheme | Example | Pros | Cons |
-|---|---|---|---|
-| **Length prefix** | `[uint32 len][payload]` — SBE, ITCH-over-TCP, most binary protocols | Single allocation, no scanning, exact bounds | Must validate the length before trusting it |
-| **Delimiter** | HTTP `\r\n\r\n`; FIX's `10=xxx\x01` trailer | Human-readable, streamable | Requires escaping, scanning cost, ambiguous if the delimiter appears in data |
-| **Fixed size** | Fixed-layout binary records | Trivial, zero parsing | Wastes space, no evolution path |
-
-FIX is a hybrid and a good illustration of why: it is delimited by SOH characters, but it carries `BodyLength` (tag 9) as the second field precisely so a receiver need not scan for the end — plus a `CheckSum` (tag 10) trailer as a frame-integrity check.
-
-### The length-prefix implementation, done correctly
-
-```cpp
-// Returns true if a complete message is available at the front of buf.
-bool try_frame(std::span<const std::byte> buf, size_t& msg_len) {
-    if (buf.size() < 4) return false;                 // header not yet complete
-    uint32_t len = rd_be32(buf.data());               // Ch. 36 §36.9
-    if (len < kMinMsg || len > kMaxMsg) throw ProtocolError{};  // ← MANDATORY
-    if (buf.size() < 4 + len) return false;           // body not yet complete
-    msg_len = 4 + len;
-    return true;
+constexpr bool seq_before(std::uint32_t a, std::uint32_t b) {
+    return a != b && (b - a) < 0x8000'0000u;
 }
 ```
 
-Four rules, each corresponding to a real production incident class:
-
-1. **Validate the length against a hard maximum before using it.** An attacker (or a corrupt link, or a version mismatch) sending `0xFFFFFFFF` becomes a 4 GB allocation or an integer overflow in `4 + len`. This is the single most common serious bug in hand-written protocol parsers (Ch. 51 §51.12).
-2. **Handle partial headers.** The 4-byte length prefix itself can arrive split across two segments. Code that reads 4 bytes assuming they are all present fails rarely and catastrophically.
-3. **Handle multiple messages per read.** One `recv` can return many complete messages plus a partial one; loop until you cannot frame another, then compact the remainder.
-4. **Never assume one `recv` = one message.** This is §38.1 restated, and it is the assumption that testing on loopback never falsifies.
-
-### The receive loop shape
-
-```cpp
-size_t used = 0;
-n = recv(fd, buf.data() + fill, buf.size() - fill, 0);
-if (n == 0) { /* peer closed: EOF */ }
-if (n < 0 && (errno == EAGAIN || errno == EINTR)) { /* Ch. 34 §34.20 */ }
-fill += n;
-size_t off = 0, len;
-while (try_frame({buf.data() + off, fill - off}, len)) { dispatch(buf.data() + off, len); off += len; }
-std::memmove(buf.data(), buf.data() + off, fill - off);   // compact the partial tail
-fill -= off;
-```
-
-The `memmove` is the naive approach; a **ring buffer** avoids it, and a fixed-capacity buffer sized to the maximum message avoids allocation entirely on the hot path (Ch. 55 §55.1). For very high rates, parse **in place** from the receive buffer with `std::span`/`string_view` views rather than copying out fields (Ch. 13 §13.4, Ch. 51 §51.9).
-
-### The performance angle
-
-- One `recv` per message is one syscall per message (~1–3 µs); **reading large chunks and framing in user space amortizes it** — the single biggest win in a TCP message parser.
-- Zero-copy parsing means constructing views over the receive buffer, which requires the buffer to outlive the views. Alignment for in-place field access is a real constraint (Ch. 3 §3.12).
-- Batching writes with `writev`/`sendmsg` avoids both extra syscalls and extra segments (§38.12).
+At exactly half the space, order is ambiguous; a conforming implementation constrains live windows and segment lifetimes so it never needs that comparison. TCP timestamps can also support PAWS, which rejects old segments after sequence wrap. Do not reuse this helper for an unbounded application counter without proving the same half-range invariant.
 
 ---
 
-## 38.21 TCP Half-Close and Reconnect Behaviour
+## 38.2 Sequence Numbers, ACKs, and a Worked Trace — Core
 
-### Half-close
+The sequence number in a segment identifies its first payload byte. The acknowledgement number is the next byte expected in the opposite direction. Thus `ACK=5001` means all bytes through 5000 arrived contiguously. It says nothing cumulative about bytes above a hole unless a SACK option reports them separately.
 
-TCP connections are full-duplex and each direction closes independently. `shutdown()` exposes this:
+SYN and FIN each consume one sequence number so setup and shutdown can be acknowledged and retransmitted in the same sequence machinery. A pure ACK consumes none.
 
-```cpp
-shutdown(fd, SHUT_WR);   // send FIN; we send no more, but CAN STILL RECEIVE
-shutdown(fd, SHUT_RD);   // stop receiving locally; no FIN is sent
-shutdown(fd, SHUT_RDWR); // both directions
-close(fd);               // release the descriptor; sends FIN if not already sent
+### Trace: one hole in the stream
+
+Assume the sender's first data byte is sequence 1001 and each shown segment carries 500 bytes:
+
+```text
+Sender                                      Receiver / application
+
+SEQ=1001 LEN=500  ───────────────────────►  accepts [1001,1501)
+                    ◄─────────────────────  ACK=1501
+
+SEQ=1501 LEN=500  ─────── X (lost)
+
+SEQ=2001 LEN=500  ───────────────────────►  buffers [2001,2501)
+                    ◄─────────────────────  ACK=1501, SACK=[2001,2501)
+
+SEQ=2501 LEN=500  ───────────────────────►  buffers [2501,3001)
+                    ◄─────────────────────  ACK=1501, SACK=[2001,3001)
+
+retransmit
+SEQ=1501 LEN=500  ───────────────────────►  fills hole
+                    ◄─────────────────────  ACK=3001
 ```
 
-| | `shutdown(SHUT_WR)` | `close()` |
-|---|---|---|
-| Sends FIN | Yes | Yes (if the last reference) |
-| Can still read | **Yes** | No |
-| Releases the descriptor | No | Yes |
-| Effect with `dup`'d/forked descriptors | Affects the connection immediately | Only when the **last** reference closes |
+After the first segment, the application can read bytes through 1500. Bytes 2001–3000 may already occupy the receive buffer, but ordered-stream semantics prevent their delivery before 1501–2000. When the retransmission fills the hole, the cumulative ACK jumps and the receiver can deliver the now-contiguous range. This is TCP head-of-line blocking in its simplest form.
 
-That last row matters: a forked child holding a copy of the descriptor keeps the connection open after the parent's `close()`, which is a classic source of connections that will not die.
+The trace also separates three kinds of information:
 
-The **half-close idiom** is "send everything, signal I am done, then read the response until EOF." It is how a client can stream a request of unknown length and still receive a reply. The peer sees `recv` return 0 (EOF) and knows the request is complete, while its own direction remains open.
+- Repeated `ACK=1501` says the cumulative edge did not move.
+- A SACK block says higher ranges arrived; it does not replace the cumulative ACK.
+- The sender infers loss from ACK/SACK/timing evidence. The receiver does not send a special "packet 2 was lost" message.
 
-**The `CLOSE_WAIT` connection:** the peer's FIN puts your socket in `CLOSE_WAIT` and delivers EOF; your side stays there until *you* call `close()`. A pile of `CLOSE_WAIT` sockets means your application read EOF and never closed (§38.3).
+### SACK and duplicate suppression
 
-### Reconnect behaviour
+Selective Acknowledgement (SACK, negotiated during setup) reports non-contiguous received byte ranges. This lets a sender retransmit holes rather than all later bytes. TCP's option budget limits the number of blocks that fit in one segment, especially when timestamps are present, so SACK state may span several ACKs.
 
-Reconnecting an exchange session is a correctness problem, not a networking one. The mechanics:
+SACK information is advisory: the sender retains data until it is cumulatively acknowledged because a receiver may renege under exceptional resource pressure. D-SACK uses the SACK format to report duplicate data and can help an implementation recognize spurious retransmission or path reordering.
 
-1. **Detect the disconnect.** EOF (graceful FIN), `ECONNRESET` (RST), `ETIMEDOUT` (`TCP_USER_TIMEOUT` or retransmission exhaustion), or an application heartbeat timeout. **Heartbeat timeout is usually first and is the one to act on** — a hung peer never sends a FIN.
-2. **Back off.** Exponential with jitter. Without jitter, every disconnected client reconnects simultaneously after a venue blip and the reconnect storm prevents anyone from getting in.
-3. **Re-establish and re-logon.** New TCP connection, new session-level logon with sequence numbers (Ch. 54 §54.1).
-4. **Resynchronize sequence numbers.** The session protocol's sequence state — *not* TCP's — determines what must be resent. FIX's `ResendRequest`/`SequenceReset` and OUCH/SoupBinTCP's sequence-based replay exist for exactly this.
-5. **Reconcile order state.** This is the part that matters: **during the disconnect, orders may have been filled, cancelled, or rejected.** Until reconciliation completes (via drop copy or an order-status request), your position is unknown.
+Duplicate packets do not become duplicate application bytes. The receiver uses sequence ranges to discard already-received data and merge overlaps. That transport duplicate suppression still does not deduplicate two application requests that happen to contain the same business operation.
 
-### The safety rules
+### Reading ACK state correctly
 
-- **Never assume an unacknowledged order was not executed.** A `send()` that succeeded, followed by a disconnect, leaves the order in an unknown state. `send()` returning N means "the kernel took N bytes" (§38.1) — nothing more.
-- **Use cancel-on-disconnect** where the venue offers it: on session loss, the exchange cancels all resting orders, which converts an unknown state into a known-flat one. This is the single most valuable disconnect-safety feature and should be requested by default (Ch. 54 §54.12).
-- **Make order state transitions idempotent**, keyed on client order ID, so a replayed or duplicated message after reconnect does not create a second order (Ch. 54 §54.8).
-- **Do not send new orders before reconciliation completes.** The gap between reconnect and reconciliation is a common source of duplicate and orphaned orders.
-- **Alarm on reconnect**, always. A reconnect is a risk event; silent automatic recovery hides a degrading link until it fails during a volatile period.
+At the sender, `SND.UNA` is the oldest unacknowledged sequence position and `SND.NXT` is the next position to transmit. An acceptable cumulative ACK normally falls within the active send range:
 
-### Diagnosing a disconnect after the fact
+```text
+ACK <= SND.UNA            old/duplicate acknowledgement; no advancement
+SND.UNA < ACK <= SND.NXT  advances the cumulative edge
+ACK > SND.NXT             acknowledges unsent sequence space; invalid/challenge case
+```
 
-| Evidence | Tool |
+Exact challenge-ACK and security behavior is standards- and implementation-specific, but the invariant is simple: an ACK cannot legitimately confirm bytes never sent.
+
+ACKs acknowledge sequence space, not packet objects. If a 1,000-byte write was transmitted as two 500-byte segments, `ACK=2001` can cumulatively acknowledge the entire range regardless of how it was segmented. Conversely, one ACK may cover many segments, and ACK loss may be harmless when a later cumulative ACK covers the same bytes.
+
+The PUSH flag does not repair message framing. It can influence when a stack makes received bytes available, but it does not define a record boundary visible through the portable stream API. Applications should not attempt to reconstruct writes from PSH flags in a capture.
+
+---
+
+## 38.3 Connection Lifecycle and Failure Ambiguity — Core
+
+### Establishment
+
+The three-way handshake synchronizes initial sequence numbers (ISNs), confirms two-way reachability, and negotiates options:
+
+```text
+Active opener                                 Passive opener
+
+SYN, seq=x, options        ─────────────────►  SYN-RECEIVED
+                            ◄────────────────  SYN+ACK, seq=y, ack=x+1, options
+ESTABLISHED
+ACK, seq=x+1, ack=y+1      ─────────────────►  ESTABLISHED
+```
+
+The third packet can carry application data after the active side has received the SYN+ACK. This is ordinary TCP; whether application scheduling actually puts data there depends on the API and stack. Sending application data on the initial SYN is different: it requires a facility such as TCP Fast Open, has deployment and replay/idempotency implications, and is not part of the basic handshake guarantee.
+
+For conventional connect-then-write behavior, the setup adds approximately one network RTT before the server receives application bytes. Retransmitted SYN timing, retry counts, SYN-cookie behavior, listener queues, and connection API errors are operating-system policy and belong to Chapter 45. Do not quote one retry schedule as TCP itself.
+
+The key options are exchanged on SYN segments:
+
+| Option | Directional meaning |
 |---|---|
-| Was there a FIN or an RST? | `tcpdump` capture, always running on session links |
-| Did the kernel time out? | `ss -tin` before death; `nstat` `TcpExtTCPAbortOnTimeout` |
-| Retransmissions leading up to it? | `nstat`, `netstat -s`, `ss -tin` `retrans` |
-| Did the peer stop responding first? | Application heartbeat log with timestamps |
-| Link-level fault? | `ethtool -S` error counters, switch port counters, link flap logs |
+| MSS | Largest TCP payload the option sender is willing to receive in one segment |
+| Window Scale | Scale used to interpret that receiver's advertised window; factors can differ by direction |
+| SACK Permitted | Allows the peer to send SACK information later |
+| Timestamps | Supports timestamp echo/RTT mechanisms and PAWS |
 
-Running a continuous rotating packet capture on every exchange session link is standard practice precisely because disconnect post-mortems are impossible without it (Ch. 48 §48.7).
+MSS is not the Ethernet MTU. It is payload after IP/TCP headers, and actual payload can be further constrained by path MTU and TCP option bytes. Window scaling must be negotiated during the handshake; it cannot be enabled halfway through a connection.
 
----
+### Graceful teardown and half-close
 
-## Key Interview Questions
+TCP is full duplex, so each sending direction closes independently:
 
-1. **Why is TCP unsuitable for market data but acceptable for order entry?** — Retransmission plus in-order delivery causes head-of-line blocking (≥ 200 ms on an RTO), and TCP is point-to-point so it cannot fairly serve thousands of subscribers. Order entry is a low-rate, point-to-point, must-not-lose flow where reliability is worth the tail risk.
-2. **Explain the three-way handshake and what it costs.** — SYN / SYN+ACK / ACK synchronizes ISNs in both directions and negotiates MSS, window scale, SACK, and timestamps; one full RTT before data, plus TLS on top.
-3. **Why three packets rather than two?** — Both directions must synchronize sequence numbers and each side must confirm the other's ISN was received; the third ACK is what completes the server's state.
-4. **What is the difference between flow control and congestion control?** — Flow control protects the receiver's buffer via the explicitly advertised window; congestion control protects the network via an inferred `cwnd`. The sender is bounded by `min(rwnd, cwnd)`.
-5. **A transfer over an 80 ms path is stuck at 6.5 Mbit/s on a 10 Gbit/s link. Diagnose.** — Window scaling not in effect (stripped by a middlebox or not offered by one side): 65535 bytes / 80 ms = 6.5 Mbit/s exactly.
-6. **What is the bandwidth-delay product and why does it matter?** — `bandwidth × RTT` is the in-flight data needed to keep the pipe full; throughput is `min(window, BDP)/RTT`. Colo BDP is ~62 KB, so colo paths are latency-limited, never bandwidth-limited.
-7. **Walk through what happens on a single lost segment.** — Out-of-order arrivals trigger duplicate ACKs; three duplicates trigger fast retransmit and fast recovery (`ssthresh = flight/2`, `cwnd = ssthresh + 3`); with SACK the sender retransmits exactly the missing ranges in one RTT. If no duplicates arrive (tail loss), only an RTO — ≥ 200 ms — recovers it.
-8. **Why is a timeout-detected loss so much worse than a duplicate-ACK-detected loss?** — Fast recovery halves the window and costs ~1 RTT; an RTO collapses `cwnd` to 1 MSS, restarts slow start, and costs at least Linux's 200 ms `rto_min`.
-9. **Explain the Nagle plus delayed-ACK interaction.** — Sender withholds a sub-MSS trailing segment because data is unacknowledged; receiver withholds the ACK hoping to piggyback or cover two segments. Neither moves until the ~40 ms delayed-ACK timer fires. Signature: latency quantized at 40 ms. Fix: `TCP_NODELAY`, and write whole messages in one call.
-10. **`TCP_NODELAY` vs `TCP_QUICKACK` vs `TCP_CORK`?** — Disable Nagle on the sender / disable delayed ACK on the receiver (and it is **not sticky** — re-arm it) / the opposite of NODELAY, batching until a full segment or 200 ms.
-11. **What is head-of-line blocking and how does QUIC avoid it?** — Correctly received bytes are withheld pending an earlier missing byte, because TCP guarantees in-order delivery. QUIC implements independent streams over UDP so a loss in one stream does not stall another.
-12. **What does SACK buy you, and how many blocks fit?** — Precise knowledge of received ranges, so multiple losses in one window are repaired in one RTT instead of one RTT each. Up to 4 blocks (34 bytes), but only 3 alongside the 10-byte timestamp option.
-13. **What is D-SACK for?** — Reporting a duplicate receipt, which lets the sender detect spurious retransmissions, undo an unnecessary window reduction, and raise its reordering threshold. High `TCPDSACKRecv` with low real loss indicates a reordering path.
-14. **Why does `TIME_WAIT` exist and who pays it?** — To absorb delayed duplicates from the old incarnation and to be able to re-ACK a retransmitted FIN. The active closer pays, for 60 s on Linux, holding the 4-tuple.
-15. **How do you fix ephemeral-port exhaustion from `TIME_WAIT`?** — Persistent connections first; then `tcp_tw_reuse` with timestamps, a wider `ip_local_port_range`, and having the other side close. Never `tcp_tw_recycle` — removed from Linux for breaking NATted clients.
-16. **A server accumulates `CLOSE_WAIT` sockets. What is wrong?** — The application read EOF and never called `close()`. Always an application bug, never the network. It leaks descriptors toward `EMFILE`.
-17. **Why are application heartbeats needed when TCP keepalive exists?** — Keepalive is generated by the kernel, so a deadlocked or stalled process still answers it. Only an application-level heartbeat proves the application is processing. Also, keepalive defaults detect death after ~2 hours 11 minutes.
-18. **Compare Reno, CUBIC, and BBR.** — Loss-based linear (RTT-unfair, hopeless at high BDP); loss-based cubic-in-wall-time (RTT-fair, fast recovery, still fills buffers); rate-and-delay-based targeting the BDP (drains queues, tolerates random loss, needs pacing).
-19. **What is bufferbloat and why is it caused by TCP itself?** — Loss-based congestion control only backs off when a buffer overflows, so it deliberately fills every buffer on the path; a large buffer therefore becomes standing queueing delay. Fixes: fq_codel/CoDel, ECN, BBR, right-sized buffers.
-20. **How do you frame messages on a TCP stream, and what must you validate?** — Length prefix, delimiter, or fixed size. With a length prefix: validate against a hard maximum before allocating or indexing, handle a partial length field, handle multiple messages per `recv`, and never assume one `recv` is one message.
-21. **After an order-entry disconnect, what must you assume?** — That any unacknowledged order may or may not have executed. `send()` succeeding proves only that the kernel accepted the bytes. Reconcile via drop copy or order status before sending anything new, and prefer cancel-on-disconnect.
-22. **What TCP settings would you apply to a trading host?** — `TCP_NODELAY` on every session socket, `tcp_slow_start_after_idle=0`, `TCP_USER_TIMEOUT` of a few seconds, TLP/RACK enabled, per-route `rto_min` lowered on a measured clean path, send buffers sized for backpressure not hoarding, and connections established and warmed before the open.
+```text
+Active closer                                  Peer
 
----
+FIN, seq=u                  ─────────────────►  receives EOF after prior bytes
+                             ◄────────────────  ACK=u+1
+                             ◄────────────────  remaining data, then FIN, seq=v
+ACK=v+1                     ─────────────────►
+TIME-WAIT                                      CLOSED
+```
 
-## Common Traps
+A FIN means "no bytes after this sequence position in my sending direction." The peer may continue sending until it sends its own FIN. A half-close exposes this property: one side can finish its request stream while continuing to receive a response. The socket API for doing so is in Chapter 45.
 
-- **Assuming one `recv` returns one message** — TCP is a byte stream; framing is the application's job.
-- **Assuming `send()` returning N means the peer received N bytes** — it means the kernel buffered them.
-- **Not validating a length prefix before allocating or indexing** — 4 GB allocations, integer overflow, and the most common serious parser vulnerability.
-- **Forgetting the length prefix itself can arrive split** across segments.
-- **Leaving Nagle enabled on a latency-sensitive socket** — 40 ms stalls that appear only under specific message sizes and pipelining.
-- **Fixing Nagle with `TCP_NODELAY` while still doing multiple small `write`s per message** — treats the symptom; use `writev`/`sendmsg` or one buffer.
-- **Setting `TCP_QUICKACK` once and assuming it persists** — Linux resets it; it must be re-armed.
-- **Setting `TCP_NODELAY` on only one end** when both sides send small messages.
-- **Setting `SO_RCVBUF`/`SO_SNDBUF` explicitly** — disables autotuning and can cap throughput on a high-BDP path. Also, Linux doubles what you request.
-- **Huge send buffers on a latency path** — hides queueing delay inside the kernel instead of surfacing it as backpressure; use `TCP_NOTSENT_LOWAT`.
-- **Leaving `tcp_slow_start_after_idle=1`** — the first burst after a quiet period is throttled back to a 10-segment window.
-- **Relying on TCP keepalive defaults** — ~2 hours 11 minutes to detect a dead peer.
-- **Relying on TCP keepalive at all to prove liveness** — the kernel answers probes for a hung process.
-- **Accumulating `CLOSE_WAIT`** — an application that never calls `close()` after EOF, leaking descriptors.
-- **`SO_LINGER(1,0)` to dodge `TIME_WAIT`** — discards unsent data, which on an order path can discard a cancel.
-- **Recommending `tcp_tw_recycle`** — removed from Linux; it broke NATted clients.
-- **Confusing flow control with congestion control** in an interview — the fastest way to lose credibility on this topic.
-- **Assuming three duplicate ACKs always means loss** — reordering produces them too, which is why RACK replaced the counting heuristic.
-- **Ignoring the tail-loss case** — the last message of a burst has nothing behind it to generate duplicate ACKs, so without TLP/RACK it costs a full RTO.
-- **Believing a congestion-control change will improve colo order-entry latency** — the BDP is 62 KB and you are never bandwidth-limited.
-- **Deep switch buffers as a latency "safety margin"** — they convert loss into hundreds of milliseconds of standing queue.
-- **Multiplexing independent order flows on one TCP connection** — one lost packet head-of-line blocks all of them.
-- **Reconnecting without jitter** — a venue blip becomes a synchronized reconnect storm.
-- **Sending new orders before post-reconnect reconciliation completes** — duplicate and orphaned orders.
-- **Reading `tcpdump` sequence numbers as absolute** — they are relative to the ISN unless you pass `-S`.
+An RST aborts a connection rather than completing the two FIN directions. Applications should not assume locally queued bytes reached the peer after an abort. A normal EOF, reset, local timeout, and application heartbeat failure are distinct observations and should remain distinct in logs.
+
+RST interpretation requires context. It may mean no matching connection existed, an endpoint aborted deliberately, a policy device rejected traffic, or a peer restarted and lost connection state. A reset after the local application writes does not identify which earlier bytes the remote application consumed. Packet direction, sequence/ACK state, and endpoint logs are required.
+
+Common states and their diagnostic meaning:
+
+| State | Meaning |
+|---|---|
+| `SYN-SENT` / `SYN-RECEIVED` | Handshake incomplete |
+| `ESTABLISHED` | Both sequence spaces established |
+| `FIN-WAIT-1/2` | Local FIN sent; waiting for its ACK or peer FIN |
+| `CLOSE-WAIT` | Peer FIN received; local application has not closed its sending side |
+| `LAST-ACK` | Local FIN sent after receiving peer FIN |
+| `TIME-WAIT` | Final-ACK side retains tuple state temporarily |
+
+An unexpected growing population in `CLOSE-WAIT` usually indicates that the application observed EOF but retained descriptors or failed to finish its half. A deliberate long-lived half-close is possible, so the state alone is evidence, not a protocol proof of a bug.
+
+### TIME-WAIT, keepalive, and reconnect
+
+TIME-WAIT lets the endpoint retransmit the final ACK if the peer repeats its FIN and prevents delayed segments from an older incarnation being mistaken for a new connection using the same tuple. The conceptual duration is tied to maximum segment lifetime; actual duration and tuple-reuse policy are implementation-specific. Persistent connections and correct lifecycle design matter more than memorizing a Linux timer or applying tuple-reuse sysctls.
+
+TCP keepalive is an optional idle-connection probe mechanism. Enablement, probe intervals, counts, and failure reporting vary by OS and configuration. A successful probe shows that the peer network stack responded; it does not prove that the peer application event loop is healthy. Application heartbeats carry semantic liveness and can include sequence/progress state.
+
+After a disconnect, transport state does not answer whether a business request executed:
+
+```text
+local write accepted → bytes transmitted → peer TCP ACKed → peer app read
+                    → peer app validated → operation committed → response received
+```
+
+A failure can occur between any two arrows. Reconnection therefore requires application session resynchronization, idempotent request identifiers, reconciliation, and jittered retry policy. TCP only establishes a new byte stream.
+
+The same ambiguity exists during graceful failure. Receiving FIN proves the peer TCP endpoint closed its sending direction after the bytes before that FIN; it does not prove that every request caused the intended business transition. Graceful transport shutdown is useful evidence, not an application commit record.
 
 ---
 
-## Compact Recall Summary
+## 38.4 Reliability, RTT Estimation, and Retransmission — Core
 
-**Semantics.** Reliable, ordered, connection-oriented **byte stream** on a 4-tuple; 20–60 byte header (Data Offset in 32-bit words); flags SYN/ACK/FIN/RST/PSH/URG/ECE/CWR. **No message boundaries** — the application must frame. `send()` returning N means the kernel buffered N bytes, nothing about the peer. Options negotiated on the SYN only: MSS, window scale, SACK-permitted, timestamps (timestamps+alignment cost 12 B, reducing payload from 1460 to 1448).
+TCP retains unacknowledged data and retransmits when it concludes that a range is missing. The conclusion can come from packet/ACK evidence or a timer.
 
-**Handshake and teardown.** SYN / SYN+ACK / ACK = **1 RTT** before data; SYN and FIN each consume a sequence number. Two queues: SYN queue (`tcp_max_syn_backlog`, SYN cookies) and accept queue (`listen` backlog, `somaxconn`) — `ss -lnt` shows depth in `Recv-Q` and limit in `Send-Q`. Teardown is per-direction: FIN/ACK/FIN/ACK; the active closer sits in **TIME_WAIT for 60 s**. **`CLOSE_WAIT` accumulating is always an application bug.** FIN flushes queued data; RST discards it and skips TIME_WAIT.
+### Evidence-based recovery
 
-**Sequencing.** Byte-offset sequence numbers in a 32-bit modular space; **cumulative** ACKs mean "everything below N." Wrap in 3.4 s at 10 Gbit/s ⇒ PAWS via timestamps. Duplicate ACKs are ambiguous between loss and reordering. Compare with `int32_t(a-b) < 0`. `tcpdump` shows relative sequences without `-S`.
+In the classic RFC 5681 model, out-of-order arrivals generate duplicate cumulative ACKs. Three duplicate ACKs trigger fast retransmit, while fast recovery reduces the congestion window without waiting for the retransmission timeout. The threshold is a heuristic: reordering can also generate duplicate ACKs, and a short flight may not contain enough later segments to produce three.
 
-**Flow vs congestion control.** Flow control = **receiver's buffer**, explicit `rwnd`; congestion control = **the network**, inferred `cwnd`; sender bounded by `min(rwnd, cwnd)`. 16-bit window caps throughput at `65535/RTT` (6.5 Mbit/s at 80 ms) without **window scaling**, which requires both sides on the SYN. Zero window → persist timer with 1-byte probes. Explicit `SO_RCVBUF` disables autotuning.
+SACK-based recovery identifies multiple holes more precisely. Modern stacks may also use time-based loss detection and tail-loss probes. RACK-TLP is standardized in RFC 8985, but kernel enablement, exact reordering windows, and counters are version/configuration details. State the observed implementation before claiming that a tail loss recovers in a particular number of RTTs.
 
-**Congestion phases.** Slow start (×2/RTT, **IW = 10 MSS ≈ 14.6 KB**, restarts after idle unless disabled) → congestion avoidance (**AIMD**, +1 MSS/RTT) → fast retransmit/recovery on 3 dup ACKs (`ssthresh = flight/2`, `cwnd = ssthresh + 3`, inflate/deflate) → **RTO** (`cwnd = 1`, slow start, **≥ 200 ms on Linux**). NewReno, SACK recovery, Limited Transmit, **TLP** for tail loss, **RACK** time-based detection.
+The recovery cost model is:
 
-**Algorithms.** Reno: linear, RTT-unfair, 71 minutes to recover 10 Gbit/s at 100 ms. CUBIC: cubic in wall time, RTT-fair, Linux default, still fills buffers. BBR: models `BtlBw × RTprop`, paces, drains queues, tolerates random loss, needs `fq`. DCTCP: proportional ECN for shallow datacentre queues. **None of them matter for colo order entry.**
+| Available evidence | Earliest plausible recovery | Latency consequence |
+|---|---|---|
+| Later data produces duplicate ACK/SACK evidence | Around an RTT plus detection/retransmission path | Hole blocks delivery until repair |
+| Time-based detector/probe is enabled | Implementation-chosen multiple/fraction of measured RTT | Often earlier than fallback RTO |
+| No usable evidence | Retransmission timeout | Timer floor plus retransmission, then backoff on repeated failure |
 
-**RTO.** `SRTT` and `RTTVAR` as EWMAs (α=1/8, β=1/4); `RTO = SRTT + 4·RTTVAR`, clamped to **`rto_min` = 200 ms on Linux** (tunable per route with `ip route ... rto_min`). Exponential backoff to `tcp_retries2` ≈ 13–30 minutes — hence `TCP_USER_TIMEOUT` and application heartbeats. **Karn**: no RTT sample from retransmissions; timestamps remove the ambiguity.
+A middle loss in a long flight has evidence behind it. A **tail loss** at the end of an otherwise idle burst does not, which is why probe-based modern recovery matters for request/response traffic.
 
-**SACK.** Reports received ranges so multiple holes are repaired in one RTT; ≤ 4 blocks (34 B), realistically 3 alongside timestamps; advisory, not binding. **D-SACK** reports duplicates, revealing spurious RTOs and reordering paths.
+### RTT estimator and RTO
 
-**Nagle and delayed ACK.** Nagle withholds sub-MSS data while anything is unacknowledged; delayed ACK withholds the ACK up to ~40 ms. Together they deadlock on a 1.5-MSS message: **latency quantized at 40 ms**. Fix with `TCP_NODELAY` plus single-call writes. `TCP_QUICKACK` disables delayed ACK but is **not sticky**; `TCP_CORK` is the deliberate opposite, batching to full segments or 200 ms.
+RFC 6298 describes the baseline estimator. For an RTT sample `R`:
 
-**Head-of-line blocking.** In-order delivery withholds correct data behind a hole: ~1 RTT with fast retransmit/SACK, ~2 RTT with TLP, **≥ 200 ms with an RTO**. The structural reason market data is UDP multicast, the flaw HTTP/2 inherited, and the thing QUIC fixes with per-stream sequencing over UDP.
+```text
+first sample:
+    SRTT   = R
+    RTTVAR = R / 2
 
-**Keepalive and TIME_WAIT.** Keepalive defaults: 7200 s idle + 9×75 s ≈ **2 h 11 m**; tune to seconds, but remember the kernel answers probes for a hung process — application heartbeats are what prove liveness. TIME_WAIT exists to absorb old duplicates **and** to re-ACK a retransmitted FIN; the active closer pays; fix exhaustion with persistent connections, `tcp_tw_reuse`, and a wider port range — never `tcp_tw_recycle`.
+later samples:
+    RTTVAR = (1 - 1/4) × RTTVAR + (1/4) × |SRTT - R|
+    SRTT   = (1 - 1/8) × SRTT   + (1/8) × R
 
-**BDP and bufferbloat.** `BDP = bandwidth × RTT`; throughput = `min(window, BDP)/RTT`. Colo ≈ 62.5 KB (latency-limited, never bandwidth-limited); transatlantic ≈ 10 MB. Loss-based CC fills every buffer before backing off, so oversized buffers become standing delay (`queue/drain_rate`: 1 MB at 1 Gbit/s = 8 ms). Fix with fq_codel/CoDel, ECN (mark CE instead of dropping — congestion signal with no loss and no HOL blocking), BBR, or right-sized buffers and physical separation of bulk traffic.
+RTO = SRTT + max(clock_granularity, 4 × RTTVAR)
+```
 
-**Framing and reconnect.** Length prefix, delimiter, or fixed size; **validate the length against a hard maximum**, handle split headers and multiple messages per `recv`, and amortize syscalls by reading large chunks. Half-close via `shutdown(SHUT_WR)` sends FIN while still reading. On reconnect: detect via heartbeat first, back off **with jitter**, re-logon, resynchronize the *session* sequence numbers, and reconcile order state before sending anything new — assume any unacknowledged order may have executed, prefer cancel-on-disconnect, make transitions idempotent by client order ID, and always alarm.
+Mean plus variation prevents ordinary jitter from causing constant spurious retransmission. RFC 6298 also specifies conservative initialization/backoff behavior. Operating systems may implement additional recovery and different effective timer bounds within their standards constraints. Linux has historically used an established-connection minimum below RFC 6298's one-second recommendation and supports route/stack-specific behavior, but neither one number nor one sysctl is a portable TCP fact.
+
+After an RTO, repeated expiration backs off, commonly exponentially. Therefore the cost of a silent blackhole is not "one timeout"; it can be a growing sequence until policy declares failure. An application with a tighter liveness objective needs its own deadline and protocol-level recovery rather than assuming TCP will fail within a chosen bound.
+
+**Karn's algorithm** avoids RTT samples from ambiguously acknowledged retransmissions: an ACK after retransmission might correspond to the original or replacement copy. Timestamp echo provides more measurement information, but exact sampling/recovery still depends on the implementation.
+
+### Worked diagnosis: loss, reordering, or receiver stall?
+
+Suppose an application reports a 12 ms pause:
+
+1. The capture shows one sequence hole, later ranges arriving, repeated cumulative ACKs, and then a retransmission. This supports network loss or reordering followed by recovery.
+2. SACK/D-SACK and timing distinguish the hypotheses: a D-SACK after retransmission suggests the original was delayed rather than lost.
+3. If sequence delivery is complete but the advertised window shrinks to zero, the network delivered bytes and the receiver stopped draining them.
+4. If neither packets nor ACKs progress until an RTO, inspect both path loss and peer liveness; do not infer one from the application pause alone.
+
+The diagnosis follows sequence state first, timers second, and implementation counters last.
+
+---
+
+## 38.5 Flow Control and Backpressure — Core
+
+Flow control protects receiver buffering. Every valid ACK advertises how much additional sequence space the receiver currently accepts. Let `rwnd` be that advertised receive window, `cwnd` the sender's congestion window, and `flight` the bytes sent but not cumulatively acknowledged:
+
+```text
+additional send allowance ≈ max(0, min(rwnd, cwnd) - flight)
+```
+
+The real stack also accounts for segmentation, recovery, pacing, and local send queues, but the minimum-window rule is the correct first model.
+
+### Receive window, scaling, and MSS
+
+The TCP header's window field is 16 bits. The Window Scale option negotiated in the handshake shifts this value, allowing a larger receive window. Each endpoint announces the scale for windows it will advertise, so directions can use different factors. A missing/stripped negotiation can cap throughput on a high bandwidth-delay path.
+
+MSS constrains payload per segment, while `rwnd` constrains unacknowledged receive sequence space. They solve different problems:
+
+| Quantity | Unit | Protects/limits |
+|---|---|---|
+| MSS | Bytes per TCP segment | Receiver/path packet size |
+| `rwnd` | Bytes in receive sequence space | Receiver buffer capacity |
+| `cwnd` | Bytes (often accounted in segments internally) | Network congestion exposure |
+
+If an application stops reading, receive-buffer occupancy rises and advertised `rwnd` shrinks. At zero window the sender stops ordinary data transmission. A persist mechanism probes periodically so a lost window-update ACK cannot leave both endpoints waiting forever. Probe timing/backoff is implementation policy, not a universal interval.
+
+This is **backpressure**, not packet loss. Increasing buffers postpones the zero-window point but also permits a larger hidden queue. A system should choose whether overload waits in the application, the socket buffers, or an upstream queue, then bound and observe that location. Socket-buffer autotuning and option semantics are OS-specific and belong to Chapter 45.
+
+### Worked receive-window calculation
+
+Suppose the receiver cumulatively acknowledges through byte 99,999, so `RCV.NXT=100,000`, and advertises a scaled window of 32,768 bytes. The advertised right edge is:
+
+```text
+100,000 + 32,768 = 132,768
+```
+
+Subject to the sender's congestion window, new data may occupy sequence positions below 132,768. If 8 KiB of out-of-order data already consumes receive-buffer space above a hole, the receiver may advertise less free space even though the application cannot read those bytes yet. This couples loss recovery and flow control: a persistent hole can hold buffer capacity while later arrivals continue.
+
+Now assume the sender has 20 KiB outstanding and `cwnd=24 KiB`. Although `rwnd` permits roughly 32 KiB, congestion permits only about 4 KiB more. If `cwnd=64 KiB` instead, the receiver window is the active bound and roughly 12 KiB remains after the 20 KiB flight. The minimum, not the largest configured buffer, controls.
+
+### Flow-control diagnosis
+
+Use a packet trace to distinguish:
+
+```text
+receiver window falls steadily → consumer is not draining as fast as arrivals
+window reaches zero           → sender is receiver-limited
+window remains large          → look at cwnd, local queue, application demand, or path
+```
+
+On Linux, `ss -tin` exposes version-dependent fields such as RTT, congestion algorithm, window scale, congestion window, delivery rate, and retransmission state. Treat the field set and units as tool/kernel documentation, not wire protocol.
+
+---
+
+## 38.6 Congestion Control, BDP, and Queueing — Core
+
+Congestion control limits how much unacknowledged data a sender injects based on inferred network capacity. It is separate from flow control:
+
+| | Flow control | Congestion control |
+|---|---|---|
+| Protects | Receiver | Network/path |
+| Primary limit | `rwnd` advertised by peer | `cwnd` computed by sender |
+| Signals | Receive-window updates | Loss, ACK timing, ECN, delay/rate model |
+| Typical stall | Receiver window closes | Congestion window/recovery limits sending |
+
+### Classic growth and recovery
+
+The RFC 5681 mental model has:
+
+- **Slow start:** grow `cwnd` rapidly, approximately doubling per RTT when ACKs cover a full window.
+- **Congestion avoidance:** grow more cautiously, approximately one sender MSS per RTT in classic Reno.
+- **Fast retransmit/recovery:** infer a hole from duplicate ACK evidence, retransmit, and reduce the sending window without waiting for RTO.
+- **Timeout recovery:** retransmit after RTO and return to a conservative sending state.
+
+The permitted initial window and restart-after-idle behavior are governed by RFCs plus implementation policy. "Always ten segments" and "always resets after one RTO idle" are not safe cross-platform claims. For a short transfer, count how much data the observed initial window admits rather than assuming bulk steady state.
+
+### Window growth as an RTT cost model
+
+Suppose a trace shows an initial congestion window of 10 segments and a response requires 25 equal-sized segments. With no loss, a simplified slow-start schedule is:
+
+```text
+round 1: send up to 10
+ACKs return
+round 2: window has grown enough to send the remaining 15
+```
+
+The response therefore needs at least two flights even though the link could serialize all 25 quickly. If the response were eight segments, it could fit in the first observed window. This is an RTT-count argument, not a throughput benchmark.
+
+Now suppose one of the first few segments is lost. Too little later data may exist to generate classic duplicate-ACK evidence, so recovery can depend on a probe or RTO. A long bulk flight is more likely to expose the hole promptly. Short transfers are consequently sensitive to initial-window and tail-loss policy even when average bandwidth is low.
+
+In congestion avoidance, recovery time after a reduction depends on the chosen algorithm. Reno's approximate one-segment-per-RTT growth can take many RTTs on a large window; CUBIC was designed to restore large windows differently. Quote the algorithm and observed state before estimating recovery.
+
+### Reno, CUBIC, and BBR — Role-specific
+
+These are algorithm families, not TCP's reliability contract:
+
+| Family | Main model/signal | Useful consequence | Boundary |
+|---|---|---|---|
+| Reno/NewReno | Loss; additive increase and multiplicative decrease | Simple reference model | Slow recovery on high-BDP paths; RTT bias |
+| CUBIC | Loss; cubic window growth in elapsed time | Faster high-window recovery | Still loss-driven; implementation parameters vary |
+| BBR family | Estimated bottleneck delivery rate and propagation RTT | Pacing around a path model | Version-specific behavior/fairness; needs suitable pacing support |
+
+Linux has commonly selected CUBIC in many distributions and offers BBR in supported kernels/builds, but availability and default choice are configuration facts. Do not prescribe a WAN algorithm for a tiny low-rate connection without showing that `cwnd` or queueing is the bottleneck.
+
+### Bandwidth-delay product
+
+The **bandwidth-delay product** (BDP) is the data required in flight to keep a path busy:
+
+```text
+BDP_bits  = bottleneck_bits_per_second × RTT_seconds
+BDP_bytes = BDP_bits / 8
+```
+
+For a hypothetical 10 Gbit/s path with 100 microseconds RTT:
+
+```text
+10,000,000,000 × 0.0001 / 8 = 125,000 bytes
+```
+
+A usable window well below 125 kB caps throughput even with no loss. A window at least that large is necessary but not sufficient: the application, pacing, CPU, NIC, and receiver must also sustain the rate.
+
+For a 100 Mbit/s path with 50 ms RTT, BDP is 625 kB. This is why long-distance throughput can be window-limited while a small-message LAN workload is dominated by RTT and processing rather than steady-state bandwidth.
+
+### Bufferbloat and queueing cost
+
+Any queue adds approximately:
+
+```text
+queueing_delay = queued_bytes / bottleneck_bytes_per_second
+```
+
+One MiB queued before a 1 Gbit/s bottleneck adds:
+
+```text
+1,048,576 × 8 / 1,000,000,000 ≈ 8.39 ms
+```
+
+Large buffers prevent drops during bursts but can turn overload into standing delay. Loss-based congestion control may build queues until loss/ECN signals cause a response. Active queue management, fair queueing, ECN, pacing, traffic separation, and right-sized application queues address different parts of this mechanism; their configuration belongs to Chapters 39, 42, and 46.
+
+ECN marks congestion instead of dropping an ECN-capable packet, but it does not eliminate queueing or guarantee that every path/device preserves markings. Treat support as an end-to-end deployment property.
+
+---
+
+## 38.7 Latency Consequences: HOL, Nagle, and ACK Policy — Core
+
+### Head-of-line blocking
+
+TCP must withhold bytes after a hole until the missing range arrives. This produces two distinct queues:
+
+1. out-of-order bytes waiting in the receiver TCP stack;
+2. later application messages trapped behind an earlier message's missing bytes.
+
+Multiplexing independent logical requests on one TCP connection couples their latency through this ordering. More connections can isolate loss domains but cost extra state, congestion histories, and application complexity. UDP-based transports with independent stream sequence spaces can avoid cross-stream transport HOL, but they introduce different protocol trade-offs.
+
+Recovery delay is not one constant:
+
+```text
+middle loss + useful later data → ACK/SACK evidence may recover near an RTT scale
+tail loss                       → needs time-based probe or fallback timer
+receiver stall                  → waits for application drain/window update
+```
+
+### Nagle's algorithm
+
+Nagle's algorithm (RFC 896) reduces tiny packets by allowing a small outstanding segment and coalescing further small writes while prior data remains unacknowledged, subject to the implementation's rules. This improves wire efficiency but can delay a latency-sensitive write pattern.
+
+The important condition is not merely "small messages." Delay appears when the application produces a small trailing write while unacknowledged data remains and the stack chooses to coalesce it. If the application writes a complete record in one operation and no other limit intervenes, Nagle may have no visible effect.
+
+`TCP_NODELAY` requests disabling Nagle. It does not make writes atomic, preserve boundaries, remove congestion/flow control, or force immediate NIC transmission. Chapter 45 covers option APIs.
+
+### Delayed acknowledgements
+
+A receiver may delay an ACK to reduce pure-ACK traffic or piggyback it on reverse data. Standards constrain correctness and broad behavior, but the trigger count, delay bound, adaptive heuristics, and quick-ACK state vary by implementation and traffic history.
+
+Nagle and delayed ACK can interact:
+
+```text
+sender: small remainder waits for ACK of prior bytes
+receiver: ACK waits briefly for more data or reverse traffic
+result: application pause until some ACK-policy event releases progress
+```
+
+This is not a universal 40 ms timer or a protocol deadlock. Diagnose it by observing a small unsent remainder, outstanding unacknowledged data, and the actual ACK delay in a capture.
+
+Consider an application that emits a 900-byte header/body and then a 20-byte trailer in separate writes. If the first write leaves unacknowledged data and the second is below the stack's useful segment threshold, Nagle may hold the trailer. If the receiver is temporarily delaying its ACK, completion waits for that ACK decision. Combining the 920 bytes before writing removes the split-write precondition and often improves behavior even without changing options.
+
+The same pause does not occur for every 900+20-byte exchange. MSS, earlier outstanding bytes, ACK ratio, reverse traffic, offload, congestion window, and scheduler timing all matter. This is why a packet trace is stronger evidence than a latency histogram with a familiar-looking mode.
+
+Linux exposes `TCP_QUICKACK` as a request to enter quick-ACK behavior; it is Linux-specific and not a permanent portable mode. Linux `TCP_CORK` requests batching toward fuller segments and has implementation-specific release behavior. Their detailed use and interactions with `TCP_NODELAY` belong to Chapter 45.
+
+| Mechanism | Intended effect | Does not guarantee |
+|---|---|---|
+| `TCP_NODELAY` | Disable Nagle-style small-write coalescing | One segment per write or immediate wire transmission |
+| Linux `TCP_QUICKACK` | Request prompt ACK behavior | A sticky mode or fixed ACK policy |
+| Linux `TCP_CORK` | Hold/coalesce output for fuller segments | A portable timer or message boundary |
+
+The first application fix is usually to frame and assemble a complete record before handing it to the transport. That reduces syscall/write fragmentation without depending on packetization.
+
+---
+
+## 38.8 Application Framing and a Bounded Decoder — Core
+
+Framing converts the byte stream into records. Common schemes:
+
+| Scheme | Benefit | Failure boundary |
+|---|---|---|
+| Fixed size | No header parsing | Wastes space or cannot represent variable records |
+| Delimiter | Human-readable/simple | Escaping, delimiter search, and maximum-length enforcement |
+| Length prefix | O(1) length discovery; binary-friendly | Untrusted length must be validated before allocation/copy |
+| Type + length + payload | Supports evolution and dispatch | Header/version validation required |
+
+A correct decoder must accept a header split across chunks, a payload split across chunks, and several frames in one chunk. It must impose a hard maximum before allocating.
+
+### Compiling C++23 decoder
+
+This decoder uses a four-byte big-endian payload length. It processes arbitrarily chunked input while retaining at most one bounded frame. The emitted view is valid only during the callback.
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <vector>
+
+class FrameDecoder {
+    static constexpr std::size_t max_payload = 1u << 20;
+    std::array<std::byte, 4> header_{};
+    std::size_t header_used_ = 0;
+    std::size_t expected_ = 0;
+    bool have_length_ = false;
+    bool failed_ = false;
+    std::vector<std::byte> payload_;
+
+    std::uint32_t decode_length() const {
+        std::uint32_t n = 0;
+        for (std::byte b : header_)
+            n = (n << 8) | std::to_integer<std::uint8_t>(b);
+        return n;
+    }
+
+public:
+    template<class Emit>
+    bool consume(std::span<const std::byte> input, Emit emit) {
+        if (failed_) return false;
+
+        while (!input.empty()) {
+            if (!have_length_) {
+                const std::size_t take =
+                    std::min(input.size(), header_.size() - header_used_);
+                std::copy_n(input.begin(), take,
+                            header_.begin() + static_cast<std::ptrdiff_t>(header_used_));
+                header_used_ += take;
+                input = input.subspan(take);
+                if (header_used_ != header_.size()) continue;
+
+                expected_ = decode_length();
+                if (expected_ > max_payload) {
+                    failed_ = true;
+                    return false;
+                }
+                payload_.clear();
+                payload_.reserve(expected_);
+                have_length_ = true;
+
+                if (expected_ == 0) {
+                    emit(std::span<const std::byte>{payload_});
+                    header_used_ = 0;
+                    have_length_ = false;
+                    continue;
+                }
+            }
+
+            const std::size_t take =
+                std::min(input.size(), expected_ - payload_.size());
+            payload_.insert(payload_.end(), input.begin(),
+                            input.begin() + static_cast<std::ptrdiff_t>(take));
+            input = input.subspan(take);
+
+            if (payload_.size() == expected_) {
+                emit(std::span<const std::byte>{payload_});
+                header_used_ = 0;
+                have_length_ = false;
+            }
+        }
+        return true;
+    }
+};
+```
+
+The zero-length branch emits immediately and resets before looping, so it neither waits for a nonexistent payload byte nor spins without consuming state. A format that forbids empty records would instead reject `expected_ == 0`.
+
+The decoder was designed for these properties:
+
+- the maximum is checked before `reserve`;
+- each input byte is copied at most once into bounded frame storage;
+- split headers, split payloads, and coalesced frames use one state machine;
+- after an oversized length, `failed_` makes all later calls fail consistently;
+- emitted spans cannot outlive the callback.
+
+Validation should enumerate every split position for representative frames, feed multiple frames in one chunk, exercise zero and maximum lengths, and encode `max_payload+1` without supplying a payload. Sanitizers help detect memory errors but do not replace assertions about emitted frame contents and counts.
+
+The transport read loop should feed whatever bytes are available to the decoder. It must not wait for "one message-sized read." Buffer reuse and zero-copy views require explicit lifetime rules; Chapter 45 covers partial reads and Chapter 51 covers hostile-input parser design.
+
+### Framing failure is a protocol decision
+
+After an invalid length, this decoder enters a terminal failed state. That is deliberate: without a self-synchronizing marker, scanning forward for a "plausible" header can mistake payload bytes for a new record and silently corrupt the session. The connection-level policy should log the reason and sequence/session context, then reject or close according to the application protocol.
+
+A hard length cap bounds memory but not all work. A stream of maximum-size valid frames can still consume bandwidth, allocation, copying, and callback time. Production protocols commonly add message-type validation, per-session rate/queue limits, and a bounded allocator strategy. These controls are application correctness and resource policy, not TCP flow control: the kernel receive window only knows bytes, not whether parsing those bytes is affordable.
+
+The decoder's retained vector keeps its largest allocated capacity. That is bounded here by one MiB; if thousands of idle sessions make that retention excessive, use a smaller protocol maximum, a pool, or release capacity outside the latency-critical path. Measure memory against concurrent sessions rather than only one decoder.
+
+---
+
+## 38.9 Diagnosis: From Symptom to Sequence State — Core
+
+Start with a capture and endpoint state rather than a sysctl list.
+
+### Minimal commands
+
+```bash
+# Linux; fields vary with kernel/iproute2 version.
+ss -tin
+nstat -az | grep -E 'TcpRetransSegs|TCP.*(Retrans|Timeout|DSACK)'
+
+# Packet trace: numeric names, absolute sequence numbers, relative time.
+tcpdump -nn -ttt -S -i <interface> 'tcp port <port>'
+```
+
+`tcpdump` ordinarily displays relative sequence numbers for readability; `-S` requests absolute values. Offloads can make host captures show segments larger than wire MSS or checksums that appear invalid before NIC completion. Capture point and offload state must be recorded (Ch. 46 and Ch. 48).
+
+### Decision procedure
+
+| Observation | Leading hypothesis | Next check |
+|---|---|---|
+| Repeated ACK edge, later SACK ranges | Hole from loss/reordering | Retransmission timing and D-SACK |
+| Advertised window trends to zero | Receiver/application backpressure | Receiver read progress and queue occupancy |
+| Large unacknowledged range, `cwnd` small | Congestion/recovery limited | Loss/ECN and congestion state |
+| Bytes queued locally but not sent | Local corking, Nagle, pacing, or closed window | Outstanding data, options, `rwnd`, `cwnd` |
+| Complete TCP delivery but no response | Peer application/protocol issue | Application heartbeat and request ID logs |
+| FIN then persistent `CLOSE-WAIT` | Local lifecycle incomplete | Descriptor ownership and shutdown path |
+| RST | Abort/no matching connection/policy | Direction, preceding FIN/data, endpoint logs |
+| Silence | Blackhole, peer failure, or capture gap | Bidirectional capture, link/route, application deadline |
+
+### Worked latency diagnosis
+
+An RPC normally completes in 300 microseconds but occasionally takes 9 ms:
+
+1. Record application request ID and local monotonic timestamps.
+2. Map its frame bytes to TCP sequence ranges in the capture.
+3. If all request bytes leave promptly but one range is retransmitted after 8 ms, the tail is transport recovery. Determine whether later SACK evidence or a timer triggered it.
+4. If bytes remain locally unsent until an ACK at 8 ms, inspect the small-write pattern and actual ACK timing rather than declaring "the 40 ms delayed-ACK bug."
+5. If the peer ACKs all request bytes immediately but responds 8 ms later, TCP transport did its job; investigate peer processing.
+6. If `rwnd` closes, investigate receiver drain/backpressure. If `cwnd` closes, investigate congestion/recovery.
+
+This trace aligns application time, sender sequence state, receiver acknowledgements, and recovery. A generic retransmission counter cannot provide that causal chain.
+
+---
+
+## 38.10 Protocol and Implementation Reference — Reference
+
+Skippable after the core.
+
+### Header fields
+
+```text
+source port | destination port
+sequence number
+acknowledgement number
+data offset | flags | advertised window
+checksum | urgent pointer
+options (header is 20–60 bytes) | payload
+```
+
+The data offset is measured in 32-bit words. Important flags are SYN, ACK, FIN, RST, and ECN-related ECE/CWR. PSH is not an application-message marker. Urgent-data behavior has portability complications and should not be used as ordinary framing.
+
+TCP's checksum covers a pseudo-header plus TCP header/data. It detects many accidental corruptions but is only 16 bits; applications needing adversarial integrity or strong end-to-end corruption detection use cryptographic/authentication checks at another layer.
+
+The option area is limited by the 60-byte maximum TCP header. Common options compete for that space:
+
+| Option | Appears when | Purpose |
+|---|---|---|
+| MSS | SYN | Bound payload accepted from peer |
+| Window Scale | SYN | Interpret future advertised receive windows |
+| SACK Permitted | SYN | Negotiate later selective acknowledgements |
+| SACK blocks | ACKs after out-of-order receipt | Describe received ranges above cumulative edge |
+| Timestamps | Negotiated on SYN, then later segments | Timestamp echo/PAWS mechanisms |
+
+At an IP MTU of 1500 bytes, IPv4 without options and a minimal 20-byte TCP header leave 1460 bytes for TCP payload. Additional IP/TCP options reduce payload that fits that MTU unless offload later segments differently. IPv6 has a larger base header. Treat "MSS is 1460" as one Ethernet/IPv4 configuration, not a TCP constant.
+
+### What varies
+
+| Topic | Protocol-level fact | Implementation/deployment variable |
+|---|---|---|
+| Delayed ACK | ACKs may be delayed within protocol constraints | Delay, ratio, adaptive triggers, quick-ACK behavior |
+| Nagle | Standard small-segment avoidance algorithm | Exact interaction with queues/offload and option timing |
+| RTO | RTT/variation estimator and backoff principles | Timer floor, granularity, modern pre-RTO recovery |
+| Initial congestion window | Standards permit bounded initial behavior | Selected IW and idle restart policy |
+| RACK/TLP | Standardized time/probe recovery mechanisms | Kernel version, enablement, reordering window, counters |
+| CUBIC/BBR | Congestion-control algorithm families | Availability, version, parameters, default selection, qdisc |
+| Keepalive | Optional probes for idle connections | Default off/on state, timers, counts, error delivery |
+| TIME-WAIT | Retain state after close for protocol safety | Duration, tuple reuse, resource accounting |
+| Receive/send buffers | Flow/local queue resources | Autotuning, accounting, caps, option semantics |
+| `QUICKACK` / `CORK` | No portable TCP guarantee | Linux-specific requests and release behavior |
+
+### Option ownership
+
+This chapter explains the mechanism of `TCP_NODELAY`, Linux `TCP_QUICKACK`, Linux `TCP_CORK`, keepalive, user timeouts, and congestion selection. Chapter 45 owns their constants, `setsockopt` calls, inheritance/error behavior, and OS comparisons. A production recommendation must name OS/kernel, topology, workload, rollback, and the packet/counter evidence that would validate it.
+
+---
+
+## 38.11 Recall and Practice — Core
+
+### Recall card
+
+- TCP is an ordered byte stream. Framing, business acknowledgement, deduplication, and post-crash reconciliation are application responsibilities.
+- `ACK=N` cumulatively acknowledges bytes below `N`; SACK reports higher received ranges. SYN and FIN each consume a sequence number.
+- Setup synchronizes two sequence spaces. Ordinary data may accompany the third ACK; initial-SYN data is an extension such as TFO.
+- A receiver withholds later bytes behind a hole. Recovery latency depends on available evidence: duplicate ACK/SACK, time-based probe, or RTO.
+- Flow control advertises receiver capacity (`rwnd`); congestion control estimates path capacity (`cwnd`). In-flight data is bounded by both.
+- `BDP = bandwidth × RTT`; `queueing delay = queued bytes / drain rate`.
+- Delayed-ACK policy and Nagle can interact, but there is no universal delay constant. Observe outstanding bytes and ACK timing.
+- On x86/Linux or any other target, label socket options, defaults, timers, and congestion algorithms as implementation behavior.
+- A transport ACK proves receipt by peer TCP, not application processing. Disconnect after submission leaves business outcome ambiguous.
+
+### Questions
+
+1. Why can three application writes be returned by one read, and why can one write require several reads?
+2. In the worked trace, why does `ACK=1501` persist after bytes 2001–3000 arrive, and what extra fact does SACK provide?
+3. Distinguish ordinary data on the third handshake packet from TCP Fast Open data.
+4. What does TIME-WAIT protect, and why is a memorized duration not a portable answer?
+5. Compare loss recovery when a middle segment is followed by more data with recovery when the final segment of a burst is lost.
+6. A sender has `rwnd=256 kB`, `cwnd=32 kB`, and 24 kB in flight. Approximately how much additional data may it send, and which subsystem is limiting it?
+7. Calculate the BDP of 2 Gbit/s at 4 ms RTT. What else must be true before that window produces 2 Gbit/s throughput?
+8. What packet evidence distinguishes receiver backpressure from congestion-window limitation?
+9. Why can `TCP_NODELAY` remove one delay mechanism without guaranteeing one packet per write or immediate delivery?
+10. After a request write succeeds and the connection resets, which outcomes remain possible and what application design resolves the ambiguity?
+
+### Code-reading puzzle
+
+Review this unsafe framing fragment:
+
+```cpp
+std::uint32_t length = decode_u32(buffer.data());
+if (buffer.size() < 4 + length) return NeedMore;
+std::vector<std::byte> payload(length);
+std::copy_n(buffer.begin() + 4, length, payload.begin());
+```
+
+Identify the missing preconditions and explain why `4 + length` can wrap in the unsigned 32-bit expression before comparison with `size_t`. Rewrite the check so the four-byte header is known present, length is bounded before allocation, and subtraction rather than unchecked addition establishes payload availability.
+
+### Implementation exercise
+
+Build a deterministic trace checker that accepts records `(direction, seq, ack, payload_length, flags, optional_sack_ranges)` and maintains `SND.UNA`, `SND.NXT`, and `RCV.NXT` for both directions. Feed it:
+
+1. a handshake whose third ACK carries data;
+2. the loss/SACK/retransmission trace from §38.2;
+3. an overlapping duplicate retransmission;
+4. FIN in one direction while data continues in the other;
+5. a wrap-around case whose live range stays below `2^31`.
+
+The checker should flag impossible ACKs, distinguish cumulative from selective acknowledgement, and output when application delivery can advance. Compare its output with a packet capture from a local test connection; Chapter 45 supplies the socket harness.
+
+### Common traps
+
+- Treating read/write calls or captured segments as message boundaries.
+- Saying TCP provides exactly-once business execution.
+- Treating a successful local write or transport ACK as peer application acknowledgement.
+- Comparing 32-bit sequence numbers with ordinary integer `<` across wrap.
+- Confusing `rwnd` with `cwnd`, or MSS with either window.
+- Interpreting all duplicate ACKs as loss rather than possible reordering.
+- Quoting one delayed-ACK, RTO, SYN-retry, keepalive, or TIME-WAIT timer as universal.
+- Claiming `TCP_QUICKACK` is portable or permanently disables delayed ACK.
+- Assuming a congestion-control change helps when the application is receiver- or queue-limited.
+- Allocating from an unvalidated length prefix or forgetting split/coalesced frames.
+- Treating persistent `CLOSE-WAIT` as a network timeout instead of investigating local lifecycle ownership.
+- Reconnecting and resubmitting an ambiguous request without an idempotency key or reconciliation.
+
+### Prerequisites for Chapter 39
+
+Chapter 39 assumes you can separate TCP's stream/recovery queueing from packet queueing in a switch. Be ready to map a missing packet to a byte-stream hole, calculate BDP and queueing delay, and explain why a complete later packet can still be blocked from application delivery.

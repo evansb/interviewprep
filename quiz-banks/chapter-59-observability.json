@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A cumulative counter plus a timestamp lets the collector derive a rate and recognize a process restart, because a decrease implies a reset. Sampling an instantaneous value throws away every event between scrapes, and the events you care about in a tail analysis are precisely the rare ones between them.",
-      "sourceAnchor": "591-metrics-types-and-semantics",
+      "sourceAnchor": "593-metrics-semantics-and-per-owner-aggregation",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Percentiles are not linear, so no arithmetic over per-instance quantiles reconstructs the fleet quantile. Fixed shared bucket boundaries make histograms mergeable by construction: sum the bucket counts and then interpolate. This is the deciding argument against the summary metric type.",
-      "sourceAnchor": "591-metrics-types-and-semantics",
+      "sourceAnchor": "593-metrics-semantics-and-per-owner-aggregation",
       "difficulty": "trap"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A map lookup keyed by a string is a hash or tree traversal plus a possible allocation, three orders of magnitude over budget. A shared atomic increment is a locked read-modify-write, roughly twenty cycles uncontended and far worse under contention as the line migrates between cores.",
-      "sourceAnchor": "591-metrics-types-and-semantics",
+      "sourceAnchor": "593-metrics-semantics-and-per-owner-aggregation",
       "difficulty": "application"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Series count is the metric name times the cross product of label values, so a handful of labels over symbols, venues, strategies, and sides reaches millions of series. Each of the three locations fails differently, and backend index explosion is the standard way a monitoring system dies.",
-      "sourceAnchor": "592-high-cardinality-metrics",
+      "sourceAnchor": "592-cost-boundedness-cardinality-and-backpressure",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Keying by an existing dense id converts unbounded cardinality into a bounded, preallocated array, and it keeps the hot path allocation-free, which is the property that actually matters. Cardinality then becomes a memory question rather than a latency question, and memory questions are tractable.",
-      "sourceAnchor": "592-high-cardinality-metrics",
+      "sourceAnchor": "592-cost-boundedness-cardinality-and-backpressure",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Any label whose value arrives from the network is a bug: it creates an unbounded series set inside the process and in the backend index simultaneously. Validate at registration that a label's values are drawn from a closed enumeration known at startup, and push per-entity detail into the event stream instead.",
-      "sourceAnchor": "592-high-cardinality-metrics",
+      "sourceAnchor": "592-cost-boundedness-cardinality-and-backpressure",
       "difficulty": "trap"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Exemplars cost a few slots and give you both a mergeable tail figure and specific cases to chase, which is why they are the highest-value pattern in latency observability. The general rule is that metrics answer whether the system is healthy while events answer what happened to a particular order.",
-      "sourceAnchor": "592-high-cardinality-metrics",
+      "sourceAnchor": "592-cost-boundedness-cardinality-and-backpressure",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The concurrent non-atomic read and write is a data race and therefore undefined behaviour; it only appears to work because aligned 64-bit accesses happen to be atomic in hardware, while the compiler remains free to tear or duplicate the load. Relaxed atomics need no fence and no lock prefix for plain loads and stores.",
-      "sourceAnchor": "593-per-core-metrics-aggregation",
+      "sourceAnchor": "593-metrics-semantics-and-per-owner-aggregation",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Shards are read at different times, so the sum corresponds to no single instant and a metric such as sent minus acked can be observed negative. Remedies are to clamp, to read in an order that makes the skew's sign harmless, or to use a sequence-number snapshot for a batch update, which costs the writer two extra stores.",
-      "sourceAnchor": "593-per-core-metrics-aggregation",
+      "sourceAnchor": "593-metrics-semantics-and-per-owner-aggregation",
       "difficulty": "recall"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Each shard read costs a coherence miss of roughly one hundred to three hundred nanoseconds and downgrades the owner's line from modified to shared, so the owner's next increment needs a fresh ownership request. Scrape cadence is an observer-effect knob: 1 Hz is fine, 10 Hz is defensible, 1 kHz makes monitoring part of the latency distribution.",
-      "sourceAnchor": "593-per-core-metrics-aggregation",
+      "sourceAnchor": "593-metrics-semantics-and-per-owner-aggregation",
       "difficulty": "trap"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "That is the entire latency budget of a trading path, spent describing the latency budget. The tail is worse than the mean because the cost spikes whenever the disk or the pipe backs up, which is exactly when the system is already under stress.",
-      "sourceAnchor": "595-structured-and-binary-logging",
+      "sourceAnchor": "595-structured-events-binary-logging-and-queues",
       "difficulty": "recall"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "All parsing and conversion move offline: the hot path pays a timestamp read of around fifteen to twenty cycles, a ring reservation, and a few small copies. That is two to three orders of magnitude cheaper than formatting eagerly, which is why designs that format on the caller's side land in the hundreds of nanoseconds instead.",
-      "sourceAnchor": "595-structured-and-binary-logging",
+      "sourceAnchor": "595-structured-events-binary-logging-and-queues",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Arguments must be trivially copyable and must outlive the deferred format step, so only string literals or interned ids are safe to pass by pointer. Copying a bounded number of bytes into the ring is the alternative when the content is genuinely dynamic, at the cost of the copy.",
-      "sourceAnchor": "595-structured-and-binary-logging",
+      "sourceAnchor": "595-structured-events-binary-logging-and-queues",
       "difficulty": "trap"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The site table lives in the executable or an extracted sidecar, and identifiers shift whenever the code changes, so decoding with the wrong artifact yields garbage that looks legitimate. Ship the dictionary alongside the binary and stamp both with the same build identifier — this is the most common operational failure of binary logging.",
-      "sourceAnchor": "595-structured-and-binary-logging",
+      "sourceAnchor": "595-structured-events-binary-logging-and-queues",
       "difficulty": "trap"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The multi-producer alternative costs a locked read-modify-write or a compare-and-swap retry loop per record on a shared head, which is unbounded under contention and drags one cache line across every logging core. The backend still merges by timestamp, which is cheap because it happens off the hot path.",
-      "sourceAnchor": "596-lock-free-logging-queues",
+      "sourceAnchor": "595-structured-events-binary-logging-and-queues",
       "difficulty": "recall"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Without the cached copy, every enqueue reads a line the consumer keeps writing, which reintroduces the cross-core traffic the design exists to avoid. Separately, the head and tail indices must sit on different cache lines, or producer and consumer ping-pong one line and the contention returns anyway.",
-      "sourceAnchor": "596-lock-free-logging-queues",
+      "sourceAnchor": "595-structured-events-binary-logging-and-queues",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Blocking hands ownership of the trading thread's tail latency to the log backend and ultimately to the disk; allocating puts an allocation and a possible page fault on the hot path at the worst moment. The counted drop is then surfaced as a synthetic gap record so an analyst cannot mistake absence for silence.",
-      "sourceAnchor": "596-lock-free-logging-queues",
+      "sourceAnchor": "595-structured-events-binary-logging-and-queues",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The tell is that the spike correlates with log volume rather than market volume, and a profile shows the trading thread parked in a futex wait or spinning in the queue's push path. Once the backend owns the producer's worst case, disk behaviour becomes part of the trading latency distribution.",
-      "sourceAnchor": "596-lock-free-logging-queues",
+      "sourceAnchor": "595-structured-events-binary-logging-and-queues",
       "difficulty": "trap"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An unaccounted drop is worse than no logging, because it yields a record that looks complete and is not, making every subsequent reconstruction wrong. The counter should also be alerted on for any non-zero value: in a correctly sized system a drop is a defect rather than a routine condition.",
-      "sourceAnchor": "597-log-sampling-and-drop-accounting",
+      "sourceAnchor": "595-structured-events-binary-logging-and-queues",
       "difficulty": "recall"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The conditional policy keeps full detail on every outlier while the histogram continues to supply the whole distribution, and pairing it with exemplars links a tail bucket to its detailed records. Rate limiting is the opposite: its drops are burst-correlated, so it discards exactly the interesting period.",
-      "sourceAnchor": "597-log-sampling-and-drop-accounting",
+      "sourceAnchor": "595-structured-events-binary-logging-and-queues",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Rate limiting is still worth having for a per-message error log firing on every message, where the logging itself becomes the outage — but pair it with a suppression counter so the count survives even when the records do not. For latency work the conditional tail-biased policy is the one that keeps the interesting events.",
-      "sourceAnchor": "597-log-sampling-and-drop-accounting",
+      "sourceAnchor": "595-structured-events-binary-logging-and-queues",
       "difficulty": "trap"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "There are several independent queues along the path and each drops differently, which is why being able to name the counter at each stage is the useful skill. Attributing a loss to the application ring when it actually happened at the NIC or the socket buffer sends the investigation in the wrong direction entirely.",
-      "sourceAnchor": "597-log-sampling-and-drop-accounting",
+      "sourceAnchor": "595-structured-events-binary-logging-and-queues",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The working construction is per-thread sequence numbers plus a per-thread counter for approximate ordering, causal identifiers threaded through the flow from ingress, and the triggering packet's hardware timestamp as a shared anchor. Copying sixteen bytes of trace id is far cheaper than a globally shared atomic and gives exact causality rather than approximate time order.",
-      "sourceAnchor": "598-sequence-and-timestamp-event-correlation",
+      "sourceAnchor": "596-traces-correlation-clocks-and-profiles",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A negative duration is impossible physically, so it is always a measurement artifact rather than a fast machine, and it should be asserted on and counted. The complementary signature is two hosts reporting a constant rather than noisy difference for the same round trip, which is an offset error rather than a performance difference.",
-      "sourceAnchor": "598-sequence-and-timestamp-event-correlation",
+      "sourceAnchor": "596-traces-correlation-clocks-and-profiles",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Typical synchronization error is ten to a hundred nanoseconds with hardware timestamping and a capable switch, and an oscillator at a hundred parts per billion drifts a hundred nanoseconds per second between corrections. So a claimed two-microsecond figure carries perhaps fifty nanoseconds of uncertainty and a claimed two-hundred-nanosecond figure is not measurable that way at all.",
-      "sourceAnchor": "599-clock-domain-uncertainty",
+      "sourceAnchor": "596-traces-correlation-clocks-and-profiles",
       "difficulty": "recall"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "One clock means no domain crossing and no synchronization error, which is the only way to get below the error floor of a two-clock method. Being able to name that trade-off — that sub-hundred-nanosecond confidence requires both endpoints measured by a single oscillator — is the mark of someone who has actually built the rig.",
-      "sourceAnchor": "599-clock-domain-uncertainty",
+      "sourceAnchor": "596-traces-correlation-clocks-and-profiles",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Take the frequency from the processor's own enumeration leaf where available, or calibrate over seconds with a continuously re-fitted regression so drift is tracked. Re-anchor periodically and store the anchor pairs in the log stream itself, so decoding a capture stays reproducible long after the run.",
-      "sourceAnchor": "599-clock-domain-uncertainty",
+      "sourceAnchor": "596-traces-correlation-clocks-and-profiles",
       "difficulty": "trap"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The fast path exists only while the counter is the selected clocksource; a fallback to an older timer makes every read a syscall, and the reason is visible in the current clocksource file. This is worth verifying explicitly rather than assuming, because nothing in the application changes when it happens.",
-      "sourceAnchor": "599-clock-domain-uncertainty",
+      "sourceAnchor": "596-traces-correlation-clocks-and-profiles",
       "difficulty": "trap"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The useful definition of health is progress, not responsiveness. Serve the check from a separate thread on a housekeeping core reading the same per-core counters the metrics path reads; a check served by the trading thread lets an external poller inject latency into trading, with spikes appearing at exactly the poll interval.",
-      "sourceAnchor": "5910-health-checks-and-heartbeats",
+      "sourceAnchor": "597-health-heartbeats-watchdogs-and-alerts",
       "difficulty": "application"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Interval and timeout must differ by a factor — for example a beat every hundred milliseconds with death declared after three missed. Heartbeats should also carry state such as sequence numbers consumed, mode, config version, and build id, and should travel a path independent of the one being monitored.",
-      "sourceAnchor": "5910-health-checks-and-heartbeats",
+      "sourceAnchor": "597-health-heartbeats-watchdogs-and-alerts",
       "difficulty": "trap"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Separating the two counters distinguishes the failure modes. Whatever the signal, it must be a plain relaxed store by the monitored thread — anything requiring the thread to actively respond is useless, because a stalled thread cannot respond and a healthy one pays for the ceremony on every iteration.",
-      "sourceAnchor": "5911-watchdogs-and-stall-detectors",
+      "sourceAnchor": "597-health-heartbeats-watchdogs-and-alerts",
       "difficulty": "application"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A restarted trading process has an empty book, a cold cache, no session, and unknown positions. Capture at the moment of detection is equally important — recorder dump, per-thread backtraces, thread run state, and counter deltas — because the evidence exists only then. Thresholds should also be staggered so a fleet-wide pause does not restart everything at once.",
-      "sourceAnchor": "5911-watchdogs-and-stall-detectors",
+      "sourceAnchor": "597-health-heartbeats-watchdogs-and-alerts",
       "difficulty": "application"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 0,
       "explanation": "One budget definition yields both sensitivities without two thresholds in conflict. It also pairs naturally with alerting on counts of samples above the budget rather than on a raw percentile, since counts are mergeable and well behaved at any sample size.",
-      "sourceAnchor": "5912-tail-latency-alerting",
+      "sourceAnchor": "597-health-heartbeats-watchdogs-and-alerts",
       "difficulty": "application"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Related hazards: percentiles conceal multimodality, so a distribution that is fine normally and catastrophic on cold paths can show a healthy figure while every cold-path order is very late; and if the metrics pipeline itself drops under load, the tail appears to improve during an incident, so the sample count must always be cross-checked.",
-      "sourceAnchor": "5912-tail-latency-alerting",
+      "sourceAnchor": "597-health-heartbeats-watchdogs-and-alerts",
       "difficulty": "trap"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Writing costs a store to a preallocated slot with no allocation, no syscall, and no I/O, and the ring never fills because it overwrites. The payoff is pre-fault context: the hardest thing about a rare latency event is that the evidence is gone by the time you know it happened, and the recorder still holds the preceding window at full fidelity.",
-      "sourceAnchor": "5913-flight-recorder-ring-buffers",
+      "sourceAnchor": "598-flight-recorders",
       "difficulty": "recall"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 0,
       "explanation": "It is the only technique giving instruction-level history at an acceptable steady-state cost, and it follows the same overwrite-and-dump discipline as the application-level recorder, which supplies the semantic events alongside it. Both need their dump path to be allocation-free and signal-safe if a crash handler may invoke them.",
-      "sourceAnchor": "5913-flight-recorder-ring-buffers",
+      "sourceAnchor": "598-flight-recorders",
       "difficulty": "application"
     }
   ]

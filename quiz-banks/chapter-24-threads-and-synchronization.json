@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The committee chose termination deliberately: silently joining would hide a blocking point inside a destructor (and therefore inside exception unwinding), while silently detaching would leave a thread running with dangling references to the destroyed scope. Both of the 'silent' answers are what people expect and exactly what was rejected. The practical consequence is that any exception thrown between construction and `join()` kills the process.",
-      "sourceAnchor": "241-stdthread-and-stdjthread",
+      "sourceAnchor": "242-thread-ownership-arguments-joining-and-structured-shutdown--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The decay-copy plus rvalue forwarding is the whole story: the copy protects against the caller's object dying, and the rvalue-ness is what breaks the binding to a non-const lvalue reference. `std::ref` wraps it in a `reference_wrapper` that converts back to `State&`. Nothing here requires trivial copyability, and reference parameters are perfectly legal — you just have to opt into the lifetime risk explicitly, which is the point of making `std::ref` visible at the call site.",
-      "sourceAnchor": "241-stdthread-and-stdjthread",
+      "sourceAnchor": "242-thread-ownership-arguments-joining-and-structured-shutdown--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`hardware_concurrency()` reports machine topology and knows nothing about cgroup CPU limits, so containerized services routinely build 32× oversized pools — a genuinely common production bug. Read `/sys/fs/cgroup/cpu.max` or call `sched_getaffinity` instead. The function *may* return 0 (it is only a hint), but that happens when the count is indeterminable, not because of containerization; and the cgroup throttles CPU time rather than refusing thread creation.",
-      "sourceAnchor": "241-stdthread-and-stdjthread",
+      "sourceAnchor": "242-thread-ownership-arguments-joining-and-structured-shutdown--core",
       "difficulty": "application"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Both halves matter: the stop request is what makes the join finite for a loop-driven worker, which is why join-only would deadlock against a `while (true)` body. That is the tempting near-miss. Note the destructor genuinely *blocks*, so a `jthread` member makes its enclosing object's destructor a synchronization point — visible, not hidden, but it must be accounted for in shutdown ordering.",
-      "sourceAnchor": "241-stdthread-and-stdjthread",
+      "sourceAnchor": "242-thread-ownership-arguments-joining-and-structured-shutdown--core",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Members are destroyed in reverse declaration order, so declaring the thread last makes it the first thing torn down — it stops and joins while the state it reads is still alive. Declaring it first is the classic use-after-free: the members die while the thread is still looping over them. The 'doesn't matter' answer inverts the ordering: the `jthread` destructor does join, but it only runs at its own position in the reverse-order sequence, which is too late if it was declared first.",
-      "sourceAnchor": "242-joining-and-detaching-threads",
+      "sourceAnchor": "242-thread-ownership-arguments-joining-and-structured-shutdown--core",
       "difficulty": "trap"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The unifying problem is the missing join point — you lose lifetime control, shutdown control, and any way to observe completion. Point 2 is the nastiest in practice: at `main`'s return, static destructors run and the process exits while detached threads are still executing, possibly mid-critical-section. Resources *are* reclaimed by the runtime, so it is not a leak; and `detach()` on a joinable thread succeeds — it throws only if the thread is not joinable.",
-      "sourceAnchor": "242-joining-and-detaching-threads",
+      "sourceAnchor": "242-thread-ownership-arguments-joining-and-structured-shutdown--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`condition_variable_any` is the only one with the `stop_token` overload; plain `condition_variable` is restricted to `unique_lock<mutex>` so implementations can hit the futex fast path directly, and it has no cancellation awareness at all. Taking the lock inside the `stop_callback` is not optional — it is what prevents the notification from slipping between the waiter's predicate check and its sleep. And there is deliberately no `std::thread::kill`: asynchronous termination cannot unwind safely.",
-      "sourceAnchor": "242-joining-and-detaching-threads",
+      "sourceAnchor": "242-thread-ownership-arguments-joining-and-structured-shutdown--core",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The problem is state, not portability: a thread stopped at an arbitrary instruction may hold a mutex, own a half-updated structure, or have skipped every destructor on its stack. `pthread_cancel` exists and is a documented source of undefined state; `TerminateThread` on Windows is worse. Both platforms *can* do it — the standard declines to expose it because the result is unusable, which is why the portability answer misses the point.",
-      "sourceAnchor": "242-joining-and-detaching-threads",
+      "sourceAnchor": "242-thread-ownership-arguments-joining-and-structured-shutdown--core",
       "difficulty": "recall"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The model determines the cost, and a `dlopen`-able library gets `general-dynamic` by default — a real function call on every access, invisible in the source and obvious in the disassembly. `-ftls-model=initial-exec` buys back the cheap `%fs` load at the price of forbidding `dlopen` of that library. The 'always a `%fs` load' answer describes `initial-exec`/`local-exec` and is exactly the assumption that hides this cost.",
-      "sourceAnchor": "243-thread-local-storage",
+      "sourceAnchor": "249-thread-local-storage-and-thread-pools--role-specific",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Dynamic initialization is worse than the access cost itself, because the guard is checked on *every* access, not just the first — on a hot path this is the difference between about 1 cycle and about 5. `constinit` removes it by requiring the value to be computable at compile time. It does not change the TLS model (that is `-ftls-model`), and it certainly does not make the variable shared — it stays one instance per thread.",
-      "sourceAnchor": "243-thread-local-storage",
+      "sourceAnchor": "249-thread-local-storage-and-thread-pools--role-specific",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The mental model 'thread_local means my-task-local' is the bug, and it fails in opposite directions for the two cases: a migrating coroutine *loses* the state it expected to follow it, while a pooled thread *keeps* state it should have discarded. The 'pools destroy and recreate TLS between work items' answer inverts the pool behaviour precisely — pooled threads are long-lived, so TLS persists rather than being reset, which is why scratch buffers must be explicitly cleared rather than assumed empty.",
-      "sourceAnchor": "243-thread-local-storage",
+      "sourceAnchor": "249-thread-local-storage-and-thread-pools--role-specific",
       "difficulty": "trap"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Creation involves `clone(2)`, stack allocation, TLS setup, and scheduler bookkeeping — three orders of magnitude more than a queue handoff, which is the entire economic argument for pools. The 1 µs figure is the cost of a *context switch*, a different thing often confused with creation. And while the stack's 8 MB is indeed lazily populated virtual address space, the surrounding setup is what dominates.",
-      "sourceAnchor": "244-thread-creation-and-thread-pools",
+      "sourceAnchor": "249-thread-local-storage-and-thread-pools--role-specific",
       "difficulty": "recall"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The asymmetry is a locality-plus-granularity argument, and stating it is the design insight interviewers listen for: recent tasks are hot in the owner's cache, and old tasks in a divide-and-conquer workload tend to represent the largest remaining subtrees, so one steal buys a lot of work. The 'owner takes FIFO, thieves take LIFO' answer reverses the ends. Accessing opposite ends does reduce contention, but the Chase–Lev deque handles the same-end race too — lock-freedom is not what forces the choice.",
-      "sourceAnchor": "244-thread-creation-and-thread-pools",
+      "sourceAnchor": "249-thread-local-storage-and-thread-pools--role-specific",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A mutex is a release/acquire pair, not merely a gate — that happens-before edge is what makes plain non-atomic reads and writes of the protected data well-defined. The cache-coherence answer describes plausible hardware mechanics but is the wrong level: coherence is automatic on these machines, and what you need is a *language-level* ordering guarantee, which is precisely what synchronizes-with provides.",
-      "sourceAnchor": "245-mutexes",
+      "sourceAnchor": "243-mutexes-critical-section-invariants-and-raii--core",
       "difficulty": "recall"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The distinction between 'UB' and 'guaranteed deadlock' matters: because it is UB, you cannot rely on the hang to reveal the bug, and an optimizer is entitled to assume it never happens. The `system_error` answer describes what `pthread_mutex_t` does with `PTHREAD_MUTEX_ERRORCHECK`, not what `std::mutex` guarantees. Counting behaviour is `std::recursive_mutex` — which is itself usually a design smell hiding a public-method-calls-public-method structure.",
-      "sourceAnchor": "245-mutexes",
+      "sourceAnchor": "243-mutexes-critical-section-invariants-and-raii--core",
       "difficulty": "trap"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The syscall plus getting the woken thread scheduled again is what turns 20 ns into microseconds — a 50–500× cliff. This is why 'reduce the probability of contention' (sharding, per-thread state, single-writer designs) beats 'shorten the critical section' as advice. The cache-line transfer is real but costs ~40–100 ns each way, two orders of magnitude short of explaining the gap.",
-      "sourceAnchor": "245-mutexes",
+      "sourceAnchor": "243-mutexes-critical-section-invariants-and-raii--core",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Shared acquisition is still a *write*, which is the contrarian insight here: the readers do not contend on the data but they do contend on the counter, so they fail to scale. Add that acquisition costs 2–3× the instructions of `std::mutex` and short read sections lose outright. Writer starvation is a real `shared_mutex` problem but a separate one, and it requires a writer to be present — here there are none.",
-      "sourceAnchor": "246-reader-writer-mutexes",
+      "sourceAnchor": "243-mutexes-critical-section-invariants-and-raii--core",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Mutual upgrade attempts are an unbreakable circular wait, so the operation is omitted rather than made unsafe. `boost::upgrade_mutex` solves it by adding a third *upgradeable* state that at most one thread may hold, which serializes upgrade attempts and removes the cycle. The unlock-then-relock workaround is possible but explicitly *not* atomic — the state can change in the gap, which is exactly what callers forget.",
-      "sourceAnchor": "246-reader-writer-mutexes",
+      "sourceAnchor": "243-mutexes-critical-section-invariants-and-raii--core",
       "difficulty": "recall"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The seqlock's defining property is exactly the one `shared_mutex` lacks: readers issue no stores, so the data line stays shared and reader scaling is genuine. The price is that readers may retry and the payload must be trivially copyable. A semaphore is still an atomic counter — it has the same bouncing-line problem the question asks you to avoid — and `shared_timed_mutex` only adds timeouts to the same reader-count mechanism.",
-      "sourceAnchor": "246-reader-writer-mutexes",
+      "sourceAnchor": "243-mutexes-critical-section-invariants-and-raii--core",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the single most common concurrency typo and it compiles cleanly: the declaration reading means `m` is shadowed by a default-constructed-looking guard, and no lock is taken. Even in the temporary reading (`std::lock_guard<std::mutex>{m};`) the object is destroyed at the semicolon, so the critical section is empty — the opposite of the 'leaked lock' answer. `-Wunused-variable` misses it because the type has a non-trivial destructor; clang-tidy's `bugprone-unused-raii` catches it.",
-      "sourceAnchor": "247-raii-lock-wrappers",
+      "sourceAnchor": "243-mutexes-critical-section-invariants-and-raii--core",
       "difficulty": "trap"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`scoped_lock` is the better default precisely because it is a strict superset of `lock_guard` — zero args is a no-op, one arg is identical, many args use the deadlock-avoiding algorithm — and it costs nothing. `unique_lock` carries an extra ownership `bool` and a branch in its destructor, so you take it only for the extra power. The multi-mutex answer inverts reality: variadic locking is `scoped_lock`'s headline feature, and both wrappers are exception-safe by construction.",
-      "sourceAnchor": "247-raii-lock-wrappers",
+      "sourceAnchor": "243-mutexes-critical-section-invariants-and-raii--core",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Backing off and retrying from the failure point is what breaks hold-and-wait, and it works regardless of the order callers pass the arguments. Address ordering is a real technique and a plausible guess, but it is not what the standard algorithm does — and 'starvation-free' gives it away, since try-and-back-off is formally susceptible to livelock. In practice implementations vary the starting mutex, which makes sustained livelock vanishingly unlikely.",
-      "sourceAnchor": "248-deadlock-free-multi-locking",
+      "sourceAnchor": "244-multi-locking-and-deadlock--core",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "'Turn a race into a deterministic failure' is the framing interviewers listen for: the violation throws the moment the wrong ordering is *attempted*, whether or not a second thread happens to be racing. It does not discover or impose an order — you assign the levels by hand, and the class merely enforces what you declared. Nothing is sorted or reordered; a violating acquisition throws rather than being fixed up.",
-      "sourceAnchor": "248-deadlock-free-multi-locking",
+      "sourceAnchor": "244-multi-locking-and-deadlock--core",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Closing the lost-wakeup window is the entire reason a condition variable exists rather than a flag plus `sleep()`. The 'the mutex would be held while sleeping' answer states a genuine requirement — the mutex certainly must be released — but a non-atomic 'unlock, then block' would also satisfy it while still dropping notifications that land in the gap. It is specifically the *atomicity* that buys correctness.",
-      "sourceAnchor": "249-condition-variables",
+      "sourceAnchor": "245-condition-variables-predicate-lost-wakeups-and-shutdown--core",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The notification is consumed by an arbitrary waiter and is not forwarded, so a wrong-recipient wake is silently lost — the 'lost wakeup by wrong recipient' hang. A condition variable has no knowledge of anyone's predicate, which is what rules out the 'any woken thread re-evaluates all predicates' answer. `notify_all` is the correctness-first fix; separate condition variables per predicate is the scalable one, since it avoids the thundering herd.",
-      "sourceAnchor": "249-condition-variables",
+      "sourceAnchor": "245-condition-variables-predicate-lost-wakeups-and-shutdown--core",
       "difficulty": "trap"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Mutation under the lock is what makes the state, rather than the notification, the source of truth — a signal arriving 'too early' is then harmless because the predicate is already true and the waiter never sleeps. Notification placement is a performance choice, with one exception worth knowing: notify *inside* the lock if the CV or waiter might be destroyed concurrently. An atomic flag mutated outside the lock does not rescue you — the race is against the waiter's check-then-sleep sequence, not against tearing.",
-      "sourceAnchor": "249-condition-variables",
+      "sourceAnchor": "245-condition-variables-predicate-lost-wakeups-and-shutdown--core",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the answer that distinguishes candidates who have merely memorized 'spurious wakeups exist': `std::condition_variable` provides no atomicity between being notified and actually running, so the loop is mandatory even on an implementation with zero spurious wakes. `wait` always returns holding the mutex — reacquisition does not fail — so the 'reacquisition may fail and return without ownership' answer describes something that cannot happen.",
-      "sourceAnchor": "2410-spurious-and-lost-wakeups",
+      "sourceAnchor": "245-condition-variables-predicate-lost-wakeups-and-shutdown--core",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Two independent defects combine here — mutating outside the lock opens the interleaving window, and the `if` fails to re-check — and the result is a permanent hang, because a notification with no waiter is simply dropped. Making `ready` atomic is the tempting fix and does not work: it removes the data race but not the check-then-sleep window, which only holding the waiter's mutex across the mutation can close.",
-      "sourceAnchor": "2410-spurious-and-lost-wakeups",
+      "sourceAnchor": "245-condition-variables-predicate-lost-wakeups-and-shutdown--core",
       "difficulty": "trap"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Statefulness is precisely the axis that separates these: semaphores, latches, and barriers hold a count and remember early signals, while condition variables carry no state of their own and drop them. That is the crisp answer to 'when would you use a semaphore instead of a condition variable' — when the signal must survive arriving early, as in a one-shot handoff to a worker that may not yet be waiting. Neither CV flavour buffers anything.",
-      "sourceAnchor": "2410-spurious-and-lost-wakeups",
+      "sourceAnchor": "245-condition-variables-predicate-lost-wakeups-and-shutdown--core",
       "difficulty": "recall"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Ownership drives every practical consequence: because a semaphore has no owner, the OS has nobody to boost, so priority inheritance is impossible and a semaphore-as-mutex is exposed to unbounded priority inversion. Conversely, because a mutex has an owner, thread A cannot unlock what thread B locked — which is why signalling needs a semaphore. Recursive locking of a plain `std::mutex` is UB, not a feature.",
-      "sourceAnchor": "2411-c-semaphores",
+      "sourceAnchor": "246-semaphores-latches-and-barriers--core",
       "difficulty": "recall"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Two savings compound: no mutex is needed at all for the signalling handoff, and the blocking path is built on `atomic::wait`/futex with a spin phase so short waits never enter the kernel. The batched wake is a genuine advantage over `notify_all`. The 'never enters the kernel' answer overshoots — `acquire()` does park after spinning, which is exactly what makes it usable rather than a core-burning spin.",
-      "sourceAnchor": "2411-c-semaphores",
+      "sourceAnchor": "246-semaphores-latches-and-barriers--core",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Reusability is the headline distinction, but the completion function is the feature that earns a barrier its keep: a guaranteed-exclusive point to swap double buffers, aggregate per-thread partials, or advance a clock — with no extra lock. It runs once, on one arriving thread, not on all of them, and it must be `noexcept` or an escaping exception calls `std::terminate`. The 'a barrier releases each thread as soon as it arrives' answer describes no barrier at all; releasing on arrival would defeat the purpose.",
-      "sourceAnchor": "2412-latches-and-barriers",
+      "sourceAnchor": "246-semaphores-latches-and-barriers--core",
       "difficulty": "recall"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Taking the maximum of many distributions is what destroys tail latency, which is why staged trading pipelines prefer queues with backpressure — a slow stage delays only its own consumers rather than gating everyone. Barriers belong in bulk-synchronous parallel compute. The syscall claim is wrong: both barriers and latches are built on `atomic::wait` with a spin phase, so uncontended arrivals stay in user space.",
-      "sourceAnchor": "2412-latches-and-barriers",
+      "sourceAnchor": "246-semaphores-latches-and-barriers--core",
       "difficulty": "application"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The Itanium ABI implements the guard as a byte checked with an acquire load, so the initialized path is a load and a predictable branch. The 'lock every call' answer is the common overestimate that pushes people toward hand-rolled double-checked locking — which is a memory-model landmine they do not need. A full CAS per call would be far more expensive than what actually happens, and no self-modification is involved.",
-      "sourceAnchor": "2413-one-time-initialization",
+      "sourceAnchor": "247-one-time-initialization-and-atomic-wait--core",
       "difficulty": "application"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This retry semantic is explicitly specified and a common exam question — and function-local statics behave the same way, retrying on the next call if the initializer threw. The 'consumed flag' answer is the dangerous misconception, since it would leave you permanently uninitialized with no error. Note this only applies to exceptions: a completed call does consume the flag.",
-      "sourceAnchor": "2413-one-time-initialization",
+      "sourceAnchor": "247-one-time-initialization-and-atomic-wait--core",
       "difficulty": "recall"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Being value-based rather than event-based is the whole trick — there is no window in which a signal can be dropped, because the state *is* the signal and `wait` re-reads it. Nothing is buffered and nothing blocks the notifier; in fact `notify_one` with no waiters is deliberately cheap (a load and a predicted branch, no syscall), which is what makes unconditional notification after every store viable on a hot path. Spurious wakeups are still permitted, so the loop remains.",
-      "sourceAnchor": "2414-atomic-wait-and-notification",
+      "sourceAnchor": "247-one-time-initialization-and-atomic-wait--core",
       "difficulty": "application"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The proxy-futex hash is why `wait` on a large atomic is both less efficient and more spuriously wakeful — harmless precisely because the mandatory re-check loop absorbs it. This is a good concrete reason the loop is not merely defensive boilerplate. Wide atomics do commonly use a lock for the *operations* themselves, but a single global spinlock waking all waiters is not the mechanism at work here.",
-      "sourceAnchor": "2414-atomic-wait-and-notification",
+      "sourceAnchor": "247-one-time-initialization-and-atomic-wait--core",
       "difficulty": "application"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the highest-value detail in the spin section: with 8 contending threads it is the difference between saturating the interconnect and near-zero bus traffic. Note the goal is not to acquire *sooner* — the load-spinner is often slower to notice a release — but to stop the spinners from destroying each other's cache lines and the holder's ability to make progress. Atomic RMWs in a loop are perfectly well-defined; the problem is purely the coherence cost.",
-      "sourceAnchor": "2415-spin-then-park-synchronization",
+      "sourceAnchor": "2410-spin-park-and-adaptive-waiting--deep-dive",
       "difficulty": "application"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 0,
       "explanation": "It is a *microarchitectural* hint, not a scheduling operation — which is exactly the confusion the 'yields the scheduler quantum' answer captures. Yielding to the scheduler is `sched_yield()`, a syscall of completely different cost. Omitting `PAUSE` actively harms the SMT sibling by monopolizing shared execution resources, and costs a machine clear when the loop exits, so it is not merely a missed optimization.",
-      "sourceAnchor": "2415-spin-then-park-synchronization",
+      "sourceAnchor": "2410-spin-park-and-adaptive-waiting--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The holder's inability to be scheduled is the whole hazard, and it is why kernel spinlocks disable preemption while user-space ones cannot. Virtualization makes it worse, since the vCPU itself may be descheduled — the reason paravirtualized spinlocks and PAUSE-loop-exiting exist. A correctly built spinlock has perfectly good acquire/release ordering, and coherence is hardware-automatic; neither is the problem.",
-      "sourceAnchor": "2415-spin-then-park-synchronization",
+      "sourceAnchor": "2410-spin-park-and-adaptive-waiting--deep-dive",
       "difficulty": "application"
     },
     {
@@ -572,7 +572,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The design insight is that the uncontended path must never enter the kernel, and the '2' state is what makes the *unlock* side syscall-free — without it, every unlock would have to pessimistically call `FUTEX_WAKE` just in case. It is a single flag, not a count, and 'possibly waiters' is deliberately conservative: a spurious wake is cheap, a missed one is a hang. Exclusion itself comes from the CAS, and robustness is a separate futex feature.",
-      "sourceAnchor": "2416-futex-backed-and-adaptive-mutexes",
+      "sourceAnchor": "2410-spin-park-and-adaptive-waiting--deep-dive",
       "difficulty": "application"
     },
     {
@@ -586,7 +586,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The standard says nothing about process-shared semantics for `std::mutex`, and an implementation may embed process-local pointers — so the fact that futexes key on the physical page does not rescue it. Robustness is not optional either: without `PTHREAD_MUTEX_ROBUST`, a process that crashes while holding the lock leaves it held forever, with no recovery path. `EOWNERDEAD` is what lets the survivor repair the invariant.",
-      "sourceAnchor": "2416-futex-backed-and-adaptive-mutexes",
+      "sourceAnchor": "2410-spin-park-and-adaptive-waiting--deep-dive",
       "difficulty": "application"
     },
     {
@@ -600,7 +600,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Backing off releases what it holds, so no thread ever waits on one mutex while retaining another — hold-and-wait is gone. Circular wait is the condition broken by a *lock ordering* discipline or a `hierarchical_mutex`, which is the tempting confusion since both approaches solve the same deadlocks by different routes. Mutexes are exclusive by definition and nothing is ever preempted from a holder.",
-      "sourceAnchor": "2417-deadlock",
+      "sourceAnchor": "244-multi-locking-and-deadlock--core",
       "difficulty": "application"
     },
     {
@@ -614,7 +614,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The lock is copied *locked* with no owner left to release it, which is why only async-signal-safe functions are legal between `fork` and `exec`, and why `pthread_atfork` exists. The first distractor inverts the defining behaviour of `fork` in a threaded program: threads are emphatically *not* inherited — exactly one thread exists in the child, which is what strands the locks.",
-      "sourceAnchor": "2417-deadlock",
+      "sourceAnchor": "244-multi-locking-and-deadlock--core",
       "difficulty": "trap"
     },
     {
@@ -628,7 +628,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The threads are running rather than blocked, which rules out deadlock — and that is what makes livelock worse operationally, since CPU sits at 100% and the process looks healthy while achieving nothing. Randomized back-off is the same trick Ethernet's CSMA/CD uses. Starvation would mean the *system* progresses while one thread does not; here nobody progresses. A convoy has the opposite signature: falling CPU utilization.",
-      "sourceAnchor": "2418-livelock",
+      "sourceAnchor": "2411-progress-pathologies--deep-dive",
       "difficulty": "application"
     },
     {
@@ -642,7 +642,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the precise dividing line between the two guarantees and a standard interview question. The system makes progress because a failed CAS means someone else's succeeded, but nothing bounds how long any *particular* thread retries. The 'lock-free guarantees per-thread progress' answer inverts the definitions — per-thread progress is the strictly stronger wait-free guarantee, which is why wait-free algorithms are rarer and more expensive.",
-      "sourceAnchor": "2418-livelock",
+      "sourceAnchor": "2411-progress-pathologies--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -656,7 +656,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Three priority levels are what make the delay unbounded: without the medium thread, the high-priority waiter waits only for the low thread's critical section, which is bounded. The medium thread's runtime is not bounded by anything, and it never even touches the lock. This is the Mars Pathfinder failure exactly, fixed by enabling priority inheritance so the holder is boosted above the medium thread.",
-      "sourceAnchor": "2419-priority-inversion",
+      "sourceAnchor": "2411-progress-pathologies--deep-dive",
       "difficulty": "application"
     },
     {
@@ -670,7 +670,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`SCHED_FIFO` runs until it blocks or yields — there is no quantum expiry to rescue you, which is what makes the 'a slowdown proportional to the quantum' answer wrong and this the most common way an RT-scheduling change takes down a system. The kernel boosts nothing automatically; priority inheritance must be requested explicitly via `PTHREAD_PRIO_INHERIT`. The structural fix is to share no locks at all across priority levels: single-writer ownership, SPSC queues, and seqlocks have no holder to invert.",
-      "sourceAnchor": "2419-priority-inversion",
+      "sourceAnchor": "2411-progress-pathologies--deep-dive",
       "difficulty": "trap"
     },
     {
@@ -684,7 +684,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Falling utilization under load is the counterintuitive signature and the reason convoys get misdiagnosed as 'not enough CPU' — the fix is fewer handoffs, not more threads. The 100% CPU answer describes livelock; low switches with idle CPUs describes deadlock. The convoy is self-sustaining: the queue never drains, so every acquisition is contended and every one parks, collapsing throughput to the context-switch rate even if the critical section is only 100 ns.",
-      "sourceAnchor": "2420-lock-convoys",
+      "sourceAnchor": "2411-progress-pathologies--deep-dive",
       "difficulty": "application"
     },
     {
@@ -698,7 +698,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Strict FIFO forces a wakeup per handoff *by construction* — the next owner is by definition a thread that must be scheduled — so the lock sits free but unavailable for 1–10 µs each time. Barging skips that. The cost is starvation risk and worse tail latency, giving the clean trade: fairness improves the tail and hurts throughput; barging does the reverse. Glibc's default mutex barges, as does Java's `ReentrantLock`.",
-      "sourceAnchor": "2420-lock-convoys",
+      "sourceAnchor": "2411-progress-pathologies--deep-dive",
       "difficulty": "recall"
     }
   ]

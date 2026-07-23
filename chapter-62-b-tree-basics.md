@@ -1,662 +1,886 @@
 # Chapter 62 — B-Tree Basics
 
-*Interview-focused revision notes. The theme: a binary search tree is the right idea and the wrong shape for a disk. The B-tree keeps the "ordered, logarithmic search" idea but makes each node a whole page, trading a tall tree of tiny pointer-chasing nodes for a short, bushy tree of high-fanout pages — turning ~30 random I/Os into ~4. PostgreSQL's `nbtree` (a B+tree) is the reference implementation throughout; the theory is universal, but the numbers are Postgres's 8 KB page.*
+This optional-track chapter develops a B+tree as an algorithm over fixed-capacity pages. The generic invariants come first. PostgreSQL appears later as one implementation with named version-dependent choices; it is not the definition of a B+tree. Concurrent split protocols, latches, WAL, and crash recovery belong to Chapters 64–65.
 
 ---
 
-## 62.1 Why In-Memory Search Trees Fail on Disk
+## The 90-Second Screen — Core
 
-Start from the structure everyone reaches for first: the **binary search tree** (BST). It keeps keys ordered, supports point lookup, predecessor/successor, and range scans, and does all of it in O(log₂ N) comparisons on a balanced tree. In RAM it is excellent. On disk it is a disaster, and understanding *why* is the entire motivation for the B-tree.
+1. A B+tree is a height-balanced multiway search tree. Internal pages contain separator keys and child references; leaf pages contain all searchable entries.
+2. In an internal page with separators `s1 < s2 < ...`, each child owns one key interval. Search chooses an interval at every level and always terminates at a leaf.
+3. All leaves have the same depth. Leaves are linked in key order, so a range scan descends once and then walks siblings.
+4. Every non-root page has a lower and upper occupancy bound in the textbook model. The root is exceptional.
+5. Insertion into a full page splits it, promotes or copies a separator into the parent, and may propagate to a new root.
+6. Deletion from an underfull page first redistributes with a sibling when possible; otherwise it merges pages and removes a parent separator. Rebalancing may propagate upward.
+7. Fanout is derived, not memorized:
 
-A BST node holds **one key and two child pointers**. To find a key among N you descend ~log₂ N nodes. For N = 10⁹ that is ~30 nodes. Three things make those 30 hops ruinous on a block device:
+   `fanout ≈ floor(usable_page_bytes / bytes_per_separator_and_child)`
 
-- **Pointer chasing with no locality.** Each node was allocated independently; the two children of a node live wherever the allocator put them, arbitrarily far apart in the file. Every descent step is a jump to an unrelated address. There is no reason the next node shares a page with the current one, so each of the ~30 steps is a fresh **random access** (Ch. 30). On disk, "random access" means a seek.
-- **Low fanout wastes the block.** The unit of transfer from a block device is not a byte or a key — it is a **block/page** (§62.3), 8 KB in Postgres. To read one 24-byte BST node you must transfer the whole 8 KB page it sits on, then use 0.3% of it and throw the rest away. You paid for 8 KB of I/O to make one comparison. The tree's *fanout of 2* means each expensive page transfer buys you exactly one bit of decision.
-- **Height grows with log₂.** Because each node discriminates only two ways, the tree is as tall as log₂ N. Height is the number of dependent, serialized I/Os on the critical path of a lookup — you cannot fetch node k+1 until node k tells you which child to visit. Tall tree = many serialized seeks.
+   Real capacity also depends on headers, slot arrays, variable-length keys, alignment, compression, fill policy, and implementation metadata.
+8. Height is approximately logarithmic in fanout. Cached upper levels often make leaf access, not root access, the dominant miss.
+9. “B-tree” often means B+tree in database conversation, but the variants differ. State which one you mean.
+10. Search correctness during a concurrent split requires extra machinery—latches, right-links/high keys, or another protocol. Chapter 64 owns that implementation proof.
 
-The disease is not "trees are bad." Trees are exactly right — ordered, logarithmic, range-friendly. The disease is **the mismatch between the node size (bytes) and the I/O granularity (kilobytes)**, and the resulting **low fanout and large height**. Fix those two and the BST becomes the B-tree. The same in-memory-vs-disk tension appeared abstractly in (Ch. 21 §21.14); this chapter is where it becomes physical.
+---
+
+## 62.1 The B+Tree Model and Its Invariants — Core
+
+A binary search tree makes one two-way decision per node. A B+tree makes one many-way decision per page. The asymptotic idea is familiar—ordered search—but the unit of work is different. A node is sized to the storage or cache-management unit used by the system, so one page access exposes many separator keys.
+
+Without an index, an equality or range predicate may need to examine every record: `O(N)` comparisons and potentially a scan of the stored relation. A sorted index narrows the candidate region while retaining order for range scans, predecessor/successor queries, and ordered output. The index costs storage, maintenance on writes, and an additional route from key to record.
+
+A conventional pointer-based balanced BST is poorly matched to page-managed storage. Its fanout is two, so a large tree needs many dependent node visits; separately allocated nodes also waste most of each transferred page. AVL or red-black rotations bound BST height but do not change that fanout. A B+tree instead packs many routing keys into one page and rebalances by page split, redistribution, and merge.
+
+This remains relevant on SSD and NVMe storage. Mechanical seek is no longer the only concern, but dependent cache/buffer misses, controller queueing, transfer size, write amplification, and CPU traversal still exist. For a fully memory-resident structure, cache-line- or SIMD-conscious variants may beat a storage-page B+tree. “Disk-oriented” describes the cost model, not a claim that one device latency dominates every deployment.
+
+Use these terms consistently:
+
+- A **key** determines ordering.
+- A **value** is the record, row reference, or payload associated with a key.
+- An **internal page** contains routing entries: separators and child references.
+- A **leaf page** contains searchable key/value entries.
+- **Fanout** is the number of children of an internal page.
+- **Capacity** is the maximum entries a particular page representation can hold.
+- **Occupancy** is the number or byte fraction currently used.
+- **Height** here counts pages on a root-to-leaf path. Some texts count edges instead; state the convention.
+
+For a simplified B+tree of order `m`, an internal node has at most `m` children and therefore at most `m - 1` separators. A common textbook minimum is `ceil(m / 2)` children for a non-root internal node. A leaf has a corresponding lower and upper entry bound. Production systems often use byte occupancy and more nuanced deletion policies, so “half full” is an algorithmic model, not a universal product rule.
+
+The structural invariants are:
+
+1. **Sorted contents.** Keys within every page are ordered according to one comparator.
+2. **Routing partition.** Each internal separator divides disjoint child key ranges.
+3. **Leaf ownership.** All searchable entries occur in leaves. Internal copies are routing information, not additional logical rows.
+4. **Equal leaf depth.** Every root-to-leaf path contains the same number of pages.
+5. **Bounded occupancy.** Except for the root, pages remain within the variant's minimum and maximum occupancy after rebalancing.
+6. **Linked leaf order.** Each leaf can reach its next leaf in key order; many implementations also keep a previous link.
+7. **Root exception.** A root may contain fewer entries than ordinary pages. An empty tree may be represented by no root or by one empty leaf, depending on the implementation.
+
+An internal page can be drawn in either of two equivalent conventions. This chapter uses `children.size() == separators.size() + 1`:
 
 ```
-BST for 8 keys                     each node = its own page transfer
-                4
-             /     \
-           2         6             lookup(7): read node(4) → page I/O
-          / \       / \                        read node(6) → page I/O
-         1   3     5   7                        read node(7) → page I/O
-                                    3 dependent random I/Os for 8 keys;
-                                    ~30 for a billion. Each moves 8 KB
-                                    to use ~24 bytes of it.
+separators:       [ 20 | 50 | 80 ]
+children:        c0    c1    c2    c3
+
+c0: k < 20
+c1: 20 <= k < 50
+c2: 50 <= k < 80
+c3: 80 <= k
 ```
 
----
+Some systems store a lower bound with each downlink instead. Duplicate keys also require a total ordering—often `(user_key, row_id)`—or explicit duplicate posting lists. The diagrams use unique integers only to keep the routing visible.
 
-## 62.2 Tree Balancing: AVL and Red-Black, and Why They Are Wrong for Disk
+### B-tree versus B+tree
 
-A raw BST can degenerate: insert keys in sorted order and it becomes a linked list of height N, O(N) lookup. **Self-balancing BSTs** fix the height by enforcing an invariant on every insert/delete:
+In a classic B-tree, values may occur in internal nodes as well as leaves, and a successful point lookup can stop above the leaf level. In a B+tree, internal nodes are routing-only and every logical entry lives at the leaf level.
 
-| Structure | Balance invariant | Height bound | Rebalance op |
-|---|---|---|---|
-| **AVL tree** | subtree heights differ by ≤ 1 | ≤ 1.44 log₂ N | rotations (strict, more of them) |
-| **Red-black tree** | no red-red edge; equal black-height | ≤ 2 log₂ N | rotations + recolor (fewer) |
-| **Treap / skip list** | randomized | ~log₂ N expected | probabilistic |
-
-These are the right tools **in memory** — the Linux kernel's VMA tree, `std::map`, Java's `TreeMap`, and Postgres's *in-memory* planner structures all use red-black or similar. But every one of them is still a **binary** structure: fanout 2, one key per node, height ∝ log₂ N. Balancing bounds the height; it does nothing about the two fatal disk properties from §62.1:
-
-- Fanout is still 2, so a page transfer still buys one bit of decision.
-- Height is still ~log₂ N ≈ 30 for a billion keys, so a lookup is still ~30 serialized random I/Os.
-
-Worse, **rebalancing rotations are pointer surgery**: a rotation relinks three-to-five nodes. In memory that is a few cache-line writes. On disk each of those nodes is on a different page, so a rotation *dirties several scattered pages*, each of which must eventually be written back — turning one logical insert into a scatter of random writes and, under a WAL (Ch. 65), a pile of log records. The AVL/red-black machinery optimizes the wrong cost function: it minimizes *comparisons and node count*, when the disk cares about *page transfers*.
-
-The B-tree keeps the balancing goal — **all leaves at the same depth, always** — but achieves it with a completely different move (splitting and merging fat nodes, §62.16–§62.17) that touches O(1) pages per operation in the common case, and it drives the height down by making each node a whole page with fanout in the *hundreds*.
-
----
-
-## 62.3 The Block Is the Unit of I/O
-
-The single fact the entire chapter is built on: **you cannot read one byte from a block device.** Storage hardware and the OS transfer data in fixed-size **blocks** (hardware sector: historically 512 B, modern "Advanced Format" 4 KB) and the OS/DBMS layer aggregates these into **pages** it reads and writes atomically.
-
-| Layer | Unit | Typical size |
+| Property | Classic B-tree | B+tree |
 |---|---|---|
-| HDD/SSD physical sector | sector | 512 B (legacy) / 4 KB (AF) |
-| OS page cache | page | 4 KB (x86-64, Ch. 32) |
-| **PostgreSQL** | page/block (`BLCKSZ`) | **8 KB** (compile-time constant) |
-| MySQL InnoDB | page | 16 KB |
-| SQLite | page | 4 KB (default since 3.12; was 1 KB) |
-| Oracle | block | 8 KB default (2–32 KB) |
+| Values | internal and leaf nodes | leaves only |
+| Successful lookup | may stop internally | ends at a leaf |
+| Internal fanout | payload may reduce it | routing entries only |
+| Range scan | traversal depends on variant | descend once, then follow leaves |
 
-The consequences that shape B-trees:
-
-- **Reading 1 byte costs one page transfer** (~8 KB in Postgres). So an on-disk structure should make every page it touches carry as many useful keys as possible — *pack the page*. That is exactly what a B-tree node is: a page densely filled with sorted keys.
-- **Writing must be page-granular and ideally atomic.** A B-tree mutates pages in place (§62.16), which raises the **torn-page** problem — a crash mid-write can leave a half-updated 8 KB page (Ch. 63, Ch. 65). This is a direct cost of in-place mutation and is why Postgres writes **full-page images** to the WAL on the first change to a page after a checkpoint.
-- **Amortization is the whole game.** If a page transfer costs ~100 µs on NVMe (§62.4), you want to extract hundreds of key comparisons from it, not one. Fanout is how a B-tree turns "expensive page transfer" into "hundreds of comparisons for the price of one I/O."
-
-Postgres's 8 KB page (`BLCKSZ`) is the atom of everything below the executor: heap pages (Ch. 61 §61.7), B-tree pages, the buffer pool slot size (Ch. 65), and the WAL's full-page-image size all inherit it.
+Database indexes commonly use B+tree-family structures because value-free internal pages can have high fanout and linked leaves make ordered scans direct. That design does not guarantee a particular page size, height, or fill percentage.
 
 ---
 
-## 62.4 Disk and SSD Primer: Random I/O Is the Enemy
+## 62.2 Point Lookup and Range Scan — Core
 
-Why a *page transfer* is the cost to minimize, and why *random* page transfers are worse than sequential, comes down to the physics of the media (developed in Ch. 30; recapped here because it is the B-tree's reason to exist).
+Point lookup repeats two operations:
 
-**Spinning disk (HDD).** A read requires (1) a **seek** — moving the head to the right track, ~5–10 ms — plus (2) **rotational latency** — waiting for the sector to rotate under the head, ~2–4 ms at 7200 RPM (half a rotation ≈ 4.2 ms). A random 8 KB read is therefore ~**8–12 ms**, dominated by mechanical motion. Once positioned, sequential transfer is fast (~100–200 MB/s), so **sequential reads are ~100× cheaper per byte than random reads.**
+1. Search the sorted separators inside the current page.
+2. Follow the selected child reference.
 
-**SSD / NVMe.** No moving parts, so no seek/rotation. A random 4–8 KB read is ~**50–100 µs** (NVMe) or ~100–150 µs (SATA SSD). Random is *much* closer to sequential than on an HDD, but a gap remains: SSDs read/write in **pages** (4–16 KB) and erase in large **blocks** (MB), so write amplification and the flash translation layer still favor sequential/large I/O. Random reads also can't be coalesced.
+At the leaf, search the sorted entries and confirm equality. If each internal page has fanout near `f` and the tree contains `N` entries, a balanced lookup touches `O(log_f N)` pages. The comparisons inside a page are commonly binary search, interpolation-like search, prefix-aware search, or a small linear/SIMD search; that choice changes CPU cost but not the routing invariant.
 
-| Media | Random 8 KB read | Sequential MB/s | Random : sequential penalty |
-|---|---|---|---|
-| DRAM (for scale) | ~100 ns | tens of GB/s | ~1× |
-| HDD 7200 RPM | ~8–12 ms | ~150 MB/s | ~100× |
-| SATA SSD | ~100–150 µs | ~500 MB/s | ~a few× |
-| NVMe SSD | ~50–100 µs | 3–7 GB/s | ~a few× |
+### Worked lookup
 
-The B-tree's design goal restated in these numbers: a lookup is a chain of *random* page reads (you can't predict the next page until the current one is read), and **height = the length of that chain.** On an HDD, cutting a lookup from 30 random reads (BST) to 4 (B-tree) is 30×12 ms = 360 ms → 4×12 ms = 48 ms. On NVMe it is ~3 ms → ~400 µs. Either way, **fanout buys height, and height is serialized random I/O.** (And note: even on fast NVMe, where random is cheap, fewer levels still means fewer buffer-pool lookups and fewer chances to miss the cache — §62.21.)
+Consider:
+
+```
+                         [ 30 | 70 ]
+                       /      |      \
+             [10 20 25]  [30 45 60]  [70 80 95]
+                  L0  <---->  L1  <---->  L2
+```
+
+Lookup `45`:
+
+1. At the root, `30 <= 45 < 70`, so choose the middle child.
+2. Binary-search leaf `L1`.
+3. Find `45`.
+
+Lookup `55` follows the same child, then fails between `45` and `60`. An unsuccessful lookup still terminates at the leaf where the key would be inserted.
+
+The route is a proof obligation. If a separator is the smallest key in its right subtree, then equality must route right. A program that uses `upper_bound` where its separator convention requires `lower_bound`, or vice versa, can silently lose boundary keys.
+
+### Range scan
+
+For `[22, 82)`:
+
+1. Descend to the first leaf that could contain `22`.
+2. Start at `lower_bound(22)` within that leaf.
+3. Emit entries while the key is below `82`.
+4. Follow the next-leaf pointer when a leaf is exhausted.
+
+```
+[10 20 25] -> [30 45 60] -> [70 80 95]
+       25       30 45 60      70 80       emitted
+```
+
+The cost is one root-to-leaf descent plus the number of leaf pages containing the range, not one descent per result. Whether sibling pages are physically adjacent is an allocation property, not a B+tree guarantee. The links provide logical order even when storage placement is fragmented.
+
+### Compact search pseudocode
+
+```cpp
+PageId find_leaf(PageId root, Key key) {
+    PageId id = root;
+    for (;;) {
+        Page const& page = read_page(id);
+        if (page.is_leaf()) return id;
+
+        // Convention: separator[i] is the lower bound of child[i + 1].
+        auto it = std::upper_bound(page.separators.begin(),
+                                   page.separators.end(), key);
+        std::size_t child = static_cast<std::size_t>(
+            it - page.separators.begin());
+        id = page.children[child];
+    }
+}
+```
+
+This is single-threaded conceptual code. It assumes pages remain stable while read and that every referenced page is valid. Chapter 64 adds pins/latches and a protocol for encountering a concurrent split.
 
 ---
 
-## 62.5 Addressing on Disk: Page-ID Plus Offset
+## 62.3 Insertion and Splitting — Core
 
-An in-memory tree links nodes with **pointers** (raw addresses). An on-disk tree cannot: the file is mapped at a different virtual address every run, and a stored pointer would be meaningless after restart (Ch. 61 §61.4). So on-disk structures address by **page id + offset**, and a B-tree "child pointer" is a **page/block number**, not a memory address.
+Insertion first performs ordinary lookup. If the target leaf has room, insert the new entry in sorted order and stop. A full leaf is split.
 
-In Postgres an index is a file (a `relation`, split into 1 GB segments) of 8 KB pages numbered `0, 1, 2, …`. A B-tree "downlink" is a `BlockNumber` (a 32-bit page index). To follow it, the engine asks the **buffer manager** (Ch. 65) for that block:
+For a conceptual split:
+
+1. Combine the old entries and the new entry in sorted order.
+2. Choose a split position satisfying the occupancy policy.
+3. Keep the lower portion in the left leaf and move the upper portion into a new right leaf.
+4. Repair leaf sibling links.
+5. Insert a separator for the new right leaf into the parent.
+6. If the parent overflows, split the parent and propagate upward.
+7. If the old root splits, allocate a new root with two children. Only this step increases tree height.
+
+The leaf and internal cases treat the separator differently:
+
+- In a **leaf split**, the first key of the new right leaf is normally **copied** into the parent. The logical entry remains in the leaf.
+- In a common **internal split**, a middle separator is **promoted** into the parent and removed from the split children, because internal keys are routing structure.
+
+Exact separator truncation, duplicate handling, and high-key representation are implementation details.
+
+### Worked insertion
+
+Use leaf capacity 4 and internal capacity 3 separators. Begin:
 
 ```
-downlink = BlockNumber 4217
-        │
-        ▼
-buffer manager: is block 4217 of this index resident in shared_buffers?
-   ├─ yes → hash-table hit, pin the buffer, return pointer into the pool   (~100 ns)
-   └─ no  → evict a victim, issue read of 8 KB from the index file          (~50 µs–10 ms)
+root/leaf: [10 20 30 40]
 ```
 
-Within a page, a specific tuple is found by a **line pointer / item id** (slotted page layout, Ch. 63): the downlink names the page, and a small binary search inside the page (§62.14) names the entry. This two-level *page-id then in-page-offset* addressing is the same indirection that lets heap tuples move within a page without invalidating references (Ch. 61 §61.14), and it is why "the pointer is a page number" is the correct mental model for every B-tree edge.
+Insert `25`. The sorted temporary contents are `[10 20 25 30 40]`, which do not fit. Split:
 
-The metapage detail worth knowing: **block 0 of a Postgres nbtree index is a metapage** (`BTMetaPageData`) that stores, among other things, the block number of the current **root** and a cached tree level. A lookup starts by reading the metapage (almost always cached) to learn where the root is, because the root's block number *changes* whenever the tree grows a level (§62.16).
+```
+left leaf  [10 20]  ->  right leaf [25 30 40]
+```
+
+Create a root whose separator is the lower bound of the right child:
+
+```
+                   [25]
+                 /      \
+          [10 20]  ->  [25 30 40]
+```
+
+The tree grew from height 1 to height 2. Search equality at `25` routes right, matching the chosen separator convention.
+
+Now insert `50`, then `60`. The right leaf eventually overflows:
+
+```
+temporary right: [25 30 40 50 60]
+split:           [25 30] -> [40 50 60]
+copy up:                    40
+```
+
+The root becomes:
+
+```
+                      [25 | 40]
+                    /     |      \
+              [10 20] [25 30] [40 50 60]
+```
+
+At each step, verify all invariants:
+
+- leaf entries sorted;
+- root separators sorted;
+- separator `25` equals the lower bound of its right child;
+- all leaves at depth 1;
+- sibling links reflect leaf order;
+- no page exceeds capacity.
+
+### Split policy is a workload choice
+
+A median split is simple and protects worst-case occupancy. Some systems bias a split for append-heavy keys or reserve free space to reduce future splits. Prefix compression and variable-length records make “half” mean bytes rather than entry count. These policies affect write amplification and utilization, but they must preserve routing and occupancy guarantees.
+
+A split is not a single atomic memory write. In a durable concurrent implementation it interacts with page allocation, parent updates, latches, WAL, and crash recovery. The conceptual order above is not a safe production write sequence; Chapter 64 supplies that layer.
 
 ---
 
-## 62.6 From BST to B-Tree: The Core Idea
+## 62.4 Deletion, Redistribution, and Merge — Core
 
-The B-tree is the answer to one question: *what if a tree node were a whole page instead of a single key?* Invented by Rudolf Bayer and Ed McCreight at Boeing in 1970 (the "B" is deliberately never officially expanded — Bayer, Boeing, balanced, block: take your pick), it generalizes the BST along exactly the axis the disk cares about.
+Deletion removes a leaf entry. If the leaf remains above its minimum occupancy, no structural change is required. Otherwise:
 
-Take a BST node — one key, two children — and inflate it to fill a page: **now it holds up to *m*−1 sorted keys and up to *m* children.** A single node with 400 keys makes a **400-way** branching decision from one page transfer, instead of 400 separate 2-way decisions from 400 page transfers.
+1. Try to **redistribute** (borrow) an entry from an adjacent sibling that has more than its minimum.
+2. Update the parent separator so it still equals the right child's lower bound under this chapter's convention.
+3. If redistribution is impossible, **merge** the underfull page with a sibling.
+4. Remove the redundant child reference and separator from the parent.
+5. If the parent becomes underfull, rebalance upward.
+6. If a root internal page ends with one child, replace the root with that child. Only root collapse decreases height.
+
+### Worked redistribution
+
+Assume leaf minimum 2, capacity 4:
 
 ```
-B-tree node (one page) with keys k1<k2<...<k(m-1) and children c0..c(m-1):
-
-        ┌────┬────┬────┬────┬─────┬────┐
-        │ c0 │ k1 │ c1 │ k2 │ ... │c(m-1)
-        └─┬──┴────┴─┬──┴────┴─────┴─┬──┘
-          │         │               │
-     keys < k1  k1 ≤ keys < k2   keys ≥ k(m-1)
+                  [30]
+                /      \
+          [10 20]  ->  [30 40 50]
 ```
 
-The three defining properties, each a direct fix for a §62.1 failure:
+Delete `20`. The left leaf becomes `[10]`, below minimum. The right sibling can spare its first entry:
 
-1. **High fanout (m in the hundreds).** Each page transfer discriminates m ways, not 2. Fanout is chosen so a node fills one page (§62.10): with an 8 KB page and small keys, m ≈ a few hundred.
-2. **Shallow height, ~log_m N.** Because branching is base m ≫ 2, the height collapses. log₄₀₀(10⁹) ≈ 3.45 → 4 levels, versus log₂(10⁹) ≈ 30 for a BST (§62.11, §62.13).
-3. **Perfect balance, always.** Every leaf is at the same depth. The tree does not rebalance by rotations; it grows and shrinks *at the root* via splits and merges (§62.16–§62.17), which keeps all root-to-leaf paths equal length by construction.
+```
+before: parent [30], leaves [10] and [30 40 50]
+move 30 left
+after:  parent [40], leaves [10 30] and [40 50]
+```
 
-That is the whole idea. Everything else in this chapter — B+trees, separator keys, splits, merges, `nbtree` specifics — is elaboration on "make the node a page, make the fanout huge, keep it balanced by splitting."
+Updating the parent from `30` to `40` is essential. Leaving the old separator routes keys in `[30, 40)` to the wrong child.
+
+### Worked merge
+
+Start with both siblings at minimum:
+
+```
+                  [30 | 70]
+                /     |      \
+          [10 20] [30 40] [70 80]
+```
+
+Delete `40`, leaving `[30]`. Neither neighbor should donate if doing so would underflow. Merge the middle leaf with the left:
+
+```
+merged leaf: [10 20 30]
+remove child and separator 30 from parent
+
+                  [70]
+                /      \
+       [10 20 30]  ->  [70 80]
+```
+
+If the parent had become empty and were the root, its sole child would become the new root. A non-root parent would itself need redistribution or merge.
+
+### Logical deletion versus physical rebalancing
+
+The textbook algorithm restores minimum occupancy immediately. Real storage engines may defer page merging because merging can add writes, contention, and complex interactions with snapshots or recovery. They may mark entries dead, compact a page, recycle empty pages later, or tolerate sparse pages. This is a product policy layered on the same search invariant; do not infer a specific merge policy from the term “B+tree.”
 
 ---
 
-## 62.7 B-Tree Versus B+Tree
+## 62.5 Page Layout, Fanout, and a Worked Capacity Calculation — Core
 
-"B-tree" is used loosely for a family. The distinction that matters in practice is between the **original B-tree** and the **B+tree** — and essentially every database, Postgres included, uses the B+tree.
-
-**Classic B-tree.** Keys *and their associated values/records* are stored in **all** nodes — internal and leaf alike. A search can terminate early at an internal node if the key is found there.
-
-**B+tree.** Internal nodes store **only keys (separators) and child pointers — no values**. *All* values live in the **leaf** level. Internal nodes are pure routing structure. Additionally, leaves are usually **linked** into a sorted list (§62.8).
+High fanout comes from packing routing entries into one managed page. Derive it from the representation:
 
 ```
-B-tree (values in every node)        B+tree (values only in leaves)
-        [ 30:v ]                             [ 30 ]           ← routing only
-       /        \                           /      \
-  [10:v,20:v] [40:v,50:v]            [10 20 30] → [30 40 50]  ← all values here,
-                                                               leaves linked →
+P = page bytes
+H = fixed header/special-area bytes
+S = slot-directory bytes per entry
+K = average encoded separator bytes
+C = encoded child-reference bytes
+E = other per-entry metadata/alignment
+
+usable bytes U = P - H
+approximate fanout f = floor(U / (S + K + C + E))
 ```
 
-Why databases overwhelmingly choose the **B+tree**:
+This estimate is intentionally parameterized. There is no universal 8 KiB page, 8-byte child reference, 90% fill factor, or 400-way fanout.
 
-| Property | Classic B-tree | B+tree | Why it matters |
-|---|---|---|---|
-| Where values live | all nodes | leaves only | keeps internal nodes value-free |
-| Internal-node fanout | lower (keys carry values) | **higher** (keys only) | more routing per page → shallower tree |
-| Range scan | must traverse tree repeatedly | **follow linked leaves** | sequential leaf walk, no re-descent |
-| All lookups touch | variable depth | **always full depth to a leaf** | uniform, predictable cost |
-| Point vs range uniformity | mixed | uniform | simpler concurrency & caching |
+### Worked generic calculation
 
-The decisive win is **fanout in the internal levels**. Because a B+tree's internal nodes hold no values, they pack far more separator keys per page, so the branching factor is higher and the tree is *shallower* — which is exactly the metric that costs I/O. The second win is **range scans**: leaves form a sorted linked list, so `WHERE x BETWEEN a AND b` descends once to the first leaf and then walks leaf-to-leaf, never re-entering the upper tree.
+Suppose a particular design chooses:
 
-**Postgres's `nbtree` is a B+tree** (specifically a Lehman & Yao B-link tree, §62.18): every index entry — the key plus a heap TID — lives in the leaf level, and internal pages hold only pivot keys and downlinks. When this book (and most engineers) say "B-tree," they mean B+tree. InnoDB, SQLite, Oracle, DB2, and SQL Server are all B+trees too.
+- page size `P = 16,384` bytes;
+- fixed overhead `H = 128` bytes;
+- slot `S = 4` bytes;
+- average compressed separator `K = 12` bytes;
+- child reference `C = 8` bytes;
+- other entry overhead `E = 4` bytes.
+
+Then:
+
+```
+U = 16,384 - 128 = 16,256 bytes
+entry budget = 4 + 12 + 8 + 4 = 28 bytes
+f ≈ floor(16,256 / 28) = 580 routing entries
+```
+
+Treat `580` as a planning estimate, not a guarantee. A real implementation may need one more child than separators, reserve free space, store a high key, align records, encode variable-length offsets, or cap entries independently. Long separators can reduce capacity sharply; prefix/suffix truncation can increase it.
+
+Now change only the average separator to 60 bytes:
+
+```
+entry budget = 4 + 60 + 8 + 4 = 76 bytes
+f ≈ floor(16,256 / 76) = 213
+```
+
+The same page format now has roughly one third the fanout. Key width and encoding can matter more than the nominal page size.
+
+### Leaf capacity
+
+Leaf entries include the full key plus a value or row reference:
+
+```
+leaf_capacity ≈ floor((P - leaf_header) /
+                      (slot + encoded_key + encoded_value + metadata))
+```
+
+Variable-length records make capacity byte-based. A page with many small entries can hold more entries than one with a few large values. Oversized values may be stored out of line, rejected, or handled by overflow pages depending on the product.
+
+### Slotted pages
+
+A common representation keeps a slot array at one end and packed variable-length records at the other:
+
+```
+low addresses
+┌──────────────────────────────────────┐
+│ header │ slots →      free      ← records │
+└──────────────────────────────────────┘
+high addresses
+```
+
+A slot stores an offset/length rather than the record itself. Records can be compacted within the page while stable slot numbers or logical identifiers remain valid. This is a storage-engine technique, not a requirement of the abstract B+tree.
 
 ---
 
-## 62.8 Linked Leaves and Range Scans
+## 62.6 Height, Caching, and the Cost Model — Core
 
-The B+tree feature that makes it a *database* index rather than just a dictionary is the **linked leaf level**. Each leaf page stores a pointer to its right (and in Postgres, left) sibling, so the leaves form a doubly/singly linked list in key order:
+Let:
 
-```
-        internal (routing)
-       /     |       \
-  [ 3 7 ] [ 12 19 ] [ 24 31 ]        leaves, sorted, linked:
-     ⇄        ⇄         ⇄
-  leaf0  →  leaf1  →  leaf2  →  ...   right-links let a scan walk
-                                       key order without touching
-                                       the internal levels again
-```
+- `L` be average leaf entries;
+- `f` be average internal fanout;
+- `h` count levels including root and leaf.
 
-This turns range and ordered access into a **sequential leaf walk**:
-
-- **Range scan** `WHERE k BETWEEN 15 AND 40`: descend once (root → internal → leaf) to the leaf containing 15 — O(log_m N) — then follow right-links, emitting keys until you pass 40. Cost = *one descent + a sequential walk of the matched leaves*, not one descent per result.
-- **`ORDER BY k` / index scan without a sort**: the linked leaf order *is* sorted order, so the planner can stream rows already ordered and skip a sort node entirely.
-- **`MIN`/`MAX`**: descend to the leftmost/rightmost leaf.
-
-In Postgres the leaf links (`btpo_next`, `btpo_prev` in the page's special area) also serve **concurrency**: the right-link is the backbone of the Lehman & Yao B-link algorithm (§62.18, Ch. 64), letting a scan that lands on a page mid-split follow the right-link to find keys that moved, without holding locks up the tree.
-
-Contrast with a **hash index** (§62.22): a hash index answers `=` in ~O(1) but supports **no range scans and no ordering** at all, because hashing destroys key order. The linked, sorted leaf level is precisely what a B+tree has and a hash index lacks — and it is why B-trees are the default index while hash indexes are a niche.
-
----
-
-## 62.9 The B-Tree Hierarchy: Root, Internal, Leaf
-
-A B+tree has exactly three *kinds* of node, distinguished by their role, not their format:
+A rough capacity model is:
 
 ```
-                         ┌──────────────┐
-   level (height-1) ───▶ │   ROOT       │   1 page, almost always cached
-                         └──┬───────┬───┘
-                            │       │
-   internal / routing  ┌────▼──┐ ┌──▼────┐   "branch" pages: separator
-   (levels 1..h-2) ───▶│ INTNL │ │ INTNL │    keys + downlinks only
-                       └─┬───┬─┘ └─┬───┬─┘
-                         │   │     │   │
-   leaf (level 0) ──▶ [leaf][leaf][leaf][leaf]  key + heap TID, linked ⇄
-                         all leaves at the SAME depth
+N(h) ≈ L * f^(h - 1)
+h ≈ 1 + ceil(log_f(N / L))       for N > L
 ```
 
-- **Root.** The single entry point (its block number is cached in the metapage, §62.5). When the tree has one page, the root *is* a leaf. As the tree grows, the root becomes an internal node. Because it is read on every lookup, it is essentially always resident in `shared_buffers` (§62.21).
-- **Internal / branch nodes.** Pure routing: each holds separator keys and **downlinks** (child block numbers). They contain **no values/TIDs** (B+tree, §62.7). Their only job is to send a search to the correct child.
-- **Leaf nodes.** Hold the actual index entries — `(key, heap TID)` in Postgres — in sorted order, and the sibling links (§62.8). *All* data is here; every successful and unsuccessful lookup ends at a leaf.
+Use conservative occupancies for a worst-case bound and measured averages for capacity planning.
 
-**Occupancy** (how full a node is) is bounded on both sides (§62.15): every node except the root must be at least ~half full, which is what guarantees the fanout — and therefore the log_m N height — actually holds. The **branching factor / fanout** is the number of children an internal node points to; it is set by how many separator keys fit in a page (§62.10).
+### Worked height calculation
 
-A key structural invariant: **B-trees grow and shrink only at the root.** Leaves never get "deeper" independently; the only way the tree gains a level is a **root split** (§62.16), and the only way it loses one is the root collapsing after merges (§62.17). This is what keeps all leaves at equal depth and the tree perfectly height-balanced without rotations.
+For the generic example, suppose measured steady-state averages are `f = 300` and `L = 240`, not the maximum capacities:
 
----
+| Height | Approximate entries |
+|---:|---:|
+| 1 | `240` |
+| 2 | `240 × 300 = 72,000` |
+| 3 | `240 × 300² = 21,600,000` |
+| 4 | `240 × 300³ = 6,480,000,000` |
 
-## 62.10 Fanout, Branching Factor, and Occupancy
+The lesson is the exponent, not the number 300. A high-fanout tree can cover billions of entries in a few levels, but wider keys, low occupancy, duplicate representation, and smaller pages change the result.
 
-**Fanout** (branching factor) is the number of children per internal node, and it is set by a simple budget: *how many `(separator key, downlink)` pairs fit in one page?* Work it out for Postgres's 8 KB nbtree page.
+### Page touches are not automatically device I/Os
 
-Page budget (8192 bytes):
-```
-  PageHeaderData        24 bytes   (LSN, checksum, free-space pointers)
-  BTPageOpaqueData      16 bytes   (special area: left/right links, flags, level)
-  ------------------------------
-  usable                8152 bytes for line pointers + tuples
-```
+A height-4 lookup conceptually visits four tree pages. It does not necessarily perform four storage reads:
 
-Per entry, for an 8-byte `bigint` key:
-```
-  ItemIdData (line pointer)   4 bytes
-  IndexTupleData header       8 bytes
-  key payload (bigint)        8 bytes   (+ null bitmap / alignment as needed)
-  ------------------------------
-  ~20 bytes per index entry
-```
+- the root and upper internal pages are small and frequently cached;
+- the target leaf may already be resident;
+- a buffer miss may be satisfied from an OS cache or from the device;
+- after finding an index entry, fetching the referenced row can add another access;
+- a covering index may avoid that row fetch;
+- prefetch and concurrent requests can overlap some latency, though one lookup's dependent descent remains sequential.
 
-So a fully packed page holds ≈ 8152 / 20 ≈ **407 entries**. That is the raw fanout budget. Adjust for reality:
+Separate three cost layers:
 
-- **Leaf pages** default to **90% fillfactor** (§62.20): ~407 × 0.90 ≈ **~366 entries** per leaf at build time.
-- **Internal pages** are always packed to ~100% and, since PG 12, use **suffix truncation** of pivot keys (§62.18) to make separators *shorter* than full leaf keys, which *raises* internal fanout above the naive number.
-- **Wider keys shrink fanout.** A 40-byte `text` key gives ~8152 / (12 + 40) ≈ **~156** entries; a 4-byte `int` gives ~8152 / 16 ≈ **~500**. Fanout scales inversely with key width — the single biggest lever on tree height.
-
-| Key type | ~bytes/entry | ~Fanout (8 KB page) |
-|---|---|---|
-| `int4` (4 B) | ~16 | ~500 |
-| `int8`/`bigint` (8 B) | ~20 | ~400 |
-| `uuid` (16 B) | ~28 | ~290 |
-| `text` ~40 B | ~52 | ~156 |
-
-InnoDB's **16 KB** page roughly doubles these fanouts; SQLite's 4 KB page halves them. The takeaway: **fanout is in the hundreds because the page is kilobytes and the keys are tens of bytes**, and that ratio — not any deep math — is why B-trees are only 3–5 levels tall (§62.11). **Occupancy invariants** (§62.15) guarantee nodes stay at least ~half full so the *worst-case* fanout is still ~half of these numbers, keeping height logarithmic even after arbitrary deletes.
-
----
-
-## 62.11 Worked Example: Height for a Billion Keys
-
-Put the fanout to work. Take a `bigint` index: fanout f ≈ 400, leaf capacity L ≈ 367 (90% fillfactor). The number of keys a tree of height *h* (counting levels) can hold is roughly `f^(h-1) × L`:
-
-```
-  h = 1 (root is a leaf):        L                 ≈ 367           keys
-  h = 2 (root + leaves):         f  × L  = 400×367 ≈ 146,800       keys
-  h = 3:                         f² × L  = 160k×367 ≈ 58,700,000   keys  (~59 M)
-  h = 4:                         f³ × L  = 64M×367  ≈ 23,500,000,000 keys (~23 B)
-  h = 5:                         f⁴ × L            ≈ 9.4 × 10¹²    keys  (~9 T)
-```
-
-Read off the practical answer:
-
-| Rows indexed | B-tree levels (f≈400, bigint) | BST height (log₂) |
-|---|---|---|
-| 10³ (1 K) | 1–2 | ~10 |
-| 10⁶ (1 M) | **3** | ~20 |
-| 10⁹ (1 B) | **4** | ~30 |
-| 10¹² (1 T) | **5** | ~40 |
-
-**A billion-row index is 4 levels deep.** A trillion-row index is 5. This is the number to have memorized, and the reason for the interview cliché that *"B-trees are always short and fat."* Even pathologically wide keys rarely push a real index past 5–6 levels, because fanout only has to be in the dozens to keep height single-digit: even f = 50 gives 50⁴ = 6.25 M leaves × 367 ≈ 2 billion keys at height 5.
-
-The payoff is entirely about the **serialized random I/O** of §62.4. A billion-key lookup is **4 page reads** in a B-tree versus **~30** in a balanced BST — and, crucially, the top 1–3 of those 4 levels are tiny and stay cached (§62.21), so the *physical* I/O per lookup is often just the **leaf read + the heap fetch**. That is the difference between a database that serves 100k point lookups/second and one that does not.
-
----
-
-## 62.12 Separator Keys and High Keys: How Routing Works
-
-Internal nodes route by **separator keys** (Postgres calls them **pivot tuples**). A separator is not a data key you can look up; it is a *boundary* that says "keys below me go left, keys at-or-above me go right." An internal node with keys `[k1, k2, …, k(m-1)]` and children `[c0, c1, …, c(m-1)]` obeys:
-
-```
-  keys in c0   <  k1
-  k1 ≤ keys in c1  <  k2
-  k2 ≤ keys in c2  <  k3
-  ...
-  k(m-1) ≤ keys in c(m-1)
-```
-
-So to route a search key `q`, find the child interval `q` falls into and descend. Because a B+tree stores all values in leaves, **the same key value can appear both as a leaf entry and as a separator up in an internal node** — the separator is just a copy used for routing (this is why leaf splits *copy* the key up while internal splits *push* it up, §62.16).
-
-**High keys (the B-link addition).** Postgres's Lehman & Yao design stores, in each page's special area, a **high key**: an upper bound on every key the page (and its subtree) may contain — effectively "the first key of my right sibling." The high key is what makes **right-links safe** (§62.8, §62.18):
-
-- During a lookup, if the search key is **greater than the page's high key**, the key must have **moved right** due to a concurrent split, so the searcher follows the **right-link** to the sibling instead of failing. This lets readers proceed during a split without locking the parent — the core of B-link concurrency (Ch. 64).
-- The high key also bounds range scans: a scan knows it has exhausted a leaf's relevant keys when it reaches the high key.
-
-**Suffix truncation** (PG 12+) exploits the fact that separators only need to be *just discriminating enough*. When splitting, Postgres computes the shortest prefix that still separates the two halves and stores only that as the pivot — e.g. to separate `"apple"` from `"banana"` it may store just `"b"`. Shorter separators mean more of them per internal page, i.e. **higher fanout and a shallower tree** for the same data (§62.10).
-
----
-
-## 62.13 Lookup Complexity: Why Base b Beats Base 2
-
-The lookup cost of a B-tree is **O(log_b N) page reads**, where *b* is the fanout — and the base of that logarithm is the whole point. Two logarithms differ only by a constant factor mathematically, but on disk the base is a factor of **8–9× in I/O count** for realistic sizes:
-
-```
-  N = 10⁹
-  BST:    log₂(10⁹)   ≈ 30      node reads (each a potential random I/O)
-  B-tree: log₄₀₀(10⁹) = log₂(10⁹)/log₂(400) = 30 / 8.64 ≈ 3.5 → 4 page reads
-```
-
-Every increment of fanout divides the height by `log₂(fanout)`. Going from fanout 2 to fanout 400 divides height by ~8.6. That constant is not "just a constant" when each unit is a serialized random seek costing milliseconds (HDD) or tens of microseconds (SSD).
-
-**In-node cost is separate and cheap.** Inside each of those ~4 pages the engine does a **binary search** over the sorted keys (§62.14): with ~400 keys per page that is ~log₂(400) ≈ 9 comparisons. Total comparisons ≈ 4 × 9 ≈ 36 — the *same* asymptotic ~log₂ N total comparisons as a BST (as it must be; comparisons are information-theoretically bounded). **The B-tree does not reduce the number of comparisons; it reduces the number of *page transfers*.** The comparisons happen in RAM on an already-loaded page (fast); the page transfers happen over the I/O bus (slow). B-trees move the log₂ N work from the slow axis to the fast axis.
-
-**Cache and TLB angle.** Even in a fully-cached index the base still helps: 4 buffer-pool lookups and 4 cache-resident pages beat 30 pointer-chases through 30 unrelated cache lines (each a likely L1/L2 miss, Ch. 27). A binary search *within* a page has poor spatial locality (it jumps around the page), which is why some engines lay keys out cache-obliviously (Eytzinger/van Emde Boas order) — an advanced optimization Postgres does not use, but the reason binary-search-in-node is not "free" even in memory.
-
----
-
-## 62.14 The Lookup Algorithm: Descent and In-Node Binary Search
-
-The algorithm is "descend, binary-searching within each node until you reach a leaf." Concretely, `lookup(q)`:
-
-```
-  page ← root (block number from metapage, §62.5)
-  loop:
-      pin page in buffer pool                      # §62.5 buffer manager
-      if page is INTERNAL:
-          i ← binary_search separators for q       # find child interval
-          child ← downlink[i]
-          if q > page.high_key:  child ← right_link # B-link: key moved right, §62.12
-          unpin page
-          page ← child                              # descend one level (one I/O if cold)
-          continue
-      else:  # LEAF
-          i ← binary_search leaf keys for q
-          if found:  return (key, TID) [+ walk right-links for duplicates/range]
-          else:      return NOT FOUND (position i is the insert point)
-```
-
-Points that come up in interviews:
-
-- **Every lookup, hit or miss, goes all the way to a leaf.** In a B+tree the value/TID is only in the leaf (§62.7), so there is no early termination at an internal node. Cost is uniform = tree height in page reads.
-- **Descent is serialized.** You cannot read level k+1 until level k's binary search names the child. Height = length of the serial I/O chain — the reason §62.11's "4 levels" is the latency-critical number.
-- **Binary search per node**, not linear scan: ~log₂(fanout) comparisons per page. Postgres's `_bt_binsrch` does exactly this on the page's sorted line-pointer array.
-- **A "not found" still returns a position** — the leaf slot where the key *would* go — which is exactly what an insert needs (§62.16), so lookup and the first phase of insert share code.
-- **The heap fetch is a separate, additional I/O.** For `SELECT * FROM t WHERE id=42`, the B-tree yields a **TID**, then Postgres reads the *heap* page and applies MVCC visibility (Ch. 61 §61.7, §61.16). So a point query is ≈ (index levels) + 1 heap read — of which the upper index levels are usually cached, leaving ~1 leaf read + 1 heap read as physical I/O (§62.21). An **index-only scan** can skip the heap read if the visibility map says the page is all-visible (Ch. 61 §61.13).
-
----
-
-## 62.15 Occupancy Invariants: The B-Tree of Order m
-
-The formal definition pins down "at least half full," which is what guarantees the fanout — and thus the logarithmic height — cannot silently collapse. A **B-tree of order m** (max m children per node) satisfies:
-
-| Invariant | Rule |
+| Layer | Example cost source |
 |---|---|
-| Max children | every node has ≤ **m** children (≤ m−1 keys) |
-| Min children (non-root internal) | every internal node has ≥ **⌈m/2⌉** children |
-| Min keys (non-root) | every node has ≥ **⌈m/2⌉ − 1** keys |
-| Root | ≥ 1 key (≥ 2 children) unless it is the only (leaf) node |
-| Depth | **all leaves are at the same depth** |
-| Order | keys within a node are sorted; subtree key ranges are separated by the parent's separators |
+| In-page CPU | comparator, binary search, decompression, branch/cache behavior |
+| Buffer manager | hash lookup, pin/reference management, latch acquisition |
+| Storage | queueing, controller/FTL behavior, media latency, page fault/read |
 
-The load-bearing invariant is the **minimum occupancy: every node except the root is at least ~half full.** Consequences:
+HDDs make random dependent reads especially costly because of mechanical positioning. SSD and NVMe devices reduce that gap substantially, but dependent misses, queueing, write amplification, and cache misses still matter. Do not attach one latency number to “NVMe” or conclude that random and sequential access are equivalent across devices and workloads.
 
-- **Guaranteed fanout ≥ ⌈m/2⌉**, so height ≤ ~log_{⌈m/2⌉} N even in the worst case. Without a minimum, deletes could leave nodes with one key each, degenerating the tree back toward a tall chain. The minimum is what makes the O(log N) bound *hold under deletes*, not just after a clean build.
-- **Space is at least ~50% utilized** in the worst case, ~69% (ln 2) on average under random insertions, and up to ~100% right after a bulk load. This bounds the on-disk size of the index to O(N).
-- **Splits and merges are the enforcement mechanism.** An insert that would exceed m−1 keys triggers a **split** (§62.16); a delete that would drop below ⌈m/2⌉−1 keys triggers a **borrow or merge** (§62.17). These are the only two operations that change node count, and they are what keep every node inside `[⌈m/2⌉−1, m−1]` keys.
+### Read and write amplification
 
-Terminology note: some texts define a B-tree by its **minimum degree t** instead, where each node holds between `t−1` and `2t−1` keys (so m = 2t). Same structure, different parameter. Interviewers may use either; be ready to translate `order m ↔ minimum degree t = ⌈m/2⌉`.
+Point lookup read amplification is roughly the uncached tree levels plus any base-row lookup. Insertion write amplification can include:
 
-**Postgres caveat (important, §62.19):** `nbtree` enforces the *maximum* (it splits on overflow) but **deliberately does not enforce the minimum** — it does not merge underfull pages during normal operation. So a heavily-deleted Postgres index can hold pages far below half full, which is the origin of **index bloat**. The classic order-m minimum-occupancy invariant is a *theoretical* guarantee that real systems often relax on the delete side for concurrency reasons.
+- the modified leaf;
+- a newly allocated split page;
+- parent pages if separators propagate;
+- logging or copy-on-write metadata;
+- storage-device internal amplification.
 
----
-
-## 62.16 Node Splits on Insert
-
-Inserts never make the tree taller by pushing leaves down; they make it taller by **splitting a full node and propagating a separator up**, growing the tree **at the root**. The algorithm, bottom-up:
-
-1. Descend to the target leaf (§62.14); the lookup's "not found" position is the insert slot.
-2. If the leaf has room (< m−1 keys), insert in sorted order. **Done — no propagation.** This is the overwhelmingly common case.
-3. If the leaf is full, **split** it: divide its keys into a left and right half around a **median**, allocate a new sibling page, and **insert a separator + downlink for the new page into the parent.**
-4. If the parent is now full, it splits too, recursively, up the tree.
-5. If the **root** splits, allocate a **brand-new root** with one key and two children. **The tree's height increases by exactly one** — the only way that ever happens.
-
-**Leaf split copies up; internal split pushes up** (the B+tree distinction, §62.7): a leaf must keep *all* its keys, so the separator is a **copy** of the right half's first key; an internal node's median key is a pure separator, so it is **moved** up and removed from the child.
-
-Worked example, order m = 4 (max 3 keys/node), inserting into a leaf that is full:
-
-```
-Start: root=leaf [10 | 20 | 30]      (full: 3 keys)
-
-Insert 40 → leaf overflows [10 20 30 40], split around median:
-   left leaf [10 | 20]      right leaf [30 | 40]
-   copy up first key of right half (30) as the new root separator:
-
-            [ 30 ]                 ← NEW ROOT, tree height 1 → 2
-           /      \
-      [10 | 20]  [30 | 40]         ← leaves, linked ⇄
-
-Insert 50, 60 → right leaf fills [30 40 50 60]... wait, 3-key max:
-Insert 50 → [30 | 40 | 50] full.  Insert 60 → split [30 40 | 50 60]:
-   push 50 up into root:
-            [ 30 | 50 ]
-           /    |     \
-    [10 20] [30 40] [50 60]
-```
-
-Properties to state:
-
-- **Splits propagate bottom-up, O(height) pages** in the worst case (a "cascading" split all the way to the root), but amortized O(1) because most inserts stop at step 2. Bulk sequential inserts (monotonic key) always split the **rightmost** page — Postgres has a *fast-path* for this (`_bt_search` right-most cache).
-- **The tree stays perfectly balanced** because growth happens only at the root, lengthening *every* root-to-leaf path by one simultaneously.
-- **Splits under crash/concurrency are the hard part** (Ch. 64): a split touches ≥ 2 pages (child + parent, or child + new sibling + parent) that must change atomically. Postgres uses the **right-link + high key** (§62.12) so a concurrent reader can still navigate a half-completed split, and WAL-logs the split as one atomic action (Ch. 65).
-- A split at ~50/50 leaves both pages ~half full; Postgres biases **rightmost-page splits** heavily to the left (~90/10) so ever-increasing keys keep the left page packed — otherwise a monotonic workload would leave every page 50% full.
+The algorithm bounds the number of pages on a path, but recovery and storage policies determine physical writes. Chapters 63–65 make those layers explicit.
 
 ---
 
-## 62.17 Node Merges and Rebalancing on Delete
+## 62.7 A Compact Validated Model — Core
 
-Deletion is the mirror image: removing a key can drop a node **below the minimum occupancy** (⌈m/2⌉−1 keys) — an **underflow** — which is repaired by *borrowing* from a sibling or *merging* with one, and merges can shrink the tree at the root.
+This small C++23 model demonstrates routing, leaf insertion, and leaf splitting. It intentionally supports a root with leaf children only; recursive internal splitting is left as an exercise. That limitation keeps the code honest and small rather than disguising a partial production implementation.
 
-The classic (textbook / InnoDB-style) delete algorithm:
+```cpp
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <vector>
 
-1. Find and remove the key from its leaf.
-2. If the leaf still has ≥ ⌈m/2⌉−1 keys, **done.**
-3. Else **underflow**. Try to **borrow (rotate)** from an adjacent sibling that has *spare* keys (> minimum): move one key from the sibling through the parent (the sibling's extreme key rotates up into the parent, the parent's separator rotates down into the deficient node). Occupancy restored, no merge.
-4. If no sibling has a spare key, **merge** the deficient node with a sibling: combine their keys plus the parent's separator into one node, and **remove the separator + downlink from the parent.**
-5. Removing the separator can now underflow the **parent**, so borrow/merge recurses upward.
-6. If the merge empties the **root** (drops it to zero keys / one child), **delete the root and make its sole child the new root** — the tree's height **decreases by one.**
+struct Leaf {
+    std::vector<int> keys;
+};
 
-Worked example, order m = 4 (min = ⌈4/2⌉−1 = 1 key), borrow then merge:
+struct Root {
+    // separator[i] is the lower bound of child[i + 1]
+    std::vector<int> separators;
+    std::vector<Leaf> children;
+};
 
+std::size_t child_for(Root const& root, int key) {
+    return static_cast<std::size_t>(
+        std::upper_bound(root.separators.begin(),
+                         root.separators.end(), key)
+        - root.separators.begin());
+}
+
+bool contains(Root const& root, int key) {
+    Leaf const& leaf = root.children[child_for(root, key)];
+    return std::binary_search(leaf.keys.begin(), leaf.keys.end(), key);
+}
+
+void insert_unique(Root& root, int key, std::size_t leaf_capacity) {
+    std::size_t i = child_for(root, key);
+    Leaf& leaf = root.children[i];
+    auto pos = std::lower_bound(leaf.keys.begin(), leaf.keys.end(), key);
+    if (pos != leaf.keys.end() && *pos == key) return;
+    leaf.keys.insert(pos, key);
+
+    if (leaf.keys.size() <= leaf_capacity) return;
+
+    std::size_t mid = leaf.keys.size() / 2;
+    Leaf right{{leaf.keys.begin() + static_cast<std::ptrdiff_t>(mid),
+                leaf.keys.end()}};
+    leaf.keys.erase(leaf.keys.begin() + static_cast<std::ptrdiff_t>(mid),
+                    leaf.keys.end());
+
+    int separator = right.keys.front();
+    root.separators.insert(root.separators.begin()
+                               + static_cast<std::ptrdiff_t>(i),
+                           separator);
+    root.children.insert(root.children.begin()
+                             + static_cast<std::ptrdiff_t>(i + 1),
+                         std::move(right));
+}
+
+int main() {
+    Root root{{}, {Leaf{{10, 20, 30, 40}}}};
+    insert_unique(root, 25, 4);
+
+    assert((root.separators == std::vector<int>{25}));
+    assert((root.children[0].keys == std::vector<int>{10, 20}));
+    assert((root.children[1].keys == std::vector<int>{25, 30, 40}));
+    assert(contains(root, 25));
+    assert(!contains(root, 26));
+}
 ```
-            [ 30 | 50 ]
-           /    |     \
-    [10 20] [40]    [60 70]
 
-Delete 40 → middle leaf [40] becomes empty (underflow, needs ≥1 key).
-  Left sibling [10 20] has a spare → BORROW:
-     move 20 up as new separator, pull old separator 30 down:
-            [ 20 | 50 ]
-           /    |     \
-      [10]   [30]   [60 70]
-
-Now delete 30 → middle leaf empty again.
-  Left sibling [10] has NO spare (at minimum) → MERGE middle with left,
-  pulling separator 20 down:
-            [ 50 ]
-           /      \
-     [10 20]    [60 70]           ← parent lost a key; still valid
-```
-
-**PostgreSQL does almost none of this.** `nbtree` **does not borrow or merge underfull pages during normal deletes.** A deleted leaf entry is just marked dead / removed, and the page is left underfull. Merging is avoided because it would require locking multiple pages and the parent in a way that fights the B-link concurrency design (§62.18, Ch. 64). Instead:
-
-- A page is only **fully emptied and unlinked** (recycled to the free space map) by **VACUUM**, and only when it becomes *completely* empty, not merely underfull.
-- This is a deliberate trade: **cheap, highly-concurrent deletes in exchange for potential index bloat** (§62.19–§62.20). It is the single biggest divergence between the textbook B-tree and Postgres's real one.
-
-So the honest interview answer is two-layered: *the general B-tree balances deletes with borrow/merge to preserve the half-full invariant; Postgres skips it, leaves pages sparse, and relies on VACUUM + REINDEX to reclaim space.*
+The model stores children by value, not page ID, and vector insertion invalidates references. It has no persistence, duplicate values, sibling links, deletion, recursive internal nodes, concurrency, or recovery. Its purpose is to validate the separator convention and split trace. A production implementation requires explicit page ownership and failure handling, which Chapter 64 develops.
 
 ---
 
-## 62.18 PostgreSQL nbtree Internals
+## 62.8 Deep Dives: Keys, Bulk Build, and Validation — Deep dive
 
-`nbtree` (`src/backend/access/nbtree/`) is Postgres's B+tree access method and the default for `CREATE INDEX`. Concrete facts worth having ready:
+### Duplicate and composite keys
 
-- **B+tree, 8 KB pages.** Every entry `(index key, heap TID)` lives in the leaf level; internal pages hold pivots + downlinks. Page = `BLCKSZ` = 8192 B (§62.3, §62.10).
-- **Lehman & Yao B-link tree.** Each page carries a **high key** and a **right-link** to its sibling (§62.12). This is what lets Postgres do lookups and splits with only **per-page** locks (latches) instead of locking a path from root to leaf, giving high write concurrency (developed in Ch. 64). A reader that arrives at a page mid-split simply *moves right* if the wanted key exceeds the high key.
-- **Metapage at block 0.** Points to the current root block and caches the tree level; read first on every descent (§62.5). The root's location changes on a root split, so the indirection is necessary.
-- **TID as tiebreaker (PG 12+).** Duplicate index keys are kept in **heap-TID order**, making the key effectively unique internally. This makes index scans over duplicates stable and enables targeted deletion.
-- **Suffix truncation (PG 12+).** Pivot tuples in internal pages are truncated to the shortest distinguishing prefix (§62.12), raising internal fanout and often shaving a level off wide-key indexes.
-- **Deduplication (PG 13+).** Runs of equal keys in a leaf are stored once as a **posting list** `(key → list of TIDs)` instead of repeating the key per TID, dramatically shrinking low-cardinality indexes (e.g. a boolean or status column) and deferring page splits.
-- **Bottom-up index deletion (PG 14+).** When a leaf is about to split due to churn from **non-HOT updates** (Ch. 61 §61.14), nbtree first tries to reclaim entries pointing to *dead* heap tuples on that page, frequently **avoiding the split entirely** and curbing "version churn" bloat.
-- **Fast path for monotonic inserts.** A cached rightmost-leaf pointer lets ever-increasing keys (serial PKs, timestamps) skip the root-to-leaf descent and append directly, with a left-biased split (§62.16).
-- **Height in practice: 3–5 levels.** For the vast majority of tables (up to hundreds of millions of rows) the index is 3–4 levels (§62.11). `SELECT * FROM bt_metap('idx')` and the `pageinspect` extension expose the actual `level`.
+The clean diagrams use unique integers, but database indexes commonly contain duplicates. A search tree still needs a total routing order. Three broad representations are:
 
-`nbtree` is thus a *B-link B+tree with suffix truncation, deduplication, and lazy space reclamation* — recognizably the textbook structure, tuned hard for concurrency and MVCC churn rather than for the classic minimum-occupancy invariant.
+1. **Composite physical key.** Order entries by `(user_key, row_id)` or another unique suffix. Every physical entry has a distinct position even when many user keys compare equal.
+2. **Posting list.** Store one user key with a list or compressed set of row references. This can reduce repeated-key storage but makes updates and overflow handling more complex.
+3. **Repeated equal entries.** Permit multiple equal keys and define precisely whether descent chooses the leftmost or rightmost candidate page, then scan across siblings as needed.
+
+Suppose a leaf split divides equal key `42` across both pages. A parent separator containing only `42` cannot tell a point lookup which page contains a particular row reference. That is not necessarily wrong: the lookup can descend to the first possible page and scan right. But uniqueness checks, deletion by row ID, and range endpoints must use the same convention. Adding a tie-breaker to the physical key can make routing exact.
+
+Composite SQL keys add another issue: lexicographic order. An index on `(venue, symbol, timestamp)` can efficiently route:
+
+- an equality prefix such as `venue = ?`;
+- a longer equality prefix plus a range on the next component;
+- a complete tuple lookup.
+
+It does not generally provide the same routing power for a predicate on `timestamp` alone, because timestamps for different venues and symbols are interleaved by the earlier components. This is an ordering consequence, not a planner quirk.
+
+Null ordering, collation, descending components, and locale/version changes belong to the comparator contract. If two processes or software versions disagree about key order, the tree can remain structurally well formed while searches return wrong results. Persistent indexes therefore tie their semantics to operator classes, collation versions, or rebuild requirements.
+
+### Variable-length keys and separator truncation
+
+A fixed-order textbook tree counts entries. A variable-length tree budgets bytes. Consider two leaves:
+
+```
+leaf A: 100 short integer keys
+leaf B: 8 long strings
+```
+
+They may have similar byte occupancy even though their entry counts differ by more than an order of magnitude. Split selection should normally balance byte use and ensure that both results satisfy any required minimum. A simple `entries.size() / 2` split can create one nearly full page and one nearly empty page.
+
+Internal separators need only distinguish adjacent child ranges; they do not always need the entire leaf key. If the largest key on the left is:
+
+```
+"exchange/alpha/2026-07-23/000099"
+```
+
+and the smallest on the right is:
+
+```
+"exchange/beta/2026-01-01/000001"
+```
+
+a shorter boundary derived from `"exchange/b..."` may suffice, subject to comparator semantics. Short separators increase fanout. The shortening algorithm must still choose a value strictly above the left range and at or below the right range under the routing convention. Byte-prefix truncation is unsafe for arbitrary collations or encodings unless the comparator contract explicitly supports it.
+
+Prefix compression can also encode each key relative to a page prefix or previous key. That trades CPU work and update complexity for smaller pages and greater fanout. Capacity calculations must then use measured encoded sizes and include restart points or metadata, rather than dividing by the uncompressed C++ object size.
+
+### Bulk construction
+
+Repeated insertion is not the only way to create a tree. If entries are already sorted, a **bulk load** can build leaves from left to right:
+
+1. Allocate a leaf and append sorted entries until its target fill is reached.
+2. Link it to the preceding leaf.
+3. Record the new leaf's lower bound for the parent level.
+4. Build the next leaf.
+5. Once leaves are complete, construct the next internal level from their lower bounds and page IDs.
+6. Repeat until one root remains.
+
+```
+sorted input
+   │
+   ├──> [leaf 0] -> [leaf 1] -> [leaf 2] -> [leaf 3]
+   │          \        |           |          /
+   └────────── separators build parent level ──┘
+```
+
+Bulk construction avoids the repeated search and split propagation of inserting every item into an initially empty tree. It can choose a desired initial free-space reserve and often writes pages in an allocation-friendly order. Its cost includes sorting when the input is not already ordered. External sorting, WAL policy, parallel construction, and crash recovery are product-level concerns.
+
+Target occupancy is a tradeoff:
+
+- Dense pages reduce space and read amplification.
+- Reserved free space can absorb future inserts without immediate splits.
+- Append-only increasing keys concentrate future inserts at the right edge.
+- Random keys distribute insert pressure but can fragment free space across many leaves.
+
+No one fill target is best for bulk build, steady updates, or skewed append workloads. Measure split rate, page utilization, and write amplification for the actual key distribution.
+
+### In-page search
+
+Tree height counts page visits, but each visit performs CPU work. Binary search takes `O(log e)` comparator calls for `e` entries. With variable strings or locale-aware comparison, comparator cost can dominate. Alternatives include:
+
+- linear search for very small pages;
+- interpolation or learned position estimates for suitable distributions;
+- cache-conscious layouts that separate fixed-size key prefixes from payload offsets;
+- SIMD comparison of fixed-width keys;
+- prefix compression with restart points;
+- storing a short discriminator alongside a long key.
+
+Binary search has non-sequential probes and branches; linear search has predictable access but more comparisons. The crossover depends on entry count, key width, comparator, cache state, compiler, and CPU. This belongs to the in-page representation, not the abstract B+tree proof.
+
+Do not optimize it from an instruction count alone. A sampled profile must show that internal-page comparison is material after accounting for buffer lookup, latching, leaf comparison, and any base-row fetch.
+
+### Bottom-up validation
+
+A validator is often more valuable than another optimization. Given a quiescent tree, validate recursively:
+
+1. Page keys are sorted by the exact production comparator.
+2. Internal pages have one more child than separator in this representation.
+3. Every child range is bounded by its neighboring separators.
+4. Every leaf has the same depth.
+5. Occupancy respects root and non-root rules.
+6. Every referenced page exists and no reachable page is visited twice unless the format explicitly permits sharing.
+7. Leaf next-links form one acyclic ordered chain containing exactly the reachable leaves.
+8. Parent-derived lower/upper bounds agree with the minimum and maximum keys found below.
+
+One useful interface carries bounds down the recursion:
+
+```cpp
+struct Bound {
+    int key;
+    bool inclusive;
+};
+
+void validate(PageId id,
+              std::optional<Bound> low,
+              std::optional<Bound> high,
+              unsigned depth,
+              std::optional<unsigned>& leaf_depth);
+```
+
+At an internal page, derive a bound pair for every child. At a leaf, verify every entry against the inherited pair and compare `depth` with the first observed leaf depth. Separately walk the sibling chain and compare it with the recursive leaf order.
+
+For the compact model, property-based testing can compare `insert`, `erase`, and `contains` with `std::set`. Generate adversarial sequences as well as random ones:
+
+- strictly increasing and decreasing insertion;
+- repeated boundary keys;
+- insert to split, then delete to minimum;
+- alternating operations near separators;
+- delete everything to force root collapse;
+- variable-size keys clustered around the page byte limit.
+
+A set oracle checks logical contents; structural validation checks the tree-specific invariants. Both are necessary. A tree can contain the right keys yet have a stale separator that only fails after a later split.
+
+### Failure boundaries
+
+The abstract operations say “allocate page, write children, update parent.” Persistence turns those into a multi-write transaction. A crash can occur after any write. Copy-on-write trees, WAL-protected in-place trees, and shadow-paging designs solve this with different publication and recovery rules.
+
+The key distinction is:
+
+- **algorithmic invariant:** what a completed tree state must satisfy;
+- **concurrent invariant:** what readers may observe during an operation;
+- **recovery invariant:** which incomplete states are legal after a crash and how replay/rollback repairs them.
+
+Chapter 62 proves only the first. Chapter 64 handles concurrent structural modification; Chapter 65 handles recovery. Keeping those contracts separate prevents plausible-looking single-thread pseudocode from being treated as durable code.
+
+### Why the bounds hold
+
+The equal-depth invariant and minimum occupancy give the height bound. Let a non-root internal page have at least `t` children, where `t >= 2`. At height 1, the root is a leaf. At height 2, the root has at least two leaf children after the first root split. Each additional internal level multiplies the minimum number of reachable leaves by at least `t`.
+
+For height `h >= 2`, a simplified minimum-leaf count is:
+
+```
+minimum leaves >= 2 * t^(h - 2)
+```
+
+If every non-root leaf contains at least `l_min` entries, then:
+
+```
+N >= 2 * t^(h - 2) * l_min
+```
+
+Solving for `h` yields a logarithmic upper bound. The root exception changes the constant, not the logarithm. This proof is why a deletion algorithm cannot simply leave arbitrary empty non-root pages: without a lower occupancy invariant, fanout can collapse toward one and the height guarantee disappears.
+
+Operation bounds follow from the same path structure:
+
+- Search visits one page per level: `O(h)`.
+- Insert searches one path and can split at most one page per level: `O(h)` page-level structural work.
+- Delete searches one path and can rebalance at most one page per level: `O(h)` page-level structural work.
+- Range scan visits `O(h + q)` pages where `q` is the number of leaf pages traversed, plus output processing.
+
+These are worst-case algorithmic counts. A split copies many bytes within one or two pages, comparator cost varies, and durable logging adds work. Big-O does not turn all page operations into equal-latency events.
+
+### Choosing a page size
+
+Larger pages tend to increase fanout and reduce metadata overhead per stored key. They can also:
+
+- increase the bytes read when a lookup needs only one entry;
+- increase split-copy and write size;
+- increase latch hold time for page-local work;
+- waste cache when access is sparse;
+- interact differently with filesystem, virtual-memory, and device granularities.
+
+Smaller pages can reduce transfer and copy size but increase height and metadata. The best unit depends on whether the engine uses a private buffer pool, the OS page cache, direct I/O, memory mapping, remote storage, or persistent memory. It also depends on checksum and atomic-write assumptions.
+
+A “page” is therefore a software contract, not necessarily one hardware sector or one virtual-memory page. An engine may issue several device sectors for one database page, or group several database pages in one I/O. Conversely, a memory-resident B+tree may size nodes for cache lines or allocator classes rather than storage blocks.
+
+Use a sensitivity table instead of a universal recommendation. For fixed overhead 128 bytes and 28-byte internal entries:
+
+| Page bytes | Approximate maximum routing entries |
+|---:|---:|
+| 4,096 | `floor((4096 - 128) / 28) = 141` |
+| 8,192 | `288` |
+| 16,384 | `580` |
+| 32,768 | `1,165` |
+
+Doubling page size roughly doubles maximum fanout in this fixed-width example, but it does not necessarily reduce measured latency. Recompute with the actual encoded key distribution, then benchmark the end-to-end workload.
+
+### Fragmentation and maintenance
+
+There are several different kinds of “empty space”:
+
+- **in-page free space** available for another entry;
+- **fragmented in-page space** recoverable by compaction;
+- **underfull live pages** that still participate in the tree;
+- **unreachable pages** awaiting safe reclamation;
+- **unused file extents** that may or may not be returned to the filesystem.
+
+Deleting half the logical rows does not imply that an index file shrinks by half. If surviving keys are spread across many leaves, each leaf may remain reachable. Merging can consolidate them, but durable concurrent merging has a cost and may move contention elsewhere. Rebuild, vacuum-like maintenance, background compaction, and online page recycling are product policies.
+
+Insertion order also shapes fragmentation. Monotonic keys usually target the rightmost leaf, producing a concentrated append/split pattern. Random keys distribute writes and splits across the key space. Neither is universally better: monotonic keys improve locality but can create a hot page under concurrency; random keys reduce one hotspot but may increase working-set breadth and fragmentation.
+
+Measure:
+
+- live bytes versus allocated bytes;
+- leaf and internal occupancy distributions, not only averages;
+- splits and merges per write;
+- tree height over time;
+- cache hit rate by level;
+- write bytes at the database, filesystem, and device layers.
+
+Those observations distinguish a structural tree problem from buffer, allocator, recovery, or device amplification.
 
 ---
 
-## 62.19 Why Postgres Rarely Merges: VACUUM and Page Splits
+## 62.9 PostgreSQL `nbtree`: A Labeled Case Study — Skippable Reference
 
-Tie together *why* Postgres relaxes the delete-side balancing of §62.17, because it is a favorite deep-dive question and it connects the B-tree to the whole MVCC story (Ch. 61 §61.14, Ch. 65).
+The following is product-specific. PostgreSQL's `nbtree` access method is a B+tree-family implementation with B-link techniques. Details can change across releases, compile-time options, and index operator classes; consult the documentation and source for the deployed major version.
 
-**MVCC makes index churn constant.** Every `UPDATE` that changes an indexed column (or any non-HOT update) inserts a **new index entry** pointing at the new heap tuple version, while the old entry lingers until it is known dead. Deletes likewise leave index entries pointing at soon-dead tuples. So an nbtree is perpetually accumulating entries that will become garbage — far more write pressure on the index than a naive "one entry per live row" model.
+At a high level:
 
-**Merging would fight concurrency.** Borrowing/merging (§62.17) requires atomically locking a node, a sibling, and the parent, coordinated up the tree — exactly the multi-page, top-down locking the B-link design (§62.18) exists to *avoid*. Eager merges would serialize writers and reintroduce the contention B-link removed. So Postgres chooses **not to merge underfull pages** at all during DML.
+- Leaf tuples contain indexed key data plus a heap tuple identifier, subject to features such as deduplication and included columns.
+- Internal pivot tuples contain routing information and downlinks.
+- Pages have sibling links and high-key conventions used to preserve navigation across splits.
+- A metapage records tree metadata including a root reference.
+- Page-local special/opaque metadata records `nbtree` state such as level and sibling-navigation information; exact structs and flags are source-version details.
+- Page size is controlled by the build's `BLCKSZ`; the common packaged default is not a universal PostgreSQL or B+tree constant.
+- Pivot-key suffix truncation is available in modern PostgreSQL releases to keep internal routing tuples smaller where semantics permit.
+- Duplicate representation, bottom-up deletion, page recycling, and vacuum interaction are version- and workload-dependent.
 
-**What reclaims space instead:**
+Do not transfer the textbook immediate-merge rule directly to PostgreSQL. PostgreSQL commonly removes dead index tuples and reuses space without eagerly coalescing every underfull page. MVCC visibility is primarily determined through heap and visibility metadata; an index entry's presence does not by itself prove that a row version is visible to the current snapshot.
 
-- **VACUUM** scans the index, removes entries pointing to dead tuples, and — only when a page ends up **completely empty** — unlinks it and records it in the **free space map** for reuse by future splits. It does **not** consolidate two half-full pages into one.
-- **Page splits are never undone.** Once a page splits, the two halves persist even if later deletes empty them below half full. A workload of "insert ascending, delete oldest" (a queue) can leave a long trail of sparse pages that VACUUM cannot merge — a classic bloat pattern.
-- **`REINDEX` / `REINDEX CONCURRENTLY`** is the real remedy: it rebuilds the index from scratch, packing leaves to `fillfactor` and restoring minimal height. It is the only routine way to *shrink* an index and reset occupancy.
-- **Bottom-up deletion (PG 14+, §62.18)** and **deduplication (PG 13+)** attack the problem preventively by deferring or avoiding splits, which reduces how much bloat accumulates in the first place — but they don't merge existing sparse pages either.
+Likewise, do not treat a PostgreSQL high key as the generic definition of every B+tree separator. High keys and right-links are part of a concurrency/navigation design. The abstract tree in §§62.1–62.7 needs only ordered separators and stable child ranges.
 
-The one-line summary: **Postgres trades the textbook half-full guarantee for lock-light, MVCC-friendly writes, and pays for it with index bloat that VACUUM only partially reclaims and REINDEX fully fixes.**
+Useful version-labeled inspection commands include:
+
+```sql
+SELECT current_setting('block_size');   -- server build/runtime report
+SELECT version();
+```
+
+Extensions such as `pageinspect` can expose page details for investigation, but their functions and output are PostgreSQL-version-specific and require appropriate privileges. They are diagnostic interfaces, not application APIs.
+
+Three PostgreSQL boundaries are especially easy to blur:
+
+**Uniqueness.** A unique B-tree index enforces a logical constraint, but MVCC means an apparently conflicting heap tuple may be deleted, uncommitted, or otherwise subject to visibility/wait rules. The index access method and transaction machinery cooperate; separator routing alone cannot decide uniqueness.
+
+PostgreSQL also has a speculative-insertion protocol used by operations such as conflict-aware insertion. Its wait/confirm/abort behavior is transaction machinery layered on the index search; it is not a generic B+tree insertion step.
+
+**Index-only scans.** An `nbtree` leaf can contain key data, a heap TID, and optionally included columns, yet PostgreSQL may still need visibility information associated with the heap. The visibility map can allow some heap visits to be skipped. “All values live in B+tree leaves” is the abstract structure; it does not mean every SQL query is answerable without consulting MVCC metadata.
+
+**Deletion and reuse.** Removing an index tuple, marking a page recyclable, unlinking a page from the sibling chain, and reusing its block number are distinct events with concurrency and recovery constraints. A generic merge diagram does not specify when PostgreSQL performs each event. Release notes and the deployed source version are the authority for bottom-up deletion, deduplication, vacuum interaction, and page-recycling behavior.
+
+**Build-time comparison.** PostgreSQL operator classes may provide sort-support routines and abbreviated keys to accelerate sorting during index construction. An abbreviation is an optimization for comparison/sort work, not necessarily the persistent logical key or an internal separator. Its safety and collision handling are defined by the operator class and release.
+
+For a concrete investigation, record at least:
+
+- `server_version_num`;
+- `block_size`;
+- complete index definition and operator classes;
+- whether deduplication or included columns apply;
+- observed index levels and page statistics from version-compatible tooling;
+- workload phase, since a newly built index and a churned index can have different occupancy.
+
+That evidence makes a fanout or bloat explanation reproducible without turning one PostgreSQL release's page layout into a universal algorithm.
 
 ---
 
-## 62.20 fillfactor, Deduplication, and Index Bloat
+## 62.10 Concurrency Handoff — Core Boundary
 
-**`fillfactor`** is the knob for how full B-tree pages are packed *at build/insert time*, trading space for split-avoidance.
+The single-thread algorithm assumes a page does not change between choosing a child and reading it. A concurrent split violates that assumption unless the implementation adds a protocol.
 
-- Default for a B-tree index is **90** (leaves filled to 90%, ~10% left free). Internal pages ignore fillfactor and pack full.
-- **Lower fillfactor (e.g. 70)** leaves more free space per leaf, so subsequent inserts/updates near existing keys find room *without splitting* — good for tables with many in-place-ish updates, at the cost of a larger index and slightly worse scan density.
-- **fillfactor 100** packs leaves completely — ideal for **read-only or append-only monotonic** indexes (nothing will be inserted between existing keys), giving the smallest, shallowest tree and best scan locality. Postgres already special-cases rightmost splits toward ~90/10 for monotonic keys (§62.16).
+Questions a concurrent design must answer include:
 
-```
-CREATE INDEX idx ON t (k) WITH (fillfactor = 100);   -- pack tight, read-mostly
-CREATE INDEX idx ON t (k) WITH (fillfactor = 70);    -- leave slack for churn
-```
+- Which operation linearizes a point lookup, insert, or delete?
+- Which latches protect in-memory page bytes, and how are they ordered to avoid deadlock?
+- Can a reader release a parent before latching a child?
+- If a child splits before its parent receives the new separator, how does a reader find the new right page?
+- How are range scans kept complete without returning an entry twice?
+- When can a removed page ID be safely reused?
+- How are partially completed structural changes recovered after a crash?
 
-**Index bloat** is the gap between an index's on-disk size and the size it *would* be if rebuilt. Its sources, all from this chapter:
+A B-link design associates a right-link and an upper bound/high key with a page. A reader whose search key exceeds that bound moves right, allowing it to recover from some parent/child timing windows. That sentence is only the intuition. Correctness depends on exact latch order, publication order, memory reclamation, and WAL/recovery rules.
 
-| Source | Mechanism | Remedy |
+Chapter 64 owns latch coupling, split propagation, B-link/high-key traversal, concurrent scans, and recovery interactions. Chapter 62 intentionally does not provide concurrent pseudocode that could be mistaken for a complete algorithm.
+
+---
+
+## 62.11 B+Tree Versus Other Access Methods — Role-specific
+
+An index is chosen for its workload and storage policy, not because one structure wins universally.
+
+| Structure | Strength | Cost or limitation |
 |---|---|---|
-| MVCC version churn | non-HOT updates add index entries per version (§62.19) | autovacuum; bottom-up deletion (PG 14) |
-| Un-merged sparse pages | deletes leave pages < half full; nbtree never merges (§62.17) | REINDEX |
-| Split fragmentation | 50/50 splits leave both halves half-empty under random inserts | REINDEX; tune fillfactor |
-| Low-cardinality repetition | repeated keys stored per TID (pre-PG 13) | deduplication (PG 13+) |
+| B+tree | point lookup, ordered scan, predecessor/successor | in-place splits and page maintenance |
+| Hash index | equality lookup | no intrinsic ordering or range scan |
+| LSM tree | high sequential write throughput | compaction and read/write amplification |
+| Radix/trie family | prefix structure, bytewise routing | key-shape and memory-layout sensitivity |
+| Sorted flat file/run | dense scans and binary search | updates require rebuilding/merging |
 
-**Deduplication** (PG 13+) is worth restating as a fanout multiplier: instead of storing `(status='active', TID1), (status='active', TID2), …` as N full entries, nbtree stores one posting-list tuple `status='active' → [TID1, TID2, …]`. For a column with few distinct values this can shrink the index several-fold and postpone splits, effectively *raising leaf occupancy* without touching fillfactor. It is enabled by default (`deduplicate_items = on`) except where semantics forbid it (e.g. unique indexes still allow it, but not with `INCLUDE`d columns in some versions).
-
-To measure bloat: the `pgstattuple` extension (`pgstatindex('idx')`) reports `avg_leaf_density` and `leaf_fragmentation`; a healthy freshly-built index shows leaf density near the fillfactor, and heavy bloat shows it far lower.
+A B+tree is attractive when ordered access and mixed reads/writes matter. An LSM design may be better for sustained ingestion, accepting background compaction and multi-run lookup. In-memory indexes can choose cache-line-sized nodes, radix partitions, or contiguous arrays rather than storage pages. Chapter 61 provides the broader storage comparison.
 
 ---
 
-## 62.21 Practical Numbers: Levels, Caching, and Latency
+## 62.12 Recall and Practice — Core
 
-Assemble the numbers into the picture a senior engineer should be able to sketch on a whiteboard: **why B-trees are shallow, and why the upper levels are free.**
+**Recall card**
 
-**Levels vs rows** (bigint key, f≈400, §62.11): 1 M → 3 levels, 1 B → 4, 1 T → 5. Real Postgres indexes are almost always **3–5 levels.**
+- B+tree internal pages route; leaves own all searchable entries and are linked in order.
+- Separators and child ranges must use one explicit equality convention.
+- All leaves have equal depth. Only a root split increases height; only root collapse decreases it.
+- Leaf split copies a boundary upward; a common internal split promotes a separator.
+- Delete redistributes when a sibling can spare occupancy, otherwise merges and removes a parent separator.
+- Minimum occupancy is part of the textbook bound, but products may use byte-based thresholds and defer merges.
+- Fanout is a page-budget calculation, not a remembered constant.
+- Height is driven exponentially by fanout, while physical I/O depends on caching and the row-fetch path.
+- PostgreSQL `nbtree`, its page size, high keys, deduplication, and deletion policy are product/version facts.
+- Concurrent correctness and recovery are Chapter 64–65 concerns.
 
-**The upper levels stay cached, so height ≠ physical I/O.** Count the pages at each level of a 4-level, billion-key index:
+**Questions**
+
+1. State the seven invariants in §62.1 and identify which ones are relaxed for the root.
+2. Given separators `[20, 50, 80]`, which child receives keys `19`, `20`, `79`, and `80` under this chapter's convention?
+3. Why is a leaf separator copied into the parent, while a common internal split promotes a separator?
+4. After borrowing the smallest key from a right leaf, which parent separator must change and why?
+5. Derive internal fanout from page, header, slot, separator, child-reference, and metadata sizes. Which inputs are averages?
+6. Explain why a height-4 lookup need not issue four device reads.
+7. Contrast textbook immediate merge with a storage engine that defers coalescing sparse pages.
+8. What information lets a B-link reader recover from landing on the left half of a concurrently split key range?
+
+**Puzzle**
+
+Leaf capacity is 4, minimum occupancy is 2, and the root is:
 
 ```
-  Level 3 (root):        1 page          ~8 KB      always in shared_buffers
-  Level 2 (internal): ~400 pages       ~3 MB       trivially cached
-  Level 1 (internal): ~160,000 pages   ~1.2 GB     mostly cached if index is hot
-  Level 0 (leaves):  ~2,700,000 pages   ~21 GB      too big to fully cache
+                  [25 | 60]
+                /     |       \
+          [5 10] [25 40] [60 70 90]
 ```
 
-The top two-to-three levels are a few megabytes — they live permanently in the buffer pool for any actively used index. So a point lookup's **physical** cost is typically:
+Apply, in order: insert `50`, insert `55`, delete `25`, delete `40`. Draw the tree after each operation. At every step list the separator updates, sibling-link changes, and whether redistribution or merge is required. More than one split policy may be valid; state yours and verify all child intervals.
 
-```
-  root + upper internals ... cache hits (0 physical reads)
-  leaf page ............... 1 physical read (if cold)         ~50–100 µs NVMe
-  heap page .............. 1 physical read (Ch. 61 §61.16)    ~50–100 µs NVMe
-  --------------------------------------------------------
-  ≈ 2 physical reads for a cold point query, ~0 for a hot one
-```
+**Implementation exercise**
 
-This is why B-trees dominate OLTP: **an indexed point lookup is ~2 random reads regardless of table size**, and both often hit cache. Compare the alternatives on a billion-row table:
+Extend the model in §62.7 with:
 
-| Access path | Page reads (cold) | Notes |
-|---|---|---|
-| Sequential scan | ~13 million (21 GB / 8 KB heap, plus more) | O(N); ruinous for a point query |
-| BST (hypothetical on disk) | ~30 random | height ∝ log₂ N |
-| **B-tree index scan** | **~2** (leaf + heap), upper levels cached | height ∝ log_f N |
-| Index-only scan | ~1 (leaf; heap skipped if all-visible) | Ch. 61 §61.13 |
-| Hash index (equality only) | ~1–2 | no ranges/order (§62.22) |
+1. a validator for sorted keys, separator lower bounds, child count, and occupancy;
+2. next-leaf links represented by stable integer IDs;
+3. deletion with redistribution and merge for a root whose children are leaves;
+4. randomized comparison against `std::set<int>` after every operation.
 
-**Height barely grows with data.** Going from 1 M to 1 B rows (1000×) adds *one* level. Going 1 B to 1 T (1000×) adds *one* more. That logarithmic-in-a-huge-base scaling is the property that makes a B-tree a *database* index: the cost of a lookup is effectively constant across the entire practical range of table sizes, and the constant is tiny because fanout is huge and the top is cached.
+Run thousands of insert/erase/contains operations with a fixed seed, then several random seeds. Keep concurrency out of this exercise. If you add recursive internal levels, validate equal leaf depth and propagate splits/merges all the way to root growth/collapse.
 
----
+**Traps**
 
-## 62.22 B-Tree Versus Hash and Other Access Methods
+- Saying “B-tree” without clarifying classic B-tree versus B+tree.
+- Mixing “order,” maximum children, maximum keys, and minimum degree from different textbooks.
+- Using inconsistent equality routing at a separator boundary.
+- Forgetting to update the parent separator after redistribution.
+- Copying an internal promoted separator into both children when the chosen variant requires removal.
+- Computing fanout from key width alone while ignoring slots, child references, headers, alignment, and compression.
+- Treating logical page visits as physical storage I/Os.
+- Quoting one page size, fill factor, fanout, height, or device latency as universal.
+- Applying PostgreSQL's deletion, visibility, or high-key behavior to every B+tree.
+- Presenting single-thread split order as a safe concurrent or crash-consistent algorithm.
 
-The B-tree is the default, but not the only access method. Knowing when it is *not* the right structure is a common senior-level probe.
+**Prerequisite for Chapters 63–65**
 
-| Access method | Good at | Bad at | Postgres |
-|---|---|---|---|
-| **B-tree (B+tree)** | `=`, `<`, `>`, `BETWEEN`, `ORDER BY`, prefix `LIKE 'abc%'`, uniqueness | nothing major for ordered data; larger than hash | default (`nbtree`) |
-| **Hash** | equality `=` only, ~O(1) | **no ranges, no ordering**, no sorting | `USING hash` (WAL-logged since PG 10) |
-| **GiST** | ranges/geometry/nearest-neighbor, extensible | not a total order; balance heuristic | `USING gist` |
-| **GIN** | multi-valued columns (arrays, JSONB, full-text) | slow point updates | `USING gin` |
-| **BRIN** | huge, naturally-ordered tables (time-series) | random-ordered data | `USING brin` |
-| **LSM tree** | write-heavy ingest, sequential writes | read/space amplification | not core (RocksDB/MyRocks, Ch. 67) |
-
-Why the **B-tree remains the default** despite hash being faster for pure equality:
-
-- **It is a superset of use cases.** A B-tree serves equality *and* ranges *and* ordering *and* uniqueness from one structure; a hash index does only equality. One index type covers `WHERE id=?`, `WHERE ts BETWEEN ? AND ?`, `ORDER BY`, and `UNIQUE` constraints.
-- **Ordering is free.** Because leaves are sorted and linked (§62.8), the B-tree answers `ORDER BY` and range predicates without a sort step; a hash index cannot produce sorted output at all.
-- **Predictable, bounded height.** 3–5 levels for anything realistic (§62.21), with the top cached — no hash-collision chains, no resize storms.
-
-**BRIN** is the instructive contrast: for a 10-billion-row append-only time-series table, a B-tree index on the timestamp is itself hundreds of GB. A **BRIN** index stores just the min/max timestamp per *range of pages* (a sparse "zone map," Ch. 61 §61.8) — kilobytes instead of gigabytes — and works only because the data is *physically* ordered by time. It trades the B-tree's precise per-row lookup for near-zero size when the correlation between key order and physical order is high. This is the same buffering/ordering trade-off framing from Ch. 61 §61.15: the B-tree keeps keys ordered *in a separate structure*; BRIN exploits ordering that already exists in the *heap*; the LSM tree (Ch. 67) keeps ordering but buffers and appends instead of mutating in place.
-
-The through-line to Chapters 63–67: this chapter defined the B-tree's **shape** (fanout, height, splits/merges). **Ch. 63** lays out how a single page is physically formatted (slotted pages, cell layout); **Ch. 64** makes the structure *concurrent and crash-safe* (the B-link locking sketched here, page-level latches, WAL); **Ch. 66** covers B-tree *variants* (copy-on-write B-trees like LMDB, Bε-trees, FD-trees); and **Ch. 67** develops the LSM tree — the buffered, immutable, append-only counterpart that makes the opposite choice on Ch. 61's three axes.
-
----
-
-## Summary
-
-- A BST is the right idea (ordered, logarithmic, range-friendly) and the wrong shape for disk: **fanout 2** wastes an 8 KB page on one comparison, and **height ~log₂ N ≈ 30** for a billion keys means ~30 serialized random I/Os. Balancing (AVL/red-black) fixes height but keeps fanout 2 and adds scattered-write rotations.
-- The **block is the unit of I/O** (Postgres page = 8 KB). A B-tree makes each node a whole page with **fanout in the hundreds**, collapsing height to **~log_f N** and turning a page transfer into hundreds of comparisons.
-- **Random I/O is the enemy** (HDD random ~10 ms vs sequential; NVMe random ~50–100 µs). Height = length of the serialized random-read chain, so cutting 30 reads to 4 is the B-tree's whole payoff.
-- Databases use the **B+tree**: values only in leaves (higher internal fanout → shallower), leaves **linked** for range scans and `ORDER BY`. Postgres `nbtree` is a B+tree (Lehman & Yao **B-link**, with high keys and right-links for concurrency).
-- Fanout for an 8 KB page and an 8-byte key is **~400**; a **billion-row index is ~4 levels**, a trillion-row index ~5. The **top 2–3 levels stay cached**, so a cold point lookup is ~2 physical reads (leaf + heap) regardless of table size.
-- **Inserts split** full nodes bottom-up and grow the tree **at the root** (the only way height increases); **deletes** classically borrow/merge to keep nodes ≥ half full — but **Postgres does not merge underfull pages**, trading the occupancy invariant for lock-light MVCC writes and relying on **VACUUM/REINDEX** to reclaim bloat.
-- The **order-m invariant** (nodes ≥ ⌈m/2⌉ children, all leaves at equal depth) is what guarantees logarithmic height under arbitrary deletes; `fillfactor` (default 90), **deduplication** (PG 13), **suffix truncation** (PG 12), and **bottom-up deletion** (PG 14) tune real occupancy and fanout.
-
----
-
-## Key Interview Questions
-
-1. **Why can't you just use a balanced BST (AVL/red-black) as a disk index?** — Fanout is still 2, so each 8 KB page transfer buys one comparison, and height is still ~log₂ N ≈ 30 for a billion keys → ~30 serialized random I/Os. Rotations also dirty several scattered pages per insert. Balancing optimizes comparisons/node-count; disk cares about page transfers.
-2. **What is the single core idea of a B-tree?** — Make each tree node a whole page holding hundreds of sorted keys (high fanout m), so branching is base m ≫ 2. Height collapses to ~log_m N (3–5 levels), and each expensive page transfer yields hundreds of in-RAM comparisons.
-3. **What is the difference between a B-tree and a B+tree, and which do databases use?** — A classic B-tree stores values in all nodes; a B+tree stores values only in leaves and links the leaves in sorted order. Databases (Postgres nbtree, InnoDB, SQLite) use B+trees because value-free internal nodes pack more separators → higher fanout → shallower tree, and linked leaves make range scans a sequential walk.
-4. **Why is fanout in the hundreds, specifically?** — Because the page is kilobytes and keys are tens of bytes. An 8 KB Postgres page minus ~40 B overhead, divided by ~20 B per bigint entry, is ~400 entries. Fanout scales inversely with key width and with page size (InnoDB's 16 KB page ~doubles it).
-5. **How many levels does a B-tree index on a billion rows have?** — About 4 (with bigint keys, fanout ~400: 400³×367 ≈ 23 B keys at height 4). A million rows is ~3 levels, a trillion ~5. Real Postgres indexes are almost always 3–5 levels.
-6. **Why does the base of the logarithm matter if all logs differ by a constant?** — Because the "constant" is log₂(fanout) ≈ 8.6 for fanout 400, and each unit is a *serialized random I/O* costing µs–ms. log₄₀₀(10⁹) ≈ 4 vs log₂(10⁹) ≈ 30 is an ~8× reduction in real page reads on the latency-critical path.
-7. **Does a B-tree reduce the number of comparisons versus a BST?** — No. Total comparisons are still ~log₂ N (≈ 4 pages × ~9 in-page binary-search steps ≈ 36). It moves those comparisons from slow page transfers onto already-loaded pages in RAM; it minimizes *page transfers*, not comparisons.
-8. **What is the lookup algorithm?** — Start at the root (block from the metapage), binary-search separators to pick a child, descend, repeat until a leaf, then binary-search the leaf. Descent is serialized (can't read level k+1 until k names the child), and in a B+tree every lookup — hit or miss — reaches a leaf.
-9. **How is a "child pointer" represented on disk and why not a real pointer?** — As a **page/block number**, resolved through the buffer manager. A raw memory pointer would be meaningless after restart because the file isn't mapped at a fixed address; on-disk structures address by page id + offset (Ch. 61 §61.4).
-10. **What is a separator/pivot key?** — A boundary value in an internal node that says "keys below go to this child, keys at-or-above go to the next," not a value you can look up. In a B+tree the same key value can appear both as a leaf entry and as a copied-up separator.
-11. **What is a high key and a right-link, and why do they exist?** — Postgres's B-link design stores a high key (upper bound on a page's keys ≈ first key of the right sibling) and a right-link to the sibling. If a search key exceeds the high key, it moved right due to a concurrent split, so the reader follows the right-link — enabling lookups/splits with only per-page locks (high concurrency).
-12. **How does a B-tree grow taller?** — Only by a **root split**: when the root fills and splits, a new root with one key and two children is created, increasing height by one. Growth happens exclusively at the root, which is what keeps all leaves at equal depth.
-13. **Walk through an insert that causes a split.** — Descend to the target leaf; if it has room, insert sorted. If full, split into two halves around the median, allocate a sibling, and insert a separator + downlink into the parent (leaf split *copies* the key up, internal split *pushes* it up). If the parent overflows it splits recursively; a root split adds a level.
-14. **What are the occupancy invariants of a B-tree of order m?** — ≤ m children (≤ m−1 keys) per node; every non-root node ≥ ⌈m/2⌉ children (≥ ⌈m/2⌉−1 keys); all leaves at the same depth. The minimum-occupancy rule guarantees fanout ≥ ~m/2 and thus logarithmic height even after deletes.
-15. **How does deletion keep the tree balanced in the textbook algorithm?** — Remove the key; if the node underflows (below ⌈m/2⌉−1 keys), borrow a key from a sibling with spare (rotate through the parent), else merge with a sibling and pull the separator down. Merges can underflow the parent, recursing up; emptying the root shrinks height by one.
-16. **How is Postgres's delete/merge behavior different, and why?** — nbtree does **not** borrow or merge underfull pages during normal deletes — it leaves pages sparse — because merging would require multi-page top-down locking that fights the B-link concurrency design. It reclaims space only via VACUUM (empty pages) and REINDEX, accepting index bloat for lock-light writes.
-17. **What is index bloat and how do you fix it?** — The gap between an index's actual size and a freshly-rebuilt size, caused by MVCC version churn, un-merged sparse pages, and split fragmentation. VACUUM removes dead entries and recycles fully-empty pages but never merges; REINDEX (CONCURRENTLY) rebuilds and repacks. pgstattuple measures it.
-18. **What does fillfactor control and when would you change it?** — How full leaf pages are packed at build/insert time (default 90). Use 100 for read-only/append-only monotonic indexes (smallest, shallowest tree); lower it (e.g. 70) for churny tables so inserts find room without splitting. Internal pages ignore fillfactor.
-19. **Why is a B-tree point lookup ~2 physical reads regardless of table size?** — The top 2–3 levels (root + upper internals) total a few MB and stay cached in shared_buffers, so only the leaf read and the heap fetch are physical (and often cached too). Height grows by just one level per ~1000× more rows.
-20. **Why is Postgres nbtree called a B-link tree?** — It implements Lehman & Yao's design: high keys plus right-links let a reader that lands on a page mid-split move right to find relocated keys without locking the parent, so concurrent readers and writers coordinate with per-page latches instead of path locks (Ch. 64).
-21. **What do suffix truncation, deduplication, and bottom-up deletion each do?** — Suffix truncation (PG 12) shortens internal pivots to the minimal distinguishing prefix → higher fanout, shallower tree. Deduplication (PG 13) stores repeated keys once as a posting list `(key→TIDs)` → smaller low-cardinality indexes. Bottom-up deletion (PG 14) reclaims dead entries to avoid splits from update churn.
-22. **When is a hash index better than a B-tree, and why is B-tree still the default?** — A hash index answers pure equality in ~O(1) but supports no ranges, ordering, or sorting. The B-tree serves `=`, ranges, `ORDER BY`, prefixes, and uniqueness from one structure with predictable 3–5-level height and cached upper levels, so it is the sensible default; hash is a narrow optimization.
-23. **Why does a B+tree make range scans efficient?** — Leaves are stored in sorted order and linked. A range query descends once to the first leaf (O(log_m N)) then walks right-links emitting matches — no re-descent per result — and the leaf order is sorted order, so `ORDER BY` needs no sort step.
-24. **What is the metapage in a Postgres nbtree index?** — Block 0, which stores the current root's block number and cached level. Every descent reads it first (it is essentially always cached). It exists because the root's location changes whenever a root split grows the tree.
-25. **Why do random writes hurt a B-tree, and how does that motivate LSM trees?** — In-place mutation of pages plus splits produces scattered random writes and torn-page risk (needing full-page WAL images). LSM trees (Ch. 67) instead buffer writes in memory and flush immutable sorted files sequentially, trading random-write cost for read/space amplification — the opposite choice on Ch. 61's three axes.
-26. **Is early termination possible at an internal node in a B+tree?** — No. Because values/TIDs live only in leaves, every lookup must descend to a leaf even if the search key equals a separator; the separator is just a routing copy. Cost is uniform = tree height in page reads.
-27. **Why does a monotonic (auto-increment) insert workload behave specially?** — Every insert lands in the rightmost leaf, so Postgres uses a cached rightmost-leaf fast path and biases the split ~90/10 to the left, keeping the left page packed instead of leaving every page 50% full as a balanced split would.
-28. **How does a B-tree stay perfectly height-balanced without rotations?** — It grows only at the root (split propagation) and shrinks only at the root (merge collapse). Because both operations lengthen or shorten *every* root-to-leaf path simultaneously, all leaves are always at the same depth — no per-node rotation needed.
-
----
-
-## Common Traps
-
-- **Confusing B-tree with B+tree.** In interviews "B-tree" almost always means the B+tree databases actually use — values only in leaves, linked leaf list. Saying values live in internal nodes describes the rarely-used classic form.
-- **Claiming a B-tree needs fewer comparisons than a BST.** It needs the same ~log₂ N comparisons; it needs far fewer *page transfers*. The win is I/O, not comparison count.
-- **Thinking the log base is "just a constant factor."** log₂(fanout) ≈ 8–9 for realistic fanout, and each unit is a serialized random I/O — a billion-key lookup is ~4 reads vs ~30, an 8× difference on the latency-critical path.
-- **Assuming Postgres merges underfull B-tree pages on delete.** nbtree does not merge or borrow on normal deletes; it leaves pages sparse and relies on VACUUM (only for fully-empty pages) and REINDEX, which is the root cause of index bloat.
-- **Believing the whole index must be read/cached to do a lookup.** Only a few pages on the root-to-leaf path are touched; the top 2–3 levels (a few MB) stay cached, so a cold point lookup is ~2 physical reads regardless of a billion-row table.
-- **Saying a leaf split moves the median up like an internal split.** A B+tree *leaf* split *copies* the separator up (leaves must keep all keys); only an *internal* split *moves* the median up and removes it from the child.
-- **Ignoring that key width sets fanout and therefore height.** A 40-byte text key has ~1/3 the fanout of a 4-byte int and can add a level. Wide/random keys (e.g. random UUIDs) inflate both index size and split churn.
-- **Forgetting the extra heap fetch in Postgres.** A B-tree scan yields a TID, not the row; the row needs a separate heap page read plus MVCC visibility (unless an index-only scan with an all-visible page skips it). Total point-query cost is index levels + 1.
-- **Confusing "order m" with "minimum degree t."** Order m = max children; minimum degree t = min keys+1 with m = 2t. Both describe the same structure; translate before answering.
-- **Treating tree height as physical I/O.** Height counts levels, but upper levels are cached, so height overstates the disk reads; conversely a sequential scan of a billion-row heap is millions of reads, not O(log N).
-- **Assuming a hash index is strictly better for equality.** It is faster for pure `=`, but it cannot do ranges, ordering, or sorting, and offers no predictable bounded height — which is why the B-tree, not the hash index, is the default.
+You should be able to route a boundary key, work a leaf and internal split, repair separators after redistribution or merge, derive fanout from a byte budget, and distinguish conceptual page visits from cache/device I/O. Chapter 63 adds page representation, Chapter 64 adds safe implementation and concurrency, and Chapter 65 adds transactional recovery.

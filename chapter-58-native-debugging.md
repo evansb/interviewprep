@@ -1,546 +1,940 @@
 # Chapter 58 — Native Debugging
 
-*Interview-focused revision notes. The theme: a production C++ binary is optimized, stripped, and running on an isolated core at 3 a.m., so the debugging skills that matter are the ones that work without a breakpoint — reading a stack from raw registers, recovering symbols from a build ID, recognizing a corruption pattern from the shape of the crash, and knowing what your crash handler is allowed to do.*
+Debugging is the conversion of evidence into a causal explanation.
 
----
+A stack trace is evidence, not a root cause. A crash inside an allocator does not prove an allocator defect. A thread waiting in a mutex does not prove deadlock. A bug that disappears at `-O0` does not prove an optimizer defect. Each observation narrows hypotheses only within the guarantees of the operating system, compiler, ABI, debugger, binary, and captured artifact.
 
-## 58.1 GDB and LLDB Fundamentals
+This chapter develops one workflow:
 
-A debugger is a process that `ptrace`s (Linux) or uses `mach_exception_ports` (macOS) another process, reads **DWARF** debug information (§58.7) to map addresses to source, and controls execution by rewriting instructions and single-stepping.
+> preserve evidence → classify failure → inspect core/live state → reconstruct chronology → identify cause → reproduce and verify
 
-**Attach modes**, and when each is the right one:
+Chapter 44 owns installation and tool catalogs. Chapter 57 owns test strategy, sanitizers as test configurations, and deterministic fault injection. Chapter 59 owns production metrics, logs, traces, watchdog signals, and flight recorders. Here those artifacts are inputs to native diagnosis.
 
+## The 90-second version
+
+When an incident begins:
+
+1. Stop changing the evidence. Preserve the exact executable, libraries, debug files, core/minidump, build identity, configuration, input, and production timeline.
+2. Classify the symptom: crash/assert, wrong result, delayed corruption, blocked hang/deadlock, CPU spin/livelock, resource exhaustion, or timing-sensitive race.
+3. Verify artifact identity before trusting symbols.
+4. For a crash, start with signal/exception, fault address, program counter, stack pointer, mappings, all thread stacks, and nearby instructions.
+5. For corruption, distinguish the detection site from the earlier invalid write. Reproduce with sanitizers, allocator diagnostics, watchpoints, or record/replay.
+6. For a hang, take repeated thread snapshots plus progress and CPU evidence. Build a wait-for graph; do not infer a cycle from one blocked thread.
+7. For optimized code, reason from machine instructions and debug-location ranges. Source stepping and local variables may be incomplete.
+8. State a mechanism that predicts the evidence. Change one causal condition, reproduce the old failure, and show the regression test fails before the fix and passes after it.
+
+Never debug a core with a merely “similar” binary. Never restart first and hope to recover evidence later. Never call the crash location the bug location without a mechanism.
+
+### Label the claim
+
+Native debugging crosses several contracts:
+
+- **OS:** core/minidump format, process attach policy, signals/exceptions, mappings, dump filters, and permissions for a named OS/kernel version.
+- **Tool:** exact GDB, LLDB, sanitizer, rr, debugger-server, symbolizer, or allocator-tool version.
+- **Compiler/linker:** compiler version, target, optimization/LTO/sanitizer flags, debug format/version, unwind and frame-pointer choices.
+- **ABI/ISA:** register roles, calling convention, stack alignment, instruction behavior, and watchpoint resources for a named architecture/ABI.
+- **Artifact:** exact executable/shared-library/debug-file identity and source revision.
+- **Measured:** observed overhead, stop duration, reproduction rate, or failure distribution with environment, sample count, and statistic.
+
+Commands in this chapter are representative. Confirm with the installed tool’s `help`, version, target, and platform documentation.
+
+## Core: preserve, classify, explain
+
+## 58.1 Preserve evidence before reproducing
+
+The first restart, package upgrade, symbol-server cleanup, or “quick rebuild” can destroy the only evidence.
+
+Preserve:
+
+- raw core, minidump, or kernel crash record;
+- exact executable and every loaded module;
+- separate debug information and source tree/commit;
+- build ID/UUID and full build manifest;
+- compiler, linker, standard library, allocator, and flags;
+- container image, filesystem mappings, environment, limits, capabilities, and working directory;
+- OS/kernel and CPU architecture/features;
+- process arguments, configuration, input/capture, random seed, and clocks;
+- signal/exception, exit status, fault address, registers, and thread list;
+- loaded-module base addresses and address-space mappings;
+- production chronology from Chapter 59, including artifact loss;
+- actions already taken by operators or automation.
+
+Core files can contain secrets, credentials, order data, and other process memory. Apply incident access controls, encryption, retention, and secure transfer. Evidence preservation does not override privacy or security policy.
+
+### Artifact identity is non-negotiable
+
+ELF build IDs, Mach-O UUIDs, PE/PDB identities, package versions, and file hashes can pair artifacts. Their generation and security properties differ: a build ID is an identifier, not automatically a cryptographic authenticity proof.
+
+A symbol mismatch can produce plausible function names and line numbers. Verify:
+
+```text
+core module identity == archived binary identity
+binary debug link/identity == archived debug identity
+debug source mapping == archived source revision
 ```
-gdb ./app                      # launch under the debugger
-gdb -p 12345                   # attach to a running process (SIGSTOPs it)
-gdb ./app core.12345           # postmortem (§58.4)
-gdb --args ./app --flag=v      # launch with arguments
-gdb -batch -ex bt -ex 'thread apply all bt' ./app core   # scripted, for automation
-```
 
-Attaching **stops the world**. On a live trading process this drops market data, trips watchdogs (Ch. 56 §56.8), and may cause the exchange to disconnect on a missed heartbeat (Ch. 54 §54.2). The safer production move is almost always: take a core with `gcore -o /tmp/x <pid>` (which also stops the process, but only for the duration of the dump) or, better, let the process crash into a core and debug the core offline. On modern Linux, attaching also requires `ptrace_scope` permission: `/proc/sys/kernel/yama/ptrace_scope` = 0 allows any same-uid attach, 1 (the default) only allows a parent, 3 forbids it entirely. "I couldn't attach" is usually Yama, not permissions.
+Do this for the executable and shared libraries. Container layers and rolling deployments make path names insufficient.
 
-**The command vocabulary that actually gets used**, GDB / LLDB:
+### Core dumps are snapshots, not histories
 
-| Purpose | GDB | LLDB |
+A core commonly provides selected memory mappings, thread register state, signal/exception notes, and module metadata. It does not generally provide:
+
+- the write that corrupted memory earlier;
+- syscall or lock history;
+- packets not retained in memory;
+- values optimized away before the snapshot;
+- every mapping excluded by policy;
+- open-resource contents or remote system state.
+
+On Linux, core production can depend on resource limits, dumpability, `core_pattern`, a user-space collector such as systemd-coredump, `coredump_filter`, `MADV_DONTDUMP`, filesystem capacity, namespace/container policy, and security settings. Other OSes use different mechanisms. Test the deployed path end to end; `ulimit -c unlimited` alone is not proof.
+
+Creating a live core with GDB `gcore` or LLDB `process save-core` can stop or perturb the target, consume memory/storage bandwidth, and omit mappings according to target/tool policy. Measure and approve this operational action before an incident.
+
+### Check core completeness
+
+Before interpreting an unreadable pointer as the runtime fault, ask whether its mapping was included in the dump. Compare core notes/mappings with the captured process map and dump policy. A valid pointer into an excluded huge mapping, file mapping, device region, or `MADV_DONTDUMP` area can be unavailable offline even though it was readable at runtime.
+
+Also check collector truncation, storage exhaustion, compression/decompression errors, and collection concurrency limits. Preserve collector logs. A debugger message such as “cannot access memory” describes the artifact presented to it; only the original signal/exception and mapping/protection evidence establish what failed in the process.
+
+Conversely, bytes present in a core need not be logically initialized or published. Memory inclusion proves availability, not C++ object lifetime or application ownership.
+
+## 58.2 Classify the failure
+
+Classification selects the first evidence, not the final diagnosis.
+
+| Symptom | First questions | Strong first artifacts |
 |---|---|---|
-| Backtrace | `bt`, `bt -full`, `thread apply all bt` | `bt`, `bt all` |
-| Frame selection | `frame 3`, `up`, `down` | `frame select 3`, `up`, `down` |
-| Registers | `info registers`, `p $rip` | `register read`, `p $pc` |
-| Disassemble | `disassemble /s`, `x/20i $pc` | `disassemble -m`, `x/20i $pc` |
-| Memory examine | `x/16xg addr`, `x/s addr` | `memory read -f x -s 8 -c 16 addr` |
-| Threads | `info threads`, `thread 4` | `thread list`, `thread select 4` |
-| Breakpoint | `b file.cc:42`, `b ns::fn` | `b -f file.cc -l 42`, `b -n fn` |
-| Source-level step | `n`, `s`, `finish`, `until` | `n`, `s`, `finish` |
-| Instruction step | `si`, `ni` | `si`, `ni` |
-| Shared libraries | `info sharedlibrary` | `image list` |
-| Symbol lookup | `info symbol 0x4011a6`, `info line *0x4011a6` | `image lookup -a 0x4011a6` |
+| Signal/exception/assert | Which thread, instruction, access, invariant? | Core/minidump, registers, exact modules |
+| Wrong result | First divergent input/state transition? | Deterministic replay, state hashes, trace |
+| Heap/stack corruption | Where detected versus where written? | Sanitizer reproducer, watchpoint, allocator report |
+| Low-CPU hang | Which threads wait for which resources/events? | Repeated all-thread stacks, wait/progress evidence |
+| High-CPU stall | Which threads execute; does useful progress advance? | Repeated stacks, sampling profile, progress counters |
+| Timing-sensitive failure | What ordering or lifetime is unprotected? | TSan/stress/replay, synchronization trace |
+| Resource exhaustion | What resource, owner, growth path, limit? | Mapping/fd/thread/heap state and chronology |
+| Optimized-only failure | UB, race, layout/timing, or tool visibility? | Sanitized optimized build, disassembly, reduced input |
 
-**Pretty printers** are what makes GDB usable on modern C++: libstdc++ ships Python printers so `p vec` shows elements rather than three pointers. They must be loaded (`~/.gdbinit` with `python ... register_libstdcxx_printers`), and they *execute Python*, which is why `p some_map` on a corrupted structure can hang or throw — `set print pretty off` / `p /r obj` gives you the raw view when the pretty printer chokes on garbage. LLDB uses built-in C++ data formatters plus `type summary add`.
+Signals are not diagnoses. A segmentation fault might be null dereference, use-after-free, stack overflow, bad instruction fetch, corrupted return address, protection-key failure, or hardware/OS action. An abort might come from an assertion, allocator consistency check, `std::terminate`, sanitizer, or explicit policy.
 
-**Non-obvious fundamentals worth having ready:**
-- `p` runs the **inferior's** code for anything non-trivial: calling `p v.size()` on an inlined-away or optimized-out method fails, and calling a function in the inferior from a core dump is impossible (nothing is running). `p` on a core only reads memory.
-- `set follow-fork-mode child` / `detach-on-fork off` for debugging across `fork` (Ch. 31 §31.3).
-- `catch throw`, `catch syscall write`, `catch signal SIGSEGV` for event-based stopping.
-- `handle SIGUSR1 nostop noprint pass` — essential when the application uses signals for timers or profiling, otherwise the debugger traps on every one.
-- `gdb -batch` plus a script is how you build automated triage: run it over every core in a directory and emit a stack signature for deduplication.
-- **Scripting**: GDB's Python API (`gdb.parse_and_eval`, `gdb.Breakpoint` subclasses with `stop()` returning False) lets you write conditional logic that is orders of magnitude faster than a `condition` string, and lets you dump application state (walk your order table, print your ring buffer's indices) in one command.
+### Reproduce, reduce, observe, explain
 
----
+Use a loop:
 
-## 58.2 Breakpoints and Watchpoints
+1. **Reproduce:** make the failure occur under recorded conditions.
+2. **Reduce:** remove irrelevant input, threads, timing, and code without changing the mechanism.
+3. **Observe:** add one discriminating check or tool.
+4. **Explain:** state the causal chain and predictions.
+5. **Falsify:** change a condition the explanation says is necessary.
 
-**Software breakpoints** work by replacing the instruction byte at the target address with a trap instruction (`0xCC`, `int3`, on x86-64), catching `SIGTRAP`, restoring the original byte, single-stepping, and re-inserting. Consequences: they are unlimited in number; they modify the text segment (so a checksum over `.text` will fail under a debugger, and they are invisible to another process reading the same page thanks to COW, Ch. 31 §31.3); and each hit costs two context switches to the debugger — a breakpoint in a 10 M-events/sec hot loop is unusable.
+Keep the original artifact. A reduced reproducer may expose a different bug.
 
-**Hardware breakpoints** use the CPU's debug registers (x86: `DR0`–`DR3` for addresses, `DR7` for control) and do not modify memory. There are **only four**, they can be set on execute, write, or read/write, and they cover 1, 2, 4, or 8 aligned bytes. `hbreak` in GDB. Use them when the memory is read-only, when you're debugging self-modifying or JIT-generated code, or when you must not perturb the instruction stream.
+Record reproduction count as a fraction over independent runs and exact conditions. “It stopped happening” is not verification for a low-probability race.
 
-**Watchpoints** are the single most useful debugger feature that engineers underuse. A watchpoint stops when a *value* changes.
+### Reconstruct chronology from partial evidence
 
+No artifact is complete. Build a timeline whose rows distinguish observation from inference:
+
+| Time/order | Observation | Source and clock | Confidence | Inference/hypothesis |
+|---|---|---|---|---|
+| A | Input record accepted | Raw capture, device clock | Captured; loss counters recorded | Trigger candidate |
+| B | Invariant record changes | Flight recorder, host monotonic | Ring may have overwritten records | State first known bad |
+| C | Allocator reports corruption | Core/stderr | Direct detection | Earlier write suspected |
+| D | Fatal signal at PC | Kernel/core | Direct snapshot | Detection site |
+
+Clock domains and buffering can reorder apparent times. A line emitted later may reach storage before another thread’s earlier line. A core can contain a ring entry whose producer had not yet published it under the application’s memory protocol. Chapter 59 develops event correlation; here, state the uncertainty.
+
+Find three boundaries:
+
+- **last known-good:** the invariant and ownership are established;
+- **first known-bad:** evidence proves corruption, stall, or divergence;
+- **detection:** the system finally faults or alarms.
+
+The invalid action lies between the first two, not necessarily near detection. A watchpoint or reverse debugger is most useful after narrowing that interval and reproducing the same mechanism.
+
+## 58.3 Symbols, DWARF, source mappings, and stacks
+
+Native symbols have several layers:
+
+- dynamic/static symbol tables name some addresses;
+- DWARF or another debug format maps addresses to source, types, variables, inlining, and unwind information;
+- unwind tables describe how to recover caller state;
+- source-path mappings connect recorded build paths to archived source;
+- language pretty-printers interpret standard-library/private layouts.
+
+Stripping debug sections need not remove all symbols or unwind tables, but results depend on linker options, platform, exception/unwind configuration, and stripping command. Verify the actual artifact with versioned `readelf`, `objdump`, `llvm-dwarfdump`, `dwarfdump`, or platform equivalents.
+
+### Split debug information
+
+ELF deployments may use separate `.debug` files, GNU debug links, split DWARF `.dwo`/`.dwp`, package debug files, or debuginfod. Mach-O commonly uses dSYM bundles. Windows commonly uses PDBs. The exact production binary and separate information must remain paired.
+
+`debuginfod` is an elfutils HTTP service indexed by build ID; debugger/binutils integration and authentication/signature policy depend on installed versions and deployment configuration. Do not permit incident hosts to fetch untrusted symbols silently.
+
+### Symbolization pipeline failures
+
+When a frame looks wrong, test the pipeline in order:
+
+1. Is the raw address inside a captured executable mapping?
+2. Was address-space relocation accounted for?
+3. Does the module identity match the archived file?
+4. Does the separate debug file identify that module?
+5. Does its compilation unit map to the archived source?
+6. Were inline frames, split units, and source-path substitutions loaded?
+7. Did unwinding reach this frame reliably?
+
+Symbolizing an absolute address from a position-independent executable without its load base can name the wrong location. Manual `addr2line` or symbolizer workflows must calculate the correct module-relative address. Debuggers normally handle relocation only when core and module metadata are adequate.
+
+Archive link maps or symbol manifests where they help identify folded/cloned functions. LTO can change which compilation unit owns generated code. A source line is not a unique instruction address.
+
+### What a stack frame means
+
+A logical source call can be:
+
+- inlined into a caller;
+- tail-called without a normal caller frame;
+- split into hot/cold regions;
+- cloned/specialized by the optimizer;
+- absent because it was eliminated;
+- represented by several machine ranges.
+
+Unwinding may use frame pointers, call-frame information, platform unwind metadata, or debugger heuristics. Handwritten assembly, JIT code, corrupt stack/registers, missing metadata, signal trampolines, and mixed runtimes can break it. Frame pointers can help sampling and postmortems, but their runtime/code-size cost and reliability benefit are target/build/workload measurements—not a universal percentage.
+
+A backtrace is strongest where:
+
+- module identity matches;
+- unwind metadata is present and valid;
+- stack memory/registers are captured;
+- the stack is not corrupted;
+- inline/tail-call presentation is understood.
+
+## 58.4 GDB and LLDB fundamentals
+
+Use a debugger offline first when possible:
+
+```sh
+# GNU/Linux examples; exact syntax/version may differ.
+gdb /archive/app /secure/core
+gdb -batch -ex 'thread apply all bt full' /archive/app /secure/core
+
+# LLDB examples.
+lldb -c /secure/core /archive/app
+lldb /archive/app
 ```
-watch counter                  # hardware if possible
-watch -l obj->field            # -l: watch the ADDRESS, not the expression's scope
-rwatch  ptr                    # on read
-awatch  ptr                    # on read or write
-watch *(uint64_t*)0x7fffdeadbeef   # watch raw memory — the corruption workhorse
-info watchpoints
-```
 
-**Hardware vs software watchpoints is the point to know.** A hardware watchpoint uses a debug register and is essentially free — the CPU traps on the access. A **software watchpoint single-steps the entire program and re-evaluates the expression after every instruction**, which is roughly 1000× slower and often means an overnight run. GDB silently falls back to software when the watched region exceeds the debug registers' capacity (more than 8 bytes, or more than 4 regions). `show can-use-hw-watchpoints` and the message "Hardware watchpoint" vs "Watchpoint" in the confirmation tell you which you got. If you need to watch a 64-byte structure, watch the specific 8-byte field that gets corrupted, not the whole object.
+A compact cross-tool card:
 
-**The canonical corruption workflow** (§58.11): a field holds a plausible value at construction and garbage later. Run to construction, `p &obj->field`, `watch -l *(uint64_t*)<that address>`, continue. The debugger stops on the exact instruction of the write, with a stack — which identifies the culprit directly, no reasoning required. The `-l` flag matters: without it, the watchpoint is deleted when the expression's scope exits.
-
-**Conditional breakpoints and the cost model.** `b handler.cc:88 if order_id == 99123` evaluates the condition *in the debugger* on every hit — two context switches per evaluation. On a hot path this is thousands of times slower than the alternatives: a `dprintf`, a GDB Python breakpoint whose `stop()` returns quickly, or (best) an `if (order_id == 99123) __builtin_trap();` compiled into a debug build. `ignore <bpnum> <count>` skips *n* hits with the same per-hit cost, so "break on the 1,000,000th iteration" is often faster achieved by a counter in the code.
-
-**Tracepoints and low-overhead alternatives.** For a running production process where stopping is unacceptable, the debugger is the wrong tool. `bpftrace`/`uprobes` attach to a function without stopping the process (Ch. 35 §35.21): `bpftrace -e 'uprobe:/opt/app:_ZN6Engine8on_orderEy { @[arg1] = count(); }'` gives you the data with microseconds of overhead per hit and no trap to a debugger.
-
----
-
-## 58.3 Debugging Optimized Code
-
-Production binaries are `-O2`/`-O3` with LTO, and the single most common frustration is `<optimized out>`. Understanding *why* is the difference between fumbling and diagnosing.
-
-**Why a variable is optimized out.** DWARF describes a variable's location as a *location expression* that can vary by PC range: "in `%rbx` from 0x4011a0 to 0x4011c8, at `-0x18(%rbp)` from 0x4011c8 to 0x4011f0, nowhere thereafter." The compiler is under no obligation to keep a variable materialized anywhere:
-
-| Cause | What you see | Recovery |
+| Goal | GDB example | LLDB example |
 |---|---|---|
-| Value lives only in a register, and that register was reused | `<optimized out>` at some PCs, correct at others | Move `up`/`down` frames; step to a PC where it is live; read the register directly |
-| Constant-folded / propagated away | `<optimized out>` everywhere | Recompute from other values |
-| Computed but never stored (dead store eliminated) | `<optimized out>` | — |
-| Inlined callee's parameter | Frame missing entirely, or shown as `inlined frame` | `info frame`, `bt` shows inline frames if `-g` is good |
-| Tail call (Ch. 41 §41.9) | The caller's frame is **gone** from the backtrace | Reason about the missing link; `-fno-optimize-sibling-calls` in debug builds |
-| Loop induction variable strength-reduced | The source variable doesn't exist; a derived pointer does | Read the pointer, back out the index |
-| Struct scalarized (SROA) | Members in separate registers, object "not available" | Read members individually if DWARF describes them |
+| All thread stacks | `thread apply all bt` | `thread backtrace all` |
+| Select thread/frame | `thread N`; `frame N` | `thread select N`; `frame select N` |
+| Registers | `info registers` | `register read` |
+| Memory | `x/32gx ADDRESS` | `memory read --size 8 --count 32 ADDRESS` |
+| Disassembly near PC | `x/16i $pc`; `disassemble /m` | `disassemble --pc`; `disassemble --frame --mixed` |
+| Modules/mappings | `info sharedlibrary`; `info proc mappings` | `image list`; `memory region --all` |
+| Address lookup | `info symbol ADDRESS`; `info line *ADDRESS` | `image lookup --address ADDRESS` |
+| Breakpoint | `break NAME` | `breakpoint set --name NAME` |
+| Write watchpoint | `watch -location EXPR` | `watchpoint set expression -- EXPR` |
 
-**Inlining changes the shape of the stack.** With `-g`, GCC/Clang emit `DW_TAG_inlined_subroutine` records, so GDB *does* show inlined frames — but they are not real frames: `finish` behaves oddly, `up` moves within one physical frame, and the return address you see in the raw stack (§58.6) will not correspond to them. When you read a stack without symbols, inlined functions are simply invisible; a five-line backtrace may represent twenty source-level calls.
+Aliases and options change. GDB and LLDB do not share all semantics. Use `help` and capture the commands in the incident record.
 
-**Statement reordering and jumpy stepping.** `-O2` interleaves instructions from different statements, so single-stepping bounces between source lines and a breakpoint on line 40 may fire "after" line 42's effects. This is not a bug; it is the scheduler. `set print address on` and stepping by instruction (`si`) plus `disassemble /s` is the honest view.
+### Live debugging and breakpoints
 
-**The build configurations that matter:**
+Attaching can suspend one or all threads depending on debugger mode, target, and command. Even a short stop can change timing, trigger watchdogs, lose network data, or violate external protocols. Obtain operational authority and prefer a clone/staging reproduction or offline artifact.
 
-```
--O2 -g                      # production: full optimization, full debug info. ALWAYS do this.
--O2 -g -fno-omit-frame-pointer     # ~1% slower, backtraces work everywhere (§58.6)
--Og -g                      # "optimize for debugging": most optimizations, but variables stay live
--O0 -g                      # everything visible; often 10-50x slower, and the bug may vanish
--O2 -g -fvar-tracking-assignments   # GCC default at -O2 with -g; improves location accuracy
-```
+Software breakpoints commonly replace an instruction with a trap on supported targets, but details are ISA/OS/debugger-specific. Hardware execution/data breakpoints use finite architectural resources with alignment/size/access constraints. The number and behavior are not universal.
 
-**`-g` does not slow down or change the generated code.** It only adds `.debug_*` sections. Shipping `-O2 -g` and splitting the debug info out (§58.7) is the correct default and the answer expected in an interview — the historical practice of building production without `-g` is what makes production crashes undebuggable.
+Conditional breakpoints often stop and communicate with the debugger before evaluating or reporting, making hot-path use intrusive. Debugger commands that evaluate expressions may:
 
-**Heisenbugs.** If the bug disappears at `-O0`, the cause is usually one of: undefined behaviour that the optimizer exploited (Ch. 4 §4.5); a data race whose window widens or narrows with instruction scheduling (Ch. 25 §25.1); uninitialized memory that happened to be zero in the larger `-O0` stack frames; or a timing dependence. The productive step is not to debug at `-O0` but to run the `-O2` build under UBSan/ASan/TSan (Ch. 44 §44.2–§44.4), which finds the actual defect rather than the symptom. `-O2 -fno-inline` or `-Og` is a middle ground that often keeps the bug alive while restoring visibility.
+- read variables only;
+- invoke the inferior’s expression evaluator;
+- allocate;
+- acquire locks;
+- change state;
+- be impossible in a core target.
 
----
+Prefer raw variable/memory inspection until you understand whether a pretty-printer or expression calls target code.
 
-## 58.4 Core Dumps
+### Watchpoints
 
-A **core dump** is a snapshot of a process's memory, registers, and thread state written by the kernel at abnormal termination. It is the primary debugging artifact for production, because it turns a 3 a.m. crash into an offline analysis.
+A data watchpoint is powerful when an address is stable and you can reproduce the invalid write:
 
-**Getting one at all** requires three things to be right:
-
-```
-ulimit -c unlimited                       # per-process RLIMIT_CORE; 0 by default in many setups
-cat /proc/sys/kernel/core_pattern         # where it goes, or which program receives it
-sysctl -w kernel.core_pattern='/var/cores/core.%e.%p.%t'
-sysctl -w kernel.core_uses_pid=1
-cat /proc/<pid>/coredump_filter           # bitmask: which VMAs are included
-```
-`core_pattern` beginning with `|` pipes the core to a program (`systemd-coredump`, `apport`, `abrt`) — a frequent surprise when the file never appears where expected; `coredumpctl list` / `coredumpctl gdb <pid>` is then the retrieval path. A setuid or `prctl(PR_SET_DUMPABLE, 0)` process does not dump at all.
-
-**Size is the operational problem in this domain.** A trading process with 64 GB of huge-page-backed arenas (Ch. 7 §7.14) and mapped market-data buffers produces a core that takes minutes to write and fills the disk — during which the process is dead and the machine is doing synchronous I/O. Mitigations:
-
-- `coredump_filter` (per-process, inheritable, `/proc/self/coredump_filter`) selects which mapping classes are dumped: bit 0 anonymous private, 1 anonymous shared, 2 file-backed private, 3 file-backed shared, 4 ELF headers, 5 private huge pages, 6 shared huge pages, 7/8 DAX. Clearing the huge-page and shared bits typically shrinks a core by orders of magnitude while retaining the stacks and heap you actually need. Default is usually `0x33`.
-- `madvise(MADV_DONTDUMP)` on specific large regions (packet buffers, mmapped reference data) is the surgical version — exclude the 40 GB of ring buffers, keep everything else.
-- Write cores to a fast local NVMe partition, never to network storage, and cap total retention (Ch. 60 §60.13).
-
-**Using the core.** `gdb ./app core` needs the *exact* binary and the *exact* shared libraries; a mismatched build silently produces a plausible-looking, wrong backtrace. This is what build IDs (§58.8) exist to prevent — GDB checks them and warns. On a different host, set `set sysroot /path/to/captured/libs` and `set solib-search-path`. `info sharedlibrary` tells you which libraries GDB failed to find; missing libc is why `bt` degenerates to `??` frames.
-
-**What a core does and does not contain.** It contains all dumped memory, all threads' registers, and the signal info (`p $_siginfo` gives `si_signo`, `si_code`, and `si_addr` — the faulting address, which is the single most informative field for a SIGSEGV). It does **not** contain: file descriptors' contents, kernel state, the contents of pages never faulted in, or anything about the *past* — you see the final state, not how it got there.
-
-**Reverse debugging is the answer to that last limitation.** `rr record ./app` captures a recording by making execution deterministic (single-threaded serialization of the trace, recorded syscall results, disabled ASLR); `rr replay` then gives a GDB session in which `reverse-continue`, `reverse-step`, and — critically — **reverse watchpoints** work. The canonical workflow for a corruption bug becomes: replay to the crash, `watch -l` the corrupted address, `reverse-continue`, and land directly on the instruction that wrote it. Costs and limits: ~1.2–2× record overhead, single-core execution (so genuinely parallel timing bugs change or vanish), a requirement for PMU access (`perf_event_paranoid ≤ 1`) and hardware or a container that exposes it, and no support for some instructions and for processes that depend on true multicore parallelism. `rr record --chaos` randomizes scheduling to *find* the race first (Ch. 57 §57.10). GDB's built-in `record full` does the same thing in software at ~1000× slowdown — usable only for the last few thousand instructions before a fault, via `record` then `reverse-stepi`.
-
-**First five commands on any core**, worth being able to recite:
-```
-bt                                 # where it died
-thread apply all bt                # what everyone else was doing (deadlocks live here)
-p $_siginfo                        # signal, code, faulting address
-info registers                     # $rip, $rsp, $rbp sanity
-x/16i $pc-32                       # the instruction that faulted, in context
+```text
+break immediately after object initialization
+record object address and lifetime generation
+watch the smallest field/region supported by the target
+continue
+inspect the writing instruction, thread, and stack
 ```
 
----
+GDB may use hardware or software watchpoints. Its manual notes that software watchpoints single-step and have limitations in multithreaded programs; confirm what was installed. A watchpoint on recycled memory can correctly stop on a new object’s write and still mislead if lifetime was not tracked.
 
-## 58.5 `std::stacktrace`
+### Measure debugger perturbation
 
-C++23's `<stacktrace>` makes capturing a backtrace a language-level facility rather than a platform hack.
+Debugger actions can change scheduling, signal delivery, timeouts, cache state, and external-peer behavior. Breakpoint patching or expression evaluation may also change process memory or invoke target code. A failure that disappears under a breakpoint is timing evidence, not proof that the stopped line is causal.
+
+Record whether the debugger uses all-stop or non-stop mode, which threads are suspended, stop duration, and which commands invoked the inferior. Choose the least intrusive method that answers the question:
+
+```text
+offline core < live snapshot < sampling/trace < watchpoint
+             < cold breakpoint < hot software watchpoint
+```
+
+That ordering is qualitative. A huge live core may perturb more than a narrow trace, and a hardware watchpoint may be nearly transparent on one target. Measure in a representative environment.
+
+Before production attachment, define authorization, downstream safety action, maximum stop duration, peer/watchdog behavior, evidence capacity, detach procedure, and consistency checks after resume. Debugging authority is not permission to mutate business state through an expression evaluator.
+
+## 58.5 Debugging optimized code
+
+Debug information describes optimized machine code; it cannot recreate values or control flow the compiler removed.
+
+Expect:
+
+- `<optimized out>` or location unavailable for some PC ranges;
+- parameters in registers only at certain points;
+- source lines executing in surprising order;
+- one source statement mapping to several instruction ranges;
+- inlined frames and synthesized values;
+- tail calls altering apparent callers;
+- loop unrolling/vectorization;
+- constant propagation and dead-store elimination.
+
+The exact transformation is compiler/version/target/flags dependent. Do not teach “the optimizer always keeps X in register.”
+
+### Work from the instruction
+
+At a crash:
+
+1. identify the exact module-relative PC;
+2. verify symbol and source mapping;
+3. disassemble a bounded region with bytes;
+4. identify the faulting instruction and memory operand;
+5. read the registers used to form the address;
+6. trace definitions backward within the function/call path;
+7. inspect the object/lifetime/invariant that should make the address valid;
+8. compare with compiler-generated assembly for the exact build.
+
+Source is the specification clue; assembly is what executed.
+
+Compiling with `-g` often places debug information in non-loaded sections and may have little direct runtime cost, but it can change artifacts, link behavior, size, build time, and sometimes code generation through related options. Measure the exact build. Keep an optimized symbolized build for production diagnosis and separate configurations for sanitizers or higher variable visibility.
+
+If a bug changes under optimization, investigate UB, data races, lifetime, uninitialized data, timing/layout, and compiler defects in that order based on evidence—not folklore. A true compiler defect still needs a minimized valid program and exact compiler version/options.
+
+## 58.6 Core, register, stack, and memory workflow
+
+For a crash core:
+
+```text
+1. confirm signal/exception and faulting thread
+2. confirm exact module identities and mappings
+3. save all-thread stack output before interactive changes
+4. record PC, SP, fault address, general registers, and signal/exception code
+5. disassemble around PC
+6. inspect the current and caller frames
+7. inspect bounded memory around relevant addresses
+8. classify access: read/write/execute, mapped/unmapped/protected
+9. correlate with other threads and chronology
+```
+
+On GDB/Linux, `$_siginfo` may expose signal details when present in the core. On LLDB/platforms, stop reasons and exception data differ. A core may lack information the live debugger would have.
+
+### ISA/ABI-specific deductions
+
+Examples must be labeled:
+
+- **x86-64:** `$rip` is the instruction pointer and `$rsp` the stack pointer in common debugger naming; effective addresses can combine base/index/scale/displacement.
+- **AArch64:** `pc` is program counter, `sp` stack pointer, and fault information comes through OS exception/signal records; load/store addressing differs.
+- calling-convention argument registers are ABI-specific and may no longer contain original arguments after instructions execute.
+
+A small fault address can be consistent with a null base plus member offset, but it is not proof. Integer corruption can produce the same address. An instruction-fetch fault at zero can be consistent with a null function pointer, corrupted return address, or bad unwind. Follow the data.
+
+### When unwinding fails
+
+Check:
+
+- whether the PC/SP and stack mapping are plausible;
+- whether the current module has unwind information;
+- whether the current instruction is in JIT/assembly/signal trampoline code;
+- whether stack bounds/guard indicate overflow;
+- whether return addresses map into executable modules;
+- whether a corrupted frame begins at a specific transition.
+
+Manual stack scanning can generate many false “return addresses.” Validate candidates against instruction boundaries/call sites, module mappings, ABI stack rules, and neighboring frames. Never present a heuristic stack as authoritative.
+
+### Guided core session
+
+Start by exporting, not clicking around:
+
+```text
+(gdb) set pagination off
+(gdb) info files
+(gdb) info sharedlibrary
+(gdb) thread apply all bt full
+(gdb) info registers
+(gdb) p $_siginfo
+(gdb) x/16i $pc-16
+(gdb) info symbol $pc
+(gdb) info line *$pc
+```
+
+This is a GNU/Linux/GDB-shaped example. `$pc-16` is only a display window; on a variable-length ISA, use a known symbol/range to establish instruction boundaries. `$_siginfo` exists only when the target/core supplies it.
+
+An LLDB-shaped equivalent begins with:
+
+```text
+(lldb) image list
+(lldb) memory region --all
+(lldb) thread backtrace all
+(lldb) register read
+(lldb) disassemble --pc
+(lldb) image lookup --address ADDRESS
+```
+
+Save raw addresses as well as symbols. If symbol correction later changes the stack, the raw evidence remains.
+
+For the faulting instruction, fill out:
+
+```text
+instruction:   target-specific load/store/branch
+access kind:   read / write / execute / unknown
+address rule:  target-specific effective-address calculation
+registers:     values from the faulting context
+computed addr: ...
+OS fault addr: ...
+mapping:       absent / protected / guard / captured?
+source claim:  exact build's mapped line/inlined call
+```
+
+If computed and reported addresses disagree, consider instruction semantics, tagged/canonical addresses, a multi-access instruction, wrong fault-thread selection, unavailable register state, or symbol error. Do not force the source hypothesis.
+
+## 58.7 Memory corruption and heap diagnosis
+
+The crash site is often the detection site:
+
+```text
+invalid write at time A
+  → nearby object/allocator/control data corrupted
+  → many successful operations
+  → corrupted data consumed at time B
+  → crash/assert inside unrelated code
+```
+
+Classify:
+
+- out-of-bounds read/write;
+- use-after-free or lifetime-end;
+- double/invalid free;
+- stack-use-after-return/scope;
+- uninitialized read;
+- integer overflow leading to wrong allocation/index;
+- data race;
+- invalid vptr/function pointer;
+- allocator misuse or cross-module mismatch.
+
+### Tools by hypothesis
+
+| Tool/configuration | Strong for | Important limits |
+|---|---|---|
+| AddressSanitizer | Many spatial/lifetime violations | Layout/timing changes; not every intra-object or stale access |
+| UndefinedBehaviorSanitizer | Selected UB checks | Only enabled checks; recovery/trap policy matters |
+| MemorySanitizer | Uninitialized data flow | Requires instrumented dependency coverage; platform limits |
+| ThreadSanitizer | Data-race reports | High perturbation; unsupported constructs/platform limits; no proof of race freedom |
+| Valgrind Memcheck | Many memory errors without compiler instrumentation | Target/platform support and substantial slowdown |
+| Hardware watchpoint | Exact write to small stable address | Few target resources; needs reproduction and valid lifetime |
+| Guard/quarantine allocator | Converts selected overrun/UAF into earlier fault | Memory/latency perturbation and allocator-specific behavior |
+| Record/replay debugger | Revisit execution chronology | Platform/version constraints and external nondeterminism |
+
+Sanitizer combinations and support change by compiler/runtime/platform. Use the current documentation and test the exact deployed dependencies. No clean sanitizer run proves the absence of corruption or races.
+
+### Heap evidence
+
+Allocator consistency errors describe detected metadata/state violations under one allocator/version. Private metadata layouts and diagnostic strings are not portable APIs. Do not inspect a `pthread_mutex_t` or malloc chunk by hard-coded offsets unless the exact libc/allocator build is archived and the inference is labeled.
+
+Useful evidence includes:
+
+- allocation/free stacks from an instrumented reproduction;
+- object lifetime generation;
+- neighboring allocation sizes/owners;
+- allocator/tool report before secondary failure;
+- heap growth separated into live allocations, fragmentation, caches, and mappings;
+- address reuse chronology.
+
+For a corrupt field, set the watchpoint immediately after the last known-good initialization, not after corruption is already visible.
+
+### Heap growth is not automatically a leak
+
+Separate:
+
+- live reachable allocations growing with real state;
+- unreachable leaked allocations;
+- allocator caches/arenas retaining freed memory;
+- fragmentation preventing page return;
+- mapped files, shared pages, stacks, JIT, and device mappings;
+- copy-on-write/private-dirty growth.
+
+On Linux, `/proc/PID/smaps` or `smaps_rollup` describes mapping accounting under that kernel interface. Glibc `malloc_info`, alternative-allocator profiles, macOS malloc stack logging, and similar facilities are allocator/OS/version-specific. Chapter 43 owns allocation profiling methodology.
+
+Take comparable snapshots over time and reconcile:
+
+\[
+\Delta RSS \neq \Delta \text{live requested heap bytes}
+\]
+
+The difference can be allocator overhead, fragmentation, unrelated mappings, page residency, or accounting semantics. Sampling heap profilers also have uncertainty and probe effect.
+
+For exhaustion, inspect ownership and release paths. A file-descriptor limit can result from a socket leak, delayed asynchronous close, inheritance, or a retry storm. Thread growth can exhaust stack/address space without a heap leak. The resource named by the final error is not automatically the causal defect.
+
+## 58.8 Concurrency: deadlock, blocked hang, spin, livelock, and race
+
+Take at least two observations separated by a declared interval. One stack is a photograph; a hang is lack of progress over time.
+
+Record:
+
+- per-thread CPU state and stack;
+- application progress counters/sequence;
+- scheduler/blocking reason where available;
+- lock/queue ownership instrumentation;
+- thread creation/lifetime and names;
+- recent synchronization events from Chapter 59;
+- whether debugger attachment changed scheduling.
+
+### Low-CPU blocked hang
+
+Build a wait-for graph:
+
+```text
+thread T1 → waits for resource R2 → owned/fulfilled by T2
+thread T2 → waits for resource R1 → owned/fulfilled by T1
+```
+
+A directed cycle supports deadlock. Threads all waiting on a condition variable could instead mean no work, missing producer, lost notification, violated predicate protocol, shutdown, or deadlock elsewhere. Inspect predicates and the code that can make them true.
+
+Debugger-specific inspection of native mutex owner fields is libc/version-specific and may be unavailable or misleading for C++ wrappers, adaptive locks, robust mutexes, or corrupted state. Prefer instrumented lock identity/ownership, known application wrappers, or a validated libc layout.
+
+### High-CPU stall
+
+High CPU can mean useful busy polling, retry storm, livelock, or an accidental infinite loop. Compare repeated PCs/stacks with progress:
+
+- same loop, no progress, no failed-operation counter: possible spin/infinite loop;
+- changing stacks, growing retries, no committed work: possible livelock;
+- expected poll loop, advancing input/output: healthy for that design;
+- one core busy, downstream blocked: backpressure or queue protocol.
+
+Sampling profiles and hardware counters can localize execution but do not prove the concurrency cause. Chapter 43 owns their measurement methodology.
+
+### Races
+
+A data race in C++ creates undefined behavior unless the accesses are properly synchronized/atomic under the language rules. The observed symptom may be stale data, corruption, impossible control flow, or a hang that changes with optimization.
+
+Use TSan/stress/model tests to find evidence, then explain:
+
+- the conflicting accesses;
+- object lifetime;
+- happens-before relationship that is absent;
+- required invariant;
+- why the chosen atomic ordering or lock establishes it.
+
+Making one field atomic can remove the reported race while leaving a multi-field invariant broken. Verification needs an adversarial test and the semantic invariant, not only a silent TSan run.
+
+Record/replay tools such as rr can help reverse from detection to the earlier write on supported OS/architecture/kernel/CPU/tool versions. They may serialize or virtualize events and cannot capture arbitrary external systems without recorded inputs. Version-gate before planning an incident around them.
+
+### Concurrency chronology without a perfect trace
+
+Combine:
+
+- lock-wrapper owner/waiter generation;
+- queue head/tail and producer/consumer progress;
+- scheduler or futex wait evidence;
+- last completed sequence per stage;
+- retry/failed-CAS counters;
+- per-thread CPU-time change;
+- two or more debugger/core snapshots;
+- deterministic barriers that recreate the ordering.
+
+Thread IDs are reusable; pair them with process/session and thread-lifetime generation. A core taken after a timeout handler starts can show the handler’s locks rather than the original stall. Freezing a process can also prevent lease/timeout threads from making their usual progress.
+
+For condition variables, reason about the predicate:
+
+```text
+mutex protects predicate P
+waiter:   while (!P) wait(lock)
+producer: lock; change P; publish/notify under the designed protocol
+```
+
+Notification is not stored state. Correctness comes from the predicate and happens-before relationships. Whether notification occurs while holding or after releasing the mutex depends on the invariant and performance design; neither style is a universal prescription.
+
+## 58.9 Worked crash diagnosis
+
+This intentionally faulty C++23 reproducer has a one-element overrun:
 
 ```cpp
-#include <stacktrace>
-void on_error() {
-    auto st = std::stacktrace::current();          // whole stack
-    auto st2 = std::stacktrace::current(1, 16);    // skip 1 frame, max 16
-    std::cerr << st << '\n';                       // formatted: index, description, file:line
-    for (const auto& e : st)
-        std::cerr << e.native_handle() << ' ' << e.description()
-                  << ' ' << e.source_file() << ':' << e.source_line() << '\n';
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+
+void copy_payload(std::span<const std::uint32_t> input,
+                  std::span<std::uint32_t> output) {
+    if (input.size() > output.size()) return;
+
+    // BUG: i == input.size() is outside both equal-sized spans.
+    for (std::size_t i = 0; i <= input.size(); ++i) {
+        output[i] = input[i];
+    }
+}
+
+int main() {
+    const std::array<std::uint32_t, 4> input{10, 20, 30, 40};
+    std::array<std::uint32_t, 4> output{};
+    copy_payload(input, output);
 }
 ```
-Build requirement on libstdc++: link `-lstdc++exp` (GCC 14+) or `-lstdc++_libbacktrace`, and compile with `-g` or you get addresses without names. It is backed by `libbacktrace` on GCC; libc++ support arrived later and MSVC has its own.
 
-**The properties that matter:**
+On a Clang/GCC-style toolchain with supported runtimes:
 
-- **`std::stacktrace_entry` is a plain address** (`native_handle()` is the program counter); everything else — `description()`, `source_file()`, `source_line()` — is resolved *lazily* by reading debug information, which is **slow** (milliseconds, allocating, and it may open files and take locks).
-- Therefore: **capture in the fast path, symbolize elsewhere.** `std::stacktrace::current()` itself walks the stack and stores addresses; that's comparatively cheap (microseconds), but it still **allocates** (it has an allocator-aware `basic_stacktrace`, so you can supply a monotonic resource, Ch. 8 §8.6). For a hot path, capture into a fixed array with `libunwind`'s `unw_backtrace` or `__builtin_return_address`, and never symbolize in-process.
-- **It is not async-signal-safe.** Calling it from a `SIGSEGV` handler is exactly what everyone wants to do and is formally unsound (§58.13) — it allocates and may take the loader lock.
-- **`std::stacktrace` needs frame information.** With frame pointers omitted it relies on `.eh_frame` CFI, which is present in optimized builds but makes unwinding much more expensive and can fail in hand-written assembly or in a frame with a corrupted stack.
-- **Inlined frames** appear or not depending on the backend's ability to read `DW_TAG_inlined_subroutine`; `libbacktrace` does expand them, plain `backtrace_symbols` does not.
-
-**Pre-C++23 and production alternatives**: `backtrace()`/`backtrace_symbols_fd()` from `<execinfo.h>` (the latter *is* roughly signal-safe because it writes to an fd without allocating, but it needs `-rdynamic` to get names for non-exported symbols and never resolves file:line); `libunwind` (`unw_backtrace`, more robust, usable from signal handlers); Boost.Stacktrace (the direct ancestor of the standard facility, with selectable backends); and `absl::GetStackTrace`.
-
-**Attaching a stack trace to an exception** is the natural use — C++26's proposed stacktrace-on-throw aside, the practical technique is a custom exception base that captures `std::stacktrace::current()` in its constructor, or a `__cxa_throw` interposer that records the stack at throw time. That matters because by the time you catch, the stack has unwound and the origin is gone (Ch. 10 §10.5).
-
----
-
-## 58.6 Postmortem Register and Stack Analysis
-
-The skill that distinguishes a strong candidate: recovering a call chain from a core with no symbols, no frame pointers, or a corrupted stack.
-
-**The x86-64 stack frame convention** (Ch. 41 §41.5–§41.6):
-
-```
-higher addresses
-   ┌──────────────────────┐
-   │  caller's locals     │
-   │  argument overflow   │
-   ├──────────────────────┤
-   │  RETURN ADDRESS      │  ← pushed by `call`
-   ├──────────────────────┤
-   │  saved RBP           │  ← only if frame pointers are used
-   ├──────────────────────┤  ← RBP points here
-   │  callee's locals     │
-   │  saved callee-regs   │
-   ├──────────────────────┤  ← RSP
-   │  128-byte red zone   │  (leaf functions may use below RSP)
-lower addresses
+```sh
+c++ -std=c++23 -O1 -g -fno-omit-frame-pointer \
+    -fsanitize=address,undefined repro.cpp -o repro-san
+./repro-san
 ```
 
-**With frame pointers** (`-fno-omit-frame-pointer`), unwinding is a trivial linked list: `saved_rbp = *(uint64_t*)rbp; retaddr = *(uint64_t*)(rbp+8)`, repeat. This is why frame pointers are worth ~1 % of performance in production — `perf` (Ch. 43 §43.15), `bpftrace`, and every crash handler unwind faster and more reliably with them, and the whole industry (Fedora, Ubuntu, Google) has swung back to enabling them by default.
+The exact report depends on compiler/runtime/version. A representative ASan diagnosis identifies an out-of-bounds access in `copy_payload`, the access size/direction, and the bounded object.
 
-**Without frame pointers**, unwinding requires **CFI** (call frame information) in `.eh_frame`: a per-PC table describing where the return address and each saved register live relative to a canonical frame address. `readelf --debug-dump=frames-interp` prints it decoded. CFI-based unwinding is correct but expensive and fails if the PC is in code without CFI (hand-written asm, some JIT), or if the stack is corrupted.
+### Evidence to root cause
 
-**Manual stack scanning** — the technique for when everything else fails:
-```
-x/256a $rsp
-```
-Then identify which of those 8-byte values are plausible **return addresses**: they fall inside a mapped executable region (`info proc mappings`, or the core's ELF program headers), and the *preceding* bytes decode as a `call` instruction. `info symbol <value>` for each candidate. This reconstructs an approximate call chain including stale frames (which is both the weakness — false positives from dead frames — and a strength, since it shows where the code has been). GDB's `bt` after `set backtrace past-main on` plus manual `set $pc`/`set $sp` fiddling is the guided version.
+Suppose production instead crashed later in allocator code:
 
-**Reading the crash from registers alone:**
+1. Core identity matches the archived optimized executable and allocator library.
+2. Faulting stack detects invalid heap state during a later allocation.
+3. This establishes detection, not the writer.
+4. The production input is reduced to the four-element frame.
+5. The sanitized optimized reproducer stops in `copy_payload`.
+6. Disassembly/source show the loop admits `i == size`.
+7. At that iteration, both `input[i]` and `output[i]` violate span preconditions.
+8. Changing `<=` to `<` removes the sanitizer report.
 
-| Observation | Interpretation |
-|---|---|
-| `$rip` = 0, or a tiny value like `0x8` | Call through a **null/garbage function pointer** or a null vtable slot; the return address at `*$rsp` names the caller |
-| `$rip` in a non-executable region | Jumped into data — corrupted function pointer or a smashed return address |
-| `si_addr` = 0 | Null-pointer dereference; the offset from 0 gives the member offset (`si_addr = 0x28` → member at +0x28 of a null object) |
-| `si_addr` just below a valid mapping | Stack overflow hitting the guard page (Ch. 32 §32.20); the backtrace will be enormous or recursive |
-| `si_addr` = `0xffffffffffffffff` or similar | An unsigned underflow used as an index/size (Ch. 23 §23.12) |
-| `si_addr` looks like ASCII or a small integer | A value was used as a pointer — type confusion or a union misuse |
-| `$rip` in `free`/`malloc`/`_int_malloc` | **Heap metadata corruption** (§58.11); the culprit is elsewhere, earlier |
-| `$rip` in `memcpy` with a huge `$rdx` | Attacker- or wire-controlled length (Ch. 51 §51.11) |
-| `si_code = SEGV_ACCERR` vs `SEGV_MAPERR` | Permission violation (e.g. write to a read-only page / text) vs unmapped address |
-| Deep uniform repeating frames | Infinite recursion |
+Verification is stronger than “no crash”:
 
-**Recovering arguments.** Under System V AMD64 (Ch. 41 §41.5) integer arguments arrive in `RDI, RSI, RDX, RCX, R8, R9`. At the *entry* of the crashed function those registers still hold the arguments — so if you crashed in the prologue, `p $rdi` is `this`. Deeper into the function they've been reused, which is exactly why arguments show as `<optimized out>`. In the caller's frame, `x/8i` backwards from the return address usually shows the `mov`s that set them up, and the source of each is often recoverable.
+- a regression test covers empty, one, exact-capacity, and rejected-oversize inputs;
+- the test fails under the faulty revision;
+- ASan/UBSan pass under the fixed revision for the declared corpus;
+- the production optimization level and captured input replay pass;
+- output equality is checked;
+- a soak/stress run reports independent run count and failures.
 
----
+The root cause is the inclusive loop bound, not “malloc crashed.”
 
-## 58.7 DWARF and Split Debug Information
+### Why a core alone may not solve it
 
-**DWARF** is the debug-information format: a tree of DIEs (Debugging Information Entries) in `.debug_info` describing types, variables, and functions; `.debug_line` mapping addresses to file:line (a compressed state machine, not a table); `.debug_loc`/`.debug_loclists` giving per-PC variable locations; `.debug_abbrev`, `.debug_str`; and `.eh_frame`/`.debug_frame` carrying unwind CFI. `.eh_frame` is special: it is a **loaded, allocated** section required for C++ exception unwinding (Ch. 10 §10.7), so it survives stripping — which is why a stripped binary can still be unwound but not symbolized.
+The one-past-end access might touch mapped stack memory and continue. The later core can contain only allocator or control-data damage. Without the original input and build, the loop may be invisible.
 
-Debug info is **large** — commonly 5–20× the size of the code for a template-heavy C++ program — so shipping it inside the binary is impractical. The three mechanisms:
+The diagnosis combines:
 
-| Technique | Flags | Result |
-|---|---|---|
-| **Split DWARF** | `-gsplit-dwarf` (+ `-Wl,--gdb-index`) | Debug info goes into per-object `.dwo` files, *not* linked in; the binary keeps a skeleton unit pointing at them. Dramatically faster links and smaller binaries. Requires the `.dwo` files to remain at their recorded paths (or a `.dwp` package via `dwp`/`llvm-dwp`). |
-| **Separate debug file** | `objcopy --only-keep-debug app app.debug; objcopy --strip-debug app; objcopy --add-gnu-debuglink=app.debug app` | Ships a stripped binary plus a `.debug` file found via `.gnu_debuglink` (name + CRC) or, better, via build ID (§58.8) |
-| **Compressed debug** | `-gz` / `--compress-debug-sections=zstd` | Same info, ~4–6× smaller on disk |
+- core: establishes production detection and exact build;
+- raw input/replay: reintroduces the trigger;
+- sanitizer: moves detection to the invalid access;
+- disassembly/source: identifies the executed condition;
+- boundary test: supplies a stable oracle;
+- fixed production-like build: verifies the mechanism under relevant optimization.
 
-Related knobs: `-g1` (line tables and function names only — enough for a backtrace, tiny), `-g3` (adds macro definitions, so `p SOME_MACRO` works), `-fdebug-types-section` and `-gdwarf-5` for deduplication, and `-Wl,--gdb-index` / `gdb-add-index` to build an index so GDB starts in seconds instead of minutes on a large binary.
+None alone is the whole proof.
 
-**The production recipe**, and the expected interview answer: build `-O2 -g -fno-omit-frame-pointer -gsplit-dwarf`, strip the deployed binary, archive the unstripped binary and `.dwp` in a symbol store keyed by build ID (§58.8), and never, ever build production without `-g`.
+## 58.10 Worked hang and race diagnosis
 
-**Debug info can be wrong in ways worth knowing.** At `-O2`, line attribution to the *middle* of an optimized region is approximate; a PC may map to a line in a function that was inlined from another file, so a backtrace can name a header you did not expect. `-fvar-tracking-assignments` (GCC's default with `-g -O2`) exists specifically to keep variable locations accurate through optimization, and disabling it (`-fno-var-tracking-assignments`) speeds compilation at the cost of more `<optimized out>`. LTO makes line attribution worse still and requires `-flto -g` throughout, with debug info merged at link time.
+At time \(t_0\), useful-progress sequence stops. Two all-thread samples at recorded later times show:
 
-`readelf -S`, `readelf --debug-dump=info`, `llvm-dwarfdump`, `eu-readelf`, and `pahole` (which reads DWARF to print struct layouts, Ch. 3 §3.4) are the inspection tools.
+```text
+T1: waits acquiring metrics_mutex inside publish_metrics()
+    application evidence says T1 currently owns book_mutex
 
----
-
-## 58.8 Build IDs and Symbol Servers
-
-A **build ID** is a unique identifier — typically a 20-byte SHA1 over the binary's contents — stored in the `.note.gnu.build-id` ELF note and emitted by the linker (`-Wl,--build-id=sha1`, on by default in most distributions).
-
-```
-$ readelf -n ./app | grep -A1 'Build ID'
-    Build ID: 3f0a1c9d4b8e2f6a71c0d5e8b3a9f2c14d7e6b02
-$ eu-unstrip -n --core core.1234        # every module in the core, with its build ID
+T2: waits acquiring book_mutex inside refresh_snapshot()
+    application evidence says T2 currently owns metrics_mutex
 ```
 
-**Why it exists:** it makes the binary–debuginfo pairing *cryptographic* rather than by-name. A core dump records the build ID of every mapped module; the debugger reads them and fetches exactly the right symbols. Without it, "we debugged the core with last week's binary" produces a confident, entirely fictional backtrace — the failure mode that wastes the most time in postmortem work.
+CPU use is low, and the owner evidence comes from validated lock wrappers—not guessed libc offsets.
 
-**The lookup convention** on Linux is a directory tree keyed by build ID:
+Wait-for graph:
+
+```text
+T1 → metrics_mutex → T2 → book_mutex → T1
 ```
-/usr/lib/debug/.build-id/3f/0a1c9d4b8e2f6a71c0d5e8b3a9f2c14d7e6b02.debug
+
+That cycle explains the hang. Inspect all acquisition paths and find inconsistent order:
+
+```text
+publish_metrics:  book → metrics
+refresh_snapshot: metrics → book
 ```
-GDB searches `debug-file-directory` for exactly this path. `debuginfod` is the network version: an HTTP server indexing debug info by build ID, queried transparently by GDB, `perf`, `eu-stack`, and `elfutils`:
-```
-export DEBUGINFOD_URLS="https://debuginfod.internal:8002"
-gdb ./core            # fetches the matching binary, debuginfo, and even sources
-debuginfod-find debuginfo 3f0a1c9d...
-```
-LLDB/macOS uses **UUIDs** and `.dSYM` bundles with the same idea; `dsymutil` builds the bundle, Spotlight or `DBGShellCommands` locates it.
 
-**Operational requirements for a symbol store that actually works:**
-1. Every artifact ever deployed is archived — unstripped binary, `.dwp`, and all shared libraries including the *system* ones from that base image. A crash in `libstdc++` is unreadable without the matching libc/libstdc++ debug info.
-2. The build is reproducible enough that the build ID identifies a source revision, and that mapping is recorded (build ID → git SHA → build flags, Ch. 44 §44.16, Ch. 60 §60.1).
-3. Retention outlives your longest core-retention window.
-4. The crash-handling pipeline records the build ID *in the crash report*, so triage does not depend on knowing which host ran which version.
+Fix by enforcing one order or removing nested ownership; add a deterministic two-thread test/barrier that reaches the old inversion. Verify the test deadlocks/times out on the faulty revision and completes repeatedly on the fix. A general timeout is a detector, not the synchronization fix.
 
-**Deduplication by stack signature** is the payoff at scale: symbolize offline, hash the top *n* frames' function names (not addresses — addresses vary with ASLR and build), and count occurrences. This turns a thousand cores into five distinct bugs ranked by frequency.
+### Race-shaped spin
 
----
-
-## 58.9 Deadlock Diagnosis
-
-A **deadlock** is a cycle in the wait-for graph: every thread holds a resource another needs (Ch. 24 §24.16). The diagnostic signature is unmistakable — **0 % CPU, no progress, process alive** — which distinguishes it immediately from livelock (§58.10, 100 % CPU) and from a crash.
-
-**The procedure**, in order:
-
-```
-gdb -p <pid>                  (or gcore, then debug offline)
-(gdb) thread apply all bt
-```
-Then read the stacks. Threads blocked in `__lll_lock_wait`, `pthread_mutex_lock`, `futex_wait`, `std::condition_variable::wait`, `pthread_cond_wait`, or `epoll_wait` are the candidates. `futex` waits (Ch. 33 §33.7) are the low-level signature of every blocking C++ synchronization primitive.
-
-**Identifying who holds the lock.** A `pthread_mutex_t` on glibc stores the owner's **TID** in its `__data.__owner` field for error-checking and PI mutexes; for a normal mutex the owner field is set too in current glibc:
-```
-(gdb) p *(pthread_mutex_t*)&my_mutex
-$1 = {__data = {__lock = 2, __count = 0, __owner = 41237, __nusers = 1, ...}}
-(gdb) info threads          # find the GDB thread number whose LWP is 41237
-```
-`__lock = 2` means locked-with-waiters (the value that forces a futex syscall on unlock). Walk from each blocked thread to its lock's owner; a cycle is your deadlock. For `std::mutex` this works because it is a thin wrapper over `pthread_mutex_t`.
-
-**Tools that do this for you:**
-
-| Tool | Mode | Notes |
-|---|---|---|
-| **TSan deadlock detector** | Runtime, pre-emptive | Detects **lock-order inversions** even when no deadlock occurred (`detect_deadlocks=1`, on by default in recent builds; `second_deadlock_stack=1` for both stacks) — this is the important one, because it finds the bug *before* production |
-| **Helgrind / DRD** (Valgrind) | Runtime | Lock-order checking; very slow |
-| `pstack` / `eu-stack -p` | Snapshot | Dumps all thread stacks without a full debugger session |
-| `gdb -batch -ex 'thread apply all bt' -p` | Snapshot | Scriptable; the standard production one-liner |
-| `/proc/<pid>/task/*/stack`, `wchan` | Kernel-side | Where each thread is blocked in the kernel |
-| `perf lock`, `bpftrace` on futex | Live | Contention and hold times without stopping |
-
-**Deadlock variants whose signatures differ:**
-- **Self-deadlock**: a non-recursive `std::mutex` locked twice by one thread. One thread, blocked in `lock`, its own TID in `__owner`. Frequently caused by a callback re-entering the locked object.
-- **Lock-order inversion across a virtual call** — the second lock is acquired inside a user callback, so no single function shows both locks. Only TSan's ordering graph finds this reliably.
-- **Deadlock with a condition variable**: all threads in `pthread_cond_wait`, none blocked on a mutex. That is not a lock cycle but a **lost wakeup** (Ch. 24 §24.10) — the predicate became true while no one was waiting, and `notify_one` was called with no waiter. Signature: everyone waiting, the predicate true, and the work queue non-empty.
-- **Deadlock with a lock-free structure**: impossible by definition for lock-free progress, but a *blocking* fallback path (spin then park, Ch. 24 §24.15) can deadlock; and a spinlock held across a preemption produces the livelock-like signature of §58.10.
-- **`fork()` in a threaded process**: the child inherits mutexes locked by threads that no longer exist. Any allocation in the child deadlocks in `malloc`'s arena lock. The canonical signature is a child process hung in `_int_malloc` immediately after `fork` — hence `pthread_atfork` and the rule that only async-signal-safe calls are legal between `fork` and `exec` (Ch. 31 §31.3–§31.4).
-
----
-
-## 58.10 Livelock and CPU-Spin Diagnosis
-
-The signature is the inverse of deadlock: **100 % CPU, no forward progress**. In a low-latency system this is genuinely ambiguous, because a healthy busy-poll loop (Ch. 55 §55.3) is *also* 100 % CPU — so the diagnosis must be based on progress counters, not on CPU usage.
-
-**Distinguishing the cases:**
-
-| Symptom | Likely cause | Confirm with |
-|---|---|---|
-| 100 % CPU, application counters advancing | Normal busy-poll | Metrics (Ch. 59 §59.1) |
-| 100 % CPU, counters frozen, one hot function | Infinite loop / non-advancing parse (Ch. 57 §57.8) | `perf top -p`, repeated `bt` |
-| 100 % CPU across several threads, all in CAS retry | **Livelock / contention collapse** on a lock-free structure | `perf record`, look for `lock cmpxchg` dominance and high retry counters |
-| 100 % CPU in `__lll_lock_wait` spin phase | Adaptive-mutex spinning under heavy contention | `perf lock`, `off-cpu` profile |
-| High `sys` time, low `usr` | Syscall storm — often `epoll_wait` returning immediately (level-triggered fd never drained, Ch. 34 §34.10) | `strace -c -p` (careful: it stops the process per syscall), `perf trace`, `bpftrace` |
-| 100 % CPU, cycles high, instructions low | Stalled, not spinning — memory or false-sharing bound (Ch. 28 §28.8) | `perf stat` IPC, cache-miss counters |
-
-**The zero-perturbation method** is the one to lead with, because attaching a debugger to a hot production process is often unacceptable:
-```
-perf top -p <pid>                        # what is executing right now
-perf record -g -F 999 -p <pid> -- sleep 10 ; perf report   # sampled stacks
-perf stat -p <pid> -- sleep 5            # IPC, branch misses, cache misses
-```
-A flat profile dominated by one function with high IPC is an infinite loop; a profile dominated by an atomic RMW with *low* IPC is contention (Ch. 43 §43.20).
-
-**The poor man's profiler** — attach, `thread apply all bt`, detach, repeat a dozen times — is still remarkably effective for a hung process, because the modal stack is the answer. `pstack`/`eu-stack` do this without the full debugger cost.
-
-**Livelock proper** is progress-free mutual retry: two threads repeatedly back off and retry in lockstep, or a CAS loop where every attempt is invalidated by another thread's success (Ch. 26 §26.1). Lock-free guarantees *system-wide* progress (someone advances), so a true CAS livelock at the system level indicates a bug in the algorithm; what usually happens instead is **starvation** of one thread and cache-line contention collapse, where throughput *falls* as thread count rises because the contended line ping-pongs (Ch. 28 §28.8, Ch. 26 §26.15). Confirm with a per-thread retry counter — instrumenting the retry count is the single most useful thing you can add to a CAS loop, and it costs a relaxed increment.
-
-**Spin-with-preemption** is the low-latency-specific trap: a thread holding a spinlock is preempted (or its core is stolen by a housekeeping task or an interrupt), and every other spinner burns a full scheduling quantum. Signature: periodic multi-millisecond latency spikes correlated with `sched:sched_switch` events on the isolated cores. `perf sched`, and the `nr_involuntary_switches` field in `/proc/<pid>/task/<tid>/status`, are the confirmation. The fix is architectural (Ch. 31 §31.19, Ch. 24 §24.18), not a debugger session.
-
----
-
-## 58.11 Memory-Corruption Diagnosis
-
-Memory corruption's defining property is that **the crash is far from the bug**, in both time and space. The discipline is to recognize the class from the signature, then use a tool that catches the write rather than the consequence.
-
-**Signatures by class:**
-
-| Class | Typical crash site | Distinguishing signature |
-|---|---|---|
-| **Heap buffer overflow** | In `free`/`malloc` much later | glibc aborts: `malloc(): invalid size`, `free(): invalid next size (fast)`, `corrupted top size`, `double free or corruption` — all mean *heap metadata* was overwritten by an adjacent-block overflow |
-| **Use-after-free** | Anywhere; often a vtable call | `$rip` garbage, or the object's first 8 bytes hold a **free-list pointer** (a heap address) where a vtable pointer belongs. `p obj->vptr` naming a nonsensical symbol is the tell |
-| **Double free** | In `free` | `double free or corruption (fasttop)`; glibc's tcache has a `key` field precisely to detect this |
-| **Stack buffer overflow** | On `ret`, jumping to garbage | `$rip` = ASCII or a data value; stack canary version aborts with `*** stack smashing detected ***` (`-fstack-protector-strong`) |
-| **Use-after-return / dangling stack reference** | Reads plausible-then-garbage values | Value correct immediately after the call, garbage after the next call reuses the frame |
-| **Wild write via bad index** | Anywhere | The corrupted target is unrelated to the writer; a watchpoint is the only reliable route |
-| **Type confusion / bad `reinterpret_cast`** | On member access | Fields hold values from a different layout; sizes and offsets are "shifted" |
-| **Buffer written by a wire-controlled length** | In `memcpy` | `$rdx` enormous; trace back to an unvalidated length field (Ch. 51 §51.11) |
-| **Data race producing torn state** | Invariant violated, no memory error | ASan/Valgrind report **nothing**; only TSan finds it |
-
-**Tools, and the crucial point that they detect different things:**
-
-| Tool | Detects | Misses | Cost |
-|---|---|---|---|
-| **ASan** (`-fsanitize=address`) | Heap/stack/global overflow, UAF, double free, and (with `detect_stack_use_after_return=1`) UAR | Uninitialized reads, races, intra-object overflow by default | ~2× time, ~3× memory |
-| **MSan** (`-fsanitize=memory`) | Reads of **uninitialized** memory, with origin tracking (`-fsanitize-memory-track-origins=2`) | Everything ASan finds; requires *all* deps instrumented | ~3× |
-| **UBSan** | Misalignment, overflow, bad enum/bool values, invalid downcasts (`-fsanitize=vptr`) | Memory errors | small |
-| **Valgrind Memcheck** | Uninitialized *and* invalid accesses, leaks; **no recompile needed** | Intra-heap-block overflows, races | 20–50× |
-| **TSan** | Data races, lock-order inversion | Memory errors | ~10× |
-| **glibc `MALLOC_PERTURB_`, `MALLOC_CHECK_=3`, `GLIBC_TUNABLES`** | Some corruption, earlier | Most | tiny |
-| **Hardware: ARM MTE, Intel LAM/`-fsanitize=hwaddress`** | Same as ASan, ~5–15 % overhead | — | production-viable |
-
-The practical hierarchy: **ASan for a reproducible case; a watchpoint for a known-corrupted address; MTE/HWASan or a guard-page allocator for production.**
-
-**The watchpoint technique** (§58.2) is the definitive answer for "the value changes and I don't know who writes it," and it is what an interviewer wants to hear: find the address once, `watch -l *(uint64_t*)addr`, run, and the debugger stops on the writing instruction with the stack. Its limitation is that the address must be stable across runs — which ASLR breaks (`setarch -R`, or `set disable-randomization on`, which GDB does by default) and which a heap address may break anyway. When the address varies, use ASan first to localize.
-
-**Guard-page allocation** is the heavyweight alternative: place each allocation at the end of a page with the next page unmapped (`electric fence`, `libgmalloc` on macOS, glibc's `M_PERTURB`+`mmap` threshold, or ASan's `redzone` mode). Every overflow faults *immediately*, at the exact instruction, converting a delayed corruption into a precise SIGSEGV. It costs a page per allocation and is only viable for targeted runs.
-
-**Corruption you cannot see with any of these**: a data race that tears a 16-byte structure (Ch. 25 §25.20), an ABA-corrupted lock-free list (Ch. 26 §26.10), or a use-after-free in a reclamation scheme (hazard pointers/EBR, Ch. 26 §26.12–§26.13) — because the memory is legitimately allocated the whole time. Those require TSan, model checking (Ch. 57 §57.11), and invariant assertions inside the structure.
-
----
-
-## 58.12 Heap Debugging
-
-Beyond corruption, the heap produces three operational problems — **leaks**, **growth without leaks (fragmentation)**, and **latency spikes from allocation** — each with a different tool.
-
-**Leaks.** LeakSanitizer is built into ASan (`ASAN_OPTIONS=detect_leaks=1`, default on Linux) and can also be used standalone (`-fsanitize=leak`); it reports at exit, with allocation stacks, classified as *definitely* vs *indirectly* lost. `LSAN_OPTIONS=suppressions=lsan.supp` handles known one-time allocations. Valgrind Memcheck's `--leak-check=full --show-leak-kinds=all` gives the same information without a rebuild, plus "still reachable" (usually benign: singletons, static caches). For a long-running trading process, exit-time leak checking is nearly useless — the process is supposed to run all day. Use `__lsan_do_recoverable_leak_check()` invoked periodically or on a signal, or track allocation counts as a metric.
-
-**Growth without leaks.** RSS rising with no leaked blocks means **fragmentation** or **arena growth** (Ch. 7 §7.13, Ch. 32 §32.23). Diagnostics:
-```
-malloc_info(0, stdout)                   # glibc: per-arena XML with free/total sizes
-malloc_stats()                           # human-readable summary
-cat /proc/<pid>/smaps_rollup             # Rss, Pss, and per-mapping detail
-jemalloc: MALLOC_CONF=stats_print:true, prof:true, prof_leak:true
-tcmalloc: MallocExtension::GetStats, HEAPPROFILE=
-```
-glibc allocates a **64 MB arena per thread** (up to `8 × ncores`), so a thread-per-connection design shows enormous VSZ and stepped RSS growth that is not a leak. `M_ARENA_MAX` / `MALLOC_ARENA_MAX=2` is the standard mitigation; switching to jemalloc/tcmalloc/mimalloc is the other. `malloc_trim(0)` returns free top-of-heap memory to the OS, which `free` does not do automatically below `M_TRIM_THRESHOLD`.
-
-**Allocation profiling** — where allocations come from and how much they cost — is covered in Ch. 43 §43.23; the tools are jemalloc/tcmalloc heap profilers, `heaptrack` (excellent flame-graph output, low enough overhead for a soak run), Massif, and `bpftrace` uprobes on `malloc`.
-
-**The low-latency angle, which is the real interview content.** On the hot path the correct number of allocations is **zero** (Ch. 55 §55.1, Ch. 8 §8.8), because `malloc` can take a lock, touch a cold arena, trigger `brk`/`mmap` and therefore page faults, and occasionally take microseconds. Debugging technique follows: rather than profiling allocations, **assert their absence**.
+A separate optimized-only hang shows one thread repeatedly in:
 
 ```cpp
-// Interpose and abort on any allocation between the markers.
-static std::atomic<bool> g_no_alloc{false};
-void* operator new(std::size_t n) {
-    if (g_no_alloc.load(std::memory_order_relaxed)) __builtin_trap();  // stack points at the culprit
-    if (void* p = std::malloc(n)) return p;
-    throw std::bad_alloc{};
+while (!ready) {
+    // no synchronization
 }
 ```
-`__builtin_trap()` gives an immediate SIGILL with the offending stack — far better than a counter that tells you the count but not the site. The same pattern applies to syscalls (a `seccomp` filter returning `SIGSYS` on anything but the whitelist) and to page faults (compare `getrusage(RUSAGE_THREAD)`'s `ru_minflt` across the hot section, Ch. 32 §32.4). These three assertions — no allocation, no syscall, no page fault — are the operational definition of a clean hot path and are checkable in CI (Ch. 57 §57.16).
 
----
+Another thread writes the non-atomic `ready`. This is a C++ data race; debugger source stepping cannot impose a valid interpretation. TSan on a supported build reports conflicting accesses. The fix is not mechanically “make it relaxed atomic”: choose a mutex/condition variable or release/acquire publication that also makes the associated data visible. Verify both race freedom under the tool and the higher-level publication invariant.
 
-## 58.13 Crash-Handler Limitations
+## 58.11 Root cause and verification
 
-A **crash handler** is a signal handler for `SIGSEGV`/`SIGBUS`/`SIGFPE`/`SIGILL`/`SIGABRT` that records diagnostics before the process dies. Almost every hand-written one is subtly unsound, and knowing exactly why is a favourite interview probe.
+A useful root-cause statement has six parts:
 
-**Constraint 1: async-signal safety.** A handler may call only the functions in the POSIX async-signal-safe list (`write`, `_exit`, `signalfd`-adjacent primitives, `kill`, some others) — see Ch. 33 §33.15. Forbidden in practice:
+1. **Trigger:** input, state, or timing that activates the defect.
+2. **Defect:** invalid code or missing invariant.
+3. **Propagation:** how memory/state/wait relationships become wrong.
+4. **Detection:** where and why the symptom appears.
+5. **Contributors:** why defenses did not expose it earlier.
+6. **Evidence:** artifacts and experiments supporting every link.
 
-- `malloc`/`new`, and therefore `std::string`, `std::vector`, `std::ostringstream`, `std::format` into a dynamic buffer, and **`std::stacktrace::current()`** (§58.5). If the crash occurred *inside* `malloc` (very common with heap corruption, §58.11), the arena lock is already held and the handler deadlocks — producing a hung process with no core instead of a crash report.
-- `printf`/`fprintf` (buffered, locks, allocates). Use `write(2)` to a preopened fd.
-- Anything taking the dynamic-loader lock, which includes `dlopen`, `backtrace_symbols`, and lazy PLT resolution of a function not yet called (Ch. 41 §41.12) — so **pre-resolve** every function the handler needs, or link with `-Wl,-z,now`.
-- Locks of any kind, since the crashing thread may hold them.
+Example:
 
-**Constraint 2: the stack may be unusable.** For a **stack overflow**, the guard page is what raised `SIGSEGV`, and the handler runs on that same exhausted stack — so it immediately faults again and the kernel kills the process with no handler output at all. The fix is `sigaltstack()` plus `SA_ONSTACK`:
-```cpp
-static char alt[SIGSTKSZ * 4];
-stack_t ss{ .ss_sp = alt, .ss_flags = 0, .ss_size = sizeof alt };
-sigaltstack(&ss, nullptr);
-struct sigaction sa{};
-sa.sa_sigaction = handler;
-sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
-sigemptyset(&sa.sa_mask);
-sigaction(SIGSEGV, &sa, nullptr);
+> When an exact-capacity payload arrived, the inclusive loop executed index `size`. The out-of-bounds access corrupted adjacent state in the production layout. A later allocator consistency check aborted. The core identified detection; replay plus ASan identified the earlier access; the boundary regression failed before and passed after changing the loop condition.
+
+“Root cause: null pointer,” “race condition,” or “process hung” only restates a symptom category.
+
+### Mitigation, workaround, fix, and detection
+
+- **Mitigation:** reduce harm now—disable, isolate, roll back, restart.
+- **Workaround:** avoid the trigger without correcting the defect.
+- **Fix:** restore the violated invariant at its owning boundary.
+- **Detection improvement:** expose recurrence earlier with context.
+
+All may be necessary. Do not close the defect because a restart cleared damaged memory.
+
+### Verification portfolio
+
+Require:
+
+- reproducer on the faulty revision;
+- oracle that detects the mechanism, not only a crash;
+- fixed revision passing the same test;
+- boundary/property variants;
+- sanitizer or race-tool run where applicable;
+- production-like optimized build and input replay;
+- adversarial schedule/fault injection for concurrency defects;
+- soak/replay with independent run count and outcomes;
+- no new invariant or performance regression under Chapter 43 methodology.
+
+For rare failures, state what the run count can support. Zero observed failures is not zero probability. Preserve seeds, schedules, and artifacts for failing runs.
+
+### Competing hypotheses and negative evidence
+
+List alternatives and the observation that would distinguish them:
+
+| Hypothesis | Predicted evidence | Discriminator |
+|---|---|---|
+| One-past-end access | Boundary-dependent; sanitizer/watchpoint at loop | Exact-capacity regression |
+| Use-after-free | Access after lifetime end; reuse/quarantine sensitivity | Allocation/free chronology |
+| Data race | Conflicting unsynchronized accesses; schedule sensitivity | TSan plus happens-before audit |
+| Wrong symbols | Raw PC fails archived module/source mapping | Identity and relocation verification |
+| Compiler defect | Minimized valid program fails for exact toolchain | Cross-version codegen after UB audit |
+
+Negative evidence is scoped. “ASan found nothing” weakens only violations it could detect on exercised paths. “The pointer was non-null in the core” does not rule out ended lifetime. Keeping alternatives explicit prevents the first convenient story from becoming an unsupported root cause.
+
+## 58.12 Crash-handler limitations
+
+The most reliable crash evidence is often produced by the OS or an external collector, not complex code inside a damaged process.
+
+At a fatal signal/exception:
+
+- the allocator may be corrupt or locked;
+- the dynamic loader may hold a lock;
+- the current stack may be exhausted/corrupt;
+- another application lock may be held;
+- global invariants may already be broken;
+- other threads continue or stop according to OS/handler behavior.
+
+POSIX signal handlers may call only async-signal-safe functions. C++ library facilities are not generally promised safe there. `std::stacktrace::current()`, formatting, iostreams, allocation, symbolization, locks, and most runtime operations do not belong in a generic fatal handler.
+
+Do not assume `backtrace()`, `backtrace_symbols_fd()`, or a third-party unwinder is safe merely because one test worked. Lazy loading, allocator use, loader locks, and implementation/version behavior matter. Prewarming reduces some risks but does not create a POSIX guarantee.
+
+An alternate signal stack can help when the normal stack overflows, but it is per-thread state on relevant POSIX systems, needs adequate guarded storage, and does not make unsafe calls safe. Signal disposition, reentrancy, and preserving core generation require OS-specific tested design.
+
+A minimal handler may write a fixed preallocated record through an async-signal-safe primitive to a preopened descriptor, then preserve the platform’s core/minidump path. Even this needs a fault-injection test for:
+
+- crash inside allocator/loader;
+- stack exhaustion;
+- recursive signal;
+- multiple threads faulting;
+- full/broken output descriptor;
+- collector unavailable;
+- sensitive-data handling;
+- correct terminating signal/exception and core creation.
+
+The crashing process should not be solely responsible for financial or operational cleanup. External watchdog/risk behavior belongs to Chapters 56 and 59.
+
+### `std::stacktrace`
+
+`std::stacktrace` is a C++23 library facility, but implementation and symbolization support vary by standard library, compiler, linker, and platform. Check `__cpp_lib_stacktrace`, compile/link support, and actual output. Capturing/symbolizing can allocate and be expensive; it is useful at controlled diagnostic points, not a portable fatal-signal primitive.
+
+## Skippable reference and incident runbook
+
+## 58.13 Symptom-to-tool map
+
+| Evidence needed | Candidate | Caveat |
+|---|---|---|
+| Offline crash state | Core/minidump + GDB/LLDB | Snapshot only; exact artifacts required |
+| Earlier invalid memory access | ASan/guard allocator/watchpoint | Reproduction and perturbation |
+| Uninitialized value | MSan or platform equivalent | Dependency coverage |
+| Race evidence | TSan | Perturbs timing; no proof of absence |
+| Reverse execution | rr/debugger recording | Version/platform/external-input limits |
+| Heap ownership/growth | Allocator profiler/tool | Allocator-specific semantics |
+| Wait chronology | Lock/scheduler tracing | Instrumentation and clock effects |
+| CPU spin location | Sampling profile | Correlation, not root cause |
+| Source/address resolution | DWARF/dSYM/PDB + build identity | Mismatch gives plausible false results |
+
+## 58.14 Ten-minute postmortem runbook
+
+1. Copy evidence read-only; record hashes and access.
+2. Identify OS/tool/compiler/ISA/artifact versions.
+3. Verify executable and every module identity.
+4. Load core/minidump with matching symbols.
+5. Export signal/exception, fault address, registers, mappings, and all-thread stacks.
+6. Classify crash, corruption, low-CPU wait, high-CPU spin, race, or resource failure.
+7. For the faulting thread, inspect PC-relative instructions and effective addresses.
+8. For hangs, compare at least two samples and build a wait-for/progress model.
+9. Correlate with Chapter 59 chronology without treating logs as complete.
+10. Write hypotheses with predictions; choose the least perturbing discriminating test.
+11. Reduce and reproduce under the appropriate sanitizer/watchpoint/replay tool.
+12. Add a regression that fails before the fix; verify mechanism and production-like build.
+
+## 58.15 Command/reference card
+
+```text
+GDB:
+  thread apply all bt full
+  info registers
+  x/16i $pc
+  disassemble /m
+  info sharedlibrary
+  info proc mappings
+  info symbol ADDRESS
+  info line *ADDRESS
+  watch -location EXPR
+
+LLDB:
+  thread backtrace all
+  register read
+  disassemble --pc
+  disassemble --frame --mixed
+  image list
+  memory region --all
+  image lookup --address ADDRESS
+  watchpoint set expression -- EXPR
 ```
-`SA_SIGINFO` gives `siginfo_t*` (so `si_addr`, the faulting address) and `ucontext_t*` (so the full register set at the fault, including `uc_mcontext.gregs[REG_RIP]` — the only way to know where it crashed if you cannot unwind).
 
-**Constraint 3: re-entrancy.** If the handler itself crashes, it re-enters. `SA_RESETHAND` restores the default disposition so the second fault produces a normal core; alternatively set a static `volatile sig_atomic_t` guard and `_exit` on re-entry.
+Confirm aliases/options with the installed tool and target.
 
-**Constraint 4: it must not prevent the core dump.** A handler that calls `exit()` or `_exit()` destroys the most valuable artifact you have. The correct ending is to **restore the default handler and re-raise**, so the kernel produces the core with the original signal and the original faulting context:
-```cpp
-signal(sig, SIG_DFL);
-raise(sig);            // or: kill(getpid(), sig) — for the whole process
-```
+### Primary references
 
-**Constraint 5: threads.** The handler runs on whichever thread faulted; `pthread_self()` inside it identifies that thread, but capturing *other* threads' stacks from a signal handler requires signalling them (`pthread_kill` with a dedicated signal, each handler writing its own stack) — fragile, and a core dump does it correctly for free.
+- GNU GDB manual: [core-file generation](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Core-File-Generation.html), [optimized code](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/Optimized-Code.html), and [watchpoints](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/Set-Watchpoints.html).
+- LLVM LLDB, [GDB-to-LLDB command map](https://lldb.llvm.org/use/map.html).
+- Linux `core(5)`, [core-dump controls](https://man7.org/linux/man-pages/man5/core.5.html).
+- elfutils, [debuginfod](https://sourceware.org/elfutils/Debuginfod.html).
+- Compiler/runtime documentation matching the exact sanitizer and standard-library version.
 
-**What a handler should therefore do**, minimally and safely: write a fixed-size, pre-formatted record with `write(2)` to a pre-opened fd — signal number, `si_addr`, `si_code`, the PC/SP from `ucontext`, the build ID (§58.8), the thread id and name, and a raw *address-only* backtrace from a signal-safe unwinder (`libunwind`'s `unw_backtrace`, or `backtrace()` which is generally safe once pre-warmed, but not `backtrace_symbols`) — then flush the flight-recorder ring buffer (Ch. 59 §59.13), which should already be a preallocated, lock-free, mmapped region precisely so that dumping it needs no allocation. Then restore and re-raise.
+## Recall card
 
-**In a trading system the handler has a domain job too**: it may need to trip the kill switch or rely on the exchange's cancel-on-disconnect (Ch. 56 §56.18, Ch. 54 §54.13). Doing this *from* the handler is risky — a `write` to an already-broken socket, or a `send` requiring a lock. The robust design puts the safety action outside the crashing process entirely: a watchdog or a separate risk process observes the heartbeat's disappearance and cancels (Ch. 56 §56.8). "The crashing process cannot be trusted to clean up after itself" is the principle, and it is the right thing to say.
+- Preserve exact cores, modules, symbols, source, configuration, input, and chronology before restarting.
+- Build IDs/UUIDs identify artifacts; verify, do not trust path names.
+- A core is a snapshot, not execution history.
+- Classify crash, corruption, blocked hang, spin, race, or exhaustion before choosing tools.
+- Verify module identity before believing a symbolic stack.
+- Optimized source variables and stepping can be incomplete; disassemble from the exact PC.
+- Register meaning is ISA/ABI/PC-position specific.
+- The crash/detection site may be far after the corrupting write.
+- Watch the smallest stable address and track object lifetime.
+- Sanitizers find evidence within their coverage; clean runs prove little outside it.
+- Deadlock requires a wait-for cycle, not merely waiting threads.
+- High CPU is interpreted with progress, not alone.
+- A race fix must restore the semantic happens-before invariant.
+- Publish root cause only after a reproducer, causal mechanism, and failing-before/passing-after regression.
+- Fatal handlers have severe async-safety, stack, reentrancy, and core-preservation constraints.
+- `std::stacktrace`, rr, debuginfod, and debugger commands are version/platform gated.
+- Chapter 59 owns production signals; Chapter 44 owns tool setup.
 
----
+## Review questions
 
-## Key Interview Questions
+1. Why can correct-looking symbols still produce a false backtrace?
+2. What evidence does a core contain, and what chronology does it normally omit?
+3. Why may a local variable be unavailable in optimized code despite debug information?
+4. How do you turn a faulting instruction and registers into a memory-access hypothesis?
+5. Why is an allocator crash commonly a detection site rather than the invalid write?
+6. What evidence distinguishes deadlock, blocked waiting, spin, and livelock?
+7. Why can a hardware watchpoint mislead when object lifetime is ignored?
+8. What must a valid data-race fix establish beyond making one field atomic?
+9. Why is in-process stack symbolization unsafe in a generic fatal signal handler?
+10. What evidence is required before calling a fix verified?
 
-1. **Why do variables show as `<optimized out>`, and does `-g` slow the program down?** — DWARF describes a variable's location per PC range; if the value lives only in a reused register, was constant-folded, or was never materialized, there is no location to report — the debugger is telling the truth. `-g` itself costs nothing at runtime (it only adds non-loaded `.debug_*` sections), so always build production `-O2 -g` and split/strip the debug info; `-Og` keeps variables live when you need visibility.
-2. **Software vs hardware breakpoints?** — Software rewrites the instruction with `int3` (unlimited, modifies text, costs two context switches per hit); hardware uses the four debug registers (no modification, works on read-only or JIT code, limited to four and to 1/2/4/8 aligned bytes).
-3. **Why can a watchpoint make the program 1000× slower?** — GDB falls back to a *software* watchpoint (single-step the whole program, re-evaluate after every instruction) when the region doesn't fit the debug registers. Watch one 8-byte field, not the whole object.
-4. **A field holds garbage and you don't know who wrote it. What do you do?** — Take the address once, `watch -l *(uint64_t*)addr`, continue; the debugger stops on the writing instruction with the culprit's stack. Disable ASLR so the address is stable, or use ASan first if it isn't.
-5. **How do you unwind a stack with no frame pointers?** — CFI in `.eh_frame` (a per-PC table of where the return address and saved registers live), which is present even in stripped binaries because C++ exceptions need it. Failing that, scan the stack for values that land in executable mappings preceded by a `call`.
-6. **Why enable `-fno-omit-frame-pointer` in production?** — ~1 % cost for fast, reliable unwinding in `perf`, `bpftrace`, and crash handlers; CFI unwinding is slower and fails in asm/JIT frames. The industry has re-standardized on frame pointers for exactly this reason.
-7. **`$rip` is 0 in a core. What happened?** — A call through a null or corrupted function pointer or vtable slot. `*$rsp` holds the return address and therefore names the caller.
-8. **`si_addr` is `0x28` with a null-pointer fault. What does the offset tell you?** — The member offset within the null object — it identifies which field was accessed, and therefore usually which line.
-9. **You crash inside `free`. Where is the bug?** — Not in `free`. A heap-buffer overflow overwrote allocator metadata earlier; the glibc message (`invalid next size`, `corrupted top size`) confirms it. Reproduce under ASan.
-10. **How do you tell a use-after-free from a wild write?** — UAF: the freed object's first bytes hold a heap-looking free-list pointer where a vtable should be, and the object's contents look like allocator metadata. Wild write: the corrupted target has no relationship to the writer, and only a watchpoint or ASan localizes it.
-11. **Why is a core dump huge and what do you do about it?** — Huge-page arenas and large mappings are dumped by default. Trim `/proc/self/coredump_filter` bits, `madvise(MADV_DONTDUMP)` the big buffers, and write to fast local disk.
-12. **What are build IDs for?** — Cryptographically pairing a binary with its debug info and its source revision; the core records the build ID of every module, so the debugger (or `debuginfod`) fetches exactly the right symbols. Without it, mismatched symbols produce plausible, wrong backtraces.
-13. **What is split DWARF and why use it?** — `-gsplit-dwarf` keeps debug info in `.dwo`/`.dwp` files out of the link, giving much faster links and smaller binaries with the same debuggability via the symbol store.
-14. **Deadlock vs livelock: how do you tell them apart in seconds?** — CPU usage. Deadlock is 0 % with threads in `futex_wait`/`__lll_lock_wait`; livelock/spin is 100 % with no progress counters advancing. In a busy-poll system, always confirm with application progress counters, not CPU.
-15. **How do you find who holds a mutex from a core?** — `p *(pthread_mutex_t*)&m` and read `__data.__owner` (the owning TID), then map it to a thread with `info threads`. Walk the wait-for graph for a cycle. TSan's deadlock detector finds the lock-order inversion before it ever deadlocks.
-16. **All threads are in `pthread_cond_wait` — is that a deadlock?** — No lock cycle; it is a lost wakeup. The predicate became true while no thread was waiting, or `notify` was called without holding the mutex that guards the predicate.
-17. **Why is `std::stacktrace::current()` unsafe in a signal handler?** — It allocates and symbolizes, which may take the loader lock and `malloc`'s arena lock — and if you crashed inside `malloc`, the handler deadlocks. Capture addresses only, symbolize offline.
-18. **What must a crash handler do and not do?** — Use `sigaltstack` + `SA_ONSTACK` (or a stack overflow gets no output at all), only async-signal-safe calls, pre-resolve everything, write a fixed record with `write(2)`, flush a preallocated flight recorder, then restore `SIG_DFL` and re-raise so the kernel still writes the core. Never `exit()`.
-19. **Why should the crashing process not cancel its own orders?** — It is untrustworthy at that moment; a `send` may block or take a lock. Put the safety action in an external watchdog or rely on exchange cancel-on-disconnect.
+## Exercise
 
----
+Use the faulty reproducer in §58.9:
 
-## Common Traps
+1. compile optimized symbolized, ASan/UBSan, and unoptimized variants with recorded tool versions;
+2. retain the sanitizer report and disassembly;
+3. fix the bound and add boundary tests;
+4. show the regression fails on the faulty revision and passes on the fix;
+5. alter allocation/layout so the unsanitized failure moves, then explain why root cause does not;
+6. produce a core or platform minidump in a controlled environment and verify exact module identities;
+7. write a five-step causal explanation from invalid index to detection;
+8. record independent run counts and outcomes rather than “works now.”
 
-- **Attaching GDB to a live trading process** — stops the world, drops market data, trips watchdogs, and can drop the exchange session.
-- **Blaming permissions when attach fails** — it is usually Yama `ptrace_scope`.
-- **Debugging a core with a binary that isn't the exact build** — produces a confident, fabricated backtrace. Check build IDs.
-- **Building production without `-g`** — `-g` costs nothing at runtime and its absence costs every future postmortem.
-- **Assuming `<optimized out>` means the debugger is broken** — the value genuinely does not exist at that PC.
-- **Trusting a backtrace to be complete under `-O2`** — inlined frames may be absent and tail calls remove the caller's frame entirely.
-- **Setting a conditional breakpoint in a hot loop** — the condition is evaluated in the debugger; expect a 1000×+ slowdown. Use `dprintf`, a Python `stop()`, `__builtin_trap()`, or `bpftrace`.
-- **Watching a whole struct** — silently degrades to a software watchpoint and single-steps the program.
-- **Forgetting `watch -l`** — the watchpoint disappears when the expression's scope exits.
-- **Debugging at `-O0` because the bug reproduces there** — if it vanishes at `-O0` the cause is UB, a race, or uninitialized memory; run the optimized build under sanitizers instead.
-- **Assuming the crash site is the bug site** — for heap corruption it never is.
-- **Expecting ASan to find data races or uninitialized reads** — it finds neither; those are TSan and MSan, and the three cannot be combined.
-- **Running MSan without instrumented dependencies** — an unusable flood of false positives.
-- **Treating "still reachable" leaks as bugs** — usually singletons and static caches.
-- **Interpreting glibc's per-thread 64 MB arenas as a leak** — cap with `MALLOC_ARENA_MAX` or change allocator.
-- **Exit-time leak checking on a process designed to run all day** — use periodic `__lsan_do_recoverable_leak_check`.
-- **Calling `malloc`, `printf`, `dlopen`, `backtrace_symbols`, or `std::stacktrace` from a signal handler** — unsafe, and a guaranteed deadlock if the crash was inside the allocator.
-- **A crash handler without `sigaltstack`** — stack-overflow crashes produce no output at all.
-- **A crash handler that calls `exit()`** — destroys the core dump.
-- **A crash handler with no re-entrancy guard** — a fault inside the handler loops.
-- **`fork()` in a threaded process, then allocating in the child** — deadlock on an inherited-locked arena.
-- **Assuming 100 % CPU means healthy in a busy-poll system, or unhealthy in a blocking one** — always confirm with progress counters.
-- **`strace`-ing a latency-sensitive process** — each syscall traps to the tracer; use `perf trace` or `bpftrace`.
-- **Symbolizing crash stacks in-process** — slow, allocating, and needs debug info on the production host. Ship addresses plus a build ID; symbolize offline.
+Then construct the two-lock inversion from §58.10 behind a test-only barrier. Capture two thread snapshots, draw the wait-for graph, and verify a single acquisition order removes the cycle.
 
----
+## Puzzle
 
-## Compact Recall Summary
+A production core shows a faulting load through address `0x20`. The source line is `return node->next->value;`, and the debugger prints `node` as non-null. Is `node->next` definitely null?
 
-**Tooling.** GDB/LLDB via `ptrace`; attaching stops the world, so prefer `gcore` or an offline core. Know `thread apply all bt`, `p $_siginfo`, `info registers`, `x/16i $pc`, `info sharedlibrary`, `info symbol`, `handle`, `catch throw`, `-batch` scripting, and the Python API. Pretty printers execute Python and choke on corrupt data (`p /r`). For live production, `perf`/`bpftrace`/uprobes instead of a debugger.
+No. The debugger may be showing `node` for a different PC location range or a reconstructed/optimized value. The faulting instruction might use a register derived earlier, and `0x20` could also result from corrupted integer/address arithmetic. Disassemble the exact PC, identify its effective-address registers, inspect their values and defining instructions, then map that operation back to `node` or `node->next`. A small address supports a null-base-plus-offset hypothesis; it does not prove it.
 
-**Breakpoints.** Software = `int3` patch, unlimited, two context switches per hit; hardware = four debug registers, no memory modification, 1/2/4/8 aligned bytes. Watchpoints are the corruption workhorse — hardware is free, software single-steps everything at ~1000× cost; use `watch -l` on one 8-byte field.
+## Common traps
 
-**Optimized code.** Variable locations are per-PC DWARF expressions, so `<optimized out>` is truthful; inlining hides frames, tail calls delete callers, statements interleave. Always `-O2 -g`; `-Og` for visibility; if the bug vanishes at `-O0` the cause is UB, a race, or uninitialized memory — reach for sanitizers, not `-O0`.
+- Restarting before preserving the core, exact modules, configuration, and input.
+- Debugging with a locally rebuilt “same source” binary.
+- Treating a build ID as cryptographic authenticity.
+- Ignoring mismatched shared-library symbols.
+- Shipping cores without sensitive-data controls.
+- Assuming one core contains execution history.
+- Treating signal name or top frame as root cause.
+- Calling every wait a deadlock.
+- Calling every high-CPU loop livelock.
+- Taking only one thread snapshot for a hang.
+- Reading private mutex/allocator fields without exact library/version layouts.
+- Assuming attach or live-core capture has negligible/identical stop behavior.
+- Copying GDB commands into LLDB and assuming the same semantics.
+- Using a conditional breakpoint in a hot path without measuring perturbation.
+- Believing a watchpoint is hardware-backed without checking.
+- Watching recycled memory without lifetime generation.
+- Calling pretty-printers on corrupt structures and trusting output.
+- Calling functions in the inferior during diagnosis without understanding side effects.
+- Expecting optimized source stepping to be chronological source execution.
+- Treating `<optimized out>` as a debugger defect.
+- Assuming `-g`, frame pointers, or unwind tables have universal cost/behavior.
+- Applying x86 register/calling-convention deductions to another ABI.
+- Treating heuristic stack scanning as an authoritative backtrace.
+- Blaming `malloc`/`free` because allocator checks detected corruption.
+- Assuming ASan finds races or TSan proves race freedom.
+- Running MSan with incomplete instrumented dependencies and trusting noise.
+- Fixing a race by changing timing or adding one relaxed atomic.
+- Declaring success because a rare race did not recur once.
+- Calling `std::stacktrace`, allocation, formatting, or symbolization in a fatal signal handler.
+- Assuming `backtrace_symbols_fd` is portable async-signal-safe.
+- Letting a custom handler suppress the OS core/minidump.
+- Relying on the crashing process as the only safety actor.
+- Using production observability as a substitute for native evidence—or vice versa.
 
-**Cores.** Need `RLIMIT_CORE`, `core_pattern` (a leading `|` pipes to `systemd-coredump`), and `coredump_filter`; trim huge/shared mappings and `MADV_DONTDUMP` big buffers to keep them small. A core holds memory, registers, and `siginfo` — not fds, not history. Match binaries by build ID.
+## Prerequisite check
 
-**Postmortem.** Frame pointers make unwinding a `rbp` linked list (worth ~1 % in production); otherwise `.eh_frame` CFI, which survives stripping because exceptions need it; otherwise scan `x/256a $rsp` for return addresses inside executable mappings. `$rip`=0 → call through a null pointer; `si_addr` small → null deref at that member offset; `$rip` in `free` → heap metadata corruption; `si_addr` at a guard page → stack overflow. Arguments live in `RDI/RSI/RDX/RCX/R8/R9` at function entry only.
+You are ready to use this chapter when you can:
 
-**Symbols.** DWARF in `.debug_*`; `.eh_frame` is loaded and survives stripping. Ship `-gsplit-dwarf`, strip, archive unstripped binaries + `.dwp` + system libraries in a build-ID-keyed store; `debuginfod` serves them over HTTP. Deduplicate crashes by hashing symbolized top frames.
+- distinguish source, machine code, ABI, debug information, and unwind metadata;
+- explain process memory mappings, stack/heap lifetime, and a data race;
+- read a small disassembly and compute an effective address for your target ISA;
+- distinguish artifact identity from file path/version label;
+- draw a wait-for graph;
+- state what a sanitizer can and cannot establish;
+- design a regression with a causal oracle.
 
-**Hangs.** Deadlock = 0 % CPU, `futex_wait`/`__lll_lock_wait`, cycle in the wait-for graph — read `pthread_mutex_t.__data.__owner` for the owning TID; all-threads-in-`cond_wait` is a lost wakeup, not a cycle; `fork` in a threaded process deadlocks in `malloc`. TSan's detector finds lock-order inversions before they deadlock. Livelock/spin = 100 % CPU with frozen progress counters; distinguish stall from spin with `perf stat` IPC, and instrument CAS retry counts.
-
-**Corruption and heap.** ASan (overflow/UAF/double-free), MSan (uninitialized, needs all deps instrumented), UBSan (alignment, overflow, bad vptr), Valgrind (no rebuild, 20–50×), TSan (races) — non-overlapping, non-combinable. Guard-page allocation converts delayed corruption into an immediate fault; ARM MTE/HWASan is the production-viable version. RSS growth without leaks is fragmentation or glibc's per-thread 64 MB arenas (`MALLOC_ARENA_MAX`). On the hot path assert *zero* allocations, syscalls, and page faults with a trapping `operator new`, `seccomp`, and `ru_minflt` deltas.
-
-**Crash handlers.** `sigaltstack` + `SA_ONSTACK` or stack-overflow crashes are silent; `SA_SIGINFO` for `si_addr` and `ucontext` registers; only async-signal-safe calls, pre-resolved (`-z now`), no `malloc`/`printf`/`std::stacktrace`; re-entrancy guard via `SA_RESETHAND`; write a fixed record with `write(2)`, flush a preallocated flight recorder, then `SIG_DFL` + `raise` so the kernel still writes the core. Never let the crashing process be responsible for cancelling its own orders — that belongs to an external watchdog or exchange cancel-on-disconnect.
+If any item is unfamiliar, begin with the reproducer: inspect its sanitizer report, disassembly, optimized variables, and core before diagnosing a production process.

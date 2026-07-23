@@ -1,604 +1,1093 @@
 # Chapter 68 — Distributed Systems: Introduction and Overview
 
-*Interview-focused revision notes. The theme: a distributed system is not one program spread across machines but many programs that can only learn about each other by exchanging messages over a network that loses, delays, duplicates, and reorders them — and, crucially, can leave one node unable to tell whether a peer has crashed or is merely slow. Part I asked how one node turns rows into durable bytes; Part II asks what breaks when the data, and the very mechanisms that manage it, are scattered across nodes that fail independently. This chapter builds the vocabulary — links, clocks, synchrony, failure models, the two great impossibility results — that Chapters 69–74 stand on. The single fact under everything: there is no shared memory and no global clock, so all coordination is communication, and communication can fail.*
+Chapter 61 opened an optional specialization in storage and distributed state.
+Chapters 62–67 asked how one recovery authority organizes durable local bytes.
+This chapter crosses the boundary to **multiple independently executing
+authorities**. They have no shared memory, learn about one another through
+messages, and may observe different failures and different prefixes of history.
 
----
+The chapter has one outcome: given a distributed protocol, state its assumptions
+and separate what must never happen from what is promised eventually. That skill
+is prerequisite to failure detection, election, replication, repair,
+distributed transactions, and consensus.
 
-## 68.1 Why Distribute at All
+This is a 30–40 minute Core chapter. The mathematical and historical sidebars
+are marked Reference. Readers taking the short HFT-to-distributed bridge should
+read the Core path here, Chapter 71 on replication and consistency, and Chapter
+74 on consensus. Specialists continue sequentially through Chapters 69–74.
 
-Distributing a system is expensive in complexity, latency, and reasoning effort. Nobody does it for fun; they do it because a single node cannot meet one of four requirements, and it is worth naming them because they pull in different directions.
+## 90-second screen — Core
 
-- **Scale beyond one machine.** A dataset larger than the biggest available disk, or a write rate higher than one machine's CPU/IO can sustain, forces **partitioning** (sharding): split the data across nodes so each holds a fraction (Ch. 72). Vertical scaling — a bigger box — hits hard ceilings (a single server tops out in the low-terabyte RAM, dozens-of-cores range) and gets superlinearly expensive at the top end. Horizontal scaling adds commodity nodes.
-- **Availability despite failures.** A single node is a single point of failure: when it dies, the service is down. **Replication** — keeping copies of the data on multiple nodes (Ch. 69) — lets the system survive the loss of a node, a rack, or a whole datacenter. Availability is the *reason replication exists*, and it is different from scale.
-- **Geographic locality.** Users in Tokyo talking to a database in Virginia pay ~150–200 ms round-trip (Ch. 30) on every request. Placing replicas near users cuts read latency to single-digit milliseconds. Geo-distribution is also a regulatory requirement (data-residency laws).
-- **Fault isolation and elasticity.** Independent nodes let you upgrade, restart, or lose parts of the system without taking down the whole; cloud deployments add and remove nodes to track load.
+1. A distributed system consists of nodes/processes with local state that
+   communicate by messages. A message is an event, not shared memory.
+2. Distribution can provide capacity, locality, administrative separation, and
+   tolerance of specified faults. It also creates coordination, failure, and
+   operations costs. “Scalable,” “available,” and “fault-tolerant” are different
+   claims.
+3. **Partial failure** means some components continue while others stop, pause,
+   disconnect, lose messages, or recover. Silence does not identify which event
+   occurred.
+4. A timeout is local evidence that a deadline passed without an expected
+   event. Whether that warrants retry, suspicion, failover, or rejection depends
+   on the protocol and failure model.
+5. Physical clocks are local and uncertain. Monotonic clocks measure local
+   elapsed time; causal order comes from program order and message send/receive.
+6. **Safety** says a bad state never occurs. **Liveness** says a desired event
+   eventually occurs under stated conditions. Loss of timeliness should usually
+   cost progress before it costs safety.
+7. Failure models include crash-stop, crash-recovery, omission, timing, and
+   arbitrary/Byzantine behavior. A protocol proved for one model does not
+   inherit guarantees in a stronger one.
+8. Synchrony models specify bounds on processing and communication. Real
+   protocols commonly preserve safety without timing bounds but need a
+   sufficiently timely period for progress.
+9. FLP does not say “consensus is impossible.” It rules out guaranteed
+   termination for deterministic consensus in a fully asynchronous model with
+   even one possible crash, across all admissible executions.
+10. Quorum intersection is useful arithmetic, not a complete protocol.
+    Versions, membership, read/write rules, recovery, and fencing still matter.
 
-These goals are not free and not independent. Replication improves availability but forces you to keep copies consistent; partitioning improves scale but makes multi-key transactions cross nodes; geo-distribution improves locality but multiplies the latency of any coordination. The rest of Part II is largely the study of these tensions, and **the CAP and PACELC framing (Ch. 70)** is the formal statement of the first of them.
-
----
-
-## 68.2 Why Distribution Is Fundamentally Hard
-
-A single-node program enjoys guarantees so basic they are invisible: memory it wrote stays written, a function call either runs or does not, the clock moves forward monotonically, and when a subroutine fails it fails *here*, where the caller can see it. A distributed system loses every one of these. Petrov frames the difficulty as the combination of three properties that a single machine does not have:
-
-1. **No shared memory.** Nodes share nothing by default. The only way one node learns anything about another is to receive a message. State must be *communicated*, and communication is slow, lossy, and takes time during which the state can change (§68.3).
-2. **No global clock.** There is no single authoritative "now." Each node has its own physical clock, and these clocks drift apart; "event A happened before event B" is not even well-defined across nodes without extra machinery (§68.6, §68.7).
-3. **Independent partial failure.** Any subset of nodes and network links can fail at any time, independently, and — the defining difficulty — **a healthy node cannot distinguish a crashed peer from a slow one or a broken link** (§68.9). In a single process, a crash takes down everything at once, so there is nothing to disagree about; in a distributed system, some parts keep running with a stale or partial view.
-
-The consequence is that facts that are trivially true locally become *agreements that must be negotiated*: which node is the leader, whether a transaction committed, what the current value of a key is. Negotiating agreement over an unreliable network, with nodes that fail silently, is exactly what the impossibility results (§68.17, §68.18) say you cannot always do — and what consensus algorithms (Ch. 74) achieve under carefully weakened assumptions.
-
----
-
-## 68.3 Concurrent Execution and Shared State
-
-On one machine, threads coordinate through **shared memory** protected by locks, atomics, and memory barriers (Ch. 24, Ch. 29): a writer stores a value and, given the right fences, a reader on another core sees it within nanoseconds. The hardware cache-coherence protocol makes "shared state" real and cheap.
-
-Across machines there is no cache coherence, no shared address space, and no hardware that propagates a store. If node A updates a value and node B needs to know, A must **send a message** and B must **receive and apply** it. This has consequences that recur throughout Part II:
-
-- **State is always a delayed, possibly-stale copy.** By the time B receives A's message, A may have moved on. B's view is A's *past*. This is why replicas are described by how stale they may be (replication lag, Ch. 69) rather than as exact mirrors.
-- **There is a window in which observers disagree.** Between A's update and B's receipt, A and B hold different values. Whether clients are ever allowed to *observe* that disagreement is precisely the **consistency model** (Ch. 70): strong consistency hides the window at the cost of coordination; eventual consistency exposes it for the sake of availability and latency.
-- **Coordination is the scarce resource.** Every guarantee that hides disagreement (a lock, a quorum, a commit) costs at least one network round trip. Where a mutex on one machine costs tens of nanoseconds, its distributed analogue costs microseconds-to-milliseconds (§68.8) — a factor discussed next that reorders every performance intuition you brought from single-node programming.
-
-The mental model to carry forward: **in a distributed system, shared state is an illusion maintained by messages, and every message costs time during which reality can change underneath you.**
-
----
-
-## 68.4 The Fallacies of Distributed Computing
-
-In the 1990s Sun engineers (Peter Deutsch, James Gosling, and others) catalogued eight false assumptions that developers new to distributed systems keep making. They are worth memorizing verbatim because interviewers use them as a checklist and because each names a real, recurring production failure.
-
-| # | Fallacy | Reality | A failure it causes |
-|---|---|---|---|
-| 1 | **The network is reliable** | Packets are lost, links flap, switches reboot | An RPC library that never retries drops writes on a transient blip |
-| 2 | **Latency is zero** | A remote call is 10⁵–10⁶× a local one (§68.8) | A loop making one RPC per row (N+1) that is instant in tests and dies over the WAN |
-| 3 | **Bandwidth is infinite** | Links have finite capacity; big payloads queue and drop | Shipping full result sets across regions saturates a link and induces loss + latency |
-| 4 | **The network is secure** | Networks are hostile; traffic is sniffed, spoofed, MITM'd | Trusting the network perimeter; no TLS/auth between services |
-| 5 | **Topology doesn't change** | Nodes, routes, and DNS change constantly (cloud autoscaling) | Hardcoding IPs/hosts; caching an address that has since moved |
-| 6 | **There is one administrator** | Many teams/orgs own pieces; configs diverge | A firewall or MTU change by another team silently breaks a path |
-| 7 | **Transport cost is zero** | Serialization, syscalls, TLS, and copies cost CPU and money | Assuming "just send it" is free; ignoring egress bandwidth billing |
-| 8 | **The network is homogeneous** | Mixed hardware, MTUs, protocols, and versions coexist | An MTU mismatch causing fragmentation/black-holing on one path only |
-
-The through-line of all eight: **the network is a hostile, lossy, changing, finite, insecure, heterogeneous medium administered by people you don't control** — the opposite of the reliable function-call abstraction that RPC frameworks tempt you to believe in. Fallacies 1 and 2 are the load-bearing ones for storage systems: unreliability forces the link and consensus machinery of the rest of this chapter, and latency forces the cost-asymmetry reasoning of §68.8. Ethernet/IP (Ch. 36) and TCP (Ch. 38) are the concrete media these fallacies describe; TCP masks *some* unreliability (retransmission, ordering within a connection) but cannot mask a partition, a crash, or unbounded delay.
-
----
-
-## 68.5 Processing Models
-
-How does a distributed system organize *who does what*? Petrov distinguishes a few coordination shapes, and the choice determines where failures hurt and how much coordination is needed.
-
-- **Leaderless / symmetric.** Every node is equal; there is no distinguished coordinator. Clients (or a coordinator chosen per-request) talk to multiple replicas and use quorums to reconcile. **Dynamo-style** systems — Amazon Dynamo, Apache Cassandra, Riak — are leaderless (Ch. 69, Ch. 73). No single node's failure is special, but there is no natural place to order writes, so conflict resolution (last-write-wins, vector clocks, CRDTs) is pushed onto reads.
-- **Leader-based / master-slave.** One node is the **leader** (primary) that orders all writes; others are **followers** (replicas) that apply the leader's stream. **PostgreSQL streaming replication**, MySQL, MongoDB, and Raft-based systems (etcd, ZooKeeper's ZAB) are leader-based. A single ordering point makes strong consistency and transactions natural, but the leader is a bottleneck and its failure requires **leader election / failover** (Ch. 74).
-- **Multi-leader.** Several leaders accept writes (often one per region) and replicate to each other. Good for write locality and regional availability, but concurrent writes to the same key on different leaders create **write conflicts** that must be resolved.
-
-Cross-cutting these is the **communication style**: synchronous request/response (RPC, blocking until a reply or timeout) versus asynchronous messaging (fire-and-forget into a queue, decoupling sender and receiver in time). Asynchronous messaging tolerates the receiver being temporarily down at the cost of harder-to-reason-about ordering and end-to-end acknowledgment. Whatever the model, the primitives underneath are the same: unreliable links (§68.12) carrying messages between nodes that can fail (§68.20).
-
----
-
-## 68.6 Clocks and Time: There Is No "Now"
-
-Distributed systems reason constantly about *order* — which write is newer, whether a lease has expired, when a timeout fires — and order needs time. The trap is assuming a single, shared, accurate clock. There is not one.
-
-Each node has its own **physical clock** (a quartz oscillator feeding a counter). No two clocks agree exactly, and each drifts relative to true time. There is no instant that all nodes can point to and call "now"; the concept of a globally simultaneous "now" is not just hard to obtain, it is **physically ill-defined** across separated nodes exchanging signals that take time to travel. This forces two different notions of time:
-
-- **Physical (wall-clock) time** — what a node's real-time clock reports (`CLOCK_REALTIME`). Useful for humans, TTLs, and coarse timestamps, but *not trustworthy for ordering events across nodes*, because clock skew (§68.7) can make a later event carry an earlier timestamp. Comparing wall-clock timestamps from two machines to decide "who wrote last" is a classic bug.
-- **Logical time** — order derived from causality, not from any clock. If event A *could have caused* B (A sent a message that B received, or A and B ran on the same node with A first), then A precedes B. **Lamport clocks** and **vector clocks** (developed fully in **Ch. 71**) capture this "happened-before" relation with counters, sidestepping physical clocks entirely. Logical clocks can tell you A→B or "concurrent," which is exactly what conflict resolution needs.
+The interview habit is:
 
 ```
-Node A:  a1 ──── a2 ──────────── a3
-            \                         (a2 sends msg m to B)
-             \────────► m
-Node B:              b1 ── b2(recv m) ── b3
-
-Causality (happened-before, →):
-   a1 → a2 → a3      (same node, program order)
-   b1 → b2 → b3      (same node, program order)
-   a2 → b2           (message send → receive)
-   therefore a1 → b3, a2 → b3, ...
-   a1 and b1 are CONCURRENT (neither could have caused the other)
-
-Wall clocks may disagree: B's clock could read EARLIER at b2 than
-A's did at a2, even though a2 → b2. Never order across nodes by wall time.
+assumptions → state machine → safety property → liveness conditions
+            → failure trace → recovery/observability
 ```
 
-The interview takeaway: **"which event happened first?" has two answers — physical (unreliable across nodes) and logical (reliable but only a partial order).** Most correct distributed algorithms use logical time for ordering and treat physical time only as an optimization or a failure-detection heuristic (timeouts).
-
 ---
 
-## 68.7 Clock Skew, NTP, and the Limits of Synchronized Time
+## Distributed execution and assumptions
 
-Since physical clocks drift, systems synchronize them, but synchronization is bounded and imperfect — and understanding *how* imperfect is the difference between a correct design and a data-loss bug.
+## 68.1 Nodes, Processes, Messages, and State — Core
 
-- **Clock drift** is the rate at which a clock diverges from true time. Commodity quartz drifts on the order of tens of parts per million — roughly a few seconds per day if left alone, and worse under temperature swings.
-- **Clock skew** is the instantaneous difference between two clocks at a moment. It is what matters when comparing timestamps.
-- **NTP (Network Time Protocol)** disciplines clocks against upstream time servers, correcting drift. In practice NTP holds skew to **~1–50 ms** on a LAN and worse across the internet; **PTP (Precision Time Protocol)** with hardware timestamping reaches sub-microsecond in a datacenter (Ch. 35 covers the tuning). Crucially, NTP can also step a clock *backward* to correct it, so `CLOCK_REALTIME` is **not monotonic** — a naive "get current time" can go down, which breaks duration measurements (use `CLOCK_MONOTONIC` for elapsed time, Ch. 35).
+A **node** is a failure/placement unit named by a design: perhaps a host, virtual
+machine, container, or device. A **process** is an executing program with local
+memory and durable state. Several processes may share a node and therefore a
+power supply, kernel, network path, and fate. A protocol that counts processes
+as independent replicas while placing them on one host has confused logical
+participants with failure domains.
 
-The design lesson: because skew is bounded but nonzero and never guaranteed to be small, **you cannot use wall-clock timestamps for correctness unless you account for the uncertainty**. Two responses illustrate the spectrum:
+A useful abstract process is a state machine:
 
-- **Cassandra's last-write-wins** uses wall-clock timestamps to order conflicting writes. If two nodes' clocks skew, a *logically later* write can be silently discarded because it carries a smaller timestamp — a real, documented data-loss mode that motivates monotonic-clock discipline and, better, logical clocks.
-- **Google Spanner's TrueTime** confronts the uncertainty head-on: it exposes time as an *interval* `[earliest, latest]` with a bound (a few milliseconds) enforced by GPS and atomic clocks, and it **waits out the uncertainty** (`commit-wait`) before releasing a commit, guaranteeing external consistency. It buys correctness by paying the skew bound in latency on every commit. Spanner is the proof that tight, *bounded* clocks are valuable — but note it never claims skew is *zero*, only bounded and known.
+```
+local state S
+  + one input event
+  ─────────────────► transition(S, event)
+                     = new state S' + zero or more output events
+```
 
-Bottom line: NTP shrinks skew, it does not eliminate it; correctness must come from either logical clocks (§68.6, Ch. 71) or explicitly bounded physical time (Spanner), never from an assumption that two machines' clocks agree.
+Input events include client requests, message arrivals, local timer events,
+storage completions, recovery records, and administrative changes. Outputs
+include messages, durable writes, responses, metrics, and new timers. A
+distributed **execution** is an interleaving of these local transitions plus the
+network’s delivery choices.
 
----
+This model deliberately omits a shared heap. If process A changes `balance`,
+process B learns only through an explicit message, a shared external service, or
+recovery from some mutually accessible durable medium. Even then B observes a
+representation at a particular point in a protocol—not A’s current memory.
 
-## 68.8 Local vs Remote Execution: The Cost Asymmetry
+Name three kinds of state:
 
-The most consequential number in distributed systems is the gap between a local operation and a remote one, because it silently invalidates the performance intuitions engineers bring from single-node code. Using the reference numbers from Ch. 30:
+- **volatile local state:** lost on a process/node restart;
+- **durable local state:** intended to survive faults included in the storage
+  contract;
+- **replicated state:** copies whose agreement, lag, and failure-domain
+  placement are defined by a protocol.
 
-| Operation | Order of magnitude |
+“Durable” and “replicated” are orthogonal. Three memory-only copies can all lose
+power; one synchronized local log can survive a process crash but not its
+device. Chapter 61 established the local durability contract. Chapters 71 and 74
+establish replicated acknowledgement and agreement.
+
+### State is knowledge, not omniscience
+
+At time \(t\), A’s local state records what A has observed so far. It cannot
+directly include an undelivered event at B. Two nodes can therefore be correct
+and disagree because their histories differ:
+
+```
+A: write x=7 ── send update ─────────────────────────►
+
+B: read x=6 ─────────────────── receive x=7 ── read x=7
+```
+
+Whether B’s first read is legal depends on the promised consistency model, not
+on the word “replica.” Chapter 71 owns those histories. Here, retain the
+mechanical fact: information moves no faster than the messages carrying it.
+
+## 68.2 Why Distribute, and What Exactly Is Promised? — Core
+
+Distribution is justified by a requirement that one authority cannot or should
+not meet:
+
+| Goal | Mechanism often used | New cost/question |
+|---|---|---|
+| Data or throughput scale | Partition keys/work across nodes | Skew, routing, rebalancing, cross-partition operations |
+| Fault tolerance | Replicate across failure domains | Agreement, lag, failover, repair, extra capacity |
+| Geographic locality | Place service/state near users or venues | Long coordination paths, residency, divergent partitions |
+| Administrative/security separation | Isolate tenants, teams, or trust domains | Authentication, policy/version drift, cross-domain failure |
+| Elasticity/maintenance | Add, remove, upgrade nodes online | Membership transitions and mixed-version compatibility |
+
+Do not treat the nouns as interchangeable:
+
+- **Scalability** describes how useful capacity or performance changes as
+  resources/load change. It requires a workload, metric, range, and bottleneck.
+- **Availability** may mean an operational fraction of successful requests, a
+  per-request response property in a formal model, or simply readiness. State
+  which.
+- **Fault tolerance** means preserving named properties despite a specified
+  number/type/placement of faults. “Survives one replica loss” says more than
+  “highly available.”
+- **Reliability** often concerns correct continuous service over time, but its
+  exact metric and failure boundary must be stated.
+
+Availability can be measured operationally as:
+
+```
+successful eligible requests
+────────────────────────────
+total eligible requests
+```
+
+That ratio is meaningless until “successful,” “eligible,” observation window,
+and excluded maintenance are defined. It also does not reveal whether returned
+answers were fresh or correct. Correctness and responsiveness need separate
+properties.
+
+A design should say why it is distributed and which new failure cases are worth
+the cost. A capture service might partition by instrument for throughput yet
+keep each partition within one low-latency site. A reference-data service might
+replicate across sites for read locality. A risk-limit service might accept
+higher coordination latency to prevent concurrent grants from exceeding a
+global limit. “Use microservices” is an organization choice, not evidence of a
+distributed-data requirement.
+
+### Concurrent execution without cache coherence
+
+Local concurrency tools still matter inside each process, but they do not cross
+the network boundary. A release store by A cannot publish memory to B; a mutex
+held by A cannot prevent B from entering its own critical section. A distributed
+lock is a protocol involving remote state, ownership generations, expiry or
+release rules, and failure handling—not a slower `std::mutex`.
+
+Concurrent messages also have no unique natural interleaving:
+
+```
+Client X ── update k=1 ──► A
+Client Y ── update k=2 ─────────► B
+
+           no causal edge between the two sends
+```
+
+If A and B both accept, a later mechanism must define their order, preserve both
+as concurrent versions, merge them, reject one, or reconcile. Arrival order at A
+can differ from arrival order at B. The scheduler in a test run is only one
+possible execution.
+
+The shared-state illusion is constructed at a cost:
+
+- replication messages propagate versions;
+- consistency rules constrain which versions clients may observe;
+- transactions coordinate groups of operations;
+- consensus can select a common ordered log;
+- fencing prevents an authority from acting after ownership moved.
+
+Each mechanism needs a state machine and failure model. None recreates
+instantaneous cache coherence across nodes.
+
+### The fallacies as an audit, not a recital
+
+The traditional fallacies of distributed computing are useful when translated
+into design questions:
+
+| Unsafe assumption | Audit question |
 |---|---|
-| L1 cache reference | ~1 ns |
-| Main-memory (DRAM) reference | ~80–100 ns |
-| Mutex lock/unlock (uncontended) | ~20 ns |
-| Same-rack network round trip (kernel bypass) | ~3–6 µs |
-| Same-datacenter round trip (kernel TCP) | ~100–500 µs |
-| Cross-country round trip (Chicago↔NY fiber) | ~13 ms |
-| Cross-continent round trip (NY↔London) | ~55–60 ms |
-| Intercontinental round trip (trans-Pacific) | ~150–200 ms |
+| Network is reliable | What does loss/reset/partition do to operation outcome? |
+| Latency is zero | How many sequential round trips and fan-out tails exist? |
+| Bandwidth is infinite | What queues or degrades at sustained and burst rates? |
+| Network is secure | How are peers authenticated and messages protected/replayed? |
+| Topology does not change | How are address, route, placement, and membership changes handled? |
+| There is one administrator | Which teams/providers control dependencies and policy? |
+| Transport cost is zero | What are serialization, encryption, copy, CPU, and egress costs? |
+| Network is homogeneous | Which MTU, protocol, hardware, region, and version differences matter? |
 
-A remote call within a datacenter is roughly **10³–10⁴×** a local memory access; a cross-region call is **10⁵–10⁶×**. A function call that reads memory (~100 ns) versus the same logical call made as an RPC to another region (~50 ms) differ by **five to six orders of magnitude** — the difference between one second and one week.
+The list is not a failure model by itself. A link protected by authentication
+can still omit messages; an ordered transport can still terminate ambiguously;
+a redundant route can still share a hidden failure domain. Convert each relevant
+assumption into a testable contract.
 
-The design consequences dominate distributed data systems:
+## 68.3 An Assumption Ledger — Core
 
-- **Round trips, not bytes, are usually the cost.** Latency is set by the speed of light and switching hops, not payload size, until you hit bandwidth limits. So you *batch* (one request for 1000 rows, not 1000 requests) and avoid the **N+1 pattern** the second fallacy warns about. Chattiness kills.
-- **Coordination is precious.** Every consensus round, quorum, or two-phase commit costs at least one round trip; strong consistency across regions costs tens of milliseconds *per operation that coordinates*. This is why systems work hard to avoid coordination on the fast path (Ch. 70, Ch. 73).
-- **Timeouts must respect the fabric.** A timeout tuned for same-rack latency will fire spuriously across regions; a timeout tuned for cross-region will react slowly to a same-rack crash. Since you cannot distinguish slow from dead (§68.9), timeout choice is a genuine trade-off, not a detail.
+Every theorem and protocol guarantee is conditional. Record assumptions before
+choosing an algorithm:
 
-The asymmetry also explains data placement: you replicate near readers, partition to keep related data co-located, and treat every cross-node hop as a cost to be minimized or hidden.
+| Dimension | Questions to answer |
+|---|---|
+| Participants | Fixed or changing membership? Which identities are authenticated? |
+| State | Volatile or durable? Can a restart recover identity, term, vote, or dedup state? |
+| Links | Can messages be lost, duplicated, delayed, reordered, corrupted, or forged? |
+| Timing | Known bounds, eventual bounds, or none? Which clock drives local deadlines? |
+| Faults | Crash-stop, crash-recovery, omission, timing, Byzantine? How many and where? |
+| Network | Can it partition asymmetrically? Are routes/failure domains correlated? |
+| Client | May it retry concurrently, forget state, move sessions, or reuse identifiers? |
+| Guarantee | Safety, liveness, consistency, durability, availability, latency under what conditions? |
 
----
+The ledger is part of the design, not paperwork after it. For example, a node
+that “crashes and comes back” is not crash-stop. If it forgets a prior vote or
+operation ID, a proof requiring stable memory may fail. A network can also be
+asymmetric: A reaches B while B’s replies cannot reach A. A diagram that models
+only symmetric partitions may omit a real execution.
 
-## 68.9 The Defining Feature: Partial Failure
+Use labels to keep abstraction levels honest:
 
-Here is the property that most sharply separates distributed systems from everything else. In a single program, failure is **total**: a crash, a segfault, an out-of-memory kill takes down the whole process at once. Everything is either working or gone, and the two states are easy to tell apart.
+| Label | Meaning |
+|---|---|
+| **Model** | Defined environment: processes, events, links, timing, faults |
+| **Property/theorem** | Mathematical claim under explicit model assumptions |
+| **Protocol** | State machines and message rules intended to provide properties |
+| **Implementation** | Concrete code, storage, timers, threading, and recovery choices |
+| **Product/version/configuration** | Behavior of a named deployed release and settings |
+| **Measured** | Result for named topology, load, failures, and observation method |
 
-In a distributed system, failure is **partial**: some nodes and links fail while others keep running, and — the sharp edge — **a surviving node cannot reliably distinguish a failed peer from a slow one or a broken link.** When node A sends a request to node B and hears nothing back within its timeout, A cannot know which of these happened:
-
-```
-   A sends request to B, then waits... and hears nothing.
-   Which of these actually happened?
-
-   (1) B crashed before receiving the request.        → request lost
-   (2) B received it, crashed before processing.       → request lost
-   (3) B processed it, crashed before replying.        → EFFECT HAPPENED, no reply
-   (4) B replied, the reply was lost in the network.   → EFFECT HAPPENED, no reply
-   (5) B is alive but slow (GC pause, overload); reply → EFFECT WILL HAPPEN, late
-       is still coming.
-   (6) The network is partitioned; B is fine and still → EFFECT HAPPENED on B's side
-       processing on the other side.
-
-   From A's vantage point, all six look IDENTICAL: silence.
-```
-
-A's only observable is *silence*, and silence is ambiguous across at least six scenarios that demand opposite responses. If A **retries**, it risks executing the operation twice (cases 3, 4, 6). If A **gives up**, it risks abandoning an operation that succeeded (also cases 3, 4, 6) or was about to. There is no local information that resolves the ambiguity — resolving it requires *more communication with a party that may itself be unreachable*.
-
-This single fact — **you cannot tell "dead" from "slow"** — is the root of an astonishing amount of distributed-systems machinery:
-
-- It is why **exactly-once delivery is impossible** at the network layer and must be simulated with idempotence + dedup (§68.15).
-- It is why **failure detectors are approximate** (§68.21) and consensus needs partial-synchrony assumptions (§68.19) to make progress.
-- It is why the **FLP result** (§68.18) says deterministic consensus can't be guaranteed asynchronously — a slow node is indistinguishable from a crashed one, so no algorithm can safely decide when to stop waiting.
-
-Everything downstream in Part II is, in one way or another, a strategy for living with partial failure you cannot diagnose.
-
----
-
-## 68.10 Network Partitions
-
-A **network partition** is the failure mode where the network splits into groups of nodes that can each communicate internally but cannot reach the other group(s) — while every node in every group is still running and processing.
-
-```
-   Healthy:                      Partitioned:
-   ┌───┐   ┌───┐   ┌───┐         ┌───┐   ┌───┐ ┊ ┌───┐
-   │ A │───│ B │───│ C │         │ A │───│ B │ ┊ │ C │
-   └───┘   └───┘   └───┘         └───┘   └───┘ ┊ └───┘
-     all can talk                 {A,B}    ┊    {C}
-                                  can talk  ┊  isolated
-                                            ┊
-                              C thinks A,B are dead.
-                              A,B think C is dead.
-                              All three are ALIVE.
-```
-
-Partitions are the most dangerous failure because they combine the ambiguity of §68.9 with *independent continued operation*: both sides are up, both think the other is down, and both may keep accepting reads and writes. If the two sides both keep serving writes, they **diverge**, and the system now has two conflicting versions of reality that must eventually be reconciled or one side must lose data. This is precisely the dilemma **CAP (Ch. 70)** formalizes: during a partition you must choose between **consistency** (refuse to serve on at least one side, staying correct but unavailable) and **availability** (keep serving on both sides, staying up but risking divergence). You cannot have both while partitioned; the only free choice is what you sacrifice.
-
-Partitions are not exotic. They are caused by switch failures, misconfigured firewalls, BGP mistakes, overloaded links that drop enough packets to look like a cut, and long GC pauses that make a node *appear* partitioned from the outside. A "partition" from the algorithm's point of view is simply *messages not arriving in time*, which is why in the partial-synchrony model a partition and extreme slowness are the same event. The practical defenses are **quorums** (require a majority to act, so at most one side of a partition can make progress — Ch. 69, Ch. 74) and **fencing** (Ch. 74), which prevent a wrongly-presumed-dead node from causing damage when it comes back.
+FLP is a theorem, not a product outage prediction. “At-least-once” is a delivery
+contract, not proof that a business operation applies once. A vendor’s
+“quorum” setting is not meaningful without its membership, version, and read/
+write semantics.
 
 ---
 
-## 68.11 Cascading Failures
+## Partial failure, communication, and retry
 
-Partial failure is bad; **cascading failure** is how a small partial failure becomes a total outage. The pattern: one component fails or slows, the load it was handling is redistributed to its peers, the extra load pushes those peers over their limit, they fail or slow, and the failure front propagates until the whole system is down.
+## 68.4 Partial Failure and Indistinguishability — Core
 
-```
-   Node X slows (or dies)
-        │  load X handled is retried / rerouted to Y, Z
-        ▼
-   Y, Z now over capacity ──► they slow ──► their clients time out
-        │                                        │
-        │  clients RETRY (amplifying load) ◄──────┘
-        ▼
-   retry storm + queue buildup ──► more nodes tip over ──► total outage
-```
-
-The accelerants are worth naming because interviewers probe mitigations:
-
-- **Retry storms.** A timeout triggers a retry; retries multiply the load on an already-struggling system exactly when it can least afford it. Mitigation: **exponential backoff with jitter**, and **retry budgets** that cap the fraction of traffic that is retries.
-- **Unbounded queues.** A slow downstream lets requests pile up in queues; latency climbs, memory grows, and clients that have already timed out are still being served (work amplification). Mitigation: **bounded queues + load shedding** — drop excess work fast rather than queue it.
-- **Thundering herds / synchronized clients.** Caches expiring together, or all clients reconnecting at once after a blip, create a spike. Mitigation: jittered timers, request coalescing.
-- **Positive-feedback loops** generally: anything where "system is slow → clients do more work → system is slower." **Circuit breakers** (fail fast when a dependency is unhealthy, giving it room to recover) and **backpressure** break the loop.
-
-The deep point connecting this to §68.9: because you cannot tell slow from dead, the *natural* reaction (retry, reroute) is exactly what turns a localized slowdown into a system-wide collapse. Robust distributed systems are designed to *degrade* rather than amplify — shedding load and failing fast instead of retrying into the ground.
-
----
-
-## 68.12 Abstractions: Links and the Fair-Loss Foundation
-
-To reason about all this precisely, distributed-systems theory builds a hierarchy of **link abstractions** — models of a communication channel between two nodes, each stronger than the last, each built from the one below. This layered construction (from Cachin/Guerraoui/Rodrigues, which Petrov follows) is the standard vocabulary; know the ladder.
-
-The weakest useful model is the **fair-loss link**, which captures what a raw IP/UDP datagram channel (Ch. 36) actually gives you. Its three properties:
-
-1. **Fair loss.** If you send a message infinitely often, it is delivered infinitely often. (A message *may* be lost, but the link cannot lose *every* copy of a message you keep retransmitting — losses are not adversarial-forever.)
-2. **Finite duplication.** The link may deliver a message more than once, but only finitely many times.
-3. **No creation.** The link does not invent messages; every message delivered was actually sent by someone.
-
-Fair-loss is deliberately weak: it can drop and duplicate freely, promising only that persistence eventually pays off. Everything stronger — reliable, ordered, exactly-once — is *built on top* of fair-loss by adding retransmission, acknowledgments, sequence numbers, and deduplication. The reason to start here is honesty: this is genuinely all the physical network guarantees, so any stronger guarantee your application relies on is *software you (or TCP) must implement*, and it is worth knowing that machinery so you understand its limits (§68.15).
-
----
-
-## 68.13 Acknowledgments, Retransmits, and the Duplicate Problem
-
-To climb from fair-loss toward reliability, you add two mechanisms — and immediately inherit a new problem.
-
-- **Acknowledgments (ACKs).** The receiver, on getting a message, sends back a small confirmation. The sender now has *evidence* of delivery. But an ACK is itself a message on a fair-loss link, so it too can be lost — the absence of an ACK does not mean the message was not delivered (this is §68.9 in miniature).
-- **Retransmission.** If the sender does not receive an ACK within a timeout, it **resends** the message. Retransmission is what converts "may be lost" into "eventually delivered": keep resending until acknowledged, and fair-loss guarantees the message (and its ACK) eventually get through.
-
-The problem retransmission creates is **duplicates**. Consider the message delivered but the ACK lost:
+In a local function call, caller and callee normally share a process fate. A
+remote interaction has independent state transitions:
 
 ```
-   Sender                         Receiver
-     │  msg #1  ──────────────────►│  (delivered, processed)
-     │                             │  ACK #1 ──┐
-     │  ◄─────────  X  (ACK lost) ─┘           
-     │  (timeout, no ACK)                       
-     │  msg #1  ──────────────────►│  (delivered AGAIN — duplicate!)
+client A        network          service B        B's durable state
+   | request ──────?────────────────► |                  |
+   |                                  | apply ─────────► |
+   |                                  | reply ───?       |
+   | ... local deadline expires ...   |                  |
 ```
 
-The receiver has now processed message #1 **twice**. If the message was "transfer $100," the account is debited twice. Retransmission — the very mechanism that gives reliability — inevitably produces duplicates, because the sender cannot distinguish "message lost" from "ACK lost" (partial failure again). This is why the next layers need **sequence numbers**: tag each message with a unique/monotonic id so the receiver can recognize and discard a re-delivery. TCP (Ch. 38) does exactly this internally — its sequence numbers and cumulative ACKs implement retransmission-with-dedup over IP's fair-loss datagrams — but TCP's guarantee ends at the connection boundary (§68.15).
+If A observes no reply by its deadline, several histories are compatible with
+that observation:
 
----
+1. the request was lost before B;
+2. B received it but has not scheduled it;
+3. B paused or crashed before applying it;
+4. B applied it and crashed before replying;
+5. B replied but the reply was lost or delayed;
+6. B is healthy on the other side of a partition;
+7. A itself was paused, so its local observation arrived late.
 
-## 68.14 Stubborn Links and Perfect Links
+From A’s current local history, these executions may be
+**indistinguishable**. Yet their correct business outcomes differ. A blind retry
+might be necessary in cases 1–3 and duplicate an effect in cases 4–6. Giving up
+avoids duplication but may report failure for committed work.
 
-Two more rungs complete the classic ladder.
+This is not a claim that a remote failure can never be learned. Later evidence
+may arrive; another authority may provide a committed record; a failure detector
+may become accurate under stronger timing assumptions. The precise claim is
+local and temporal: silence alone at A’s deadline does not determine B’s state.
 
-- **Stubborn link.** Built on fair-loss by **retransmitting forever**: the sender keeps resending every message periodically, without end. This guarantees eventual delivery (property: if a correct process sends a message to a correct process, it is delivered infinitely often) but does nothing about duplicates — the receiver sees each message endlessly. Stubborn links are a stepping stone, not something you use directly; they isolate "guaranteed delivery" from "no duplicates."
+### Timeouts are policy inputs, not truth
 
-- **Perfect link (reliable link).** Built on a stubborn link by adding **deduplication**: the receiver tracks which message ids it has already delivered and discards repeats, delivering each message to the application exactly once. Its guarantees:
-  1. **Reliable delivery** — if a correct process sends to a correct process, the message is eventually delivered.
-  2. **No duplication** — no message is delivered more than once (to the application).
-  3. **No creation** — only sent messages are delivered.
+A timeout establishes:
+
+> By local monotonic elapsed time \(D\), this process did not observe the
+> expected event.
+
+It does not establish “B is dead,” “the request failed,” or “the network is
+partitioned.” The application may still use the event to bound waiting:
+
+- return an **unknown/pending** outcome and let the client query by operation ID;
+- retry a safely idempotent operation;
+- mark a peer **suspect** and gather more evidence;
+- stop accepting work whose safe authority cannot be established;
+- begin an election whose votes/terms, rather than the timeout itself, prevent
+  split authority.
+
+There is no universal correct timeout. The value depends on the intended
+detection/latency objective, delay distribution, overload behavior, topology,
+and cost of a false suspicion. Chapter 69 owns detector design and tuning.
+
+## 68.5 Link and Delivery Contracts — Core
+
+An application sees a link abstraction supplied by several layers: network,
+transport, RPC/messaging library, and its own retry/dedup protocol. Define its
+contract rather than saying “the network is unreliable.”
+
+Potential effects include:
+
+- **loss:** a sent message is never delivered;
+- **delay:** delivery occurs after an arbitrary or bounded interval;
+- **duplication:** the receiver observes the same logical message more than
+  once;
+- **reordering:** messages arrive in a different order from sends;
+- **corruption/forgery:** bits or identities are wrong unless detected or
+  authenticated;
+- **connection reset:** an ordered byte stream ends without resolving the
+  application operation.
+
+TCP provides an ordered, duplicate-suppressed byte stream while one connection
+is usable. It does not tell an application whether a framed request whose
+connection failed was durably applied. Reconnecting creates another stream; the
+application must recover its operation semantics.
+
+Common delivery labels are:
+
+| Contract | Receiver-side observation | Cost/risk |
+|---|---|---|
+| At-most-once delivery/invocation | Receiver observes zero or one scoped invocation | May omit an operation after loss/ambiguity |
+| At-least-once delivery/invocation | Receiver observes one or more if retry conditions eventually succeed | Receiver may see duplicates |
+| Deduplicated/effectively-once operation | Stable identity plus atomic apply/dedup state within a defined scope | Retention, recovery, race, and transaction-boundary complexity |
+
+An unqualified “exactly once” claim is too broad. It may legitimately describe a
+product’s scoped processing guarantee, but ask:
+
+- exactly one delivery, handler invocation, committed state transition, or
+  externally visible effect?
+- between which endpoints and within which failure/recovery boundary?
+- where is the operation identity durably retained, and for how long?
+- are state update and dedup record atomic?
+- what happens when the operation calls an external system outside that atomic
+  boundary?
+
+### Idempotence and deduplication
+
+An operation \(f\) is idempotent if:
+
+\[
+f(f(S)) = f(S)
+\]
+
+for relevant state \(S\). “Set status to cancelled” may be idempotent; “add 10
+to balance” is not. A request ID can make a non-idempotent business operation
+safe to retry if the receiver atomically stores:
 
 ```
-   Fair-loss link      (may lose, may duplicate, no creation)
-        │  + infinite retransmission
-        ▼
-   Stubborn link       (delivered infinitely often; still duplicates)
-        │  + sequence numbers / dedup at receiver
-        ▼
-   Perfect link        (delivered exactly once, no dups) — the abstraction
-                        higher-level algorithms assume
+(client_id, operation_id) → completed result
 ```
 
-The crucial fine print: the "perfect link" guarantee holds **only between correct (non-crashing) processes**. If either endpoint crashes, all bets are off — a message in flight or not yet retransmitted is simply lost, and the perfect-link abstraction says nothing. That caveat is exactly why perfect links are *not* the same as exactly-once end-to-end delivery, which is the subject of the next section, and why higher-level protocols (consensus, replication) still need their own retry and idempotence logic on top.
+with the state transition, then returns the stored result for duplicates.
+Atomicity matters. Recording the ID before applying may lose work after a crash;
+recording it after applying may repeat work. Retention matters too: reuse or
+expiry of an ID can make an old duplicate appear new.
 
----
+## 68.6 Worked Failure: Reserve a Risk Limit Once — Core
 
-## 68.15 Why Exactly-Once Delivery Is a Myth
-
-"Exactly-once delivery" is the most-requested and most-misunderstood guarantee in distributed messaging. As a *network-transport* property it is **impossible**, and understanding why is a rite of passage.
-
-The impossibility follows directly from §68.9 and §68.13. A sender must decide whether to retransmit, and it decides based on whether it got an ACK. But "no ACK" is ambiguous — the message may have been delivered (ACK lost) or not (message lost). So the sender's only two strategies are:
-
-- **At-most-once:** send and never retry. No duplicates, but messages can be silently lost. (Fewer than one delivery.)
-- **At-least-once:** retry until acknowledged. No loss, but duplicates are inevitable (§68.13). (One or more deliveries.)
-
-There is no third option at the transport layer, because to get *exactly* one you would need to know whether the previous attempt succeeded, which is exactly the information partial failure denies you. Add crashes — the receiver can crash after processing but before ACKing, or the sender can crash mid-retry — and no amount of protocol closes the gap.
-
-What real systems mean by "exactly-once" is **effectively-once processing**, achieved by combining at-least-once delivery with **idempotence at the receiver**:
-
-- **At-least-once delivery** ensures nothing is lost (retransmit until ACK).
-- **Idempotent operations or deduplication** ensure that duplicates have no additional effect. Either the operation is naturally idempotent (`SET x = 5` applied twice equals once, unlike `x += 5`), or the receiver assigns each request a unique id and **remembers which ids it has already applied**, discarding repeats. Kafka's "exactly-once semantics," for example, is idempotent producers (sequence numbers per partition) plus transactional atomic commits — dedup and atomicity, not a magic network.
-
-The interview formulation: **exactly-once *delivery* is impossible; exactly-once *effect* is achievable = at-least-once delivery + idempotence/dedup.** Anyone selling exactly-once at the wire level is either wrong or quietly doing dedup for you. This is why designing operations to be idempotent (§68 and Ch. 69's replication, Ch. 74's log application) is a recurring discipline, not a nicety.
-
----
-
-## 68.16 Message Ordering
-
-Beyond delivery, algorithms care about the *order* in which messages arrive, and there is a hierarchy of ordering guarantees, each more expensive than the last.
-
-- **No ordering.** Messages may be delivered in any order regardless of when sent. This is what raw datagrams give.
-- **FIFO order (per link/sender).** Messages from the *same sender* are delivered in the order that sender sent them. A single TCP connection (Ch. 38) provides FIFO for its two endpoints via sequence numbers. FIFO says nothing about messages from *different* senders.
-- **Causal order.** If message m1 *happened-before* m2 (§68.6 — m1's send causally precedes m2's send, possibly through a chain of other messages), then every recipient delivers m1 before m2. Causal order respects the happened-before relation across all senders; it is implemented with **vector clocks** (Ch. 71). It is strictly stronger than FIFO (FIFO is causal order restricted to one sender).
-- **Total order.** *All* nodes deliver *all* messages in the *same* single order, even messages that are causally concurrent. This requires the nodes to *agree* on an order for concurrent events — which is **consensus** (Ch. 74). Total-order broadcast (atomic broadcast) is equivalent in power to consensus, which is why it is the expensive top of the ladder and why systems avoid it on the fast path.
+Suppose a trading gateway asks a risk service to reserve USD 2 million under a
+limit. The unsafe implementation sends:
 
 ```
-   Strength / cost:
-     none  <  FIFO  <  causal  <  total
-                                    │
-                          requires agreement on a single order
-                          for concurrent events  ⇒ consensus (Ch. 74)
+reserve(account=42, amount=2_000_000)
 ```
 
-The reason ordering matters: a replicated state machine (Ch. 74) that applies the same operations in the same **total order** on every node ends up in the same state — this is the foundation of strongly-consistent replication. Weaker orders are cheaper and suffice for weaker consistency (causal consistency, Ch. 70, needs only causal order). Choosing the weakest ordering that still makes your application correct is a core design skill, because each step up the ladder costs coordination.
+and retries on timeout. If the first request committed but its response was
+lost, the retry can reserve twice.
 
----
-
-## 68.17 The Two Generals' Problem
-
-The first of the two great impossibility results, and the cleanest illustration of why an unreliable link defeats guaranteed agreement.
-
-Two generals, on opposite hills, must **attack simultaneously** to win; if only one attacks, it loses. Their only means of communication is a messenger who must cross the enemy valley and **may be captured** (the message may be lost). Can they reach *certain* mutual agreement on a time to attack?
+Use a stable operation:
 
 ```
-   General A  ──msg: "attack at dawn"──►  General B     (may be captured)
-   General A  ◄──ACK: "confirmed"───────  General B     (may be captured)
-   General A  ──ACK of the ACK──────────►  General B     (may be captured)
-   ...
-
-   Whoever sends the LAST message can never be sure it arrived,
-   so can never be sure the other will act. No finite exchange ends
-   with both sides CERTAIN. Agreement over a lossy link is impossible.
+Reserve {
+    account: 42,
+    amount: 2_000_000,
+    operation_id: (gateway_7, session_epoch_91, sequence_1842)
+}
 ```
 
-The proof is an infinite-regress argument. Suppose there is a shortest sequence of messages that guarantees agreement. The *last* message in that sequence must have been unnecessary for the sender to reach its decision (the sender decided before sending it, since that message might be lost). But then the receiver cannot rely on it either, so a shorter sequence would also work — contradicting minimality. Hence **no finite protocol guarantees agreement over a link that can lose messages**, no matter how many acknowledgments you stack, because the last sender can never be certain its final message arrived.
-
-The lessons carried forward:
-
-- **Certain agreement over a lossy channel is impossible.** You cannot achieve guaranteed two-party consensus with a fixed number of round trips over an unreliable link.
-- **Therefore, aim for high probability, not certainty.** Real systems retransmit to make the probability of disagreement negligibly small, and design so that residual disagreement is *safe* (idempotence, timeouts, reconciliation) rather than catastrophic.
-- **This is the two-party special case that motivates the general result** (§68.18) and everything about why distributed commit (Ch. 74's two-phase commit) is a blocking, failure-sensitive protocol rather than a clean guarantee.
-
----
-
-## 68.18 FLP Impossibility
-
-The **FLP result** (Fischer, Lynch, Paterson, 1985) is the theoretical cornerstone of distributed systems, and stating it precisely — with its exact assumptions — separates people who have read the theory from people who have heard of it.
-
-> **In an asynchronous system where even a single process may fail by crashing, there is no deterministic algorithm that is guaranteed to solve consensus (reach agreement) in bounded time.**
-
-Unpack every clause, because the assumptions are the whole point:
-
-- **Consensus** here means all correct processes agree on one value, satisfying three properties: **agreement** (no two decide differently), **validity** (the decided value was proposed by someone), and **termination** (every correct process eventually decides). FLP shows you cannot guarantee **termination** while keeping agreement and validity.
-- **Asynchronous** means *no bound* on message delay or relative process speed — messages arrive eventually but there is no timeout you can trust, and a process can be arbitrarily slow. This is the crux: with no time bound, a slow process is **indistinguishable** from a crashed one (§68.9).
-- **Even one crash failure** (fail-stop, the mildest failure model, §68.20) is enough to defeat any deterministic protocol. The result is not about many failures or malice; a single silent crash suffices.
-- **Deterministic** matters: the impossibility is about deterministic algorithms.
-
-The intuition: because a non-responding process might be dead *or* just slow, any deterministic algorithm faces moments where it must either wait (and risk waiting forever for a crashed process, violating termination) or proceed (and risk being wrong when the "dead" process was merely slow and now disagrees, violating agreement). There always exists an adversarial schedule of message delays that keeps the system perpetually undecided — a "bivalent" configuration it can never be forced out of.
-
-**Why FLP does not doom real systems** — this is the part interviewers want, because FLP sounds like it forbids etcd, ZooKeeper, and Spanner, which manifestly work:
-
-- **Partial synchrony (§68.19).** Real networks are not adversarially asynchronous forever; they are *usually* timely. Algorithms like **Paxos** and **Raft** (Ch. 74) guarantee **safety** (agreement, validity) *always*, and guarantee **liveness** (termination) only during periods when the network behaves synchronously enough. FLP is dodged by giving up guaranteed *bounded-time* termination while never giving up correctness.
-- **Randomization.** FLP forbids *deterministic* solutions; randomized consensus algorithms terminate with probability 1, escaping the deterministic assumption.
-- **Failure detectors (§68.21).** Augmenting the async model with an (even unreliable) failure detector — essentially, a source of timing hints — restores solvability. Chandra–Toueg showed the weakest failure detector (◇W) that makes consensus solvable.
-
-The precise takeaway: **FLP says a deterministic async protocol cannot guarantee it will always terminate; it does *not* say consensus is unachievable in practice.** Practical consensus keeps safety unconditionally and accepts that it may stall (not decide wrongly, just not decide) during network misbehavior — exactly the CAP trade-off (Ch. 70) seen from the consensus angle.
-
----
-
-## 68.19 System Synchrony Models
-
-FLP's teeth come from the *asynchronous* assumption, so the timing model you assume is a first-class design decision. There are three, and knowing which one the real world resembles is essential.
-
-| Model | Message delay | Process speed / clocks | Consensus? | Realism |
-|---|---|---|---|---|
-| **Synchronous** | Known upper bound on delivery time | Known bounds on relative speed; bounded clock skew | Solvable, even simply | Unrealistic — no real network guarantees a hard bound |
-| **Asynchronous** | No bound; messages arrive eventually | No bound on relative speed; no useful clocks | **Impossible** (FLP) | Too pessimistic — real networks are usually timely |
-| **Partially synchronous** | Bounded, but the bound is *unknown* and/or holds only *after some unknown time* | Bounds exist but are not known a priori | Solvable (safety always; liveness when timely) | **The practical model** |
-
-- **Synchronous model.** Every message arrives within a known Δ, and processes take steps at bounded relative rates. In this model you *can* build a perfect failure detector (if no reply in Δ, the process is definitely dead) and consensus is easy. But no real network offers a Δ that is never violated — a GC pause, a queue buildup, or a congested link breaks it — so building for the synchronous model is fragile.
-- **Asynchronous model.** The opposite extreme: nothing about timing can be assumed. It is the model in which FLP holds and in which timeouts are meaningless (any timeout can fire on a live-but-slow process). It is a useful *worst case* to prove impossibility against, but too weak to build progress on.
-- **Partially synchronous model (Dwork–Lynch–Stockmeyer).** The middle ground and the one that describes reality: the network *is* eventually well-behaved — after some unknown **"global stabilization time" (GST)**, delays are bounded — but you never know when you are in a good period or what the bound is. This is exactly enough to build correct systems: design so that **safety never depends on timing** (agreement holds even during the async period) and **liveness only requires an eventual synchronous window** (progress happens once the network calms down). Raft and Paxos are engineered precisely to this model: they never decide wrongly no matter how the network misbehaves, and they make progress whenever it is timely enough for a leader's heartbeats to be believed.
-
-The one-line summary: **assume partial synchrony — timeouts are heuristics that are usually right, so use them for liveness/failure-detection but never let correctness depend on them.**
-
----
-
-## 68.20 Failure Models
-
-To reason about what an algorithm tolerates, you must specify *how* nodes are allowed to fail. Failure models form a hierarchy from benign to malicious; each stronger model subsumes the weaker ones, and tolerating a stronger one costs more.
-
-| Failure model | What a faulty node may do | Example cause | Cost to tolerate |
-|---|---|---|---|
-| **Crash / fail-stop** | Halt permanently; before halting it behaved correctly; never sends wrong messages | Power loss, kernel panic, `kill -9` | Cheapest; majority quorum (2f+1 for f failures) |
-| **Omission** | Fail to send or receive *some* messages, but otherwise correct | Dropped packets, full buffers, overload | Similar to crash, plus retransmission |
-| **Timing** | Respond correctly but too late (or too early) — violate timing bounds | GC pause, clock skew, scheduling delay | Handled by partial-synchrony designs / timeouts |
-| **Arbitrary / Byzantine** | Anything: send wrong, contradictory, or malicious messages; lie to different peers differently | Bugs, corruption, compromise, malice | Most expensive; needs **3f+1** nodes, signatures, BFT protocols |
-
-- **Crash (fail-stop)** is the mildest and the assumption most database systems make. A fail-stop node simply stops; it never lies, never sends a corrupt message, and (in the strict *fail-stop* variant) others can eventually detect the halt. Systems like Raft/Paxos, PostgreSQL replication, and most quorum systems assume crash failures and tolerate up to **f** failures with **2f+1** nodes (a majority survives).
-- **Omission** failures sit just above crash: the node is up but silently drops some messages. From a peer's view an omission and a crash can look the same (silence), which is why crash-tolerant protocols usually handle omissions too, via retransmission and quorums.
-- **Timing** failures are the province of the synchrony discussion (§68.19): the node computes correctly but misses deadlines. In the partially-synchronous model these are absorbed as "temporarily slow," and the danger is only that a timing failure can be *mistaken* for a crash (§68.9), triggering unnecessary failover.
-- **Arbitrary / Byzantine** failures are the worst case — a node may behave in any way at all, including actively adversarial behavior: sending different (contradictory) answers to different peers, forging data, or colluding. Tolerating Byzantine faults requires **3f+1** nodes to survive f faulty ones, plus cryptographic signatures and specialized protocols (PBFT, and the BFT consensus underlying blockchains). It is expensive and reserved for adversarial settings (public blockchains, cross-organization trust); **the vast majority of datacenter databases assume crash/omission, not Byzantine, faults**, because inside a trusted datacenter the cost is not justified.
-
-The practical stance: name your failure model explicitly. Most of Part II — replication (Ch. 69), consensus (Ch. 74) — lives in the **crash/omission + partial-synchrony** world. Assuming a weaker failure model than reality bites you (silent corruption is a real, non-crash failure that motivates checksums, Ch. 63); assuming a stronger one than you need (Byzantine when a datacenter is trusted) wastes resources.
-
----
-
-## 68.21 Failure Detectors
-
-If you cannot distinguish dead from slow (§68.9), how does any system make progress? Through **failure detectors**: components that *suspect* nodes of having failed, based on timing heuristics, accepting that they will sometimes be wrong. Failure detectors are how practical systems buy their way around FLP.
-
-A failure detector is characterized by two properties, which trade off against each other:
-
-- **Completeness** — every actually-crashed node is *eventually suspected* by correct nodes. (Don't miss real failures.)
-- **Accuracy** — a correct (live) node is *not wrongly suspected*. (Don't cry wolf.)
-
-You cannot have both perfectly in an asynchronous system — that would be a perfect failure detector, which would let you solve consensus and contradict FLP. So real detectors weaken one. The important class is **◇P (eventually perfect)** and **◇W (eventually weak)**: they may make mistakes for a while (wrongly suspect a slow node) but become accurate *eventually* (during synchronous periods). Chandra and Toueg proved ◇W is the **weakest failure detector that makes consensus solvable** — the precise bridge from FLP-impossible to practically-possible.
-
-In practice, failure detectors are implemented with:
-
-- **Heartbeats.** Each node periodically pings its peers; a missed heartbeat for longer than a timeout marks the peer "suspected." The timeout embodies the completeness/accuracy trade-off: **short timeout → fast detection but many false positives** (a GC pause looks like death, triggering needless failover — a real cause of outages); **long timeout → few false positives but slow reaction to real crashes.**
-- **Adaptive detectors** like the **φ-accrual failure detector** (used in Cassandra and Akka) don't output a boolean; they output a *suspicion level* φ that rises as a heartbeat is overdue, letting the application pick its own threshold and adapt to observed network variance rather than a fixed timeout.
-
-The connection to everything above: heartbeat timeouts are the concrete embodiment of the partial-synchrony assumption (§68.19). They are *usually* right, they can be wrong during a bad network period, and the whole system is designed so that a wrong suspicion costs **liveness** (a spurious failover, some churn) but never **safety** (never two leaders committing conflicting data — that is what fencing and quorums in Ch. 74 guarantee).
-
----
-
-## 68.22 RPC: The Leaky Abstraction
-
-A **remote procedure call** dresses a network request as an ordinary function call: `result = service.method(args)` that happens to run on another machine. The abstraction is seductive and, in the ways that matter, a lie — every fallacy of §68.4 leaks through it, and pretending otherwise is the single most common source of distributed bugs.
-
-A local call and a remote call differ in ways no syntax can hide:
-
-- **A local call cannot partially fail.** It runs or the whole process dies with it (§68.9). A remote call has the six-way ambiguity of §68.9: it may complete, complete-but-lose-the-reply, or never run, and the caller sees only a timeout.
-- **A local call has predictable, nanosecond latency.** A remote call is 10³–10⁶× slower (§68.8) and its latency has a long tail — the 99.9th percentile can be orders of magnitude above the median because of queuing, retransmits, and GC pauses.
-- **A local call passes arguments by reference in shared memory.** A remote call must **serialize** arguments to bytes, ship them, and deserialize — costing CPU, forbidding pointers, and requiring schema/version compatibility across two independently-deployed programs (the eighth fallacy, heterogeneity).
-- **A local call needs no failure-mode design.** A remote call forces the caller to choose delivery semantics, which map exactly onto the impossibility of exactly-once (§68.15):
+The risk service’s conceptual transition is:
 
 ```
-   RPC delivery semantics (caller's retry policy):
-
-   at-most-once   : send, never retry on timeout
-                    → no duplicate execution, but a lost request just... vanishes
-                    (safe for non-idempotent ops; may silently drop work)
-
-   at-least-once  : retry until a reply arrives
-                    → never lose the request, but the server may execute it twice
-                    (safe ONLY if the operation is idempotent — §68.23)
+if operation_id exists:
+    return stored_result
+else if remaining_limit >= amount:
+    atomically:
+        remaining_limit -= amount
+        store operation_id → GRANTED(new_remaining_limit)
+    return stored_result
+else:
+    atomically store operation_id → REJECTED(current_remaining_limit)
+    return stored_result
 ```
 
-The interview point: RPC does not remove the network; it hides it, and hidden networks fail in ways the caller has not planned for. Mature RPC frameworks (gRPC, Thrift) surface deadlines, retries, backoff, and status codes precisely because the "just a function call" framing is dangerous. Treat every RPC as a message send that may not arrive, may arrive twice, and will be slow — and design its semantics deliberately.
+The result—including rejection—is retained so the same operation cannot change
+outcome after another trade changes the balance. This design resolves duplicate
+delivery at the service’s durable transaction boundary.
+
+It does **not** solve every failure:
+
+- If two replicas accept independently without an agreement/partition rule,
+  each may grant against stale remaining capacity.
+- If a gateway reuses its `(epoch, sequence)`, dedup can suppress a new request.
+- If dedup records expire before delayed duplicates, the effect can recur.
+- If grant triggers a non-transactional external side effect, that effect needs
+  its own identity/reconciliation protocol.
+- If the client times out, its immediate result remains **unknown** until it
+  reads the stored outcome or another authoritative protocol resolves it.
+
+The key distinction is between **operation outcome** and **client knowledge**.
+The server may have exactly one durable outcome while the client temporarily
+does not know which. A truthful API exposes `PENDING/UNKNOWN` rather than
+inventing certainty from a timeout.
 
 ---
 
-## 68.23 Idempotence and Deduplication in Practice
+## Time, order, and properties
 
-Because at-least-once is the only delivery strategy that never loses work, and it inevitably duplicates (§68.13, §68.15), **idempotence** — the property that applying an operation more than once has the same effect as applying it once — is the workhorse that makes retries safe. It is the practical resolution of the exactly-once myth, so know how it is actually built.
+## 68.7 Physical Time, Monotonic Time, and Causal Order — Core
 
-An operation is **naturally idempotent** if its effect does not depend on prior state:
+Each node has local clocks. A wall/real-time clock estimates civil time and can
+be disciplined or corrected. A monotonic clock is intended for measuring local
+elapsed intervals and deadlines. Neither automatically provides a globally
+agreed event order.
+
+Separate three questions:
+
+1. **Local duration:** did this process’s deadline pass? Use an appropriate
+   monotonic clock and account for suspension/clock semantics.
+2. **Civil timestamp:** when should humans/auditors interpret an event? Record
+   wall time with source/uncertainty where material.
+3. **Causal order:** could event \(a\) have influenced event \(b\)? Derive this
+   from execution, not raw cross-node timestamps.
+
+Define Lamport’s happened-before relation \(\rightarrow\):
+
+- if \(a\) and \(b\) occur in one process and \(a\) precedes \(b\), then
+  \(a \rightarrow b\);
+- if \(a\) sends a message received by \(b\), then \(a \rightarrow b\);
+- it is transitive: \(a \rightarrow b\) and \(b \rightarrow c\) imply
+  \(a \rightarrow c\).
+
+If neither \(a \rightarrow b\) nor \(b \rightarrow a\), the events are
+**concurrent** in this model. That does not require simultaneous wall time; it
+means the observed execution contains no causal path between them.
 
 ```
-   Idempotent (safe to retry):        Non-idempotent (unsafe to retry):
-     SET balance = 500                  balance = balance + 100   (each retry adds again)
-     DELETE key k                       INSERT new row (dup rows)
-     PUT object at path p               "increment counter"
-     assign leader = node3              "append to log" (dup entries)
+Process A:  a1 ── a2(send m) ───────── a3
+                    \
+                     \ m
+                      ▼
+Process B:  b1 ───────────── b2(receive) ── b3
+
+a2 → b2 → b3
+a1 → b3 by transitivity
+b1 and a2 may be concurrent
 ```
 
-When an operation is not naturally idempotent, you make it idempotent by attaching an **idempotency key** (a unique request id, often a UUID or a client-sequence number) and having the receiver **remember which keys it has already applied**:
+Clock readings could show B’s `b2` timestamp numerically earlier than A’s `a2`
+timestamp if their physical clocks differ. That does not overturn the causal
+edge. Conversely, `timestamp(a) < timestamp(b)` does not by itself prove
+\(a \rightarrow b\).
 
-1. Client generates a stable id for the logical operation (the *same* id is reused across retries of that operation — this is the crucial detail).
-2. Server, on receiving the request, checks a **dedup table** keyed by that id. If seen, it returns the *stored prior result* without re-executing. If new, it executes, records the id and result atomically with the effect, then replies.
-3. Retries therefore hit the dedup table and become no-ops that still return success.
+Logical clocks assign metadata consistent with causal order. A Lamport-clock
+rule can ensure:
 
-This is exactly how Stripe's payment API (`Idempotency-Key` header), Kafka's idempotent producer (per-partition sequence numbers), and TCP's own duplicate suppression (sequence numbers) all work — the same pattern at three different layers. The costs and caveats interviewers probe:
+\[
+a \rightarrow b \implies L(a) < L(b)
+\]
 
-- **The dedup state must be durable and atomic with the effect.** If the server records "applied" but crashes before the effect commits (or vice versa), the guarantee breaks. Recording the id and the effect in one atomic transaction is what closes the gap.
-- **The dedup table cannot grow forever.** It is bounded by a time window or a per-client sequence high-water mark; ids older than the window are forgotten, so retries must fall inside it.
-- **Idempotence is per-operation, not free.** `x += 5` is not idempotent; rewriting it as "set x to 5 more than its value *as of version v*" (a conditional/compare-and-set write) makes a retry detect it already ran. Conditional writes and version checks are the general tool.
+but the converse is not guaranteed; numeric order can compare events that were
+concurrent. Vector clocks can expose more causal/concurrent structure at greater
+metadata cost. Chapter 71 owns logical-clock and consistency applications.
 
-The mantra: **at-least-once delivery + idempotent apply = effectively-once**, and idempotence is engineered, most often by a durable dedup table or a naturally state-independent operation.
+### Ordering contracts are distinct
 
----
+“Ordered messages” needs a scope:
 
-## 68.24 Backpressure, Flow Control, and Graceful Degradation
+| Contract | What is constrained | What remains unordered |
+|---|---|---|
+| Per-sender FIFO | One receiver observes one sender’s messages in send order | Other senders; reconnections unless protocol preserves sequence |
+| Causal order | Delivery respects known happened-before edges | Concurrent events may appear in different orders |
+| Total order | Participants observe one protocol-defined order | The order need not reveal causality unless specified |
 
-Section 68.11 showed how retries and unbounded queues turn a slowdown into a cascade. The defenses deserve their own treatment because "how would you keep this from cascading?" is a standard design-interview follow-up, and the answers are a small, memorable toolkit.
+A single TCP byte stream preserves byte order within that connection; it does
+not merge multiple connections into one order, and reconnect/retry requires
+application sequence rules. Causal delivery requires causal metadata or a
+mechanism with equivalent knowledge. Total-order broadcast/atomic broadcast
+requires participants to agree on an order and is closely related to consensus.
 
-- **Backpressure.** When a consumer cannot keep up, it must *signal upstream to slow down* rather than silently queue without bound. TCP's receive window (Ch. 38) is backpressure at the transport layer; reactive-streams and bounded channels are backpressure at the application layer. The alternative — accepting work faster than you can process it — is an unbounded queue, which converts a throughput problem into a latency-and-memory catastrophe.
-- **Bounded queues + load shedding.** Cap every queue. When it is full, **shed load** — reject or drop excess work *fast* (return a 503, drop a low-priority request) instead of admitting it. Fast rejection lets clients back off; slow admission serves requests whose callers have already timed out (pure waste). Shedding the least-valuable work first (priority-aware) preserves the most important traffic under overload.
-- **Circuit breakers.** When a dependency is failing, stop calling it. A circuit breaker trips after a failure threshold, fails fast for a cooldown, then lets a trickle through to test recovery (half-open). This gives the struggling dependency room to recover instead of hammering it with retries, breaking the positive-feedback loop of §68.11.
-- **Exponential backoff with jitter.** Retries must space out geometrically and add randomness, or synchronized clients retry in lockstep and create a thundering herd. Jitter de-correlates them.
-- **Timeouts and deadlines, propagated.** Every remote call needs a timeout, and in a call chain the deadline should be *propagated* so downstream services do not work on a request whose caller has already given up (deadline propagation, as in gRPC).
+Do not ask for the strongest label by default. A per-instrument market-data
+stream may need sequence order within an instrument but no global order between
+unrelated instruments. A risk ledger may need a single order for grants against
+one limit. Scoping order by key/partition can reduce coordination, while
+cross-scope invariants reintroduce it.
+
+Physical time can support correctness only through an explicit model of
+uncertainty/bounds and a protocol that uses it safely. Time synchronization
+reduces uncertainty; it does not make independent clock readings a proof of
+causality. Product-specific time guarantees must name service, version,
+topology, hardware, and configuration.
+
+## 68.8 Safety, Liveness, and Progress Conditions — Core
+
+A distributed protocol should state properties over executions.
+
+A **safety property** says a forbidden event/state never occurs. A finite bad
+prefix demonstrates violation:
+
+- two different values are decided for one consensus instance;
+- the same operation ID reduces a limit twice;
+- two authorities hold valid fencing generations for the same resource;
+- an acknowledged durable write disappears under a fault the contract claims
+  to tolerate.
+
+A **liveness property** says a desired event eventually occurs:
+
+- every accepted request eventually receives a terminal outcome;
+- an available message is eventually processed;
+- after failures stop and communication becomes timely, a leader is eventually
+  elected;
+- a submitted proposal eventually decides.
+
+Liveness always needs conditions. “Eventually replies” cannot hold if every
+participant remains crashed, messages are delayed forever, or new work
+permanently exceeds capacity. State fairness, fault count, network/timing,
+membership stability, and load assumptions.
+
+| Property | Example | Violation evidence |
+|---|---|---|
+| Safety | At most one grant per operation ID | Two committed grants are a finite counterexample |
+| Liveness | A valid request eventually completes while quorum and timely links persist | Requires an infinite/nonprogress execution under the stated conditions |
+| Bounded latency | 99.9% complete within a stated deadline under named load/faults | Measured distribution exceeds bound/SLO |
+| Operational availability | Eligible requests succeed over a window | Measured success ratio, scoped to definition |
+
+Safety and liveness can conflict operationally. During uncertainty, refusing
+writes may preserve a single-writer invariant while reducing availability.
+Allowing every isolated side to write may preserve local responsiveness while
+violating a strong consistency property. A mature protocol states which
+property remains unconditional and which depends on a stable/timely period.
+
+### Availability is not one universal property
+
+In everyday engineering, availability often measures useful successful service.
+In theoretical results, it can have a specific quantification, such as every
+request received by a non-failing node eventually obtaining a response.
+Returning a stale value, an explicit error, or an `UNKNOWN` result may count
+differently across definitions.
+
+Therefore do not jump from a theorem’s “availability” to a product SLO. Translate:
 
 ```
-   Overload response, good vs bad:
-
-   BAD:  accept everything → queue grows → latency climbs → clients time out
-         → clients retry → MORE load → collapse   (positive feedback)
-
-   GOOD: bounded queue full → shed load (fast 503) + backpressure upstream
-         → clients back off (jittered) → circuit breaker protects deps
-         → system DEGRADES (serves less) instead of COLLAPSING (serves nothing)
+model property
+  → client-visible behavior
+  → eligible operations and failure scope
+  → measurement and alert
 ```
 
-The unifying principle, and the connection back to §68.9: because you cannot tell slow from dead, the *reflexive* reactions (retry, reroute, queue) are exactly what amplify a local problem into a global one. A well-built system is engineered to **degrade gracefully** — shed, fail fast, back off — rather than amplify, so that partial failure stays partial.
+## 68.9 A Small Latency and Fan-out Model — Core
+
+Remote work is not a local call with a larger constant. It adds serialization,
+queues, transport, independent scheduling, retries, and ambiguous completion.
+Avoid universal latency ratios; calculate the actual critical path.
+
+For sequential stages:
+
+\[
+T_{\text{request}} \approx
+\sum_i (T_{\text{queue},i} + T_{\text{service},i} + T_{\text{transport},i})
+\; T_{\text{coordination}} + T_{\text{retry}}
+\]
+
+Parallel fan-out reduces sum-of-latencies but couples success to many branches.
+For a deliberately simplified illustration, if each of \(k\) independent
+branches succeeds within deadline with probability \(p\), then:
+
+\[
+P(\text{all succeed}) = p^k
+\]
+
+With \(p=0.999\) and \(k=20\):
+
+\[
+0.999^{20} \approx 0.9802
+\]
+
+Thus individually “three-nines” branches yield only about 98.02% all-branch
+deadline success in this independence model. Real failures are often correlated
+by shared network, host, dependency, or load, so this is not a production
+prediction. It is a warning to define whether all branches are required and to
+measure end-to-end tails.
+
+### How a partial slowdown becomes a cascade
+
+Partial failure is sometimes a slow component rather than a stopped one. A
+simple positive-feedback loop is:
+
+```
+dependency slows
+  → callers retain work longer
+  → queues and concurrent requests grow
+  → callers time out and retry
+  → dependency receives more work
+  → service time and failure rate grow again
+```
+
+Rerouting can spread the same overload to previously healthy replicas. Large
+queues hide admission failure until requests are too old to matter, consuming
+capacity after callers abandoned them. Correlated client retries can synchronize
+into a new burst.
+
+The correctness connection is subtle: an overloaded node may be falsely
+suspected, an acknowledgement may arrive after a retry, and failover may overlap
+the old authority. Backpressure and circuit breakers manage load, but terms,
+quorums, and fencing must still manage authority.
+
+Bounded queues, admission control, retry budgets, exponential backoff with
+jitter, circuit breaking, and deadline propagation are owned by Chapters 52 and
+56. Their role here is to keep a local slowdown from multiplying the number of
+ambiguous in-flight operations. No fixed retry count or timeout is universally
+safe; budget attempts from the end-to-end objective and make overload behavior
+explicit.
+
+Bounded concurrency, batching, admission control, load shedding, deadline
+propagation, and retry budgets belong to Chapters 52 and 56. Here the model
+serves one point: distribution changes the number and dependence of possible
+failure events, not merely average execution time.
 
 ---
 
-## 68.25 Putting It Together: The Road Through Part II
+## Failure and synchrony models
 
-Every mechanism in the coming chapters is a response to the constraints laid out here. It is worth seeing the map before diving in.
+## 68.10 Failure Models — Core
 
-- **No shared memory + stale copies (§68.3)** → you replicate state by shipping a stream of changes. **Replication (Ch. 69)** — synchronous vs asynchronous, leader-based (PostgreSQL streaming replication) vs leaderless (Cassandra), and quorum reads/writes — is the study of keeping copies useful despite lag.
-- **Partitions force a choice (§68.10)** → **CAP and PACELC, and the consistency models (Ch. 70)** formalize what you give up (consistency or availability under partition; and latency vs consistency even without one). Linearizability, causal, and eventual consistency are points on that spectrum.
-- **No global clock (§68.6, §68.7)** → **logical time (Ch. 71)**: Lamport clocks, vector clocks, and version vectors give you causality and conflict detection without trusting wall clocks.
-- **Scale beyond one node (§68.1)** → **partitioning/sharding (Ch. 72)**: hash vs range partitioning, rebalancing, and routing, plus how transactions and joins survive being split across shards.
-- **Leaderless conflict resolution (§68.5)** → **anti-entropy and dissemination (Ch. 73)**: Merkle trees, read-repair, hinted handoff, and gossip protocols that let symmetric nodes converge.
-- **The impossibility results and failure detectors (§68.17–68.21)** → **consensus (Ch. 74)**: Paxos, Raft, and atomic broadcast, which achieve agreement by keeping safety unconditional and requiring only eventual synchrony for progress — plus leader election, fencing, and two-phase/three-phase commit.
+A **failure model** defines behavior the protocol must tolerate. Models are not
+diagnoses; a real incident may cross several.
 
-The unifying discipline: **name your assumptions.** What failure model (crash vs Byzantine)? What synchrony model (you should almost always answer "partial")? What consistency guarantee, and what does it cost in round trips? Every good distributed-systems answer, in an interview or a design doc, starts by pinning those three down — because, as this chapter has shown, the guarantees you can offer are entirely determined by the assumptions you are willing to make about time, failure, and the network.
+| Model | Allowed faulty behavior | State question |
+|---|---|---|
+| Crash-stop | Process halts and does not resume in that execution | Can others progress without it? |
+| Crash-recovery | Process halts and later restarts | Which identity/protocol state survives durably? |
+| Omission | Expected sends, receives, or deliveries may be absent | Can retry/dedup/reconciliation preserve properties? |
+| Timing | Responses occur outside required timing bounds | Does lateness affect safety or only liveness? |
+| Arbitrary/Byzantine | Process may send inconsistent or adversarial messages | What authentication, quorum, and protocol assumptions constrain it? |
+
+**Fail-stop** is sometimes used for a crash that other participants can reliably
+detect. That is stronger than crash-stop in an asynchronous network; avoid using
+the terms interchangeably without a definition.
+
+Storage corruption, software bugs, operator mistakes, credential compromise,
+and correlated power/network loss do not disappear because a consensus proof
+assumes crash faults. Systems frequently combine a crash-fault protocol with
+checksums, validation, authentication, fault-domain placement, backups, and
+independent recovery controls. Those mitigations do not automatically make the
+protocol Byzantine-fault tolerant.
+
+Fault counts are also conditional. “Tolerates \(f\) faults” must state:
+
+- participant count and current membership;
+- simultaneous or lifetime faults;
+- placement/failure-domain independence;
+- whether failed participants recover with valid durable state;
+- which property survives—safety, liveness, reads, writes, or durability.
+
+## 68.11 Synchrony Models — Core
+
+Synchrony describes timing assumptions, not whether code uses blocking APIs.
+
+| Model | Processing/message-delay assumption | What it permits |
+|---|---|---|
+| Synchronous | Known finite bounds hold in the modeled execution | Time can distinguish lateness beyond the bound |
+| Asynchronous | No known upper bounds; a correct process/message may be delayed arbitrarily long | Algorithms cannot use elapsed time as proof of failure |
+| Partially synchronous | Bounds exist but are unknown, or hold only after an unknown stabilization time | Safety can be timing-independent; progress can wait for a timely period |
+
+An implementation can set an illustrative 500 ms timeout in an asynchronous
+model; the timer will fire, but its expiry proves only the local deadline
+observation. Conversely, a synchronous model is not “fast”: its bound could be
+large. The distinction is epistemic—what the algorithm may assume and infer.
+
+Many practical coordination protocols are designed so that arbitrary delay,
+reordering, or partitions cannot create two committed outcomes, while eventual
+timeliness and enough non-faulty participants allow progress. Exact guarantees
+depend on the protocol. Do not turn “partial synchrony is practical” into a
+claim that all production networks eventually satisfy every configured timeout.
+
+### Failure detectors: only the boundary here
+
+A failure detector produces suspicion from observations such as missing
+heartbeats or failed probes. Its useful properties are commonly described in
+terms of:
+
+- **completeness:** which crashed processes are eventually suspected;
+- **accuracy:** which correct processes avoid false suspicion, and when.
+
+In weak timing conditions, these cannot both be perfect at every moment.
+Protocols therefore make safety depend on votes, generations, quorums, or
+fencing—not merely on one detector’s suspicion. Chapter 69 owns timeouts,
+heartbeats, accrual detectors, indirect probes, and their operational tuning.
+
+## 68.12 Partitions and the CAP Boundary — Core
+
+A **network partition** is an execution in which some messages between groups
+are not delivered for a relevant interval while processes on more than one side
+may remain active. Partitions can be asymmetric or selective; “the network split
+cleanly in half” is only one diagram.
+
+Consider two replicas A and B that both previously stored `x=0`:
+
+```
+Client 1 → A: write x=1     A  - - - partition - - -  B
+                                           Client 2 → B: read x
+```
+
+If B must answer without communication, it lacks the information needed to
+distinguish:
+
+- execution E0: no write occurred at A;
+- execution E1: A accepted `x=1`, but the partition hides it.
+
+If the contract requires B’s read to reflect a completed write with real-time
+semantics, the same immediate value cannot be correct in both executions. B can
+wait/reject/return `UNKNOWN`, or answer under a weaker consistency/staleness
+contract. This is an indistinguishability argument, not a slogan about product
+categories.
+
+The CAP theorem is treated properly in Chapter 71. For this overview, remember
+its narrow shape:
+
+- “C” is a specified consistency property, conventionally linearizability in
+  the theorem’s common formulation—not generic ACID consistency;
+- “A” is a formal response/availability condition, not a measured uptime
+  percentage;
+- partitions are allowed by the model;
+- during such executions, a system cannot guarantee both of those properties
+  for all requests.
+
+“Choose two of consistency, availability, and partition tolerance” is
+misleading. A deployed network cannot generally purchase away every partition,
+and systems make per-operation choices with nuanced failure responses. Outside
+partitions, latency, replica placement, and coordination still matter. Chapter
+71 supplies the histories and consistency vocabulary.
 
 ---
 
-## Summary
+## Impossibility and quorum foundations
 
-- Systems are distributed for **scale** (partition), **availability** (replicate), **geo-locality**, and **fault isolation** — goals that pull against each other, since every mechanism that hides disagreement costs coordination.
-- Distribution is hard because of three things a single machine has for free: **shared memory**, a **global clock**, and **total (not partial) failure**. Distributed systems have none: state is communicated by messages, time is local and skewed, and components fail independently.
-- The **defining feature is partial failure**: a node cannot distinguish a **crashed** peer from a **slow** one or a **broken link** — silence is ambiguous. This single fact underlies exactly-once impossibility, approximate failure detectors, and FLP.
-- The **eight fallacies** (network reliable / zero latency / infinite bandwidth / secure / static topology / one admin / zero transport cost / homogeneous) are the checklist of false assumptions.
-- A **remote call is 10³–10⁶× a local memory access** (µs–ms vs ~100 ns); round trips, not bytes, dominate, so batch and minimize coordination.
-- **No global "now":** physical clocks drift; NTP bounds skew to ~ms but never to zero and can step backward, so order events with **logical clocks** (Ch. 71) or explicitly bounded time (Spanner TrueTime), never raw wall-clock comparison.
-- **Link hierarchy:** fair-loss (raw IP) → stubborn (retransmit forever) → perfect (dedup, exactly-once *between correct processes*). **Exactly-once *delivery* is a myth**; you get effectively-once via **at-least-once + idempotence/dedup**.
-- **Message ordering** ladder: none < FIFO < causal < total; total order requires agreement = consensus.
-- **Two Generals'**: certain agreement over a lossy link is impossible. **FLP**: no deterministic algorithm guarantees consensus in an asynchronous system with even one crash — dodged in practice by **partial synchrony**, randomization, and **failure detectors**, keeping safety always and liveness when timely.
-- **Synchrony models:** synchronous (unreal), asynchronous (FLP-cursed), **partially synchronous** (the practical one). **Failure models:** crash ⊂ omission ⊂ timing ⊂ Byzantine; datacenters assume crash/omission, needing **2f+1** nodes; Byzantine needs **3f+1**.
+## 68.13 Two Generals: Knowledge Has a Last Message — Reference
+
+The Two Generals problem models two parties that must coordinate an action over
+a channel that may lose messages. Suppose A sends “attack at dawn,” B
+acknowledges, A acknowledges the acknowledgement, and so on.
+
+Any finite protocol has a final message. If that final message may be lost, its
+sender cannot know that the receiver obtained it. Removing the final message
+therefore leaves a protocol with the same uncertainty one step earlier.
+Repeating the argument shows that finite acknowledgements cannot create common
+knowledge with certainty over the assumed lossy channel.
+
+The result does not say useful coordination never occurs. Engineering changes
+the requirement or assumptions:
+
+- accept probabilistic confidence rather than certainty;
+- use a durable third party or an agreed log;
+- make unilateral action safe or reversible;
+- choose a default on uncertainty;
+- continue retry/reconcile later;
+- require a quorum under a different link/failure model.
+
+The lesson is to ask what each participant knows after the last possible lost
+message and whether residual disagreement is safe.
+
+## 68.14 Consensus and FLP, Precisely — Core
+
+Binary consensus asks non-faulty processes to decide a value while satisfying
+properties such as:
+
+- **agreement:** no two correct participants decide different values;
+- **validity:** the decided value obeys the proposal-validity rule;
+- **termination:** every correct participant eventually decides.
+
+Definitions vary in details, so name the chosen formulation.
+
+The Fischer–Lynch–Paterson result applies to a specific model: deterministic
+consensus in a fully asynchronous message-passing system, with reliable
+communication as modeled and even one process allowed to crash. Across all
+admissible executions, no algorithm can guarantee termination while retaining
+the required agreement and validity.
+
+What FLP does **not** establish:
+
+- that agreement or physical time is universally impossible;
+- that every execution fails to decide;
+- that consensus cannot work well in deployed systems;
+- that safety must be weakened;
+- that adding more replicas alone restores guaranteed termination.
+
+### Worked intuition: delay can preserve ambiguity
+
+Imagine participants proposing 0 or 1. Before a decision, the global
+configuration may be **bivalent**: some future admissible schedules decide 0,
+others decide 1. A decisive next message/event would move it to a **univalent**
+configuration.
+
+In a fully asynchronous model, the scheduler can delay a relevant process or
+message without revealing whether that process crashed. The FLP proof shows
+there is an execution in which events can be chosen so the system remains
+bivalent indefinitely. No participant sees a definitive fault; it simply never
+gets the event that forces progress.
+
+This is an existence result over schedules. A normal run with prompt messages
+may decide quickly. But a protocol cannot promise termination for *every*
+admissible asynchronous run with a possible crash.
+
+Practical protocols alter the conditions:
+
+- assume partial synchrony/eventual timely communication for liveness;
+- use failure-detector abstractions with stated properties;
+- use randomized choices and probabilistic termination;
+- preserve agreement independent of timing while allowing elections/rounds to
+  repeat until conditions improve.
+
+Chapter 74 develops consensus and states its actual fault, quorum, persistence,
+and timing assumptions.
+
+## 68.15 Quorum Intersection: Arithmetic, Not a Protocol — Core
+
+For a fixed membership of \(N\) participants, two quorums of size \(q\) must
+intersect when:
+
+\[
+2q > N
+\]
+
+A majority chooses:
+
+\[
+q = \left\lfloor \frac{N}{2} \right\rfloor + 1
+\]
+
+For \(N=5\), \(q=3\). Any two three-member sets intersect because
+\(3+3>5\). If participants are crash-stopped and communication among the others
+is timely, a three-member quorum can still form with two unavailable
+participants.
+
+But “quorums overlap” is only a set fact. Safety also needs protocol rules about:
+
+- which values/terms/versions an intersecting member reports or accepts;
+- whether state survives crash-recovery;
+- whether two configurations are active during membership change;
+- how incomplete writes and reads are repaired;
+- whether faulty participants can equivocate;
+- how a stale authority is fenced;
+- which acknowledgement constitutes commit.
+
+Classic replicated-register arithmetic may use read size \(R\) and write size
+\(W\):
+
+\[
+R + W > N
+\]
+
+so each read set intersects the last write set, plus often:
+
+\[
+2W > N
+\]
+
+so write sets intersect. These inequalities do not alone provide
+linearizability. The protocol still needs version ordering, correct handling of
+concurrent/incomplete writes, membership, and repair. Chapters 70, 71, and 74
+show how election, replicated storage, and consensus use quorum intersection
+differently.
+
+Thresholds such as “\(2f+1\)” for crash-fault majorities or “\(3f+1\)” in
+certain Byzantine consensus models are conditional on their protocol and model.
+Do not transfer them to arbitrary systems by mnemonic.
+
+## 68.16 The Protocol Review Frame — Core
+
+For any algorithm, write one table:
+
+| Review item | Example question |
+|---|---|
+| State | What persists across restart: term, vote, log, request IDs? |
+| Messages | Can each be lost, delayed, duplicated, reordered, or replayed? |
+| Authority | What evidence permits a write, and how is stale authority fenced? |
+| Safety | Give a finite trace that would violate the invariant |
+| Liveness | Under what faults/timeliness/load must progress resume? |
+| Ambiguity | After timeout, which outcomes remain indistinguishable? |
+| Membership | Who counts, and how does a configuration change safely? |
+| Recovery | How does a returning node reject stale state and catch up? |
+| Operations | What metric reveals loss of progress before queues/cascades grow? |
+| Version scope | Which implementation/product release/configuration was verified? |
+
+Then test transitions, not only steady state:
+
+```
+normal
+  → delayed/duplicated message
+  → one process pauses or crashes
+  → partition
+  → recovery with old durable state
+  → membership/configuration change
+  → mixed-version deployment
+```
+
+A proof may abstract storage as stable; implementation must still make the
+required term/vote/log durable under Chapter 61’s crash contract. A proof may
+assume authenticated identities; deployment must maintain keys and reject stale
+credentials. Correctness lives at the seam between model and mechanism.
 
 ---
 
-## Key Interview Questions
+## Ownership map and practice
 
-1. **Why distribute a system at all, given the complexity cost?** — To exceed one machine's capacity (scale via partitioning), survive node/rack/datacenter loss (availability via replication), reduce latency for distant users (geo-locality), and isolate faults / scale elastically. Scale and availability are distinct reasons that pull in different directions.
-2. **What three guarantees does a single machine have that a distributed system loses?** — Shared memory (state is instantly visible), a single global clock (a well-defined "now"), and total failure (everything fails at once). Distributed systems have no shared memory, no global clock, and independent partial failure.
-3. **What is partial failure, and why is it the defining difficulty?** — Some nodes/links fail while others keep running, and a survivor cannot tell a crashed peer from a slow one or a broken link — silence is ambiguous across at least six scenarios demanding opposite responses. It underlies nearly all distributed-systems machinery.
-4. **List the eight fallacies of distributed computing.** — The network is reliable; latency is zero; bandwidth is infinite; the network is secure; topology doesn't change; there is one administrator; transport cost is zero; the network is homogeneous. Each is false and each names a real production failure.
-5. **How much slower is a remote call than a local one, and why does it matter?** — A same-datacenter round trip is ~10³–10⁴× a ~100 ns memory access; cross-region is ~10⁵–10⁶× (tens of ms). It means round trips (not bytes) dominate cost, coordination is precious, and chatty N+1 patterns that pass tests locally die over the network.
-6. **Why is there no meaningful global "now" in a distributed system?** — Each node has its own drifting physical clock, and a globally simultaneous instant is physically ill-defined for separated nodes exchanging finite-speed signals. "Which event happened first" across nodes must come from causality (logical time), not wall clocks.
-7. **Physical vs logical clocks — when do you use each?** — Physical (wall-clock) time is for humans and TTLs but is unreliable for cross-node ordering because of skew. Logical clocks (Lamport, vector — Ch. 71) capture happened-before/causality and give a reliable partial order for conflict resolution. Order across nodes with logical time.
-8. **What are clock drift and clock skew, and how well does NTP fix them?** — Drift is the rate a clock diverges from true time (tens of ppm); skew is the instantaneous difference between two clocks. NTP disciplines clocks to ~1–50 ms skew on a LAN (worse on the internet), never to zero, and can step a clock backward, so CLOCK_REALTIME is not monotonic.
-9. **Why can't you order writes across nodes by comparing wall-clock timestamps?** — Because skew can make a logically later write carry a smaller timestamp, so last-write-wins can silently discard the newer write (a documented Cassandra data-loss mode). Correctness needs logical clocks or explicitly bounded time (Spanner's TrueTime commit-wait).
-10. **What is a network partition and why is it uniquely dangerous?** — A split where groups of live nodes can talk internally but not across the divide; each side thinks the other is dead while both keep running. If both keep serving writes they diverge, forcing the CAP choice between consistency and availability.
-11. **State the CAP dilemma in terms of partitions.** — During a partition you must choose: refuse to serve on at least one side (consistency, but unavailable) or keep serving on both (available, but risking divergence). You cannot have both while partitioned; the only choice is what you sacrifice (Ch. 70).
-12. **What is a cascading failure and how do you prevent it?** — A localized failure/slowdown whose load shifts to peers, overloading them in a spreading front, amplified by retry storms and unbounded queues. Prevent with exponential backoff + jitter, retry budgets, bounded queues + load shedding, circuit breakers, and backpressure.
-13. **Describe the link hierarchy from fair-loss to perfect links.** — Fair-loss (raw IP: may lose/duplicate, no creation, but infinite retransmission eventually delivers) → stubborn (retransmit forever; delivered infinitely often, still duplicates) → perfect (add dedup: reliable, no duplication, no creation — but only between correct/non-crashing processes).
-14. **Why does adding retransmission for reliability create duplicates?** — Because the sender retransmits when it gets no ACK, but "no ACK" is ambiguous — the message may have been delivered and only the ACK lost. Resending then delivers the message twice. Sequence numbers + dedup at the receiver are needed to fix it.
-15. **Why is exactly-once delivery impossible, and what do systems do instead?** — The sender can't tell "message lost" from "ACK lost," so it must choose at-most-once (may lose) or at-least-once (may duplicate); there is no exactly-once at the transport layer. Systems achieve effectively-once = at-least-once delivery + idempotent operations / dedup by request id.
-16. **Give the message-ordering hierarchy and its cost.** — None < FIFO (per-sender order, e.g. one TCP connection) < causal (respects happened-before across senders, via vector clocks) < total (all nodes agree one order for all messages, including concurrent ones). Total order requires agreement, i.e. consensus, and is the most expensive.
-17. **What is the Two Generals' Problem and its lesson?** — Two parties needing coordinated action over a lossy link cannot reach certain mutual agreement with any finite message exchange, because the last sender can never be sure its final message arrived (infinite regress). Lesson: aim for high probability + safe residual disagreement, not certainty.
-18. **State FLP impossibility precisely.** — In an asynchronous system where even one process may crash, no deterministic algorithm can guarantee consensus (agreement + validity + termination) in bounded time. It sacrifices guaranteed termination; the crux is that a slow process is indistinguishable from a crashed one.
-19. **If FLP forbids async consensus, how do etcd, ZooKeeper, and Spanner work?** — They assume partial synchrony: keep safety (agreement/validity) unconditionally and require only eventual timeliness for liveness/termination. Randomization and failure detectors are the other escape hatches. FLP forbids guaranteed bounded-time termination, not practical consensus.
-20. **Contrast the three synchrony models.** — Synchronous: known bound on delay/speed — consensus easy but unrealistic. Asynchronous: no bounds — FLP-impossible, too pessimistic. Partially synchronous: bounds exist but are unknown / hold only after some unknown time — the practical model; design safety independent of timing, liveness needing eventual synchrony.
-21. **List the failure models from benign to malicious.** — Crash/fail-stop (halts, never lies) ⊂ omission (silently drops some messages) ⊂ timing (correct but late) ⊂ arbitrary/Byzantine (anything, including malicious/contradictory). Each subsumes the previous; tolerating stronger models costs more.
-22. **How many nodes to tolerate f failures under crash vs Byzantine faults?** — Crash/omission: 2f+1 (a majority quorum survives f losses). Byzantine: 3f+1, plus signatures and BFT protocols, because faulty nodes may lie differently to different peers. Datacenter databases usually assume crash and use 2f+1.
-23. **What failure model do most databases assume, and why not Byzantine?** — Crash/omission under partial synchrony. Byzantine tolerance (3f+1, cryptographic protocols) is expensive and justified only in adversarial/cross-trust settings like public blockchains; inside a trusted datacenter it wastes resources, though silent corruption is handled with checksums.
-24. **What is a failure detector, and what two properties define it?** — A component that suspects nodes of having crashed from timing heuristics. Completeness: every crashed node is eventually suspected. Accuracy: live nodes aren't wrongly suspected. You can't have both perfectly in async (that would beat FLP); eventually-perfect (◇P/◇W) detectors are the practical class.
-25. **How does a heartbeat timeout embody the completeness/accuracy trade-off?** — A short timeout detects real crashes fast but false-positives on slow nodes (GC pause looks like death → needless failover); a long timeout avoids false positives but reacts slowly. The φ-accrual detector outputs a suspicion level instead of a boolean to adapt to network variance.
-26. **What does Spanner's TrueTime do differently from NTP?** — It exposes time as a bounded interval [earliest, latest] enforced by GPS + atomic clocks and waits out the uncertainty (commit-wait) before releasing a commit, guaranteeing external consistency. It never assumes skew is zero — only bounded and known — paying the bound in latency per commit.
-27. **Why is coordination the scarce resource in distributed systems?** — Every guarantee that hides observer disagreement (lock, quorum, commit, consensus round) costs at least one network round trip — µs to tens of ms — versus tens of ns for a local mutex. So strong consistency is expensive and systems avoid coordination on the fast path.
-28. **What does it mean that "safety" and "liveness" are separated in practical consensus?** — Safety (never decide wrongly / two leaders) is guaranteed unconditionally, regardless of network behavior; liveness (eventually decide / make progress) is only guaranteed during synchronous-enough periods. A bad network costs progress, never correctness — the engineering answer to FLP.
+## 68.17 What Later Chapters Own — Reference
 
----
+This chapter intentionally stops at foundations:
 
-## Common Traps
+| Chapter | Owner |
+|---|---|
+| 69 — Failure Detection | Timeout/heartbeat evidence, completeness/accuracy, accrual and indirect detection |
+| 70 — Leader Election | Candidates, terms/epochs, votes, leases, quorums, split authority, fencing |
+| 71 — Replication and Consistency | Topologies, sync/async acknowledgement, CAP histories, consistency models, logical clocks, read/write quorums, CRDT overview |
+| 72 — Anti-Entropy and Dissemination | Digests, Merkle comparison, read repair, hinted handoff, gossip convergence |
+| 73 — Distributed Transactions | Atomic commit, 2PC/3PC boundaries, sagas, isolation across partitions |
+| 74 — Consensus | Paxos/Raft-family reasoning, replicated logs, commit, snapshots, membership |
 
-- **Assuming a timeout tells you a node is dead.** A timeout only tells you a node is unreachable *in time*; it cannot distinguish crash, slow node, or partition — treat suspicion as a heuristic, never a fact.
-- **Comparing wall-clock timestamps from two machines to decide event order.** Clock skew can invert them; use logical clocks (Lamport/vector) or bounded time, or you silently lose the newer write.
-- **Believing a message broker gives true exactly-once delivery at the wire level.** It is impossible; "exactly-once" is always at-least-once delivery plus idempotence/dedup somewhere — know where.
-- **Thinking TCP's reliability makes the network reliable end-to-end.** TCP masks loss only within a connection; it cannot mask a partition, a crashed peer, unbounded delay, or a dropped connection, so application-level retries and idempotence are still required.
-- **Treating a remote call like a local function call.** It is 10³–10⁶× slower and can fail independently; a loop of per-item RPCs (N+1) that is instant in tests collapses over the WAN.
-- **Stating FLP as "consensus is impossible."** FLP forbids only *deterministic, guaranteed-bounded-time* consensus in a *fully asynchronous* model with a crash; partial synchrony, randomization, and failure detectors make real consensus work while keeping safety always.
-- **Assuming the synchronous model when reasoning about correctness.** Real networks are partially synchronous — bounds exist but are unknown and violated during pauses/congestion — so never let correctness depend on any fixed timing bound.
-- **Retrying aggressively into a struggling system.** Retries multiply load exactly when the system is weakest, turning a local slowdown into a cascading outage; use backoff+jitter, retry budgets, and circuit breakers.
-- **Calling Cassandra's last-write-wins "safe" for concurrent writes.** It orders by wall-clock timestamp and can discard the logically newer write under clock skew — a real data-loss mode, not a theoretical one.
-- **Designing for Byzantine faults inside a trusted datacenter (or ignoring crash-vs-Byzantine entirely).** Byzantine tolerance needs 3f+1 and cryptography and is wasteful when nodes only crash; conversely, assuming crash-only where corruption occurs misses silent data faults that checksums catch.
-- **Forgetting that a network partition means both sides stay alive.** It is not "half the nodes died"; both halves keep running and can diverge, which is why quorums and fencing, not just retries, are required.
+Short reminders here are vocabulary, not substitutes for those chapters. There
+is no promised standalone partitioning chapter: partition placement/routing
+appears where it affects replication, repair, transactions, and consensus.
+
+## Common Traps — Core
+
+- Treating a timeout as proof of death or proof that an operation failed.
+- Saying “the network is unreliable” without naming loss, delay, duplication,
+  reordering, corruption, authentication, and link scope.
+- Assuming TCP resolves whether an application request committed.
+- Retrying a non-idempotent effect without a stable identity and atomic dedup
+  record.
+- Returning `FAILED` when the truthful result is temporarily `UNKNOWN`.
+- Ordering causal events by raw wall-clock timestamps from independent nodes.
+- Calling every numeric timestamp a logical clock, or assuming Lamport-clock
+  order proves causality in both directions.
+- Giving a liveness claim without fairness, fault, timing, membership, and load
+  conditions.
+- Using “available” without distinguishing formal responsiveness from useful
+  successful service.
+- Explaining CAP as “pick any two,” or using “consistency” without a history
+  definition.
+- Explaining FLP as “consensus is impossible.”
+- Assuming quorum intersection alone establishes latest-value reads, exclusive
+  leadership, or safe reconfiguration.
+- Citing a product guarantee without release, configuration, topology, failure
+  domain, and acknowledgement point.
+- Modeling replicas as independent when they share a host, rack, power path,
+  account, operator, or software defect.
+
+## Recall Card — Core
+
+- Nodes/processes own local state; messages create cross-node knowledge.
+- Distribution serves named scale, locality, isolation, or fault goals and
+  introduces coordination and operations costs.
+- Write an assumption ledger: membership, durable state, links, timing, faults,
+  client behavior, guarantee.
+- Partial failure creates indistinguishable histories. Silence is evidence of no
+  observed reply by a deadline, not the remote outcome.
+- Scope delivery claims. Retriable effects need idempotence or stable IDs with
+  atomic, durable deduplication.
+- Wall time is local/uncertain; monotonic time measures local intervals; causal
+  order follows program and message edges.
+- Safety forbids bad outcomes. Liveness promises eventual progress under named
+  conditions. Preserve safety when timeliness disappears.
+- Failure model: crash-stop/recovery, omission, timing, or Byzantine.
+- Synchrony model: known bounds, no bounds, or eventual/unknown bounds.
+- CAP is a precise partition execution result, not “pick two.”
+- FLP removes guaranteed termination in its asynchronous deterministic model;
+  it does not ban practical consensus.
+- \(2q>N\) guarantees set intersection only. Protocol state/version/membership
+  rules turn intersection into a useful guarantee.
+
+## Questions — Core
+
+1. Model a three-node service as local state machines and message events. Which
+   state must survive restart for request deduplication?
+2. A client times out after sending a write. List four indistinguishable remote
+   histories and give a truthful client-visible outcome.
+3. Distinguish scalability, operational availability, formal availability, and
+   fault tolerance with one concrete metric/property for each.
+4. Given events on two processes and two messages, derive happened-before and
+   identify concurrent events. Why can wall-clock order disagree?
+5. State one safety and one conditional liveness property for a replicated risk
+   limit. What finite trace disproves the safety property?
+6. State FLP precisely enough to identify the algorithm type, timing model,
+   possible fault, and property it prevents from being guaranteed.
+7. For \(N=7\), calculate the majority quorum and maximum unavailable members
+   while a quorum can still form. Why is the arithmetic insufficient for safe
+   reads after reconfiguration?
+8. Explain CAP using two executions indistinguishable to an isolated replica,
+   without saying “pick two.”
+9. Review an “exactly-once” product claim. Which boundary, identity, atomicity,
+   retention, recovery, and external-side-effect questions must be answered?
+10. What belongs in Chapters 69, 70, 71, and 74 rather than this foundations
+    chapter?
+
+## Protocol-Reading Puzzle — Core
+
+The following pseudocode tries to provide a single active writer:
+
+```text
+on heartbeat_timeout(peer):
+    if peer == current_leader:
+        role = LEADER
+        accept_writes = true
+
+on client_write(command):
+    if accept_writes:
+        local_log.append(command)
+        reply(COMMITTED)
+```
+
+Construct an execution in which the old leader is paused or partitioned, the
+follower times out, and both acknowledge writes. Identify:
+
+1. the observation that was mistaken for authority;
+2. the violated safety property;
+3. why lengthening the timeout cannot prove the property;
+4. which evidence categories a real design needs—terms/votes, quorum commit,
+   durable state, fencing, and recovery—without implementing Chapter 70 or 74
+   here.
+
+## Implementation Exercise — Core
+
+Design a small simulator for the risk-limit operation in §68.6. It may be
+single-threaded and deterministic; the goal is execution reasoning, not network
+code.
+
+Represent:
+
+- two service replicas with volatile and durable state;
+- a client with stable operation IDs;
+- messages in an explicit queue;
+- events for deliver, drop, duplicate, delay, process crash, and restart;
+- an optional partition predicate.
+
+First implement the unsafe retry. Generate a trace that applies one logical
+reservation twice. Then implement atomic deduplication at one authority and show
+that arbitrary duplicate delivery does not double-apply there. Finally split
+the two replicas and demonstrate why local dedup does not prevent each replica
+from independently granting.
+
+Submit:
+
+1. the model/failure assumptions;
+2. the state transition table;
+3. safety invariant and liveness conditions;
+4. three minimized counterexample traces;
+5. a statement of what later election/replication/consensus mechanism is still
+   missing;
+6. tests that replay each trace deterministically.
+
+Mark simulator conveniences that are stronger than reality—for example, a
+central event scheduler that knows which node crashed.
+
+## Prerequisite for Chapter 69 — Core
+
+Chapter 69 assumes you can distinguish remote truth from local suspicion,
+explain why silence is compatible with crash, pause, loss, and partition, and
+state the accuracy/completeness trade-off without treating any timeout as
+universally correct. Carry forward the assumption ledger: detector guarantees
+are meaningful only relative to a timing and failure model.

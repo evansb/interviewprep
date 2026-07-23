@@ -1,702 +1,673 @@
 # Chapter 28 — Caches
 
-*Interview-focused revision notes. The theme: every memory access is a bet that the data is nearby, and the entire discipline of low-latency data layout is the business of making that bet win — which requires knowing exactly what "nearby" costs and exactly why a miss happened.*
+## Why this matters — Core
+
+A short loop can be limited by where its data resides rather than by its arithmetic. Four mechanisms explain most cache-sensitive behavior: caches transfer blocks called lines, each line maps to a limited set of slots, coherent writers acquire ownership of a line, and speculative fetchers try to move predictable data before demand. These mechanisms let you predict which layout will reduce misses or ownership traffic. Chapter 30 contains measured latency ranges; this chapter derives behavior without repeating them.
+
+## 90-second screen — Core
+
+Five facts:
+
+1. On common CPUs, a cache line is the allocation and transfer unit and usually the coherence granule. Its size is a target property, not a C++ constant.
+2. In a conventional set-associative cache, an address selects a byte offset, a set, and a tag. Too many simultaneously live lines mapping to one set cause conflict misses even when total capacity is sufficient.
+3. Normal cacheable memory commonly uses write-back, write-allocate caches. A store miss normally requests ownership and may fetch the existing line: the **read for ownership** (RFO) tax.
+4. False sharing (independent variables in one line) is fixed by padding. True sharing (one variable) is not — it needs an algorithm change.
+5. Hardware prefetchers readily learn sequential or simple strided streams. Dependent pointer chains expose the next address too late for ordinary stream prefetchers, though more capable prefetchers exist on some processors.
+
+Two decisions:
+
+- Given a hot structure, decide its layout: which fields travel together, what the access stride is, and how many lines one operation touches.
+- Given a shared datum, decide whether to pad it, partition it per core, batch updates to it, or restructure so writes flow in one direction only.
+
+Chapter 29 develops DRAM and NUMA; Chapter 30 supplies reproducible latency ranges; Chapter 32 covers translation, page walks, and huge pages; Chapter 42 turns these mechanisms into an optimization workflow.
 
 ---
 
-## 28.1 Cache Hierarchy
+## 28.1 Lines, Sets, and Address Decomposition — Core
 
-A **cache** is a small, fast memory holding a subset of a larger, slower one, exploiting **temporal locality** (recently used data is used again) and **spatial locality** (data near recently-used data is used soon).
-
-### Typical modern x86-64 server (Ice Lake SP / Sapphire Rapids / Zen 4 class)
-
-| Level | Size | Assoc | Latency | Bandwidth | Scope |
-|---|---|---|---|---|---|
-| Registers | ~1 KB | — | 0 (bypass) | ~6 ops/cyc | Per-thread |
-| **L1d** | 32–48 KB | 8–12-way | **4–5 cycles (~1.3 ns)** | 2×64 B load + 1–2×64 B store /cyc | Per-core (shared by SMT siblings) |
-| **L1i** | 32–64 KB | 8-way | ~5 cycles | 32 B/cyc fetch | Per-core |
-| **L2** | 1–2 MB (Intel SPR: 2 MB; Zen 4: 1 MB) | 8–16-way | **~14 cycles (~4.5 ns)** | ~64 B/cyc | Per-core |
-| **L3 / LLC** | 1.5–4 MB per core, 30–100+ MB total | 12–16-way | **~40–60 cycles (~15–20 ns)**, higher on large-mesh parts | ~16–32 B/cyc/core | Shared per socket (or per CCX on AMD) |
-| **DRAM (local)** | GBs | — | **~70–100 ns (~250–350 cycles)** | ~20–40 GB/s per channel | Socket |
-| **DRAM (remote NUMA)** | GBs | — | **~120–200 ns** | Interconnect-limited | Other socket (Ch. 29 §29.19) |
-
-*(Cycle figures at ~3 GHz. ARM: Neoverse V2 L1d 64 KB / ~4 cyc, L2 1–2 MB / ~13 cyc, system-level cache tens of MB at ~30–40 ns; Apple M-series L1d 128 KB with ~4-cycle latency and a very large shared SLC. The **shape** is identical everywhere; the constants shift.)*
-
-The ratio that matters: **L1 to DRAM is ~50–70×**. A single unhidden DRAM miss costs more than 200 dependent ALU operations. Consequently, on any modern machine, *data layout beats instruction count* for almost all real workloads — the entire argument for data-oriented design (Ch. 42 §42.1).
-
-### Inclusive, exclusive, non-inclusive
-
-| Policy | Meaning | Used by | Consequence |
-|---|---|---|---|
-| **Inclusive** | L3 contains everything in L1/L2 | Intel pre-Skylake-SP | L3 eviction must **back-invalidate** L1/L2 copies; simplifies coherence (L3 acts as a snoop filter) but wastes capacity |
-| **Non-inclusive** | L3 *may* contain L2 lines | Intel Skylake-SP onward | Needs a separate snoop filter; larger effective capacity |
-| **Exclusive / victim** | L3 holds only lines evicted from L2 | AMD (L3 is a victim cache per CCX) | Max effective capacity = L2 + L3; but an L3 hit on AMD does **not** mean another core had it |
-
-This matters for interpreting counters. On AMD, the L3 is a **victim cache private to a CCX** (core complex, 8 cores on Zen 3/4), so a miss that crosses CCXs costs an Infinity Fabric round trip — **~100+ ns even to the same socket's other CCX**. Cross-CCX thread placement is an AMD-specific latency hazard that has no Intel analogue; pin communicating threads within a CCX (`lscpu -e`, `numactl --hardware`, and `/sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list` reveal the boundaries).
-
-### Where the tools look
+A cache holds a subset of a larger memory, exploiting **temporal locality** (recent data is reused) and **spatial locality** (nearby data is used soon). For a conventional power-of-two, set-associative cache:
 
 ```
-$ lscpu -C                      # cache sizes, ways, line size, sharing
-$ getconf -a | grep CACHE       # LEVEL1_DCACHE_LINESIZE etc.
-$ cat /sys/devices/system/cpu/cpu0/cache/index0/{size,ways_of_associativity,coherency_line_size}
-$ perf stat -e L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses ./a.out
-$ likwid-topology -g            # graphical topology incl. cache sharing
+sets       = size / (line_size × ways)
+index_bits = log2(sets)
 ```
 
----
-
-## 28.2 Cache-Line Organization
-
-The **cache line** (Intel: cache line; ARM: cache line; the coherence unit) is the atomic unit of transfer and coherence: **64 bytes on all mainstream x86-64 and most ARM**; Apple Silicon uses **128 bytes**; some IBM POWER parts use 128.
-
-Everything about cache behavior follows from this granularity:
-
-- Touching **one byte** transfers **64 bytes** from the next level. A random 8-byte read from a large array wastes 87.5% of the bandwidth it consumes.
-- Two variables in the same line are **coherently indistinguishable** — a write to either invalidates the whole line elsewhere. That is false sharing (Ch. 26 §26.15) if they're logically independent, and true sharing (§28.8) if they aren't.
-- An access **straddling** two lines requires two lookups (§29.12).
-
-### Lines, sectors, and the adjacent-line prefetcher
-
-Intel's L2 has an **adjacent-line prefetcher** ("spatial prefetcher") that, on a miss, also fetches the *paired* line so that the 128-byte-aligned pair is brought in together. The effective sharing granularity for false-sharing purposes is therefore often **128 bytes, not 64**, on Intel. This is why `std::hardware_destructive_interference_size` is **128** in libstdc++ on x86-64 while the line size is 64, and why HFT codebases commonly pad to 128 (and to 128 on Apple for the real line size).
-
-```cpp
-struct alignas(64)  Counter64  { std::atomic<uint64_t> v; char pad[56]; };  // may still bounce
-struct alignas(128) Counter128 { std::atomic<uint64_t> v; char pad[120]; }; // safe on Intel
-```
-
-### Address decomposition preview
-
-A physical (or, for L1 VIPT caches, partly virtual) address splits into:
+An address decomposes accordingly:
 
 ```
- 63                    offset_bits+index_bits              6           0
+ 63                       index+offset bits             6           0
 ┌────────────────────────┬──────────────────────────┬──────────────────┐
 │          TAG           │          INDEX           │   BLOCK OFFSET   │
 └────────────────────────┴──────────────────────────┴──────────────────┘
                                                      └ 6 bits = 64 B line
 ```
-`INDEX` selects the set; `TAG` is compared against every way in that set; `OFFSET` selects the byte. §28.3 works the arithmetic.
 
-### Critical-word-first and early restart
-
-The memory controller returns the **requested word first**, and the core can restart the dependent instruction before the full 64 bytes arrive. So the *latency* of a miss is the latency to the critical word, while the *bandwidth* consumed is the whole line. This is why a load's latency and a line fill's occupancy are different numbers, and why measuring "DRAM latency" with a pointer-chase gives a smaller number than the line's total transfer time.
-
----
-
-## 28.3 Cache Associativity and Address Decomposition
-
-**Associativity** (*N*-way) is the number of distinct lines that may occupy a given set. Direct-mapped is 1-way; fully associative is "any line anywhere" (used only for tiny structures like TLBs and victim buffers).
+The index selects a set, tags identify which memory blocks occupy its ways, and the offset selects a byte within the line. As a worked example, consider a hypothetical 32 KiB, 8-way L1 data cache with 64-byte lines:
 
 ```
-sets = size / (line_size × ways)
-index_bits = log2(sets)
+sets   = 32768 / (64 × 8) = 64
+offset = bits [5:0]
+index  = bits [11:6]
+tag    = bits [63:12]
 ```
 
-Worked, for a 32 KB 8-way L1d with 64 B lines:
-```
-sets       = 32768 / (64 × 8) = 64 sets
-offset     = bits [5:0]        (6 bits, 64 B line)
-index      = bits [11:6]       (6 bits, 64 sets)
-tag        = bits [63:12]
-```
-**The crucial consequence:** two addresses map to the same set iff they agree in bits [11:6] — that is, iff they are **congruent modulo 4096 (the page size)**. This is not a coincidence: L1 index+offset ≤ 12 bits is deliberate, so that the set index comes entirely from the page *offset*, which is identical in virtual and physical addresses. That permits **VIPT** (virtually-indexed, physically-tagged) lookup: the set lookup starts from the virtual address in parallel with the TLB translation, and the physical tag comparison completes when the TLB result arrives. This overlap is exactly why L1 latency can be 4 cycles rather than TLB-latency plus cache-latency.
+This simple bit selection accurately models many L1 caches because their index lies within the page offset. Lower cache levels may use physical-address bits, hashing, slice selection, or undocumented indexing, so the same arithmetic is a starting hypothesis rather than a universal mapping formula.
 
-It also explains why L1 caches stopped growing: to stay VIPT with 4 KB pages, `size ≤ page_size × ways`. 32 KB needs 8 ways; 48 KB needs 12 (Ice Lake did exactly that); 64 KB needs 16 ways, which is expensive. AMD and ARM use way-prediction or larger associativity to get past it.
+### Locality means useful work per fill
 
-For a 2 MB 16-way L2: `sets = 2097152/(64×16) = 2048`, index = bits [16:6], so conflicts occur modulo **128 KB**.
-
-### The power-of-two stride disaster
+Spatial locality is not "arrays are fast" as a rule; it is the fraction of each fetched line that the operation uses. With a target 64-byte line, scanning sixteen contiguous 32-bit quantities can use every transferred byte. Reading one 32-bit field from records spaced 64 bytes apart uses only one sixteenth of each line before eviction unless other fields are also consumed.
 
 ```cpp
-double m[1024][1024];                       // row stride = 8192 B
-for (int i = 0; i < 1024; ++i) sum += m[i][0];   // column walk
+#include <cstdint>
+#include <vector>
+
+struct Quote {
+    std::int64_t price;
+    std::int32_t quantity;
+    std::uint32_t venue;
+    std::int64_t timestamp;
+};
+
+std::vector<Quote> aos;             // array of structures
+std::vector<std::int32_t> quantity; // one column of a structure-of-arrays
 ```
-Every element is 8192 bytes apart. 8192 mod 4096 = 0, so **all 1024 addresses map to L1 set 0**. With 8 ways, you get 8 useful lines and then thrash — a 100% miss rate on a working set that would trivially fit. The same happens in L2 (stride 8192 mod 128 KB gives 16 distinct sets, so 1024 accesses hit 16 sets × 16 ways = 256 lines).
 
-**Fixes:** pad the leading dimension to a non-power-of-two (`double m[1024][1024+8]`), tile the loop (Ch. 42 §42.7), or transpose. Padding by one line is the classic one-line fix and a good thing to produce on a whiteboard.
+If every operation needs all four fields for one quote, `aos` packs related data and avoids coordinating several arrays. If an aggregation reads only quantities across thousands of quotes, the separate column transfers more useful quantities per line and gives the prefetcher one dense stream. Structure-of-arrays is therefore an access-pattern decision, not a universally superior layout.
 
-The diagnostic signature: L1 miss rate near 100% with a working set far smaller than L1, and a **stride that is a large power of two**. Detect with `perf stat -e L1-dcache-load-misses` plus a stride sweep, or with `cachegrind`/`valgrind --tool=cachegrind` which simulates the exact set mapping.
+Temporal locality is governed by **reuse distance**: the distinct cache footprint touched between two uses of the same line. A line reused after touching more competing data than the effective cache capacity may be evicted even when wall-clock time is short. Loop tiling improves temporal locality by finishing work on a small block before moving on:
 
----
+```text
+poor reuse:  touch one element in every row, then return much later
+tiled reuse: finish a B×B region while its lines remain candidates for residency
+```
 
-## 28.4 Cache Replacement Policies
+Count three things for a proposed layout: lines touched per operation, useful bytes per fetched line, and reuse distance in lines. Those quantities explain the direction of the change before a benchmark supplies target-specific magnitude.
 
-On a miss into a full set, one line must be evicted. Real policies are approximations of LRU because true LRU for 16 ways requires log2(16!) ≈ 45 bits of state per set.
+### Worked cache-set derivation
 
-| Policy | Mechanism | Where |
-|---|---|---|
-| **Pseudo-LRU (tree-PLRU)** | Binary tree of N−1 bits per set | L1/L2 on many cores |
-| **NRU** | One reference bit per line, periodic clear | Simple L2s |
-| **RRIP / DRRIP / SRRIP** | 2-bit "re-reference prediction value"; new lines inserted with *distant* prediction so streaming data doesn't evict the working set | Intel LLC since Ivy Bridge, ARM |
-| **Adaptive / set-dueling** | A few sampled sets run each policy; the winner drives the rest | Intel LLC |
-| **Random / pseudo-random** | Cheap; avoids pathological patterns | Some ARM L2s |
+For this L1, index plus offset consumes 12 low address bits. Addresses separated by 4096 bytes therefore preserve both the line offset and set index. Nine such lines compete for eight ways:
 
-### Why RRIP exists — the scan-resistance problem
+```text
+base + 0 × 4096  ┐
+base + 1 × 4096  │ same index bits [11:6]
+...              │ eight ways available
+base + 8 × 4096  ┘ ninth live line requires a victim
+```
 
-Under true LRU, a **single sequential pass over data larger than the cache** evicts everything and hits nothing: each new line is MRU, so it displaces the resident working set, and the working set is destroyed for no benefit. This is the "streaming kills the cache" pathology. RRIP inserts new lines with a *distant re-reference prediction*, so a line that is never reused is the first victim, and the resident working set survives a scan.
-
-The practical implications:
-
-- **You cannot reason about LLC hit rates as if it were LRU.** Intel's adaptive LLC policy will often behave better than LRU on streaming workloads and worse than an idealized model on others.
-- **Non-temporal stores and `prefetchnta`** (§28.14, §28.13) exist to give software the same hint explicitly: "this data has no reuse; don't disturb the cache."
-- Benchmarks that assume LRU (classic cache-simulation exercises) will disagree with hardware. `cachegrind` models LRU and is therefore *approximate* on modern LLCs — a good thing to say when asked about its limitations.
-
-### Sub-policies you may be asked about
-
-- **Insertion policy** — where in the recency order a fill lands. This is where RRIP does its work.
-- **Promotion policy** — how a hit updates recency. "Hit-promote to MRU" vs. "gradual."
-- **Victim selection** — which of the N ways to evict.
-- **Dead-block prediction** — some LLCs predict lines that will not be reused and evict them early.
-
-**Interview framing:** *"Is the LLC LRU?"* — No; it's an adaptive RRIP variant chosen specifically to be scan-resistant, which is why a streaming memcpy doesn't destroy your hot data as badly as naive analysis predicts — and why explicit non-temporal hints are still worth using when you *know* there's no reuse.
-
----
-
-## 28.5 Write-Back and Write-Through Caches
-
-What happens on a store that hits in cache?
-
-| | **Write-back** | **Write-through** |
-|---|---|---|
-| On a store hit | Update the line, set the **dirty bit**. Lower level unchanged. | Update the line **and** propagate to the next level immediately |
-| Traffic to next level | Only on eviction of a dirty line | Every store |
-| Latency of the store | Store-buffer speed (retire immediately) | Same for the core (buffered), but sustained bandwidth is far higher |
-| State needed | Dirty bit per line | None |
-| Coherence | Needs M state (Modified) | Line is never stale below |
-| Used by | **All modern x86-64 and ARM data caches** | Some L1s in embedded/GPU designs; some ARM L1s are write-through to L2 |
-
-**All mainstream CPU data caches are write-back.** The reason is bandwidth: a hot loop doing `++counter` a million times generates one memory transaction with write-back and a million with write-through. Write-through survives only where the next level is very close and the simplicity is worth it.
-
-### Dirty-line eviction and the writeback buffer
-
-An eviction of a dirty line does not stall the miss — the dirty line is moved to a **writeback buffer** (or the LLC's victim path) and drained asynchronously while the fill proceeds. This decoupling is why read latency doesn't double in a store-heavy workload. But the writeback buffer is finite; a workload dirtying lines faster than they can drain to DRAM becomes **writeback-bandwidth-bound**, and the symptom is that read latency rises even though the reads themselves hit.
-
-### The memory-type dimension (x86)
-
-Write-back is one of several **memory types** set by the MTRRs/PAT:
-
-| Type | Cached? | Write combining? | Ordering | Typical use |
-|---|---|---|---|---|
-| **WB** (write-back) | Yes | Yes (via cache) | TSO | Normal RAM |
-| **WT** (write-through) | Reads yes | No | TSO | Rare |
-| **WC** (write-combining) | No | **Yes** (WC buffers) | **Weakly ordered** | Framebuffers, **PCIe MMIO doorbells** (Ch. 29 §29.11) |
-| **UC** (uncacheable) | No | No | Strongly ordered, no reorder | MMIO control registers |
-| **WP** (write-protect) | Reads yes | No | — | Rare |
-
-This table is directly relevant to kernel-bypass networking (Ch. 47): the NIC doorbell register is mapped **WC**, writes to it are combined in a write-combining buffer, and you need an `sfence` to force the flush — which is why ef_vi/DPDK transmit paths contain explicit fences and why a missing one manifests as "the packet sits there until the next unrelated write flushes the buffer."
-
----
-
-## 28.6 Write Allocation Policies
-
-What happens on a store **miss**?
-
-| Policy | Behavior | Pairs with |
-|---|---|---|
-| **Write-allocate** (fetch-on-write) | Read the line into cache (an **RFO**, Ch. 29 §29.10), then write into it | Write-back |
-| **No-write-allocate** (write-around) | Send the store to the next level; don't cache the line | Write-through |
-
-Mainstream x86-64 and ARM use **write-back + write-allocate**. So a store to a cold line costs a **full line read from memory**, even if you are about to overwrite all 64 bytes. That read is pure waste.
-
-### The overwrite cost — the number to know
+A dependent cycle prevents memory-level parallelism from hiding the effect:
 
 ```cpp
-memset(buf, 0, 1<<30);          // 1 GiB
+#include <cstddef>
+#include <span>
+
+std::size_t chase(std::span<const std::size_t> next,
+                  std::size_t index, std::size_t steps) {
+    while (steps-- != 0) index = next[index];
+    return index;
+}
 ```
-With write-allocate this consumes **2 GiB of DRAM traffic**: 1 GiB of RFO reads plus 1 GiB of eventual writebacks. The measured bandwidth appears to be half of what the DIMMs can do, and this is the single most common reason a `memcpy`/`memset` benchmark misses the theoretical peak.
 
-Three escapes:
+Build `next` so its cycle visits slots `0, 4096/sizeof(std::size_t), 2×4096/sizeof(std::size_t), ...`. Compare eight and nine slots over many rounds. Eight can reside in the set; nine exceeds associativity. Then change the stride to 4096+64: the addresses rotate through sets while total touched bytes remain the same. That control separates conflict pressure from capacity. A benchmark must consume the returned index, randomize trial order, and follow Chapter 43's timing rules.
 
-**1. Non-temporal stores** (§28.14) — `movntdq`/`movntps` bypass the cache and write directly through **write-combining buffers**, eliminating the RFO. Restores full bandwidth for large, non-reused writes. `memset`/`memcpy` in glibc switch to NT stores above a size threshold (roughly the non-shared LLC size), which is why the bandwidth curve has a visible knee.
+The set capacity is `ways × line_size = 8 × 64 = 512` useful bytes for these congruent addresses, even though the whole cache holds 32 KiB. Padding a matrix leading dimension, tiling a traversal, or changing allocation offsets changes the index sequence; Chapter 42 covers how to choose and verify such transformations.
 
-**2. Full-line write combining without NT stores.** Modern cores can detect that a full 64-byte line is being written by consecutive stores and skip the RFO. Intel calls this an optimization for `rep stosb`/`rep movsb` (ERMSB/FSRM) and for some store streams; AMD Zen does the same. This is why `rep movsb` — historically slow — is now the fastest small-to-medium `memcpy` on Ice Lake+ (Fast Short REP MOV), and why glibc dispatches to it.
+### Virtual indexing and fill behavior
 
-**3. AVX-512 masked/full-line stores** with all lanes written can also avoid the RFO on some parts.
+Many L1 caches are virtually indexed and physically tagged (VIPT). When offset and index bits fit entirely inside the page offset, a set lookup can begin in parallel with address translation because those bits do not change during translation. For 4 KiB pages, the common design relation is:
 
-### The measurement
-
+```text
+L1 capacity ≤ page size × associativity
 ```
-$ perf stat -e L1-dcache-stores,l2_rqsts.all_rfo,offcore_requests.demand_rfo,\
-             longest_lat_cache.miss ./a.out
-```
-On Intel, `offcore_requests.demand_rfo` counts RFOs going to memory — comparing it against your intended store volume shows whether you're paying the write-allocate tax. Intel PCM (`pcm-memory`) shows actual DRAM read and write bandwidth separately; seeing read traffic roughly equal to your write volume is the smoking gun.
+
+This is a design pressure, not an architectural requirement. Processors can use extra alias handling, banking, way prediction, different page sizes, or other organizations. It is therefore safer to derive geometry from the target's documentation or system topology than to infer it from a product family.
+
+A demand fill transfers a line, but some processors can return the requested **critical word** before the remaining beats arrive. Consequently, dependent-load latency and sustained line-fill bandwidth are different quantities. Chapter 30 measures the former; Chapter 29 develops the path beyond the cache hierarchy.
 
 ---
 
-## 28.7 Cache Coherence Protocols
+## 28.2 The Hierarchy and What a Miss Actually Costs — Core
 
-**Coherence** guarantees that all cores see a single, consistent value for each memory location, with writes to a location serialized. It is a *per-location* guarantee, distinct from **consistency/memory ordering**, which is about the relative order of accesses to *different* locations (Ch. 25, Ch. 29 §29.13).
+Most server CPUs provide small private caches near each core and a larger shared or distributed last-level cache (LLC). Exact sharing domains, inclusivity, capacities, and lookup paths are implementation properties.
 
-### MESI and its extensions
+| Level | Common organization | Consequence |
+|---|---|---|
+| L1 data / instruction | Private to a core, shared by its SMT threads | Smallest capacity; nearest target for the active loop |
+| L2 | Often private to a core or core cluster | A useful working-set residency target |
+| LLC | Shared or distributed across cores/clusters | Hit cost and available capacity depend on placement and sharing domain |
+| Beyond LLC | Coherent peer cache or memory hierarchy | An LLC miss does not by itself identify the responder |
 
-| State | Meaning | Other caches may hold it? | Memory up to date? |
+Three structural facts matter more than the numbers:
+
+**Inclusion changes eviction effects.** In an inclusive hierarchy, every private-cache line is represented in the inclusive level, so eviction there may require invalidating private copies. An exclusive or victim organization uses levels for mostly different lines, increasing aggregate data capacity at the cost of more movement on promotion. A non-inclusive cache promises neither containment relation. These terms describe policies, not performance rankings.
+
+Coherence directories or snoop filters also have finite capacity. On designs where an entry is required to track private copies, directory pressure can cause probes or back-invalidations even when the data itself appeared resident. Whether this occurs, and which counter exposes it, is processor-specific.
+
+**The responder matters.** A clean LLC hit, a cache-to-cache transfer from a peer, and a memory response follow different paths. Intel performance tools use **HITM** ("hit modified") for a load served from a peer's modified line. Do not equate an LLC miss with DRAM traffic without a data-source or offcore-response event. §28.3 covers the mechanism.
+
+Where to look on Linux:
+
+```bash
+$ lscpu -C                       # sizes, ways, line size, sharing
+$ cat /sys/devices/system/cpu/cpu0/cache/index0/{size,ways_of_associativity,coherency_line_size}
+$ cat /sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list   # reported sharing domain
+```
+
+The index numbers are not portable; enumerate the `index*` directories and read each `level` and `type` file before interpreting them.
+
+### From miss rate to exposed latency
+
+For a single dependent access, a simplified average-access model is:
+
+```text
+L1 hit time
++ P(L1 miss) × additional L2 service time
++ P(L2 miss) × additional LLC service time
++ P(LLC miss) × additional off-chip/peer service time
+```
+
+The probabilities after the first are conditional: "L2 miss rate" must be clear about whether its denominator is all loads or only L1 misses. Mixing counter denominators is a common way to produce an impossible estimate.
+
+Real loops need a second dimension: **memory-level parallelism**. Four independent misses may overlap, consuming fill buffers and bandwidth while exposing much less than four times one miss's latency. Four dependent pointer loads cannot overlap because each address waits for the previous result. Thus the same miss count can describe two different bottlenecks:
+
+```text
+independent:  load A ─────────┐
+              load B ────────┼─ overlap
+              load C ────────┘
+
+dependent:    load A ───────► address B ───────► address C
+```
+
+Prefetching also changes whether a line is a *demand* miss without eliminating the underlying fill traffic. For latency reasoning, ask how many cycles are exposed on the dependency chain. For throughput reasoning, ask how many lines per unit time move through the hierarchy and which finite resources—miss-status entries, fill buffers, cache ways, or bandwidth—saturate. Chapter 27 develops dependency chains; Chapter 30 supplies target measurements.
+
+### Replacement policies are implementation behavior
+
+On a miss into a full set, the cache chooses a victim. Exact replacement is generally not an ISA guarantee and is often undocumented. High-associativity caches avoid the state and update cost of exact least-recently-used (LRU) tracking by using approximations or adaptive policies.
+
+| Policy family | Mechanism | Trade-off |
+|---|---|---|
+| Pseudo-LRU | Compact state approximates recency | Cheap, but can choose a non-LRU victim |
+| Not-recently-used | Tracks coarse recent use | Low metadata cost |
+| Re-reference prediction | Predicts whether a new/resident line will return soon | Can resist one-pass scans |
+| Adaptive / set dueling | Sample sets compare policies and select one dynamically | Responds to workload phases |
+| Randomized | Selects victims with little recency state | Avoids some deterministic adversarial patterns |
+
+Scan resistance illustrates why replacement matters. Strict LRU treats each line in a one-pass stream as most recently used, allowing the stream to displace a reusable working set. A re-reference predictor can insert streaming lines as early victims instead. Which policy a particular CPU uses is research- and measurement-informed, not a portable fact.
+
+Three consequences:
+
+- Do not predict an exact eviction sequence without a documented policy or a measurement.
+- Cache simulators use simplified replacement and omit many physical-address, coherence, and prefetch effects. They remain useful for controlled comparisons within their model.
+- Non-temporal hints (§28.6) can express expected low reuse, but their effect remains target-specific.
+
+### Thrashing is repeated eviction before reuse
+
+A workload **thrashes** when competing lines repeatedly evict one another before useful reuse. Total footprint can cause capacity thrashing; congruent addresses can cause set thrashing; two writers can cause coherence thrashing. The visible symptom—many misses or transfers—does not identify which resource is over capacity.
+
+Estimate the active footprint over one reuse interval:
+
+```text
+active lines =
+    payload lines
+  + index/pointer lines
+  + control and stack lines
+  + concurrently active instruction/metadata effects
+```
+
+Compare payload and metadata with the effective sharing domain, not the marketing capacity. An LLC shared by several cores does not reserve its full nominal size for one thread, replacement does not partition capacity fairly, and inclusion may duplicate lines across levels. There is no portable "use at most 50% of cache" threshold.
+
+The diagnostic is a controlled sweep. Vary only the number of active records while holding access order constant; then vary stride/base alignment while holding footprint constant. A footprint-dependent knee suggests capacity. A sharp sensitivity to congruence suggests conflict. A dependency on the second writer suggests coherence. This three-axis experiment is more informative than one aggregate miss rate.
+
+---
+
+## 28.3 Coherence and Store Ownership — Core
+
+Store cost follows from two layers: the cache's write/allocation policy determines whether old data is fetched and when dirty data moves downward; coherence determines which core may write the line. These hardware mechanisms are separate from the C++ memory-order rules that make inter-thread communication correct.
+
+### Write-back, write-allocate, and the RFO
+
+Two orthogonal policies describe stores.
+
+| Question | Policy choices | Consequence |
+|---|---|---|
+| When does modified data move downward? | Write-back vs. write-through | Combines repeated stores vs. propagates each store promptly |
+| What happens on a store miss? | Write-allocate vs. no-write-allocate | Fetch/own a cache line vs. write without normal allocation |
+
+These policies describe a cache or memory type, not the C++ memory-order relation. A release store can target ordinary write-back memory; a relaxed store still participates in hardware coherence.
+
+**On a store hit**, normal memory on common x86-64 and AArch64 systems uses *write-back* caching: update the cached line, mark it dirty, and propagate it to the next level later. A write-through policy propagates each store promptly. Write-back combines repeated updates while a line remains resident, but dirty evictions consume finite writeback-buffer and downstream bandwidth. Once those resources fill, later loads or fills can be delayed.
+
+**On a store miss**, normal write-back memory commonly uses *write allocate*: obtain the line in a writable coherence state before modifying it. The ownership request invalidates peer copies and, absent a target-specific optimization, fetches existing line contents. That transaction is called a **read for ownership**. It is necessary for a partial-line store because untouched bytes must be preserved; it is avoidable traffic when software overwrites the whole line and has an appropriate non-allocating mechanism.
+
+The resulting traffic matters for write bandwidth:
+
+```cpp
+std::memset(buf, 0, 1u << 30);   // 1 GiB written
+```
+
+In the simple write-allocate model, this phase causes approximately 1 GiB of ownership reads and 1 GiB of later dirty writebacks. Real `memset` implementations may choose specialized paths, and traffic can be served or absorbed at several hierarchy levels, so confirm the model with separate read/write traffic counters.
+
+Ways to reduce the ownership-read component are target-specific:
+
+1. **Non-temporal stores** (§28.6) request low-pollution, write-combining behavior and commonly avoid ordinary write allocation for full-line streams.
+2. **Architecture-specific whole-block operations**, such as cache-block zeroing on some AArch64 implementations, can establish a complete new block without reading old contents.
+3. **Optimized library routines** may select non-temporal, block-zero, or other specialized sequences according to size, alignment, CPU dispatch, and library version.
+
+Neither ordinary full-width vector stores nor `rep stos`/`rep movs` has a portable promise to avoid RFO traffic. Library thresholds are implementation details and sometimes runtime tunables; do not quote a universal cutoff. Inspect the selected routine and sweep size/alignment on the deployed build.
+
+To test the hypothesis, compare intended store bytes with RFO/offcore events and memory-controller read/write traffic supported by the named processor. Event names and what they count vary. MMIO and write-combining memory types have different caching and ordering rules; Chapters 29 and 47 cover those device-facing cases.
+
+### Coherence states and transfers
+
+Hardware coherence establishes a serialization of writes to each coherent location and propagates ownership/data among caches. It is not the same as a memory-consistency model, which constrains observations across different locations.
+
+This hardware property does **not** make an unsynchronized C++ race legal. Conflicting non-atomic accesses without a happens-before relation are undefined behavior. Use atomics or another synchronization protocol first (Ch. 25–26); then use coherence to reason about its physical traffic.
+
+MESI is a useful mental model; actual protocols add states and transient transitions:
+
+| Stable state | Meaning | Others may hold it | Memory up to date |
 |---|---|---|---|
-| **M** odified | This cache has the only copy, and it's dirty | No | **No** — must write back |
-| **E** xclusive | Only copy, clean | No | Yes |
-| **S** hared | Possibly multiple clean copies | Yes | Yes |
-| **I** nvalid | Not present | — | — |
-| **O** wned (MOESI, AMD/ARM) | Dirty, but **shared** — this cache supplies data to others without writing back to memory | Yes | No |
-| **F** orward (MESIF, Intel) | One designated S copy responsible for forwarding data on a request | Yes | Yes |
+| Modified | Sole copy, dirty | No | No |
+| Exclusive | Sole copy, clean | No | Yes |
+| Shared | Possibly several clean copies | Yes | Yes |
+| Invalid | Not present | — | — |
+| Owned (MOESI family) | Dirty but shared; an owner supplies data | Yes | No |
+| Forward (MESIF family) | A designated clean sharer may answer requests | Yes | Yes |
 
-**Why E exists:** a load of a line nobody else has enters **E**, so a subsequent store can transition E→M **silently, with no bus traffic**. Without E, every first store to a private line would broadcast. This is why read-then-write on private data is cheap.
+Two extensions illustrate traffic reduction:
 
-**Why O exists (MOESI):** without O, a dirty line requested by another core must be written back to memory before sharing. With O, the owner supplies the data cache-to-cache and keeps the dirty copy. AMD's and ARM's use of MOESI makes producer-consumer sharing cheaper in principle; Intel's MESIF designates a forwarder to avoid multiple caches responding to the same request.
+- **Exclusive** allows a clean sole copy to transition E→M without first invalidating sharers. This removes a coherence transaction for read-then-write private data.
+- **Owned** allows a dirty line to be shared while a cache remains responsible for supplying it. **Forward** designates one clean sharer as responder. Protocol names and details are implementation-specific.
 
-### The transitions that cost you
+The two transitions that cost:
 
 ```
-Core A: store x   →  needs M. If S or I elsewhere: send RFO (Read For Ownership),
-                     INVALIDATE all other copies, wait for acks. → Ch. 29 §29.10
-Core B: load x    →  A has it in M. Snoop hits modified (HITM):
-                     A supplies the line cache-to-cache, downgrades M→S (or O)
+Core A stores x  →  needs M. If any other cache holds it, send a read-for-ownership,
+                    invalidate every other copy, wait for acknowledgements.
+Core B loads x   →  A holds it Modified. The snoop hits modified (HITM): A supplies
+                    the line cache-to-cache and downgrades to S (or O).
 ```
 
-Costs on a modern server (typical, same socket):
+Both operate at the coherence granule and require interconnect messages. Their cost depends on topology, sharer count, and responder placement. Chapter 30 contains measured examples; Chapter 29 covers cross-socket topology.
 
-| Event | Latency |
-|---|---|
-| L1 hit, line in E or M | 4–5 cycles |
-| L2 hit | ~14 cycles |
-| L3 hit, uncontended | ~40–60 cycles |
-| **L3 hit with HITM** (another core's L1/L2 has it dirty) | **~70–110 cycles (~25–35 ns)** |
-| Cross-socket HITM | **~150–300 ns** |
-| Cross-CCX (AMD) | ~100+ ns |
+Large systems commonly use directories or snoop filters to narrow coherence probes rather than broadcasting every request. Their placement and protocol are not architectural C++ properties.
 
-`HITM` is the key counter name: `mem_load_l3_hit_retired.xsnp_hitm` and `offcore_response...HITM_OTHER_CORE` on Intel. `perf c2c` is the purpose-built tool — it records HITM events with PEBS and reports **which cache line, which offsets within it, and which threads** are contending, with a per-line report distinguishing false from true sharing. Naming `perf c2c` when asked "how would you find false sharing in production?" is the expected answer.
+On supported Linux processors, `perf c2c` samples data-source/coherence events and groups accesses by cache line and offset. Availability and HITM precision vary by CPU and kernel, but when supported the offset report helps distinguish the two sharing cases in §28.4.
 
-### Directories and snoop filters
+### Publication has a correctness cost and a traffic cost
 
-Broadcasting snoops does not scale past a handful of cores. Large servers use a **directory** (or snoop filter) tracking which cores may hold each line — on Intel, distributed with the LLC slices on the mesh; on AMD, in the Infinity Fabric coherent masters. A **snoop filter eviction** can force back-invalidation of lines still live in a core's L2, producing mysterious misses on data that "should" be cached. This is a genuine effect on large-core-count parts and a strong detail to mention.
+Suppose a producer fills a slot, performs a release store to a ready sequence, and a consumer waits with an acquire load. Release/acquire establishes C++ visibility when the acquire reads the published value (Ch. 25). Coherence then implements the physical ownership changes.
+
+If the payload and sequence share a line, publication can move one line but consumer polling may repeatedly interact with a line the producer is still modifying. If they occupy separate lines, the control line can bounce independently while payload lines remain read-only after publication. Neither arrangement is automatically best: a tiny immutable payload may benefit from one transfer; a large payload and frequent polling may benefit from separation and batching.
+
+Count publications, not only messages. Publishing once per batch amortizes ownership of the control line, but increases queueing delay before the consumer sees the first item. That is a throughput-versus-latency trade-off, while release/acquire is the correctness boundary. Changing memory order to `relaxed` does not solve the ownership bottleneck and may break the protocol.
 
 ---
 
-## 28.8 True Sharing and Cache-Line Bouncing
+## 28.4 False Sharing, True Sharing, and the Miss Taxonomy — Core
 
-**False sharing** (Ch. 26 §26.15) is *logically independent* data sharing a line. **True sharing** is genuinely shared data — a queue head, a sequence number, a lock word — and it cannot be padded away. Both produce **cache-line bouncing**: the line migrating between cores' caches under RFO/invalidate traffic.
+**False sharing** is logically independent data occupying one line. **True sharing** is genuinely shared data — a queue index, a sequence number, a lock word. Both produce line bouncing: the line migrating between cores under ownership traffic. Only one of them can be padded away.
 
 | | False sharing | True sharing |
 |---|---|---|
-| Cause | Unrelated variables in one 64/128 B line | The algorithm genuinely shares one variable |
-| Fix | **Padding / `alignas(64)` or 128** | Algorithm change: partition, batch, or use a different protocol |
-| Detection | `perf c2c` shows different offsets in the line touched by different threads | `perf c2c` shows the **same offset** contended |
-| Signature | Slowdown vanishes when you pad | Padding changes nothing |
+| Cause | Unrelated variables in one line | The algorithm shares one variable |
+| `perf c2c` signature | Different offsets in the line, different threads | The same offset, contended |
+| Fix | Padding or alignment | Partition, batch, or make the sharing one-directional |
+| Test | Slowdown disappears when padded | Padding changes nothing |
 
-### The cost model
+Assume `a` and `b` occupy different offsets of one line and start shared in cores P and Q. This is the ownership cycle when P updates `a` and Q updates `b`:
 
-An uncontended atomic RMW on a line already in M state is **~20 cycles**. A contended one where the line must be pulled from another core is **~70–110 cycles same-socket, 150–300 ns cross-socket**. With *N* cores hammering one line, throughput collapses to roughly one operation per transfer latency, and it gets *worse* with more cores because the line is stolen before any core makes progress. A shared `std::atomic<uint64_t> counter{}; counter.fetch_add(1)` across 32 cores can run at **under 10 million ops/sec total** — worse than a single thread.
-
-### The fixes, in order of preference
-
-1. **Don't share.** Per-core counters aggregated on read. This is the answer to metrics counters (Ch. 59 §59.3) and to allocator statistics.
-2. **Batch.** Accumulate locally, publish every N operations. Turns N bounces into one.
-3. **Make the sharing one-directional.** An SPSC ring buffer (Ch. 26 §26.3) with the producer's index and consumer's index on **separate lines** has each line written by exactly one core and read by the other. Read-sharing (S state) is cheap; it's the write-invalidate that costs. Putting both indices on one line is the classic bug that turns an SPSC queue into a bouncing disaster — and it's exactly the padding question interviewers ask.
-4. **Reduce polling frequency.** A consumer spinning on the producer's index in a tight loop generates continuous coherence traffic. Reading a *cached local copy* of the tail and only re-reading the shared one when exhausted (the "cached index" optimization in every good SPSC queue) can double throughput.
-5. **Backoff.** Exponential backoff with `pause` under contention (Ch. 24 §24.15).
-
-### The read-mostly case
-
-Lines read by many cores and written rarely sit in **S** (or F) everywhere and cost nothing. This is why configuration and lookup tables are free to share, and why the correct structure for read-mostly data is copy-on-write with RCU-style publication (Ch. 26 §26.14) — the readers never write, so they never invalidate.
-
----
-
-## 28.9 Compulsory, Capacity, and Conflict Misses
-
-The **3 Cs** taxonomy (Hill & Smith), plus a fourth for multicore. It exists because the *fix* is different for each.
-
-| Class | Definition | Test | Fix |
-|---|---|---|---|
-| **Compulsory** (cold) | First-ever reference to the line | Occurs in an infinite fully-associative cache | Prefetch (§28.13); larger lines; better spatial layout so one fill serves more useful data |
-| **Capacity** | Working set exceeds cache size | Occurs in a fully-associative cache of the real size | **Shrink the working set**: blocking/tiling, smaller data types, SoA, compression |
-| **Conflict** | Too many lines map to one set | Present in the real cache but not in a fully-associative one of the same size | **Change addresses**: pad the leading dimension, offset arrays, cache coloring (§28.15) |
-| **Coherence** (4th C) | Line invalidated by another core | Disappears single-threaded | Padding (false) or algorithm change (true) — §28.8 |
-
-### Identifying which one you have
-
-The classification is operational: run the same access pattern with progressively larger caches (or simulate). In practice:
-
-- **Compulsory** — miss count ≈ (unique bytes touched)/64, independent of cache size. Streaming workloads are ~100% compulsory.
-- **Capacity** — miss rate is a step function of the working-set size, with the knee at each cache level. The classic **cache-size sweep** benchmark (walk an array of size S with a random stride, plot ns/access vs S) reveals the entire hierarchy as a staircase, and drawing that staircase from memory is a standard interview task:
-
-```
-ns/access
-   ▲
-80 |                                    ┌────────  DRAM
-   |                                ┌───┘
-20 |                    ┌───────────┘                LLC
-   |             ┌──────┘
- 5 |      ┌──────┘                                   L2
- 1 |──────┘                                          L1
-   └──────┴──────┴──────┴────────────┴───────────►  working set
-         32KB   1MB    32MB                          (log scale)
+```text
+P stores a:  P requests ownership ──► Q invalidates its copy ──► P has M
+Q stores b:  Q requests ownership ──► P supplies/invalidates ──► Q has M
+P stores a:  repeat
 ```
 
-- **Conflict** — miss rate is wildly sensitive to *stride* and to *base address*. If adding 64 bytes of padding to a struct or array changes performance by 2×, it's conflict.
+The language-level variables are independent, but the hardware cannot grant write permission to half a line. Each handoff moves coherence messages and may transfer data; a relaxed atomic changes ordering constraints but does not shrink the coherence granule. If P performs many consecutive updates while it owns the line, those stores combine locally. Alternating ownership is the damaging pattern.
 
-### Tooling
+The fixes for true sharing, in order of preference:
 
-- `cachegrind` / `callgrind` — full simulation, exact miss classification per source line, ~50× slowdown, LRU model (so LLC numbers are approximate, §28.4).
-- `perf stat -e cache-references,cache-misses,L1-dcache-load-misses,l2_rqsts.miss,LLC-load-misses`.
-- `perf mem record` / `perf mem report` — PEBS-based, attributes each sampled load to the level it was serviced from (L1/L2/L3/DRAM/remote DRAM). This is the fastest way to find *which line of code* eats DRAM latency.
-- `toplev.py --level 3` → `Memory_Bound` → `L1_Bound`/`L2_Bound`/`L3_Bound`/`DRAM_Bound` splits the stall time by level directly.
+1. **Do not share.** Per-core counters aggregated at read time. This is the answer for metrics (Ch. 59) and allocator statistics.
+2. **Batch.** Accumulate locally and publish every N operations, reducing the opportunities for ownership handoff from one per operation to one per batch.
+3. **Make sharing one-directional.** An SPSC ring (Ch. 26) can put producer- and consumer-written positions on separate lines. Each line then has one writer, rather than two writers repeatedly exchanging ownership.
+4. **Reload shared state only when necessary.** Repeated loads can hit locally while a line remains shared, but after the producer writes, the consumer's next load requests a fresh copy and the producer's next store reacquires ownership. A cached local position reduces those transitions.
+5. **Back off** under contention (Ch. 24).
 
----
+Read-mostly immutable data can remain shared without recurring write invalidations after initial fills. Publication still requires synchronization and safe reclamation (Ch. 25–26), and capacity misses remain possible.
 
-## 28.10 Cache Thrashing
+### A minimal false-sharing experiment
 
-**Thrashing** is repeated eviction and refetch of lines that are still needed — the working set is nominally live but never resident. It is capacity or conflict miss behavior taken to its pathological limit.
-
-### The three flavors
-
-**1. Conflict thrashing.** The power-of-two-stride case from §28.3. N+1 hot lines mapping to an N-way set: every access misses, forever. The tell is a 100% miss rate with a tiny working set.
-
-**2. Capacity thrashing.** Working set slightly larger than the cache, accessed cyclically. With LRU this is the worst possible pattern — by the time you come back to a line, it was just evicted. A loop over 1.1× the L2 size can be dramatically slower than one over 0.9×. (RRIP-family policies, §28.4, mitigate this — another reason the LLC isn't LRU.)
-
-**3. Multi-tenant / LLC thrashing.** A co-resident process (or the kernel, or a logging thread, or a `memcpy`-heavy backup) streams through memory and evicts your hot data from the shared LLC. Your latency degrades with **no change to your code**. This is the "noisy neighbor" problem, and it is the single most common cause of unexplained p99.9 regressions on shared hardware.
-
-### Diagnosing multi-tenant LLC thrashing
-
-Intel **CMT/MBM** (Cache Monitoring Technology / Memory Bandwidth Monitoring), part of RDT, reports per-process LLC occupancy and memory bandwidth:
-```
-$ pqos -m "all:0-7"          # live LLC occupancy + local/remote MBM per core
-$ perf stat -e intel_cqm/llc_occupancy/ -p <pid>
-```
-Seeing your process's LLC occupancy collapse when a neighbor runs is conclusive. The remedy is **CAT** (Cache Allocation Technology), §28.15.
-
-### The low-latency structural answer
-
-Thrashing is why HFT hot paths are designed to have a working set that provably fits:
-
-- **Order books sized to fit in L2.** A per-instrument book of a few thousand price levels at 16–32 bytes each is 100 KB or less; the hot top-of-book slice is a few hundred bytes.
-- **Flat arrays indexed by dense integer IDs**, not hash maps of pointers — one cache line per lookup instead of two or three.
-- **Nothing else on the isolated core**, so nothing else evicts anything (`isolcpus`, `nohz_full`, Ch. 31 §31.19).
-- **`memcpy` of large buffers kept off the hot core**, or done with NT stores (§28.14) so it doesn't pollute.
-- Logging, serialization, and stats aggregation moved to other cores over an SPSC queue precisely so their footprints don't touch the hot core's L1/L2.
-
----
-
-## 28.11 Cache Warming
-
-Caches are cold when a code path hasn't run recently. In a system that executes its critical path a few thousand times a second while doing millions of other things, **every critical-path execution starts cold** — and the first-touch penalty lands exactly on the message that matters.
-
-What is cold, and what it costs:
-
-| Cold structure | Penalty on first touch |
-|---|---|
-| L1d line | +250 ns if from DRAM (per line) |
-| L1i / DSB | Front-end starvation for the whole path (Ch. 27 §27.15) |
-| dTLB / iTLB entry | +~100–300 ns for a page walk (Ch. 32 §32.8); worse if the page-table lines themselves miss |
-| Branch predictor / BTB entries | 15–20 cycles per mispredicted branch, across the whole path |
-| Page not yet faulted in (first touch) | **µs to ms** — a minor fault is ~1–3 µs, a major fault is a disk I/O |
-| NIC descriptor rings, DMA buffers | Miss + possibly IOMMU translation (Ch. 29 §29.23) |
-
-Note that branch-predictor and BTB state are as real a "cache" here as the data cache, and are often the larger effect on a branchy parsing path.
-
-### Warming techniques
-
-**1. Prefault and lock everything at startup.**
-```cpp
-mlockall(MCL_CURRENT | MCL_FUTURE);   // no swapping, no lazy faults later
-// touch every page of the heap/arena once
-for (size_t i = 0; i < size; i += 4096) ((volatile char*)p)[i] = 0;
-```
-Combined with a pre-sized arena allocator (Ch. 7 §7.7) and `MAP_POPULATE`. This removes the page-fault class entirely.
-
-**2. Synthetic warming — run the real path on fake data.** Feed a shadow order book with synthetic ticks, run the full parse→decide→encode path, and discard the output at the last possible moment (a flag checked immediately before the `send`). This warms **I-cache, D-cache, TLB, branch predictors, and the DSB** together, which is why it beats any "touch the arrays" approach. The catch — and the interview point — is that the discard branch must be *outside* the warmed path's shape, or you warm the predictor for the wrong direction and pay a mispredict on the real message. Standard technique: warm with the send present but pointed at a dead socket / a disabled TX queue, so the code executed is byte-identical.
-
-**3. Warm on every quiet period, not just at startup.** A path idle for 100 ms is cold again. Production systems warm on a timer (e.g. every few hundred µs when idle).
-
-**4. Keep the hot path small enough to *stay* warm.** The real fix. If the working set fits comfortably in L2 and the code fits in L1i, background activity on other cores can't evict it — provided the core is isolated.
-
-**5. Warm the NIC path too.** Kernel-bypass TX paths (Ch. 47) have their own state: descriptor rings, doorbell pages, and the PCIe posted-write path. "Pre-arming" a TX descriptor so the hot path only writes the doorbell is a related and widely used technique.
-
-**Measuring warm vs cold:** run the path once after a deliberate cache flush (`clflush` over the structures, or `wbinvd` in kernel) and compare to steady-state. The gap is your warming benefit. HdrHistogram (Ch. 43 §43.4) with first-message tagging shows it in production.
-
----
-
-## 28.12 Hardware Prefetchers
-
-Hardware prefetchers predict future accesses and fetch lines before demand. They are the reason sequential access is 10–20× faster than random access on the same data volume.
-
-### The Intel complement (four, per core)
-
-| Prefetcher | Level | Trigger | Reach |
-|---|---|---|---|
-| **DCU (streaming)** | L1d | Ascending sequential access | Next line |
-| **DCU IP-based (stride)** | L1d | Constant stride detected per *instruction pointer* | Stride × small distance; up to ~2 KB, **within a 4 KB page** |
-| **L2 streamer** | L2 | Ascending/descending streams | Up to **20 lines ahead**, multiple streams tracked |
-| **L2 adjacent line (spatial)** | L2 | Any miss | Fetches the 128 B-aligned partner line |
-
-AMD Zen has analogous stream and stride prefetchers plus a **region prefetcher**; ARM Neoverse has stride, region, and (on V2) a **temporal/pointer-chase prefetcher** that can follow indirect patterns.
-
-### The rules they obey (and the consequences)
-
-- **Prefetchers do not cross 4 KB page boundaries** (the L2 streamer on Intel stops at the page boundary), because crossing would require a TLB translation for an address that may not be mapped. Consequence: a sequential stream over 4 KB pages **restarts prefetch training every 4 KB**, taking a fresh demand miss at each page start. **Huge pages (2 MB) let the prefetcher run 512× further before restarting** — a real, measurable, often-overlooked benefit of THP/hugepages beyond TLB coverage (Ch. 32 §32.10).
-- They detect **constant strides**, forward or backward. They do **not** follow pointers (except ARM V2's special case), so linked lists, trees, and hash tables of pointers get nothing.
-- They track a limited number of concurrent streams (Intel L2: ~16–32). More streams than that and each one falls off.
-- They can be **too aggressive**: prefetching data you don't use consumes bandwidth and evicts useful lines. On some Intel parts, prefetchers can be disabled per-type via MSR 0x1A4 (`wrmsr -a 0x1a4 0xf`), which is occasionally a genuine latency tuning knob for pointer-chasing workloads that get only pollution from them.
-
-### The layout implications
+Use relaxed atomics so the increments remain observable operations without adding cross-location ordering. The packed form usually places both counters in one line; the separated form guarantees at least the chosen alignment between array elements/fields:
 
 ```cpp
-// Prefetcher-friendly: one stream, constant stride, no pointers
-struct Tick { uint64_t ts; int64_t px; uint32_t qty; uint32_t flags; };
-std::vector<Tick> ticks;                    // 24 B stride, sequential
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 
-// Prefetcher-hostile: pointer chase, unpredictable stride
-std::map<Key, Tick*> m;                     // node per element, random addresses
-```
-This is the concrete mechanism behind "use flat containers" (Ch. 12 §12.7), "SoA over AoS when you touch few fields" (Ch. 42 §42.2), and "intrusive lists over `std::list`" (Ch. 21 §21.5).
+struct alignas(64) PackedCounters { // 64 is the documented target granule
+    std::atomic<std::uint64_t> a{0};
+    std::atomic<std::uint64_t> b{0};
+};
 
-**Measuring:** compare `l2_rqsts.pf_hit` / `l2_rqsts.pf_miss` (prefetch effectiveness) against `l2_rqsts.demand_data_rd_miss`. A useful ratio is *prefetched lines that were never used* — Intel exposes `l2_lines_out.useless_hwpf` on some parts, and a high value means the prefetcher is burning bandwidth for nothing.
+template<std::size_t Separation>
+struct alignas(Separation) Counter {
+    std::atomic<std::uint64_t> value{0};
+};
 
----
-
-## 28.13 Software Prefetching and Prefetch Distance
-
-When the hardware prefetcher can't predict (pointer chasing, indirect indexing, hash lookups), you can issue the fetch yourself.
-
-```cpp
-#include <xmmintrin.h>
-_mm_prefetch(addr, _MM_HINT_T0);   // into L1 (and all levels)
-_mm_prefetch(addr, _MM_HINT_T1);   // into L2
-_mm_prefetch(addr, _MM_HINT_T2);   // into L3 / LLC
-_mm_prefetch(addr, _MM_HINT_NTA);  // non-temporal: minimize pollution
-__builtin_prefetch(addr, rw, locality);   // GCC/Clang; rw: 0=read 1=write, locality 0-3
-```
-Key properties: a prefetch is a **hint**. It never faults, never traps, and is dropped if the TLB misses (on most cores) or if resources are busy. It costs a µop and an L1 lookup slot.
-
-### Prefetch distance — the actual calculation
-
-Issue the prefetch far enough ahead that the line arrives just in time:
-
-```
-distance (iterations) = memory_latency / cycles_per_iteration
-```
-For a 250-cycle DRAM latency and a loop body taking 10 cycles/iteration: **prefetch 25 iterations ahead.**
-
-```cpp
-constexpr int PD = 25;
-for (size_t i = 0; i < n; ++i) {
-    __builtin_prefetch(&data[index[i + PD]], 0, 1);   // indirect: HW can't do this
-    process(data[index[i]]);
+template<class Atomic>
+void increment(Atomic& x, std::uint64_t count) {
+    for (std::uint64_t i = 0; i < count; ++i)
+        x.fetch_add(1, std::memory_order_relaxed);
 }
 ```
-- **Too close** — the line hasn't arrived; you've paid a µop for nothing.
-- **Too far** — the line is evicted before use, or you've filled the cache with future data and evicted present data.
 
-The distance is workload-specific and must be **tuned empirically** — a sweep from 4 to 64 typically shows a broad optimum. Stating "you must tune it, and the formula gives you the starting point" is the expected answer.
+Run two pinned threads, one per counter, comparing `PackedCounters` with the two elements of `std::array<Counter<64>, 2>` and `std::array<Counter<128>, 2>`. Record topology, compiler, iteration count, elapsed-time distribution, and line/offset evidence from a supported coherence tool. The experiment measures both atomic-instruction cost and ownership movement; the meaningful comparison holds the atomic operation constant and changes only placement.
 
-### Where software prefetch actually wins
+### How much padding, and what the standard constant means
 
-| Pattern | Does HW handle it? | SW prefetch worth it? |
-|---|---|---|
-| Sequential array scan | Yes | **No** — pure overhead |
-| Constant-stride scan | Yes | No |
-| Indirect/gather `a[idx[i]]` | No | **Yes**, big win |
-| Hash-table probe (two-phase: compute hash for i+D, prefetch bucket) | No | **Yes** — the standard technique in high-performance hash maps |
-| Linked list with a known-ahead pointer | No | Yes, if you can look ahead (e.g. `node->next->next`) |
-| Binary search | No | **Yes** — prefetch both possible next probes; also the reason Eytzinger layout exists (Ch. 21 §21.8) |
-| Tree traversal | No | Yes, prefetch both children |
+`std::hardware_destructive_interference_size` from `<new>` is an implementation-defined recommendation for the minimum separation between objects likely to suffer destructive interference. It is neither a runtime query nor a portable cache-line-size value.
 
-### `prefetchw` and the RFO trick
-
-`__builtin_prefetch(p, 1)` emits `prefetchw`, which fetches the line into **M/E state** — acquiring ownership up front. For a read-modify-write pattern (`++hist[bucket]`) this eliminates a separate RFO round trip later. It is one of the few genuinely underused instructions.
-
-**Caveat worth stating:** software prefetch adds instructions to the front end and can *reduce* performance if the hardware prefetcher already handles the pattern, and it's brittle — it must be retuned when the loop body or the machine changes. It is a late-stage optimization, applied after layout is already right, and always measured.
-
----
-
-## 28.14 Non-Temporal Stores
-
-A **non-temporal** (streaming) store writes to memory **bypassing the cache hierarchy**, avoiding both the RFO (§28.6) and the cache pollution.
+- Common libstdc++ x86-64 configurations report 64, not 128. The value may depend on compiler target/tuning options; GCC can warn when it affects public layout. Keep all translation units and ABI participants consistent.
+- A project may choose 128-byte separation after measuring adjacent-line interactions or future-proofing on a named target. That is a project layout policy, not the standard constant's meaning. A hardware prefetch into a neighboring line is not itself proof of destructive interference.
 
 ```cpp
-_mm_stream_si128((__m128i*)dst, v);    // movntdq  — 16 B
-_mm256_stream_si256(...);              // vmovntdq — 32 B
-_mm_stream_si64(dst, v);               // movnti   — 8 B (integer)
-_mm_sfence();                          // MANDATORY before making data visible
+// Suitable for internal layout when every translation unit uses one build target.
+#include <atomic>
+#include <cstdint>
+#include <new>
+
+struct alignas(std::hardware_destructive_interference_size) PaddedCounter {
+    std::atomic<std::uint64_t> value{0};
+};
 ```
 
-### The mechanism
+Alignment makes `sizeof(PaddedCounter)` a multiple of the alignment, so adjacent array elements receive the same separation without a hand-written padding array. For a stable external ABI, use an explicit project constant and version the layout.
 
-NT stores go into a small set of **write-combining (WC) buffers** — typically 4–10 per core, each 64 bytes (Ch. 29 §29.11). When a WC buffer is fully written, it is flushed as a single 64-byte burst to memory, with no line read and no cache allocation. If the buffer is only partially filled when evicted, it must be flushed as a **partial write**, which is much less efficient and defeats the purpose.
+### The miss taxonomy
 
-Hence the rules:
+Four classes, each with a different fix — which is the entire reason the taxonomy exists.
 
-1. **Write full 64-byte lines, sequentially.** Partial-line NT stores are a pessimization.
-2. **Don't interleave many NT streams.** More concurrent streams than WC buffers causes premature partial flushes. Keep it to ~4 or fewer streams.
-3. **`sfence` before the data is read by anything else** — NT stores are **weakly ordered even on x86** (they are the documented exception to TSO, Ch. 29 §29.13). Without the fence, another thread can observe the NT stores out of order relative to a subsequent flag store. This is the classic bug: the producer sets `ready = true` after NT-storing a buffer, and the consumer sees `ready` before the data.
-4. **Only for data you will not read again soon.** If you're going to read it, you want it cached.
-
-### The measured effect
-
-| Operation, 1 GiB, single core | DRAM traffic | Typical bandwidth |
-|---|---|---|
-| Regular stores (write-allocate) | 2 GiB (1 RFO + 1 WB) | ~10–12 GB/s effective |
-| NT stores | 1 GiB | **~18–22 GB/s effective** |
-
-Roughly a **1.5–2× improvement** for large, write-once data — and, just as importantly, the hot working set of *other* code on the machine survives.
-
-### Where it belongs in a trading system
-
-- Writing large log/journal buffers (Ch. 56 §56.1) before an `fsync` or an `io_uring` submit — the data will not be re-read, and you don't want it evicting the order book.
-- Zeroing or filling large arenas at startup.
-- Bulk `memcpy` of market-data snapshots to a secondary process's shared-memory region.
-
-And where it does **not** belong: anything on the hot path that will be read back, and anything small (the fence cost and partial-line risk dominate).
-
-**`clflushopt`/`clwb`** are the complements: explicitly evict or write back a line. `clwb` (write back, keep the line valid) is the persistent-memory primitive; `clflush`/`clflushopt` are useful for benchmarking (forcing a cold cache) and for the "flush after DMA" patterns on non-coherent hardware. `clflushopt` is weakly ordered and also needs `sfence`.
-
----
-
-## 28.15 Cache Coloring and Way Partitioning
-
-Two techniques for controlling *who gets which part of the cache*, addressing conflict misses and multi-tenant interference respectively.
-
-### Page coloring (software)
-
-A physically-indexed cache's set index includes bits **above** the page offset. For a 2 MB 16-way L2 with 64 B lines, the index is bits [16:6]; bits [16:12] come from the **physical page number**, which software doesn't choose — the kernel does. Two virtual pages the application believes are unrelated can land on physical pages that conflict in L2/L3.
-
-**Page coloring** is the OS-level practice of allocating physical pages so that a process's pages spread evenly across cache sets. The number of "colors" is `cache_size / (page_size × ways)`. Linux does not implement page coloring (FreeBSD historically did); the practical mitigation on Linux is **huge pages**, which make a 2 MB region contiguous in physical memory and therefore span all sets uniformly by construction. That's a second, distinct performance benefit of hugepages after TLB coverage and prefetcher reach.
-
-Application-level coloring is what you do when you pad an array's leading dimension (§28.3) or offset successive buffers by a line: you're choosing addresses to spread across sets.
-
-### Intel CAT — way partitioning (hardware)
-
-**Cache Allocation Technology**, part of Intel RDT, partitions the LLC by **ways**. You define Classes of Service (CLOS), each with a bitmask of allowed ways, and assign cores or processes to a CLOS.
-
-```
-# 16-way LLC. Give the hot trading core 8 exclusive ways; everything else shares 8.
-$ pqos -e "llc:1=0x00ff;llc:2=0xff00"      # CLOS1 = low 8 ways, CLOS2 = high 8
-$ pqos -a "llc:1=3"                        # core 3 → CLOS1
-# or via resctrl:
-$ mount -t resctrl resctrl /sys/fs/resctrl
-$ mkdir /sys/fs/resctrl/hotpath
-$ echo "L3:0=00ff;1=00ff" > /sys/fs/resctrl/hotpath/schemata
-$ echo <pid> > /sys/fs/resctrl/hotpath/tasks
-```
-
-Related RDT features: **CMT** (occupancy monitoring), **MBM** (bandwidth monitoring), **MBA** (memory bandwidth allocation — throttle a noisy neighbor's DRAM bandwidth), and **CDP** (code/data prioritization, separate masks for instructions and data).
-
-**When CAT matters:** shared hosts where you cannot isolate physically. Reserving LLC ways for the latency-critical process removes the noisy-neighbor eviction described in §28.10. The counterintuitive part is that **giving the hot path fewer, exclusive ways often beats giving it all ways shared** — determinism beats capacity for tail latency. Measure the p99.9, not the mean.
-
-**Caveats:** masks must be contiguous on most parts; way-granularity is coarse (a 16-way 32 MB LLC gives 2 MB per way); and CAT partitions capacity, not bandwidth — a neighbor can still saturate the memory controller, which is what MBA is for. ARM's equivalent is **MPAM** (Memory System Resource Partitioning and Monitoring), available on Neoverse.
-
----
-
-## 28.16 Instruction TLB Behavior
-
-The **TLB** caches virtual→physical translations (Ch. 32 §32.7). The **iTLB** is separate from the dTLB, smaller, and — because it's on the front-end critical path — its misses are especially damaging.
-
-### Typical capacities (Intel Golden Cove class)
-
-| Structure | Entries | Page size | Coverage |
+| Class | Definition | Experimental test | Fix |
 |---|---|---|---|
-| L1 iTLB | 256 | 4 KB | 1 MB |
-| L1 iTLB | 32 | 2 MB | 64 MB |
-| L1 dTLB | 96 | 4 KB | 384 KB |
-| L1 dTLB | 32 | 2 MB | 64 MB |
-| **L2 STLB** (shared i+d) | 2048–3072 | 4 KB / 2 MB | 8–12 MB / 4–6 GB |
+| Compulsory | First reference to the line | Still occurs in an infinite cache | Improve spatial use; prefetch may hide demand latency but not remove the fill |
+| Capacity | Working set exceeds the cache | Occurs in a fully associative cache of the same size | Shrink the working set: tiling, smaller types, structure-of-arrays |
+| Conflict | Too many lines map to one set | Absent in a fully associative cache of the same size | Change addresses: padding, offsetting, coloring (§28.8) |
+| Coherence | Line invalidated by another coherent writer | Disappears when other writers are removed | Separate false sharers or redesign true sharing |
 
-An iTLB miss that also misses the STLB requires a **page walk**: up to 4 (or 5 with LA57) memory accesses through the page-table hierarchy. If those page-table lines are cached, the walk is ~20–30 cycles; if not, **it can cost hundreds of cycles**, and it stalls the front end completely — no fetch, no decode, nothing to do.
+The classic taxonomy has three Cs; coherence misses are a useful fourth class on multiprocessors. Experiments can separate hypotheses:
 
-### Why this bites large C++ binaries
+- Compulsory: miss count tracks unique bytes touched ÷ line size and is insensitive to cache size.
+- Capacity: sweep working-set size and plot time per access. Knees may correspond to effective cache capacities, blurred by replacement and prefetch.
+- Conflict: hypersensitive to stride and base address. A sharp change after padding supports the hypothesis, then set arithmetic should predict the new mapping.
+- Coherence: disappears with one thread; `perf c2c` names the line.
 
-A monolithic trading binary with a 20–80 MB `.text` section, template-instantiated everywhere, will have a hot instruction footprint of several MB spread across many pages. **256 4 KB iTLB entries cover 1 MB.** The hot path simply cannot be iTLB-resident. Symptom: high `itlb_misses.walk_active` / `frontend_retired.itlb_miss`, front-end-bound top-down, and a benchmark that is much faster than production for identical code (because the benchmark's footprint is small).
-
-### The fixes
-
-**1. Huge pages for `.text`.** 2 MB pages give 32 entries × 2 MB = **64 MB of iTLB coverage** — an entire large binary, from 32 entries.
-```bash
-# libhugetlbfs approach (classic):
-hugeedit --text ./trader                      # mark .text for huge pages
-# Modern: align .text to 2 MB and let khugepaged back it with THP for file maps
-$ gcc -Wl,-z,common-page-size=2097152 -Wl,-z,max-page-size=2097152 ...
-$ echo always > /sys/kernel/mm/transparent_hugepage/enabled   # + CONFIG_READ_ONLY_THP_FOR_FS
-```
-Reported gains on large server binaries are **5–15%** — comparable to BOLT, and they stack.
-
-**2. Shrink the hot footprint.** PGO/AutoFDO + BOLT (Ch. 40 §40.9–§40.11) cluster hot basic blocks and hot functions together, so the hot path occupies a few contiguous pages instead of being scattered. This reduces iTLB *and* L1i pressure simultaneously and is why BOLT's gains are so large on server binaries.
-
-**3. Static linking / `-fno-plt` / prelinking.** PLT indirection (Ch. 41 §41.12) adds branch targets and pages; a statically linked binary with `-fno-plt` has a tighter, more predictable text layout.
-
-**4. Avoid over-inlining and over-instantiation.** Template bloat (Ch. 17 §17.22) is an iTLB problem as much as a compile-time one.
-
-### Measuring
-
-```
-$ perf stat -e itlb_misses.miss_causes_a_walk,itlb_misses.walk_active,\
-             dtlb_load_misses.miss_causes_a_walk,frontend_retired.itlb_miss:pp ./a.out
-$ perf record -e frontend_retired.itlb_miss:pp   # locate the offending code
-```
-On ARM: `ITLB_WALK`, `L1I_TLB_REFILL`, `INST_RETIRED` for normalization. A rule of thumb: iTLB walk cycles above ~2% of total cycles means huge pages for text will pay.
-
-**A final subtlety:** TLB entries are flushed on address-space change unless tagged. x86 **PCID** tags entries with the address space, so a context switch doesn't flush the TLB — but KPTI (Ch. 27 §27.18) reintroduces flushes for the kernel/user split unless PCID is available, which is precisely why Meltdown mitigation was catastrophic on pre-Westmere CPUs and merely expensive on modern ones. On ARM, **ASIDs** do the same job.
+Chapter 43 covers sampled data-source events, top-down analysis, and cache simulation. Use them to test a hypothesis formed from the taxonomy rather than treating one generic miss counter as a diagnosis.
 
 ---
 
-## Key Interview Questions
+## 28.5 Hardware Prefetchers — Core
 
-1. **Give the latency of each cache level and DRAM.** — L1 4–5 cyc (~1.3 ns), L2 ~14 cyc (~4.5 ns), L3 ~40–60 cyc (~15–20 ns), local DRAM ~70–100 ns, remote DRAM ~120–200 ns. L1-to-DRAM is ~50–70×.
-2. **Why is the cache line 64 bytes and why does it matter?** — It's the transfer and coherence unit; one byte touched costs a 64-byte fill, and two variables in one line are coherently identical, which is the whole false-sharing story.
-3. **Why is `hardware_destructive_interference_size` 128 on x86 when lines are 64 bytes?** — The L2 adjacent-line prefetcher pulls the 128-byte-aligned partner, making the effective sharing granularity 128.
-4. **Why does striding an array by 4096 bytes destroy L1 performance?** — L1 index bits are [11:6], so addresses congruent mod 4096 map to the same set; an 8-way set holds 8 lines and then thrashes. Fix by padding the leading dimension.
-5. **Why is L1 index+offset limited to 12 bits?** — So the index comes from the page offset and lookup can proceed (VIPT) in parallel with TLB translation. It's also why L1 sizes stalled at 32–48 KB.
-6. **Is the LLC LRU?** — No; it's an adaptive RRIP-family policy chosen to be scan-resistant, so a streaming pass doesn't evict the working set. `cachegrind` models LRU and is therefore approximate.
-7. **Why does `memset` of 1 GiB generate 2 GiB of DRAM traffic?** — Write-allocate: each store miss reads the line (RFO) before overwriting, then writes it back. NT stores or `rep stosb` full-line detection eliminate the read.
-8. **What is MESI's E state for?** — It lets a first store to a privately-held clean line go E→M silently, with no bus traffic.
-9. **What does the O state in MOESI buy?** — A dirty line can be shared and supplied cache-to-cache without writing back to memory.
-10. **Distinguish false from true sharing and say how you'd tell.** — `perf c2c`: different offsets in the line ⇒ false (pad it); same offset ⇒ true (change the algorithm: partition, batch, or make sharing one-directional).
-11. **What does a contended atomic actually cost?** — ~20 cycles uncontended (line in M), ~70–110 cycles for a same-socket HITM transfer, 150–300 ns cross-socket. N cores on one line collapses to one op per transfer.
-12. **Name the 3 Cs and the distinct fix for each.** — Compulsory (prefetch/better spatial layout), capacity (shrink the working set: tiling, SoA, smaller types), conflict (change addresses: padding, coloring). Plus coherence as the fourth.
-13. **How do you tell a conflict miss from a capacity miss experimentally?** — Conflict misses are hypersensitive to stride and base address: if adding 64 bytes of padding changes performance 2×, it's conflict. Capacity shows a knee at the cache size.
-14. **Why do huge pages help beyond TLB coverage?** — Hardware prefetchers stop at page boundaries, so 2 MB pages let a stream prefetch 512× further; and physical contiguity spreads sets uniformly, which is page coloring for free.
-15. **When is software prefetch worth it?** — Only for patterns hardware can't learn: indirect `a[idx[i]]`, hash probes, tree/list traversal with lookahead. Distance = memory latency / cycles per iteration, then tuned empirically.
-16. **What does `prefetchw` do that `prefetch` doesn't?** — Fetches into M/E state, acquiring ownership, eliminating a later RFO for read-modify-write patterns.
-17. **What are the rules for non-temporal stores?** — Full 64-byte sequential lines, few concurrent streams, mandatory `sfence` before publication (NT stores are weakly ordered even on x86), and only for data not read again.
-18. **How would you protect a latency-critical process from a noisy neighbor?** — Intel CAT way-partitioning via resctrl/pqos, plus MBA for bandwidth; monitor with CMT/MBM. Fewer exclusive ways often beats more shared ways for p99.9.
-19. **Why do large C++ binaries suffer iTLB misses, and what's the fix?** — 256 4 KB iTLB entries cover only 1 MB while `.text` hot footprint is many MB; use 2 MB pages for text (32 entries × 2 MB = 64 MB coverage) and shrink/cluster the hot path with PGO+BOLT.
-20. **What is cache warming and why isn't touching the data enough?** — A path that runs rarely starts cold in L1i, DSB, BTB, and TLBs as well as L1d; you must execute the real code path on synthetic input, with a discard as late as possible, so branch predictors and instruction caches warm too.
+Prefetchers predict future accesses and request lines before a demand load stalls. Sequential and simple strided access give them both a recognizable pattern and enough lead time; random dependent access does not.
 
----
+The useful model is deliberately less specific than any vendor's undocumented design:
 
-## Common Traps
+- **Streams and stable strides are easiest.** Detectors may be keyed by the load instruction, region, or recent address history. Forward/backward support, stride limits, and training length vary.
+- **A dependent pointer chain exposes no next address until the current load completes.** Ordinary stream prefetchers cannot get ahead. Some processors implement indirect or correlation-based prefetchers, so "no processor follows pointers" is too strong.
+- **Page boundaries can interrupt training.** Many prefetchers are conservative near translation boundaries; others can cross under particular confidence or translation conditions. Do not assume either behavior without a target experiment. Huge-page policy belongs to Chapter 32.
+- **Tracking and fill resources are finite.** Too many streams compete for prefetch state, miss-status entries, cache capacity, and bandwidth.
+- **Incorrect predictions hurt.** Unused lines consume those resources and may evict useful lines.
 
-- **Padding to 64 bytes on Intel and still seeing bouncing** — adjacent-line prefetch makes the effective granularity 128.
-- **Power-of-two array dimensions** — guarantees set conflicts; pad the leading dimension.
-- **Assuming a benchmark's cache behavior transfers to production** — production has a vastly larger footprint and cold caches.
-- **Reasoning about the LLC as LRU** — it isn't; it's scan-resistant RRIP with set dueling.
-- **Ignoring the write-allocate tax** — half of your "write bandwidth" can be RFO reads.
-- **Non-temporal stores without `sfence`** — a genuine, hard-to-reproduce ordering bug: the consumer sees the ready flag before the data.
-- **Partial-line or many-stream NT stores** — WC buffers flush partially and you lose the benefit.
-- **Software prefetching a sequential scan** — pure overhead; hardware already has it.
-- **Prefetch distance copied from a blog post** — it depends on your loop's cycles/iteration and must be swept.
-- **Putting an SPSC queue's head and tail on the same line** — turns a wait-free queue into a bouncing contention point.
-- **A consumer spinning directly on the shared producer index** — continuous invalidation traffic; cache a local copy.
-- **Sharing a `std::atomic` counter across many cores for metrics** — worse than single-threaded; use per-core counters.
-- **Assuming `perf`'s `LLC-load-misses` means DRAM** — on AMD the L3 is a per-CCX victim cache; cross-CCX traffic isn't DRAM but isn't cheap either.
-- **Believing a co-resident process can't hurt you if you're pinned** — the LLC and memory controller are shared; you need CAT/MBA or physical isolation.
-- **Forgetting that `mlockall` doesn't prefault by itself with `MCL_FUTURE` semantics you assumed** — touch every page explicitly, or use `MAP_POPULATE`.
-- **Warming with a branch that only exists in warm-up mode** — trains the predictor wrong and costs you a mispredict on the real message.
-- **A 20 MB `.text` with default 4 KB pages** — the iTLB cannot hold the hot path; the fix (huge text pages) is a config change, not a code change.
+```cpp
+// One contiguous stream exposes future addresses early.
+struct Tick {
+    std::uint64_t ts;
+    std::int64_t price;
+    std::uint32_t quantity;
+    std::uint32_t flags;
+};
+std::vector<Tick> ticks;
+
+// Each next address depends on the current node load.
+struct Node { Tick value; Node* next; };
+Node* head = nullptr;
+```
+
+The comparison is not only prefetching: nodes add allocation overhead and consume pointer bytes. A fair measurement holds the represented data and operation constant, varies layout, and records useful bandwidth plus cache misses (Ch. 43).
 
 ---
 
-## Compact Recall Summary
+## 28.6 Software Prefetch and Non-Temporal Stores — Role-specific
 
-**Hierarchy.** L1d 32–48 KB / 4–5 cyc; L2 1–2 MB / ~14 cyc; L3 30–100 MB shared / ~40–60 cyc; local DRAM ~70–100 ns; remote ~120–200 ns. Intel L3 is non-inclusive with a snoop filter; **AMD L3 is a per-CCX victim cache** so cross-CCX traffic costs ~100 ns. Line = 64 B (128 on Apple), and Intel's adjacent-line prefetch makes the effective sharing granularity 128 B.
+### Software prefetch
 
-**Indexing.** `sets = size/(line×ways)`; L1 index+offset ≤ 12 bits keeps lookup VIPT (overlapped with TLB), which is why L1 stalled at 32–48 KB and why **stride-4096 access maps every element to one set**. Padding the leading dimension is the standard fix. LLC replacement is adaptive RRIP, not LRU — scan-resistant by design.
+When hardware cannot learn a pattern but software knows a future address early enough, consider a software hint.
 
-**Writes.** Write-back + write-allocate everywhere: a store miss costs an **RFO read** of the line first, so `memset` of N bytes moves 2N. NT stores (`movntdq` + mandatory `sfence`, full sequential lines, few streams) or full-line detection (`rep stosb`/ERMSB) eliminate it, worth ~1.5–2×. Memory types matter: **WC** for NIC doorbells, **UC** for MMIO.
+GCC and Clang expose `__builtin_prefetch`; x86 also provides `_mm_prefetch`. Both are non-standard extensions.
 
-**Coherence.** MESI(F) on Intel, MOESI on AMD/ARM. E enables a silent E→M first store; O enables sharing dirty lines cache-to-cache. Costs: ~20 cyc uncontended RMW, ~70–110 cyc same-socket HITM, 150–300 ns cross-socket. `perf c2c` identifies the exact line and offsets — different offsets ⇒ false sharing (pad), same offset ⇒ true sharing (partition, batch, or make sharing one-directional; cache the peer index locally).
+A prefetch instruction is a hint and may be ignored. It generally does not raise the data-access fault that a demand load would, but source code must still avoid undefined pointer arithmetic and target-specific instructions have architectural caveats. It consumes front-end, lookup, fill, bandwidth, or cache resources even when it does not help.
 
-**Misses.** 3 Cs + coherence, each with its own fix: compulsory→prefetch/layout, capacity→shrink the working set, conflict→change addresses, coherence→pad or redesign. Diagnose with `perf mem record`, `toplev --level 3` Memory_Bound split, and a working-set sweep that draws the latency staircase. Thrashing from a noisy neighbor is measured with CMT/MBM and fixed with CAT/MBA.
+The distance is a calculation followed by a sweep:
 
-**Prefetching.** HW: L1 stream + IP-stride, L2 streamer (~20 lines) + adjacent-line; **stops at 4 KB page boundaries** (hence a further benefit of huge pages) and does not follow pointers. SW prefetch pays only for indirect/hash/tree patterns; distance = memory latency ÷ cycles-per-iteration, then swept. `prefetchw` pre-acquires ownership for RMW.
+```
+distance in iterations ≈ miss latency / steady-state cycles per iteration
+```
 
-**Warming and residency.** Cold means L1d, L1i, DSB, BTB, and TLBs. Prefault + `mlockall`, then warm by executing the real path on synthetic input with a byte-identical code shape. Keep the hot working set inside L2 and the hot code inside L1i, on an isolated core.
+Too close and the line has not arrived; too far and it is evicted before use, or it evicts data you still need. Use the formula for a starting point, then sweep — a plot of time against distance is usually broad and flat near the optimum, and the optimum moves when the loop body or the machine changes.
 
-**TLB.** 256 4 KB iTLB entries = 1 MB of coverage — nowhere near a multi-MB hot `.text`. 2 MB pages give 64 MB from 32 entries; combine with PGO/BOLT clustering for 5–15% on large binaries. PCID/ASID avoid flush-on-context-switch; KPTI reintroduces the cost when PCID is unavailable.
+```cpp
+#include <cstddef>
+#include <cstdint>
+#include <span>
+
+template<class Process>
+void indirect_pass(std::span<const std::uint64_t> data,
+                   std::span<const std::size_t> index,
+                   Process process) {
+    constexpr std::size_t distance = 24; // example starting point
+    for (std::size_t i = 0; i < index.size(); ++i) {
+        if (distance < index.size() - i)
+            __builtin_prefetch(&data[index[i + distance]], 0, 1);
+        process(data[index[i]]);
+    }
+}
+```
+
+Assume every `index[j]` is in range; otherwise even forming the pointer is invalid C++. Indirect access such as `data[index[i]]` is a reasonable candidate because the index stream reveals future addresses. Hash probes, trees, and binary search may benefit when enough independent work exists between hint and use. Prefetching both tree children can instead double bandwidth for one useful path.
+
+`__builtin_prefetch(p, 1)` expresses an intent to write; the generated instruction and whether it obtains ownership are target-dependent. It can be tested for histogram-like updates, but is not a C++ guarantee that the later RFO disappears.
+
+### Non-temporal stores
+
+Non-temporal stores hint that written data has little near-term reuse. On x86 write-back memory, streaming-store intrinsics commonly use write-combining resources and avoid ordinary cache allocation/RFO traffic for well-formed full-line streams. "Bypasses every cache" is too strong: handling of hits, partial writes, and hierarchy paths is microarchitecture- and memory-type-specific.
+
+```cpp
+#include <atomic>
+#include <immintrin.h>
+
+// x86/AVX2; dst is 64-byte aligned and names one complete target line.
+void stream_line_then_publish(__m256i* dst, __m256i lo, __m256i hi,
+                              std::atomic<bool>& ready) {
+    _mm256_stream_si256(dst, lo);
+    _mm256_stream_si256(dst + 1, hi);
+    _mm_sfence();
+    ready.store(true, std::memory_order_release);
+}
+```
+
+The common mechanism coalesces adjacent writes in a finite number of write-combining buffers. Complete, aligned, sequential lines make good use of them; interleaved streams and partial lines consume buffers and may require read/merge traffic.
+
+1. Write full lines, sequentially.
+2. Keep concurrent streams within measured write-combining capacity; the count is part-specific.
+3. **Fence before publication.** On x86, streaming stores are weakly ordered relative to later stores. Execute `_mm_sfence()` after the streaming stores and before the atomic release publication; a release store alone often compiles to an ordinary store and is not a substitute for the required streaming-store fence. The consumer uses an acquire load. Other architectures require their documented barrier sequence (Ch. 25).
+4. Prefer them for data with little near-term reuse. When the destination is read soon, a temporal store may be better because it leaves the line cached.
+
+The payoff for large write-once data is the elimination of the ownership read described in §28.3, plus survival of everyone else's working set. Both effects are workload-dependent; measure DRAM read and write bandwidth separately before and after.
+
+Non-temporal stores are compiler/ISA extensions, not standard C++ operations. Verify generated instructions, alignment handling, read/write traffic, and publication ordering on the deployed target.
+
+---
+
+## 28.7 Case Study: Laying Out a Top-of-Book Structure — Core
+
+The mechanisms above turn into one design problem: a per-instrument book updated by a feed handler and consumed by a strategy, with top levels read much more often than deep levels. Assume a correct SPSC or snapshot-publication protocol already exists. Layout changes do not make unsynchronized concurrent field access legal.
+
+Start by counting lines per operation, not bytes.
+
+```cpp
+// Layout A: node-based baseline.
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+
+struct Order;
+inline constexpr std::size_t kLevels = 8;
+
+struct Level { std::int64_t price; std::int64_t qty; Order* orders; };
+std::map<std::int64_t, Level> bids; // one allocation per level, pointer chase per lookup
+
+// Layout B: flat, indexed by a dense tick offset from a reference price.
+inline constexpr std::size_t kTargetLine = 64; // measured/documented target property
+struct alignas(kTargetLine) TopOfBook {
+    std::int64_t bid_px, ask_px;
+    std::int32_t bid_qty, ask_qty;
+    std::uint32_t sequence;
+    std::uint32_t flags;
+};
+static_assert(sizeof(TopOfBook) == kTargetLine);
+
+struct BookDepth {                  // separate lines; touched only on deeper updates
+    std::array<std::int32_t, kLevels> bid_qty;
+    std::array<std::int32_t, kLevels> ask_qty;
+};
+```
+
+The analysis that justifies B:
+
+- **Lines per read.** Layout A follows tree nodes at unrelated addresses, creating dependent loads that ordinary stream prefetching cannot cover. Layout B puts the frequently consumed snapshot in one target line.
+- **Sets and strides.** `BookDepth` is contiguous and supports predictable scans. If an array-of-books has a power-of-two object stride, use §28.1's arithmetic to check whether corresponding fields cycle through too few L1 sets. A small layout change can rotate the index sequence, but it must be measured because lower-level hashing differs.
+- **Sharing direction.** The publication channel should have one writer per control line. A strategy-owned "last seen sequence" placed beside feed-owned state creates two writers and avoidable ownership movement even though the fields are logically related.
+- **Residency.** Splitting top data from depth prevents a top-only operation from fetching depth fields. Whether all hot top snapshots fit L2 is a capacity calculation using the deployed cache sharing domain, not a guarantee from `alignas`.
+- **What not to do.** Do not pad every field to a line "to be safe." Padding costs residency, and residency is the thing you are optimizing. Pad what is written by different cores; pack what is read together.
+
+### Compare layouts with a line budget
+
+Suppose 20,000 instruments are active. A one-line top snapshot consumes about 1.22 MiB at a 64-byte target line, before container metadata. Padding each of six fields to its own line raises that to about 7.32 MiB. The padded form might remove false sharing between independent writers, but here all six fields travel together and share one logical owner, so it multiplies fills and reduces residency without removing an ownership conflict.
+
+The decision rule is:
+
+```text
+pack fields read together and owned together
+separate fields written by different cores
+```
+
+Validate both sides. A working-set sweep tests the predicted capacity knee; sampled load addresses count lines per operation; a supported coherence tool checks whether different threads write different offsets of one line. Chapter 43 covers experiment design.
+
+---
+
+## 28.8 Residency Control: Warming and Partitioning — Role-specific
+
+**Warming** means deliberately touching code or data before a latency-sensitive event so the first measured access is not compulsory. It can reduce cold-start tails, but residency is not permanent: unrelated activity, interrupts, migration, and capacity pressure can evict the warmed state. A credible warm-up executes the same path and data footprint without external side effects, then verifies instruction/data misses on the first real operations. Page prefaulting and locking solve a different problem—page faults—and belong to Chapter 32; operational warm-up policy belongs to Chapter 42 and Chapter 55.
+
+**Way partitioning** restricts which LLC ways a workload or class of service may allocate. Intel CAT exposed through Linux `resctrl` and Arm MPAM are examples, subject to processor and kernel support.
+
+| Expected benefit | Cost / boundary | Verification |
+|---|---|---|
+| Reduced cross-workload capacity eviction | Each class receives less usable LLC capacity | Occupancy/miss counters plus workload latency distribution |
+| More repeatable residency under co-tenancy | Does not isolate memory bandwidth or all coherence traffic | Run controlled noisy-neighbor A/B trials |
+| Operational grouping by core/task | Masks and assignment semantics are platform-specific | Read back configuration and monitor placement |
+
+More private ways are not automatically better: a partition that is smaller than the hot working set creates its own capacity misses. Conversely, unrestricted shared capacity may have worse tails under an interfering tenant. Chapter 42 develops the optimization decision; this chapter supplies the eviction mechanism.
+
+**Page coloring** selects physical pages so physically indexed cache bits distribute or isolate allocations among sets. User-space virtual addresses alone generally do not control those physical bits, and mainstream general-purpose allocators do not offer a portable coloring contract. OS, hypervisor, and real-time deployments may provide target-specific controls. Huge pages change translation and physical-contiguity constraints but are not a portable substitute for an explicit coloring policy (Ch. 32).
+
+---
+
+## 28.9 Instruction-Side Locality and the iTLB — Reference
+
+Data is only half of cache locality. Instructions occupy L1 instruction-cache lines, and their virtual pages require translations cached in the instruction TLB (iTLB). A large or scattered hot path can therefore stall even when its data fits L1d.
+
+Keep three mechanisms distinct:
+
+- An **L1i miss** fetches instruction bytes from a lower cache level.
+- An **iTLB miss** looks for a cached translation at another TLB level or invokes a page walk.
+- A **front-end delivery limit** may instead come from decode, branch-target, or µop-cache behavior (Ch. 27).
+
+One event can lead to another, but their remedies and counters differ. Function order and hot/cold splitting change instruction-line locality; page size changes translation reach; neither guarantees better branch prediction. Huge executable pages are OS/toolchain/deployment-specific and trade translation reach against fragmentation, permissions, placement constraints, and operational complexity. Chapter 32 covers page mechanics, while Chapter 42 covers code-layout experiments.
+
+Diagnose with instruction-cache and iTLB events available on the target, plus a source/assembly profile. Do not infer an iTLB problem merely from a large binary: only the executed working set and its page distribution matter.
+
+---
+
+## 28.10 Reference: Structures and Counters — Reference
+
+Skippable. Counter names for Intel; ARM equivalents differ in name and availability, and both change with the part. Always confirm against `perf list` on the target rather than a book.
+
+| Question | Intel counters |
+|---|---|
+| Am I missing L1/L2/LLC? | `L1-dcache-load-misses`, `l2_rqsts.miss`, `LLC-load-misses` |
+| Which load, and served from where? | `perf mem record` / `perf mem report` (PEBS) |
+| Is a line contended, and false or true? | `perf c2c`, `mem_load_l3_hit_retired.xsnp_hitm` |
+| Am I paying the write-allocate tax? | `offcore_requests.demand_rfo`, plus DRAM read/write bandwidth |
+| Is the prefetcher helping or wasting? | `l2_rqsts.pf_hit`, `l2_rqsts.pf_miss`, useless-prefetch counters where available |
+| Where is stall time going by level? | Top-down `Memory_Bound` breakdown (Ch. 43) |
+| Is code missing L1i or translation? | Target-specific L1i/iTLB miss and page-walk events |
+
+Counter semantics vary by processor, kernel, privilege settings, and event scheduling. In particular, an LLC miss can be satisfied by another coherent cache or another hierarchy domain; use a supported data-source/offcore event before attributing it to memory.
+
+---
+
+## 28.11 Recall and Practice — Core
+
+**Recall card.**
+
+1. Cache line size, sharing domains, indexing, inclusion, and replacement are target properties. C++ does not specify them.
+2. For a conventional cache, `sets = size / (line × ways)`. More live congruent lines than ways create conflict pressure.
+3. A VIPT L1 can overlap set lookup with translation when its index and offset lie within the page offset; that relation is a common design, not an ISA mandate.
+4. Normal write-back, write-allocate memory generally requires ownership before a store. A cold partial-line store needs old contents; a full-line streaming overwrite may avoid that read with a target-specific mechanism.
+5. Coherence serializes ownership per location, but it does not make C++ data races legal.
+6. False sharing has different writers at different offsets of one line. True sharing has writers contending on the same logical data. Only the former is removed by separation.
+7. Prefetchers readily learn streams, but page-boundary, stride, and indirect-pattern capabilities vary. Software hints compete for finite resources.
+8. On x86, streaming stores require `_mm_sfence()` before a later release publication; a release store alone is not a guaranteed substitute.
+
+**Questions.**
+
+1. Given a cache size, line size, and associativity, derive the set count and the index bits, and state which addresses collide.
+2. Derive the `capacity ≤ page_size × ways` relation for a VIPT L1. Why is it a design pressure rather than a universal limit?
+3. Under the plain write-allocate model, why can a full-buffer overwrite cause read traffic comparable to write traffic? Why might an optimized `memset` not follow that model?
+4. What does the Exclusive state save, and what would happen without it?
+5. You see a shared counter's throughput fall as you add cores. Distinguish the two possible causes and give the measurement that separates them.
+6. Why can an LLC miss not be translated directly into "DRAM access"?
+7. Explain why a dependent linked-list traversal is difficult to prefetch. What exceptions keep that statement from being an architectural guarantee?
+8. Under what conditions does software prefetch make a loop slower?
+9. A producer writes a buffer with x86 non-temporal stores and then publishes readiness. State the required producer and consumer ordering.
+10. Why can indiscriminate cache-line padding improve a two-counter microbenchmark yet worsen end-to-end latency?
+
+### Worked exercises
+
+**False-sharing experiment.** Extend §28.4's benchmark with separations of 8, 16, 32, 64, 128, and 256 bytes. Keep each counter distinct; a separation of zero would instead measure true sharing. Pin threads to two specified cores in one cache/coherence domain using a platform API. Plot operations per second and a latency distribution, then inspect line/offset samples if supported. Predict a knee when counters stop occupying one coherence granule; treat any second 128-byte effect as measured target behavior, not as the meaning of `hardware_destructive_interference_size`. Report CPU, topology, compiler flags, frequency policy, repetitions, and uncertainty.
+
+**Cache-set exercise.** Use the target L1d's reported size, ways, and line size to compute its set count. For the hypothetical geometry in §28.1, eight 4096-byte-spaced lines fit one set and a ninth overflows it. Construct dependent cycles containing 7, 8, 9, and 10 lines, plus controls at a 4160-byte stride. Predict which runs add conflict misses before measuring. Randomize trial order and consume the returned index. If the knee differs, investigate replacement, address alignment, virtual/physical indexing, and prefetch effects rather than changing the prediction after seeing the result.
+
+### Code-reading puzzle
+
+```cpp
+struct Shared {
+    alignas(64) std::atomic<std::uint64_t> produced{0};
+    std::atomic<std::uint64_t> consumed{0};
+};
+```
+
+The author says `alignas(64)` prevents false sharing. Is that guaranteed for these two fields? Draw their possible offsets, then repair the layout for a target whose measured destructive-interference granule is 64 bytes. Explain why aligning the first member or the containing object does not by itself align the second member to another line.
+
+### Common traps
+
+- Treating a virtual address's visible bits as the exact index for every cache level.
+- Calling every miss a capacity miss, or interpreting an LLC miss as DRAM.
+- Padding the containing struct while leaving two writer-owned members adjacent within it.
+- Using `hardware_destructive_interference_size` as a runtime cache-line query or assuming it is 128 on x86.
+- Benchmarking non-atomic counters so the compiler combines increments and removes the coherence traffic.
+- Prefetching an already streamed loop, issuing the hint too late, or forming an out-of-range address.
+- Assuming wide temporal stores or `rep stos` portably avoid RFOs at a fixed size threshold.
+- Publishing after x86 non-temporal stores without an explicit streaming-store fence.
+
+**Prerequisites for Chapter 29.** Be able to derive set pressure from cache geometry (§28.1), explain when a store requests ownership, and trace a peer-cache transfer (§28.3). Chapter 29 extends that path through memory controllers, interconnects, and NUMA placement.

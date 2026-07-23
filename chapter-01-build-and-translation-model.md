@@ -1,590 +1,1286 @@
 # Chapter 1 — Build and Translation Model
 
-*Interview-focused revision notes. Assumes you can already write C++; the goal is to be able to defend answers about what the compiler and linker actually do.*
+C++ is compiled in pieces. That fact explains most build failures that survive parsing: a source file can compile because it saw a declaration, yet the program can fail to link because no matching definition exists. More dangerously, every source file can compile and the program can link even though different pieces were compiled against incompatible definitions.
+
+For interview purposes, use one governing model:
+
+> Preprocessing forms translation units; each translation unit is compiled independently; the linker resolves implementation-level references between the resulting object files; the C++ One Definition Rule makes the independently compiled pieces one coherent program.
+
+The C++ standard specifies translation and program rules. It does not require `.o` files, archives, ELF, PE/COFF, Mach-O, name mangling, a separate assembler, or a particular linker. Those are dominant toolchain mechanisms, and a low-latency engineer must understand them, but they are not language guarantees.
 
 ---
 
-## 1.1 Translation Units
+## 1.1 Why This Matters — Core
 
-A **translation unit (TU)** is the fundamental compilation input in C++: one source file after the preprocessor has run, i.e. the `.cpp` file plus the full transitive textual expansion of every `#include`, with conditional compilation resolved and macros substituted. The compiler sees TUs, never "files" in the sense the programmer thinks of them. The linker sees the object files produced from TUs.
+A build model is a correctness model before it is a compile-time concern. It determines whether:
 
-The critical consequence: **C++ has no module boundary at the file level in the classical model.** A TU is a self-contained, independently compiled world. Nothing in TU A is visible to TU B unless it passes through the linker as a symbol, or unless the declaration is textually re-included in B. This is why C++ builds are `O(TUs × headers)` in preprocessed size — a project with 500 TUs each pulling in 50k lines of headers compiles 25M lines, not 500 files' worth.
+- two components agree on the layout of an order message;
+- a function declared in a header has one matching definition;
+- a global is initialized before another global uses it;
+- a header-only optimization obeys the One Definition Rule;
+- a static archive contributes a registration object;
+- a shared-library call performs work on its first invocation;
+- a deployed binary loads the ABI-compatible library you tested.
 
-```
-foo.cpp ──preprocess──> TU (foo.cpp + all headers, expanded)
-                            │
-                         compile
-                            ↓
-                        foo.o  (machine code + symbol table)
-                            │
-        bar.o, baz.o ────────┼───── link ──> executable / shared lib
-```
+These failures land at different stages. A missing header is normally a preprocessing failure. Calling an undeclared function is a compilation failure. Calling a declared but undefined function is usually a link failure. Loading an unavailable shared library is a load failure. An inconsistent class definition can be worse: the build may succeed and the program may have undefined behavior.
 
-**Separate compilation** is the design goal this serves: change one `.cpp`, recompile one TU, relink. It fails the moment your change is in a widely included header — then every dependent TU is invalidated. This is the entire economic argument for the pimpl idiom, forward declarations, and (in C++20) modules.
+In a low-latency system, build choices also affect operational latency. Dynamic loading can add startup relocation and symbol-resolution work; lazy binding can move some of that work to the first call. Header-visible definitions and link-time optimization can expose more code to the optimizer, but they increase build cost and can grow hot instruction footprints. None of those mechanisms proves a performance outcome. Measure startup, steady-state latency, and tail latency on the actual binary, loader configuration, hardware, and workload.
 
-**Isolation properties worth stating in an interview:**
-- Two TUs may disagree about the meaning of a name and the compiler cannot detect it. If `struct S` has three `int` members in `a.cpp` and four in `b.cpp`, both compile cleanly; the program is ill-formed NDR (no diagnostic required) and typically produces memory corruption. This is the classic ODR violation, and it's why mismatched `-D` flags or `NDEBUG` inconsistency across a build is dangerous rather than merely untidy.
-- Optimization is, by default, **per-TU**. The compiler cannot inline a function whose body lives in another TU. **LTO (link-time optimization)** exists precisely to break this wall: the compiler emits IR instead of machine code into object files, and the linker re-runs optimization across the whole program. LTO costs link time and memory, and it turns previously benign ODR violations into visible miscompiles because the optimizer now sees both conflicting definitions.
+### What a strong interview answer sounds like
 
-**C++20 modules** change the model: a module interface unit is compiled once into a binary artifact (BMI/CMI) that other TUs *import* rather than textually re-parse. Macros do not leak across `import`, and the compiler can enforce ODR across module boundaries. Adoption is gated on build-system support because module builds require dependency-ordered compilation, unlike headers, which are order-independent.
+A strong answer separates four layers:
 
-**Common misconception:** "one file = one TU." A header included by nobody is not a TU. A `.cpp` file `#include`d by another `.cpp` (occasionally done in unity builds) is not a separate TU. **Unity builds** (concatenating many `.cpp` files into one TU) trade incremental build speed for full-build speed and inlining opportunity, and they break code relying on internal linkage collisions — two TUs each with a `static int counter;` suddenly conflict, or worse, silently share.
+1. **Language rule:** what the C++ abstract machine requires.
+2. **Compiler action:** what one translation unit can be checked or optimized against.
+3. **Linker/loader action:** how a particular ABI and object format connect binaries.
+4. **Engineering consequence:** what fails, what it costs, and how to verify it.
+
+“`inline` makes functions faster” mixes these layers and is wrong. “`inline` permits certain repeated definitions across translation units; actual call inlining is an optimization decision, and I would inspect generated code and benchmark the hot path” keeps them separate.
 
 ---
 
-## 1.2 Header Inclusion and Include Guards
+## 1.2 The 90-Second Screen — Core
 
-`#include` is **textual substitution**, nothing more. The preprocessor locates a file and splices its contents in place of the directive. There is no notion of "importing a symbol." Everything downstream — parsing, name lookup, template instantiation — happens as though you had typed the header's contents at that point.
+Remember these six facts:
 
-**Search rules:**
-- `#include <name>` searches the *implementation-defined* system include paths (`-I`, `-isystem`, compiler defaults). By convention, system and third-party headers.
-- `#include "name"` searches an implementation-defined additional set first — in practice, the directory of the including file — then falls back to the `<>` search. By convention, your own project headers.
+1. A **translation unit (TU)** is, informally, one source file after preprocessing has handled its inclusions and macros. TUs are compiled independently.
+2. `#include` is token-level textual inclusion, not a symbol import. Include guards prevent repeated inclusion only within one preprocessing run.
+3. A **declaration** provides enough information to use a name in permitted ways. A **definition** supplies the entity: function body, object storage, class layout, or another complete definition.
+4. **Scope**, **linkage**, **storage duration**, and **symbol visibility** answer different questions. Never use them as synonyms.
+5. The **One Definition Rule (ODR)** permits one program to be assembled from separate TUs. Some violations are diagnosed by the linker; others are ill-formed, no diagnostic required.
+6. `inline` primarily changes definition and ODR rules. It does not command the optimizer to inline a call.
 
-The distinction is convention plus one real effect: `-isystem` directories typically suppress warnings from those headers, which is why you want third-party dependencies on `-isystem` and your own on `-I`.
+Be able to defend two decisions:
 
-### Include guards
+- **Header body or source-file body?** A header-visible body enables templates and optimization without LTO, but expands dependency, compile-time, code-size, and ODR risk. An out-of-line body narrows the interface and rebuild graph.
+- **Static or dynamic library?** Static linking can simplify deployment and remove runtime-library lookup for that component; dynamic linking enables code sharing and independent replacement but adds ABI, loader, and version-management constraints.
 
-Without protection, a header included twice in one TU redefines its types → hard error (a class may be declared many times, defined once per TU).
+Fast failure classification:
+
+| Symptom | First question |
+|---|---|
+| Header not found or bad `#if` | What tokens did preprocessing produce? |
+| Type or syntax error | What did this TU know at the point of use? |
+| Undefined reference | Was there one link-visible, ABI-matching definition in the link? |
+| Duplicate symbol | Did more than one strong definition enter the link? |
+| Build succeeds, behavior changes with link order | Is there an ODR, weak-symbol, initialization-order, or interposition problem? |
+| Executable starts on one host only | Which dynamic libraries, versions, search paths, and CPU requirements differ? |
+
+---
+
+## 1.3 From Source to Program — Core
+
+The familiar preprocess–compile–assemble–link pipeline is a useful toolchain model:
+
+```text
+ quote.hpp ───────────────┐                 quote.cpp
+                          v                     |
+ quote.cpp ──> preprocess tokens ──> compile ──> assembly/IR ──> assemble ──> quote.o ──┐
+                                                                                       |
+ quote.hpp ───────────────┐                                                            +──> link ──> executable
+                          v                     |                                      |
+  main.cpp ──> preprocess tokens ──> compile ──> assembly/IR ──> assemble ──> main.o ──┘
+```
+
+Real compilers commonly fuse compilation and assembly, and LTO may place intermediate representation in an object container for later optimization. The C++ standard describes translation phases and a program; the separate commands below are a typical Unix-like interface, not a standard requirement:
+
+```sh
+c++ -std=c++23 -E main.cpp             # inspect preprocessed output
+c++ -std=c++23 -S main.cpp             # emit target assembly
+c++ -std=c++23 -c quote.cpp -o quote.o
+c++ -std=c++23 -c main.cpp  -o main.o
+c++ quote.o main.o -o quote_app
+```
+
+### A two-source-file build
+
+The header is the shared contract:
 
 ```cpp
-#ifndef MYPROJ_WIDGET_H          // 1. not yet defined → enter
-#define MYPROJ_WIDGET_H          // 2. define, so a second pass skips
-...
+// quote.hpp
+#ifndef BOOK_QUOTE_HPP
+#define BOOK_QUOTE_HPP
+
+#include <cstdint>
+
+struct Quote {
+    std::int64_t bid_ticks;
+    std::int64_t ask_ticks;
+};
+
+[[nodiscard]] std::int64_t spread(const Quote& quote) noexcept;
+
 #endif
 ```
 
-**`#pragma once`** is a non-standard but universally supported alternative. Trade-offs:
+One source file defines the operation:
 
-| | Include guards | `#pragma once` |
-|---|---|---|
-| Standard | Yes | No (de facto universal) |
-| Failure mode | Name collision between two headers using the same macro → one header silently vanishes | Compiler must identify "same file"; hard-links, symlinks, bind-mounts, or two build roots pointing at the same file can defeat it |
-| Speed | Compiler must still open + tokenize the file (though most implement the "multiple-include optimization" and skip it) | Compiler can skip the `open()` entirely |
-| Robustness | Copy-pasting a header and forgetting to rename the guard is a real, silent bug | No naming discipline needed |
+```cpp
+// quote.cpp
+#include "quote.hpp"
 
-Practical answer: use `#pragma once`, or both. Name guards with a project prefix and, ideally, a path (`MYPROJ_NET_SOCKET_H_`). Never use a leading underscore followed by a capital, or a double underscore anywhere — those identifiers are reserved to the implementation.
+std::int64_t spread(const Quote& quote) noexcept {
+    return quote.ask_ticks - quote.bid_ticks;
+}
+```
 
-### The include-what-you-use discipline
+The other source file calls it:
 
-A header should compile standalone: include every header whose declarations it uses and no more. **Transitive inclusion is a latent break** — if `a.h` gets `std::string` only because `b.h` happened to include `<string>`, then a cleanup in `b.h` breaks `a.h`. Enforce with a self-compilation test or a tool like `include-what-you-use`.
+```cpp
+// main.cpp
+#include "quote.hpp"
 
-**Forward declarations** cut dependency edges. You may declare `class Widget;` and use `Widget*`, `Widget&`, and function signatures taking/returning `Widget` by value — but you need the complete type to construct, destroy, call members, take `sizeof`, or use it as a value member. Note you must *not* forward-declare standard library types (`std::string`, `std::vector`) yourself: the standard reserves the right to add default template arguments and hidden parameters. Use `<iosfwd>`, or the library's own forwarding headers.
+#include <iostream>
 
-**Pimpl (pointer to implementation)** is forward declaration taken to its conclusion: the header exposes only `std::unique_ptr<Impl> p_;` and an opaque `class Impl;`, so implementation changes never invalidate dependent TUs and ABI stays stable. Costs: one heap allocation, one pointer indirection per access, loss of inlining, and the destructor must be defined in the `.cpp` (where `Impl` is complete) or `unique_ptr` fails to instantiate.
+int main() {
+    const Quote quote{10'005, 10'008};
+    std::cout << spread(quote) << '\n';
+}
+```
+
+Both `.cpp` files include the same declaration of `spread` and definition of `Quote`. `main.cpp` can type-check the call without seeing the body of `spread`. A typical compiler emits a reference from `main.o`; `quote.o` contains the definition; the linker connects them.
+
+This example establishes three boundaries:
+
+- The compiler checks each TU using only declarations and definitions visible in that TU.
+- The linker usually connects ABI-level names and addresses, not source-level intent.
+- The ODR requires the repeated definition of `Quote` to be valid across TUs.
+
+Change `quote.cpp` alone and an incremental build can recompile one TU, then relink. Change `quote.hpp` and both dependent TUs must normally be rebuilt. A build system that misses this dependency can combine a new `quote.o` with a stale `main.o` compiled against an old layout. That is why dependency tracking is part of correctness.
+
+### What each stage contributes
+
+| Stage | Input and output in a common toolchain | Typical failure | Low-latency relevance |
+|---|---|---|---|
+| Preprocess | Source text to preprocessed tokens/text | Missing include, malformed directive, `#error` | Macro consistency and rebuild fan-out |
+| Compile | TU to assembly or IR | Syntax, type, access, template errors | Optimization sees one TU unless LTO expands scope |
+| Assemble | Assembly to relocatable object | Invalid target instruction/directive | ISA and object-format selection |
+| Link | Objects/libraries to executable or shared object | Undefined or duplicate symbols, relocation overflow | Layout, dead stripping, interposition, LTO |
+| Load | Executable plus shared dependencies to process image | Missing/incompatible library or symbol | Startup relocation, lazy binding, page faults |
+
+The load step is outside the source-to-binary phrase “compile and link,” but it belongs in the operational model. A binary that links is not necessarily deployable.
 
 ---
 
-## 1.3 Preprocessor Macros and Conditional Compilation
+## 1.4 Source Files, Headers, and Translation Units — Core
 
-The preprocessor is a **token-level, type-unaware, scope-unaware** text processor that runs before the language proper exists. Every macro pathology follows from those three properties.
+A source file is a build input by convention. A header is also a source file in the standard’s broad sense; the `.cpp`, `.cc`, `.h`, and `.hpp` suffixes are tool conventions. What matters is how the build treats the file.
 
-### Object-like and function-like macros
+For a conventional header-based build:
 
-```cpp
-#define BUFSZ 4096                   // object-like
-#define MAX(a,b) ((a) < (b) ? (b) : (a))   // function-like
+```text
+main.cpp + everything it includes + active macro state
+                         |
+                         v
+              one preprocessing translation unit
+                         |
+                         v
+                  one translation unit
 ```
 
-**Failure modes, in the order interviewers ask about them:**
+The compiler does not compile a header once and share its parsed meaning automatically. If 300 TUs include a large header, a conventional build may preprocess and parse that material 300 times. Precompiled headers and C++20 modules change implementation strategy and dependency handling, but do not turn ordinary `#include` into a semantic import.
 
-1. **Missing parentheses.** `#define SQ(x) x*x` then `SQ(1+2)` → `1+2*1+2` = 5. Parenthesize every parameter *and* the whole body.
-2. **Multiple evaluation.** `MAX(i++, j)` increments `i` twice. No amount of parenthesization fixes this; it's inherent to substitution. This is the primary argument for `constexpr`/`inline` functions and templates.
-3. **No scope, no namespaces.** A macro named `min` in a Windows header destroys `std::min` at every use site. (`#define NOMINMAX` before `<windows.h>` is the standard workaround; the general lesson is that macro names should be `SHOUTY_AND_PREFIXED`.)
-4. **Type invisibility.** Macros can't overload, can't be templates, can't participate in ADL, and are invisible to debuggers and IDE tooling.
+### `#include` is textual
 
-Modern replacements: `constexpr` variables for constants, `inline`/`constexpr` functions for computation, templates for generic code, `enum class` for named constants. Macros remain legitimately irreplaceable for: header guards, conditional compilation, stringification of expressions (assertion/logging macros capturing `__FILE__`, `__LINE__`, and the source text), and X-macros for generating parallel tables.
-
-### Operators `#` and `##`
-
-- `#x` **stringifies** the argument's tokens: `#define STR(x) #x` → `STR(a+b)` yields `"a+b"`.
-- `a##b` **pastes** tokens into one: `#define CAT(a,b) a##b` → `CAT(foo,bar)` yields `foo bar` joined as `foobar`.
-
-Both suppress macro expansion of their operands, hence the standard two-level idiom:
+Given:
 
 ```cpp
-#define STR_(x) #x
-#define STR(x)  STR_(x)     // expands x first, then stringifies
-#define VERSION 3
-STR(VERSION)   // "3"   (STR_ alone would give "VERSION")
+// limits.hpp
+inline constexpr int max_orders = 1'024;
 ```
 
-`__LINE__`-based unique-name generation (`CAT(tmp_, __LINE__)`) requires the same indirection.
-
-### Variadic macros
+and:
 
 ```cpp
-#define LOG(fmt, ...) fprintf(stderr, fmt, __VA_ARGS__)
+#include "limits.hpp"
+static_assert(max_orders >= 256);
 ```
-The trailing-comma problem when `__VA_ARGS__` is empty was long solved by the GNU extension `, ##__VA_ARGS__`; C++20 standardized `__VA_OPT__(,)`, which emits its content only if the variadic arguments are non-empty.
 
-### Conditional compilation
+the directive behaves approximately as if the header’s preprocessing tokens appeared at the directive. Macro definitions active before the include can affect the header; macros introduced by the header can affect following code. Include order can therefore change a TU’s meaning.
+
+The precise search paths for `#include "name"` and `#include <name>` are implementation-defined. Toolchains conventionally search the includer’s location first for quotes and configured system paths for angle brackets, but build flags and compilers differ. Treat the distinction as a build-system contract, not a portable language path algorithm.
+
+### Headers should be self-sufficient
+
+A public header should include or declare what it needs. If `orders.hpp` uses `std::uint64_t`, include `<cstdint>` rather than relying on a previous header to do so. A useful check is to include the header first in its implementation file:
 
 ```cpp
-#if defined(__linux__) && !defined(NDEBUG)
-#elif defined(_WIN32)
+#include "orders.hpp"
+
+#include <algorithm>
+#include <vector>
+```
+
+If `orders.hpp` has a hidden dependency, this ordering exposes it. The same principle keeps macro state predictable and reduces accidental include-order coupling.
+
+Forward declarations can reduce dependencies:
+
+```cpp
+class OrderBook;
+
+void publish(const OrderBook&) noexcept;
+```
+
+A pointer or reference can usually be declared while the class is incomplete. Constructing the object, accessing members, deriving from it, using it as a by-value data member, or applying `sizeof` requires a complete type. Do not hand-write forward declarations for standard-library types; include the prescribed header or an official forwarding header such as `<iosfwd>`.
+
+Forward declarations reduce parsing and rebuild fan-out, but can make ownership and lifetime less obvious. Choose them when the abstraction boundary is real, not merely to minimize include counts.
+
+### Include guards prevent one-TU repetition
+
+The portable pattern is:
+
+```cpp
+#ifndef TRADING_ORDER_ID_HPP
+#define TRADING_ORDER_ID_HPP
+
+struct OrderId {
+    unsigned long long value;
+};
+
+#endif
+```
+
+The first inclusion defines the guard macro. A second inclusion during the same preprocessing run skips the body. It does **not** prevent the header from being included in another TU; repeated class, inline, and template definitions across TUs are governed by the ODR.
+
+Guard names must be project-unique and must avoid identifiers reserved to the implementation. `#pragma once` is widely supported but not specified by C++23. It asks the implementation to identify that a physical header has already been included. Projects often choose it for brevity; portable libraries commonly retain macro guards. Using both is usually redundant.
+
+Guards solve repeated inclusion, not circular design. If `a.hpp` and `b.hpp` include each other, a guard may prevent an infinite include loop while leaving one file with an incomplete declaration at the wrong point. Break the dependency using a forward declaration or a smaller shared interface.
+
+### Header rules, costs, and traps
+
+| Choice | Governing rule | Cost or benefit | Interview trap |
+|---|---|---|---|
+| Put a class definition in a header | Multiple valid ODR definitions are permitted under strict conditions | Consumers know layout; every dependent TU parses it | “The guard guarantees one definition in the program” |
+| Put a non-`inline` function body in a header | Usually creates a definition in every including TU | Body visible, but program normally violates ODR | “The linker will always choose one safely” |
+| Forward-declare a class | Incomplete-type uses are restricted | Smaller dependency edge; implementation hidden | Destroying an owning pointer where the type is incomplete |
+| Use an include guard | Macro suppresses later body in the same preprocessing run | Prevents within-TU redefinition | Guard collision silently suppresses another header |
+| Use `#pragma once` | Implementation extension | Concise; typically efficient | Calling it a C++23 guarantee |
+| Change a widely included header | Dependents must see a consistent definition | Large rebuild; prevents stale ABI assumptions | Treating dependency files as optional optimization |
+
+C++20 modules can provide compiled interfaces and restrict macro leakage, but their artifact formats and build procedures are implementation-specific. In C++23 code, they are an available language facility, not a universal replacement for every header or a guarantee of faster builds. Measure the toolchain and project.
+
+---
+
+## 1.5 Preprocessor, Conditional Compilation, and Translation Phases — Core
+
+The preprocessor manipulates preprocessing tokens before C++ type checking. It has no C++ scope, overload resolution, templates, or object lifetime. That explains both its usefulness and its hazards.
+
+### Prefer language facilities for values and functions
+
+This macro evaluates one argument more than once:
+
+```cpp
+#define BOOK_MAX(a, b) ((a) > (b) ? (a) : (b))
+
+// Undefined sequencing concerns or surprising increments can follow:
+// const int result = BOOK_MAX(i++, limit);
+```
+
+Parentheses protect operator grouping but cannot prevent repeated evaluation. A function template evaluates each argument once:
+
+```cpp
+template<class T>
+constexpr const T& max_value(const T& a, const T& b) {
+    return a > b ? a : b;
+}
+```
+
+The example has its own lifetime constraints when called with temporaries because it returns a reference; `std::max` has comparable concerns. The point is not that every replacement is trivial. The point is that C++ declarations express types, evaluation, and scope, while a macro does not.
+
+Prefer:
+
+- `inline constexpr` variables to object-like value macros;
+- functions or templates to function-like macros;
+- `enum class` to groups of integer macros;
+- `if constexpr` when both alternatives can be represented in valid C++ source.
+
+Macros remain appropriate for include guards, implementation-provided feature detection, conditional availability, and capturing spelling or source location when a language facility does not meet the need. C++20 `std::source_location` removes many logging-macro use cases.
+
+### Conditional compilation changes the program before type checking
+
+```cpp
+#if defined(BOOK_ENABLE_METRICS)
+void record_fill_latency(long long nanoseconds) noexcept;
+#endif
+```
+
+An undefined identifier in a preprocessor `#if` expression is replaced with `0` after macro expansion. A misspelled feature name can silently disable code:
+
+```cpp
+#if BOOK_ENABLE_METRCIS  // typo; commonly false unless warnings catch it
+#endif
+```
+
+Use `defined(...)`, enable warnings such as GCC/Clang `-Wundef` where available, and centralize configuration. Compiler flags are implementation-specific; the correctness principle is portable.
+
+The highest-risk pattern lets a per-TU macro alter an externally shared definition:
+
+```cpp
+// message.hpp — dangerous configuration boundary
+struct Message {
+    int kind;
+#if defined(BOOK_TRACE_BUILD)
+    long long trace_id;
+#endif
+};
+```
+
+If some TUs define `BOOK_TRACE_BUILD` and others do not, `Message` has inconsistent definitions and layout. The build may succeed; crossing the boundary has undefined behavior. Configuration that changes public types, calling conventions, exception mode, alignment, or standard-library ABI must be consistent across every participating binary.
+
+`#if` is still useful for truly unavailable platform declarations:
+
+```cpp
+#if defined(_WIN32)
+// Windows-specific adapter
+#elif defined(__linux__)
+// Linux-specific adapter
 #else
-#  error "unsupported platform"
+#error "Unsupported platform"
 #endif
 ```
 
-`#ifdef X` ≡ `#if defined(X)`. Undefined identifiers in `#if` evaluate to `0`, which means **a typo in a feature macro silently takes the false branch** — a top-tier source of "why is this code not running." Prefer `#if defined(FEATURE_X)` over bare `#if FEATURE_X`, and consider compiling with `-Wundef`.
+The platform macros here are implementation-provided, not standard C++ macros. Hide such branches behind a stable C++ interface so most code has one definition.
 
-Real dangers:
-- `#if` arithmetic uses the largest integer type and evaluates independently of the target's actual types, so `#if sizeof(int) == 4` is *not* even legal — `sizeof` doesn't exist in the preprocessor. Use `<climits>`/`<cstdint>` limits or `static_assert`.
-- **Configuration skew.** Because macros can change class layout (`#ifdef DEBUG` adding a member) and macros are per-TU, mismatched flags across TUs are ODR violations that link successfully and crash at runtime. This is why `NDEBUG` must be consistent across your whole build including prebuilt dependencies.
-- Prefer `if constexpr` and normal `if` over `#ifdef` inside function bodies where possible: unpreprocessed-out code is still type-checked, so it can't rot.
+### The standard’s phases versus the everyday pipeline
 
-**Standard predefined macros worth knowing:** `__cplusplus` (`201703L`, `202002L`, …), `__FILE__`, `__LINE__`, `__DATE__`, `__TIME__`, `NDEBUG` (controls `assert`), and the feature-test macros (`__cpp_lib_ranges`, etc., via `<version>`), which are the correct modern way to probe library support rather than guessing from compiler version.
+The standard describes nine conceptual translation phases through C++23. Implementations may combine them as long as observable behavior conforms.
 
----
-
-## 1.4 Phases of Translation
-
-The standard defines **9 phases** (C++17 onward; older texts say 8). They are a semantic model — compilers fuse them — but interviewers ask because the *ordering* explains real behaviors.
-
-| Phase | What happens | Why it matters |
+| Phase | Conceptual work | Useful consequence |
 |---|---|---|
-| 1 | Physical source chars → basic source character set; trigraphs (removed in C++17) | Encoding conversion happens *first* |
-| 2 | Backslash-newline **line splicing** | A trailing `\` in a `//` comment eats the next line. Splicing precedes comment removal. |
-| 3 | Decompose into preprocessing tokens and whitespace; **comments become one space** | Comments cannot be produced by macro expansion; `/*` inside a string literal is not a comment |
-| 4 | Preprocessor directives executed, macros expanded, `#include`d files run through phases 1–4 recursively | Recursion is why included files get their own line splicing |
-| 5 | Character/string literal characters converted to the execution character set | Source encoding vs execution encoding split |
-| 6 | **Adjacent string literals concatenated** | `"a" "b"` → `"ab"`; happens after macro expansion, so `"x" MACRO` works |
-| 7 | Tokens → syntactic/semantic analysis; **translation unit compiled** | The "real" compiler |
-| 8 | **Template instantiation** — instantiation units produced | Explains two-phase lookup and why template errors appear late |
-| 9 | **Linking**: external references resolved, translation units + libraries combined | Where ODR and linkage bite |
+| 1 | Map source-file characters into the translation character set and normalize line endings as specified | Source encoding handling precedes tokenization |
+| 2 | Splice a backslash followed by a newline | A trailing backslash can unexpectedly continue a directive or line comment |
+| 3 | Form preprocessing tokens and whitespace; replace each comment with one space | Comments do not emerge later from macro expansion |
+| 4 | Execute preprocessing directives, expand macros, and process included files | Include order and macro state affect the resulting TU |
+| 5 | Convert character and string literal contents according to their associated encoding rules | Source spelling and execution representation are distinct concerns |
+| 6 | Concatenate adjacent string-literal tokens | `"bid=" "100"` forms one literal |
+| 7 | Convert preprocessing tokens to C++ tokens; perform syntactic and semantic analysis | Declarations, types, and expressions acquire C++ meaning |
+| 8 | Determine and instantiate required templates as specified | Some errors arise only when a specialization is needed |
+| 9 | Combine translation units and resolve external references | Program-wide ODR and linkage obligations matter |
 
-**Consequences to be able to recite:**
+The everyday “preprocess, compile, assemble, link” picture maps onto these phases only approximately. In particular, the standard does not have a language-level “emit ELF object” phase. This distinction matters in an interview: use standard phases to explain token-order effects, and toolchain stages to diagnose files, symbols, and relocations.
 
-- Line splicing before tokenization means this is a bug:
-  ```cpp
-  // comment ending in backslash \
-  doSomething();      // <-- swallowed into the comment
-  ```
-- Because comments become whitespace in phase 3, you cannot form a comment via macro pasting, and `//` inside a `"string"` is inert.
-- Because `#include` is phase 4, the included file's macros are live in the includer from that point on — inclusion order is semantically significant. Hence "include your own header first" (proves self-sufficiency) and "include `<windows.h>` last, or after `NOMINMAX`."
-- Phase 8 separation explains **two-phase name lookup**: non-dependent names in a template are bound at definition (phase 7), dependent names at instantiation (phase 8), using the instantiation context plus ADL. MSVC historically deferred everything to phase 8, which is why code written against MSVC often fails on GCC/Clang with "`there are no arguments to 'foo' that depend on a template parameter`" — the fix is usually `this->foo()` or a qualified name.
-- Phase 9 is where the linker has no type information (only mangled names), which sets up everything in §1.6–§1.12.
+### Two phase-order puzzles
+
+First:
+
+```cpp
+#define BOOK_SIDE bid
+const char* label = "best " "BOOK_SIDE";
+```
+
+Macro names inside string literals are not expanded; adjacent string literals are concatenated later. `label` is `"best BOOK_SIDE"`, not `"best bid"`. Stringification requires a macro designed for it.
+
+Second:
+
+```cpp
+// Do not write this:
+// a comment ending in a backslash \
+int hidden = 7;
+```
+
+Backslash-newline splicing occurs before comments are replaced. The next physical line becomes part of the line comment. This is uncommon but directly follows from phase order.
+
+The consequence for production code is restraint: preprocessor behavior is global within a TU and often invisible in the final source view. When a build differs by host or flag, inspect preprocessed output and the exact compile command before guessing.
 
 ---
 
-## 1.5 Declarations and Definitions
+## 1.6 Declarations, Definitions, and `odr-use` — Core
 
-A **declaration** introduces a name and gives it a type, letting the compiler type-check uses. A **definition** additionally provides the entity itself — the code, the storage, or the class layout — so that the entity can be brought into existence.
-
-Every definition is a declaration; the reverse is false.
+A declaration introduces or redeclares a name and its type. A definition is a declaration that also defines the entity. “Provides storage” is a useful shortcut for variables, but definitions cover functions, classes, enumerations, and templates too.
 
 ```cpp
-extern int  x;              // declaration
-int         x = 5;          // definition (allocates storage)
-int         y;              // definition at namespace scope (zero-init)
+extern int session_count;       // variable declaration, not a definition
+int session_count = 0;          // variable definition
 
-void f(int);                // declaration
-void f(int a) { /*...*/ }   // definition
+int decode(char);               // function declaration
+int decode(char c) { return c; }// function definition
 
-class C;                    // declaration (incomplete type)
-class C { int a; };         // definition (complete type)
+class Feed;                     // class declaration; Feed is incomplete
+class Feed { int fd_; };        // class definition
 
-struct S { static int s; }; // declares S::s; does NOT define it
-int S::s = 0;               // definition, must appear in exactly one TU
-
-using A = int;              // definition of a type alias
-typedef int B;              // ditto
-enum class E : int;         // declaration (opaque enum, needs fixed underlying type)
+struct Stats {
+    static int packets;         // declares the static data member
+};
+int Stats::packets = 0;         // defines it
 ```
 
-### Complete vs incomplete types
+Every definition is a declaration, but not every declaration is a definition. A declaration must be visible before a use that needs it. A required definition may live in another TU.
 
-An **incomplete type** is declared but not defined. You may form pointers and references to it, declare (not define) functions using it, and `extern`-declare objects of it. You may not: `sizeof`, instantiate, dereference-and-use, access members, or use it as a base class or by-value member. Incompleteness is the mechanism behind pimpl, opaque handles, and mutually recursive types.
+### The four-axis table
+
+The following table maps common declarations to definition status, scope, linkage, and storage duration. Storage duration applies to objects, not functions or types.
+
+| Source form | Declaration or definition? | Scope of name | Linkage | Storage duration |
+|---|---|---|---|---|
+| `extern int x;` at namespace scope | Declaration, normally not definition | Namespace | Usually external | `x`, once defined, has static duration |
+| `int x = 0;` at namespace scope | Definition | Namespace | External by default | Static |
+| `static int x = 0;` at namespace scope | Definition | Namespace | Internal | Static |
+| `const int x = 1;` at namespace scope | Definition | Namespace | Internal by default in C++ | Static |
+| `inline int x = 1;` at namespace scope | Inline definition | Namespace | External by default | Static |
+| `void f();` at namespace scope | Function declaration | Namespace | External by default | Not applicable |
+| `static void f() {}` at namespace scope | Function definition | Namespace | Internal | Not applicable |
+| `int n = 0;` inside a block | Definition | Block | No linkage | Automatic |
+| `static int n = 0;` inside a block | Definition | Block | No linkage | Static |
+| `thread_local int n = 0;` at namespace scope | Definition | Namespace | External by default | Thread |
+| `auto p = new int{0};` inside a block | Defines automatic pointer `p`; dynamically creates an `int` object | Block for `p` | No linkage for `p` | Automatic for `p`; dynamic for allocated `int` |
+
+This table prevents common category errors:
+
+- `static` at namespace scope changes linkage; `static` at block scope changes storage duration.
+- A name can have block scope while its object has static storage duration.
+- Dynamic allocation does not make the pointer variable itself dynamically stored.
+- External linkage does not mean “stored outside the object” or “exported from a shared library.”
+
+### When a definition is required
+
+A compiler can compile:
 
 ```cpp
-struct Node;                 // incomplete
-struct List { Node* head; }; // fine — pointer to incomplete
-struct Node { int v; Node* next; }; // now complete
+long long sequence();
+
+long long next() {
+    return sequence() + 1;
+}
 ```
 
-`std::vector<Incomplete>` was UB before C++17; `vector`, `list`, and `forward_list` now explicitly permit incomplete element types provided the type is complete before any member is used. Most other containers still require completeness.
+The declaration is enough to check the call. If `next` is retained in the program and calls `sequence`, a matching definition is needed in the program. A conventional linker reports an undefined reference if none is provided.
 
-### Rules of thumb
+The standard uses **odr-use** to distinguish uses that require an object or non-inline function definition from some uses that need only a value known at compile time. The full wording is detailed. A reliable interview approximation is:
 
-- **Declare in headers, define in exactly one TU** — with three exceptions that are the subject of §1.6 and §1.9: classes, inline functions/variables, and templates may be defined in every TU that needs them, provided the definitions are token-identical.
-- **The most vexing parse**: `Widget w();` declares a function returning `Widget`, it does not define an object. `Widget w{};` disambiguates. Similarly `Widget w(Gadget());` is a function declaration taking a pointer-to-function.
-- Default arguments belong on the declaration (typically once, in the header), not repeated on the definition.
-- A function definition without a prior declaration also *declares* it; forward declarations exist to permit use-before-definition and cross-TU visibility.
+- calling a named function usually odr-uses it;
+- taking an object’s address or binding a reference to it usually odr-uses it;
+- reading a variable in a potentially evaluated expression usually odr-uses it;
+- certain constant-expression uses can substitute a value without requiring storage.
+
+```cpp
+struct Limits {
+    static const int depth = 16;
+};
+
+static_assert(Limits::depth == 16);     // value can be used as a constant
+const int* address = &Limits::depth;    // odr-use: an object must exist
+```
+
+In older language modes, the address-taking line requires one out-of-class definition. In C++17 and later, a `constexpr` static data member is implicitly an inline variable:
+
+```cpp
+struct Limits {
+    static constexpr int depth = 16;
+};
+
+const int* address = &Limits::depth; // valid; no separate definition needed
+```
+
+Do not reduce `odr-use` to “the optimizer emitted storage.” ODR requirements come from the abstract program before a dead-code or constant-folding optimization happens. Conversely, implementation dead stripping can remove unneeded machine code without changing the language-level rule.
 
 ---
 
-## 1.6 The One Definition Rule (ODR)
+## 1.7 The One Definition Rule — Core
 
-The ODR is the contract that makes separate compilation sound. Three clauses:
+Separate compilation is sound only if repeated declarations and definitions agree. The ODR is that agreement.
 
-**ODR-1 (per TU):** No TU may contain more than one definition of any variable, function, class type, enumeration, or template.
+At interview depth, divide it into three cases:
 
-**ODR-2 (per program):** Every non-inline function or variable that is *odr-used* must have **exactly one** definition in the entire program. Zero definitions → undefined-reference link error. Two → duplicate-symbol link error. These are the friendly failures.
+1. Within one TU, a definable item has at most one definition.
+2. A non-inline function or variable that is odr-used must have one definition in the program.
+3. Some entities may have definitions in multiple TUs: class types, enumeration types, templates, and inline functions and variables are central examples. Their definitions must satisfy strict equivalence conditions, including matching token sequences and consistent name lookup, with additional rules for constants, lambdas, and internal/no-linkage entities.
 
-**ODR-3 (the dangerous one):** Classes, inline functions, inline variables, and templates may be defined in multiple TUs, **but every definition must consist of the same sequence of tokens, and names must resolve to the same entities in every TU.** Violation is **ill-formed, no diagnostic required (IFNDR)** — the compiler and linker are permitted to silently accept it and produce nonsense.
+There are refinements for named modules and specialized entities in C++20–23. The safe handbook rule is: put one canonical definition in one interface, compile every consumer with consistent configuration, and do not create a second spelling of the “same” type.
 
-### Why ODR-3 fails silently
+### Loud violations
 
-The linker deduplicates these multiply-defined symbols by *name only*. Given two different definitions of `Widget::size()` in two TUs (because a macro differed), the linker keeps whichever it encounters first and discards the other. Half your program now calls a function compiled against a different class layout.
+Zero matching definitions commonly produces an undefined-reference error:
+
+```cpp
+// main.cpp
+int risk_limit();
+
+int main() {
+    return risk_limit(); // declaration seen; no definition linked
+}
+```
+
+Two ordinary external definitions commonly produce a duplicate-symbol error:
 
 ```cpp
 // a.cpp
-#define FAST 1
-#include "widget.h"     // struct Widget { int a; #if FAST  int cache; #endif };
+int risk_limit() { return 100; }
 
 // b.cpp
-#include "widget.h"     // struct Widget { int a; };
-// sizeof(Widget) differs across TUs → any cross-TU Widget traffic is corruption
+int risk_limit() { return 200; }
 ```
 
-Real-world sources of ODR violations, ranked by frequency:
-1. **Inconsistent macro definitions** across TUs (`NDEBUG`, `_GLIBCXX_DEBUG`, `-D` flags, packing pragmas).
-2. **Mixing ABI-incompatible builds** — debug and release runtimes, different `-std=`, different `_ITERATOR_DEBUG_LEVEL` on MSVC.
-3. **Anonymous-namespace types used in inline function signatures** — the type is distinct per TU, so the inline function's definitions are not equivalent even though the tokens are identical.
-4. **Two different libraries statically linking different versions of a third**, each exporting the same symbols.
-5. `static` local variables in header-defined functions that differ per TU by a macro.
+The exact diagnostic and whether it occurs at traditional link time are implementation details. The language rule is not “the linker must catch this”; the program is ill-formed.
 
-### Odr-use
+### Silent violations
 
-A variable is **odr-used** roughly when its address is taken or a reference binds to it — i.e. when the entity must actually exist in memory. If a constant is only ever read as a value, it is not odr-used and no definition is required. This was the pre-C++17 headache:
+The dangerous case is an entity for which multiple definitions are permitted only when the definitions agree:
 
 ```cpp
-struct S { static const int N = 10; };     // declaration + initializer
-int S::N;                                  // pre-C++17: needed if odr-used
-std::min(S::N, x);                         // binds const int& → odr-use → link error without the definition
-```
-C++17's **`inline` variables** (and implicitly `inline` for `constexpr static` data members) removed the need for the out-of-line definition. This is the single most common modern answer to "how do I put a global in a header?"
+// packet.hpp
+struct Packet {
+    int type;
+#if defined(BOOK_WITH_CAPTURE)
+    long long capture_ns;
+#endif
+};
 
-### Detection
-
-- Compile with identical flags everywhere; centralize them in your build system.
-- **`-fsanitize=address` with `detect_odr_violation=2`** (default 1) catches distinct definitions of the same global.
-- **`gold`/`lld --detect-odr-violations`**, or comparing debug-info type hashes.
-- LTO frequently *surfaces* ODR bugs as miscompiles or ICEs — a good reason to run an LTO build in CI even if you ship non-LTO.
-- Put implementation-only helpers in an **anonymous namespace** so they cannot collide at all.
-
----
-
-## 1.7 Linkage
-
-**Linkage** determines whether a name declared in one scope can refer to the same entity as a declaration in another scope.
-
-| Linkage | Meaning | How you get it |
-|---|---|---|
-| **No linkage** | Name refers to a unique entity; not visible outside its scope | Local variables, function parameters, local classes, local typedefs |
-| **Internal** | Refers to the same entity within the TU only | `static` at namespace scope; members of anonymous namespaces; `const`/`constexpr` namespace-scope variables (C++ only — differs from C!); anonymous unions; enumerators/typedefs at namespace scope |
-| **External** | Refers to the same entity across the whole program | Non-`static` functions and variables at namespace scope; class types and their members; `extern` declarations; enums and templates |
-| **Module** (C++20) | Visible across the TUs of one named module, not beyond | Exported-less declarations in a module unit |
-
-**The C/C++ `const` divergence is a classic interview question.**
-
-```cpp
-const int  N = 10;   // C++: internal linkage → safe to put in a header
-                     // C:   external linkage → duplicate symbol if in a header
-extern const int M = 10; // C++: force external linkage
-```
-Because namespace-scope `const` is internal in C++, each TU gets its own copy — usually optimized away entirely, but if odr-used, you get *N distinct objects at different addresses*. Never depend on the address of a header-declared `const` being unique. Use `inline constexpr` (C++17) when you need a single, shared object.
-
-### Anonymous namespaces vs `static`
-
-```cpp
-namespace { void helper(); }   // preferred
-static void helper();          // legacy, still fine for functions/variables
-```
-An anonymous namespace gives its members internal linkage (formally: a unique name unique to the TU, plus a using-directive). Advantages over `static`: it works for **types**, and types with internal linkage can be used as template arguments (which pre-C++11 `static` entities could not). Trap: a type defined in an anonymous namespace is a *different type in every TU* — leaking it into an inline function's or template's signature is an ODR violation (§1.6).
-
-### Linkage vs scope vs visibility — do not conflate
-
-- **Scope**: the region of source text where a name is *usable* by lookup. A compile-time, language-level concept.
-- **Linkage**: whether declarations in different scopes/TUs denote the *same entity*. Resolved at compile+link time.
-- **Storage duration**: when the object's memory exists (§1.8). Orthogonal.
-- **Symbol visibility**: an ELF/Mach-O *loader* concept about what's exported from a shared object (§1.12). A different layer entirely.
-
-A `static` local variable has **no linkage**, **static storage duration**, and **block scope** — the canonical example proving the three axes are independent.
-
-### Language linkage
-
-`extern "C"` (§1.10) is a fourth, orthogonal property: it selects the calling convention and name-mangling scheme, not the internal/external axis.
-
----
-
-## 1.8 Storage Duration
-
-**Storage duration** is the lifetime of the *memory*, distinct from the *object lifetime* (which begins at the end of construction and ends when the destructor starts).
-
-| Duration | Allocated | Deallocated | Examples |
-|---|---|---|---|
-| **Automatic** | On entry to the block (conceptually) | On exit from the block, incl. exceptions | Non-static locals, parameters |
-| **Static** | Before `main` (storage), init per rules below | After `main` returns, reverse order of completed construction | Globals, `static` locals, `static` members, `extern`, `thread_local`'s sibling |
-| **Thread** | Thread start | Thread exit | `thread_local` |
-| **Dynamic** | `new` / `operator new` / allocator | `delete` / `operator delete` | Heap objects |
-
-Since C++20, **temporary materialization** doesn't create a fifth category, but temporaries' lifetime rules are their own topic (destroyed at end of full-expression, unless lifetime-extended by binding to a `const&` or rvalue reference).
-
-### Static initialization order
-
-Two stages before `main`:
-1. **Static initialization** — *zero-initialization*, then *constant initialization* for entities whose initializer is a constant expression. Done at load time from the binary image; no code runs. `constinit` (C++20) asserts an entity is constant-initialized, converting a dynamic-init surprise into a compile error.
-2. **Dynamic initialization** — everything else, i.e. constructors and non-constant initializers. Within a TU: **guaranteed in order of definition.** Across TUs: **unspecified.**
-
-This is the **static initialization order fiasco**: a global in `a.cpp` whose constructor uses a global in `b.cpp` may see a zero-initialized-but-not-constructed object.
-
-**Fix — Construct On First Use / Meyers singleton:**
-```cpp
-Registry& registry() {
-    static Registry r;      // initialized on first call
-    return r;
+inline int packet_type(const Packet& packet) {
+    return packet.type;
 }
 ```
-Since C++11, function-local static initialization is **thread-safe**: concurrent first calls block until one thread completes the initialization (implemented via a guard variable and `__cxa_guard_acquire`). Cost: one relaxed atomic load of the guard byte on the fast path — usually negligible, but measurable in the hottest loops, and `-fno-threadsafe-statics` exists for freestanding targets.
 
-The mirror problem is the **static *de*initialization fiasco**: destructors run in reverse order of construction completion, so a global logger may be destroyed before its last user. The nuclear-but-correct answer is a leaked singleton (`static Registry* r = new Registry;`) — never destroyed, so never destroyed too early. Trades a one-time "leak" (reported by leak sanitizers unless suppressed) for correctness at shutdown.
+If `BOOK_WITH_CAPTURE` differs across TUs, both TUs can compile, and a conventional linker may have no reason to complain. Yet the program contains inconsistent definitions of `Packet`; the ODR is violated. The standard does not require a diagnostic for many cross-TU ODR violations. If the build accepts the program, behavior is undefined.
 
-### `thread_local`
+This is not “the linker picked the wrong layout.” Each compiler generated code under a different premise. A function in one TU may calculate an offset, size, alignment, copy length, or array stride that disagrees with another. The bug can emerge as data corruption far from the header.
 
-Each thread gets its own instance; construction happens on first use in that thread, destruction at thread exit. Access is not free: depending on the TLS model (`initial-exec`, `local-dynamic`, `global-dynamic`), it may cost a call to `__tls_get_addr`, especially for variables in dynamically loaded shared libraries. `-ftls-model=initial-exec` speeds it up at the cost of forbidding `dlopen` of that library.
+### ODR decision procedure
 
-### Practical points
+When reviewing a multi-file definition, ask:
 
-- Automatic storage is a stack-pointer adjustment: allocation is effectively free, and the whole frame is released at once. This is why arena/stack allocation dominates heap allocation in performance work.
-- Objects with automatic storage are destroyed during stack unwinding — the foundation of RAII.
-- Dangling references from returning the address of an automatic object is a top-3 UB source; `-Wreturn-local-addr` catches the naive cases.
-- "Static storage duration" ≠ "`static` keyword". `static` means internal linkage at namespace scope, static duration at block scope, and "no `this`" for class members — three unrelated meanings, a favorite trivia question.
+1. **May it have multiple definitions?** If not, place the definition in one source file.
+2. **Are the definitions derived from one canonical header or module interface?**
+3. **Can macros, include order, generated headers, pragmas, or compiler flags change its tokens or name lookup?**
+4. **Do all binaries agree on ABI-relevant options?** Examples include packing, target ABI, standard-library debug mode, exception/RTTI expectations, and compiler ABI switches.
+5. **Could stale objects remain after the interface changed?**
+6. **Can CI build with another link order, LTO, sanitizers, or ODR-oriented diagnostics to expose disagreement?**
 
----
+No single tool proves ODR compliance. Some sanitizers and LTO modes detect subsets; compiler and linker options vary. Reproducible commands, uniform configuration, complete dependency graphs, and clean rebuilds after ABI-affecting changes are the primary controls.
 
-## 1.9 Inline Functions and Variables
+### What the linker normally cannot prove
 
-**`inline` does not mean "inline this."** It never really did; it is a *linkage/ODR* keyword. It means: **this entity may be defined in multiple TUs, and the linker shall pick one and treat them as the same entity.**
+A conventional linker can compare symbol names and object-format metadata. It does not generally prove that every TU used the same:
 
-Mechanically, the compiler emits the definition into every TU that needs it, marking each in a **COMDAT** section (`.text._Z3foov` in ELF, or `__gnu_linkonce`), and the linker discards all but one. Without `inline`, two definitions are a duplicate-symbol error.
+- class layout;
+- inline body;
+- default argument;
+- exception specification;
+- template meaning;
+- packing state;
+- compiler option set.
 
-Inlining as an optimization is decided by the compiler based on cost heuristics (call-site count, body size, `-O` level), largely ignoring the keyword — though it *is* a weak hint, and it does have a strong practical effect: **inlining is only possible if the body is visible**, so putting a definition in a header (which requires `inline`) is what actually enables cross-TU inlining without LTO.
-
-```cpp
-// util.h
-inline int clamp(int v, int lo, int hi) { return v < lo ? lo : v < hi ? v : hi; }
-inline constexpr double kPi = 3.14159265358979;   // C++17 inline variable
-```
-
-**Implicitly inline:**
-- Member functions defined inside the class body.
-- `constexpr` functions and `consteval` functions.
-- `constexpr` **static** data members (C++17) — hence no out-of-line definition needed.
-- Function templates and member functions of class templates are not *inline* per se, but obey the same "define everywhere" ODR exemption.
-- Deleted and defaulted-in-class functions.
-
-**Inline variables (C++17)** finally solve header-only globals:
-```cpp
-// before C++17
-extern Config g_config;             // header
-Config g_config;                    // exactly one .cpp — annoying for header-only libs
-// C++17
-inline Config g_config;             // header only, one object program-wide
-```
-
-### Trade-offs and failure modes
-
-- **Every inline definition is duplicated in every TU** until the linker collapses it: bigger object files, slower links. Aggressive header-only libraries are the main cause of multi-minute link times.
-- **ABI fragility**: an inline function's body is baked into every caller. Changing it and relinking only the "owning" library leaves stale copies inlined into callers. This is why library authors keep ABI-critical logic out-of-line and why pimpl exists.
-- **ODR trap**: if two TUs see different bodies for the same `inline` function (macro divergence again), the linker silently keeps one. No diagnostic.
-- **`static` in a header ≠ `inline` in a header.** `static inline` in a header gives each TU its *own copy* of the function and, crucially, its own copy of any function-local `static` variable inside it. `inline` alone gives one shared copy. A counter inside a `static inline` header function counts per-TU — a genuinely nasty bug.
-- **Force/forbid**: `__attribute__((always_inline))` / `[[gnu::always_inline]]` and `__forceinline` (MSVC) actually force it (or error); `__attribute__((noinline))` forbids. Use sparingly and with measurements — the optimizer is usually right, and forced inlining of a large function can blow the instruction cache and *slow* the program.
-- Excessive inlining hurts: I-cache pressure, larger stack frames, longer compile times. It helps most for small functions where call overhead dominates, and for exposing constants to the optimizer (constant propagation across the call boundary is often the real win, not the saved `call` instruction).
+Debug information or LTO metadata can enable extra checks, but those remain toolchain facilities. Successful linking is evidence that references were resolved, not proof that the C++ program obeys the ODR.
 
 ---
 
-## 1.10 Name Mangling and `extern "C"`
+## 1.8 Scope, Linkage, and Storage Duration — Core
 
-C++ requires the linker to distinguish `void f(int)` from `void f(double)` from `Ns::C::f() const`, but the linker only sees strings. **Name mangling** (formally, *decoration*) encodes the full signature — namespaces, class, parameter types, cv-qualifiers, ref-qualifiers, template arguments, return type for templates — into a single flat identifier.
+These concepts are independent:
 
-```
-void ns::C::f(int, const char*) const
-  →  _ZNK2ns1C1fEiPKc          (Itanium ABI, used by GCC/Clang)
-     ^^^ ^  ^  ^  ^^^^
-     |   |  |  |  parameters: i = int, PKc = pointer to const char
-     |   |  |  function name
-     |   |  class
-     |   namespace, length-prefixed
-     _Z = mangled name, N…E = nested, K = const member
-```
+- **Scope:** where unqualified or qualified name lookup can find a declaration.
+- **Linkage:** whether declarations in different scopes or TUs can denote the same entity.
+- **Storage duration:** the minimum potential duration of an object’s storage.
+- **Lifetime:** when an object exists in that storage as a particular type.
+- **Visibility:** in object-file discussions, usually a platform rule controlling dynamic symbol exposure.
 
-Decode with `c++filt` (or `nm -C`, `llvm-cxxfilt`). Interviewers like: "given an undefined-symbol error, what do you do?" → `c++filt` the symbol, then `nm -C --defined-only` the libraries to find who should provide it.
+### Scope answers “where can I name it?”
 
-**Mangling schemes are ABI, not standard.** GCC and Clang share the Itanium C++ ABI; MSVC has its own (`?f@C@ns@@QEBAXHPEBD@Z`). Consequence: **you cannot link C++ objects across incompatible compilers/ABIs.** The GCC 5 `std::string` ABI break (`_GLIBCXX_USE_CXX11_ABI`) is the standard war story — `std::__cxx11::basic_string` vs the old COW string mangle differently, so mixing them produces undefined references rather than silent corruption. That was a *deliberate* use of mangling as a safety net.
-
-### `extern "C"`
-
-Declares **C language linkage**: no mangling (or minimal platform decoration like a leading underscore) plus the C calling convention.
+Common scopes include namespace, class, block, function parameter, template parameter, and enumeration scopes. A local variable’s name stops being available after its block:
 
 ```cpp
-extern "C" void  init(void);
-extern "C" { #include "c_api.h" }        // typical pattern
+void consume() {
+    int batch = 8;
+    {
+        int batch = 16; // hides the outer name in this inner block
+        (void)batch;
+    }
+    (void)batch;         // names the outer object again
+}
+```
 
-// canonical dual-language header:
+Hiding changes lookup, not storage duration or linkage. Both `batch` objects have automatic storage duration and no linkage.
+
+### Linkage answers “can declarations denote one entity?”
+
+For the chapter’s main cases:
+
+| Linkage | Meaning | Common source form |
+|---|---|---|
+| No linkage | Declarations outside the relevant scope cannot redeclare the same entity by linkage | Block locals, local classes, function parameters |
+| Internal linkage | The name denotes one entity within one TU | Namespace-scope `static`; unnamed-namespace members; non-template non-`volatile` namespace-scope `const` unless adjusted |
+| External linkage | Declarations can denote one entity across TUs | Ordinary namespace-scope functions and variables; many named types and templates |
+| Module linkage | C++20 module-related declarations can denote an entity across units of one named module | Non-exported names attached to a named module, subject to module rules |
+
+An unnamed namespace is the normal way to keep implementation names TU-local:
+
+```cpp
+namespace {
+constexpr int bucket_count = 64;
+
+int bucket_for(int id) noexcept {
+    return id & (bucket_count - 1);
+}
+}
+```
+
+Each TU that includes such a definition gets distinct entities. Do not expose a TU-local type through an external inline or template interface whose repeated definitions are supposed to agree.
+
+Namespace-scope `const` has a notable C++ default:
+
+```cpp
+const int local_depth = 16;          // internal linkage by default
+extern const int shared_depth = 16;  // definition with external linkage
+```
+
+If the first line is in a header, every TU has a distinct object if storage is needed. Use `inline constexpr` when the design requires one ODR entity defined in the header:
+
+```cpp
+inline constexpr int shared_depth = 16;
+```
+
+### Storage duration answers “how long can the storage exist?”
+
+| Duration | Typical object | Begins/ends conceptually | Latency concern |
+|---|---|---|---|
+| Automatic | Non-static block local, parameter | On block/function activation; released on exit | Usually no allocator call; initialization and destruction can still cost |
+| Static | Namespace object, static data member, block `static` | Storage spans program execution | Initialization order, first-use guard, shutdown order |
+| Thread | `thread_local` object | Per thread | Access model and thread-start/exit work are implementation-dependent |
+| Dynamic | Object created in allocated storage | Controlled by allocation/construction and destruction/deallocation | Allocator contention, cache misses, fragmentation, tail latency |
+
+Do not say “stack is always fast.” Automatic storage commonly uses a stack, but the standard does not require one; constructing a large or complex automatic object can be expensive. Similarly, dynamic storage duration does not require the global heap or a system call on every allocation; an arena can provide dynamic storage from preallocated memory.
+
+Storage duration and lifetime differ. Raw storage may exist before an object’s lifetime begins and after it ends. That distinction becomes important in allocator, union, and object-model work.
+
+### Static initialization is a correctness and latency boundary
+
+Objects with static storage duration are first zero-initialized; constant initialization occurs where its requirements are met. Other initialization is dynamic and may execute code. Ordering across TUs is nuanced and often not a safe dependency mechanism.
+
+Use `constinit` to require static initialization of a variable:
+
+```cpp
+constinit int feed_count = 0;
+```
+
+`constinit` does not make the object constant. It rejects an initializer that would require disallowed dynamic initialization, helping move surprise work out of startup.
+
+A block-local static gives construction on first control passage, with thread-safe initialization since C++11:
+
+```cpp
+class Registry {
+public:
+    void add(int);
+};
+
+Registry& registry() {
+    static Registry instance;
+    return instance;
+}
+```
+
+This avoids a cross-TU initialization dependency, but it can put synchronization and constructor work on the first caller. For a latency-sensitive path, initialize deliberately during startup and warm the exact operation, then measure. Compiler switches that disable thread-safe statics weaken the language guarantee and are non-portable; do not use them casually.
+
+`thread_local` can remove sharing between worker threads, but its access and initialization costs depend on TLS model, linkage, loader arrangement, and platform. Inspect generated code and benchmark the deployed form instead of assuming it is equivalent to an ordinary register or stack access.
+
+---
+
+## 1.9 Inline Functions and Variables — Core
+
+`inline` permits an entity to be defined in multiple TUs under ODR conditions. For an inline function or variable with external or module linkage, its definition must be reachable in each TU where it is declared and odr-used, and it represents one entity with one address as required by the language rules.
+
+```cpp
+// price_math.hpp
+#ifndef BOOK_PRICE_MATH_HPP
+#define BOOK_PRICE_MATH_HPP
+
+inline constexpr long long ticks_per_unit = 10'000;
+
+[[nodiscard]] inline long long to_ticks(long long units) noexcept {
+    return units * ticks_per_unit;
+}
+
+#endif
+```
+
+This is valid in many TUs if the definitions satisfy the ODR. A typical ABI emits coalescible COMDAT/weak-like sections so the linker can retain one out-of-line copy when needed, but that is an implementation technique, not the definition of `inline`.
+
+### Inline in the language versus call inlining
+
+The optimizer may inline a call to a function that lacks the `inline` specifier. It may also retain an actual call to a function declared `inline`. Decisions depend on optimization settings, profile data, body size, target, visibility, and surrounding code.
+
+The indirect relationship is visibility of the body:
+
+- A body in a header is available to each compiling TU, enabling local call-site optimization.
+- A body in another TU is normally unavailable during ordinary compilation.
+- LTO can make bodies available across TU boundaries without placing every body in a public header.
+
+For low-latency code, call inlining can remove call/return overhead and expose constants, aliases, and branches to further optimization. It can also increase machine-code size and instruction-cache pressure. Confirm with compiler optimization remarks or disassembly, then benchmark representative instruction working sets and report tail as well as typical latency.
+
+### Inline variables solve header-defined shared state, not design
+
+Before C++17, a non-`const` global in a header normally caused multiple definitions. An inline variable permits a header definition:
+
+```cpp
+inline std::atomic<unsigned long long> packets_seen{0};
+```
+
+The ODR issue is solved; contention is not. Every worker updating this one cache line can create coherence traffic. Prefer per-thread or sharded counters if the workload permits, and merge off the hot path. The linkage mechanism and the runtime sharing design are separate decisions.
+
+### `static inline` changes identity
+
+```cpp
+// counter.hpp
+static inline int next_local_id() {
+    static int value = 0;
+    return ++value;
+}
+```
+
+The namespace-scope function name has internal linkage because of `static`. Each TU has a separate function and a separate function-local `value`. Remove `static`, leaving a valid external inline definition, and the function-local static denotes one object shared across all TUs. Both forms compile; they express different identity and synchronization.
+
+Implicitly inline cases include functions defined inside class definitions and `constexpr`/`consteval` functions. `constexpr` static data members are inline variables since C++17. Templates have their own multiple-definition provisions; do not explain them merely as “implicitly inline.”
+
+---
+
+## 1.10 Object Files, Symbols, and Relocation — Core
+
+The standard stops at translation units and the program. Mainstream native toolchains represent separately compiled output as **relocatable object files**. ELF is common on Linux, Mach-O on Apple platforms, and PE/COFF on Windows. Details below are ABI and toolchain behavior.
+
+A relocatable object commonly contains:
+
+- machine-code and read-only-data sections;
+- writable and zero-initialized data sections;
+- a symbol table describing defined and unresolved names;
+- relocation records identifying locations whose final address is not yet known;
+- optional debug, unwind, exception, and LTO information.
+
+For the two-source example, a simplified view is:
+
+```text
+main.o
+  text: main machine code
+  defined symbol: main
+  undefined symbol: spread(Quote const&)
+  relocation: patch call site to resolved spread address
+
+quote.o
+  text: spread machine code
+  defined symbol: spread(Quote const&)
+
+linker
+  chooses output addresses
+  resolves the reference to the definition
+  applies or preserves the relocation
+```
+
+A **symbol** is an object-format name plus attributes such as binding, type, section, size, visibility, or version, depending on the format. The linker does not generally reason from the original C++ type system. It acts on the ABI encoding and metadata the compiler emitted.
+
+A **relocation** says, approximately, “once the address of this target is known, adjust these bytes using this relocation kind.” Some references can be resolved by a static link. Others remain for the dynamic loader, often through indirection tables or stubs.
+
+Useful inspection commands are platform-specific:
+
+```sh
+nm -C main.o
+objdump -dr main.o
+readelf -Ws quote.o
+```
+
+On macOS, `otool` and Apple’s `nm` are typical; on Windows, `dumpbin` is common. `-C` requests C++ demangling where supported.
+
+### Worked symbol prediction
+
+Suppose `main.o` calls `spread` and the final link omits `quote.o`.
+
+1. `main.cpp` compiled because `quote.hpp` declared `spread`.
+2. `main.o` therefore contains code for a call plus an unresolved reference.
+3. No linked input defines an ABI-matching symbol.
+4. The linker cannot apply the call relocation.
+5. It reports an undefined symbol/reference.
+
+Now suppose `quote.cpp` accidentally defines:
+
+```cpp
+long spread(const Quote& quote) noexcept {
+    return static_cast<long>(quote.ask_ticks - quote.bid_ticks);
+}
+```
+
+while the header declares:
+
+```cpp
+long long spread(const Quote&) noexcept;
+```
+
+On many C++ ABIs, non-template function return types are not encoded in the mangled name. If the mismatched definition was created without including the header, the linker may connect the call despite incompatible source-level types. The program then violates its language contract, and behavior depends on the ABI mismatch. This is why an implementation file must include its own header first: the compiler, not the linker, should compare declaration and definition.
+
+That is a high-yield interview lesson: name mangling detects many signature mismatches, not every possible type disagreement.
+
+---
+
+## 1.11 Worked Diagnosis: Compile, Link, Load, or ODR? — Core
+
+Consider a service update that produces:
+
+```text
+undefined reference to `book::apply(book::Update const&)'
+```
+
+Use a staged diagnosis instead of adding libraries at random.
+
+### Step 1: Confirm what the caller requested
+
+Demangle the diagnostic if necessary. Check the exact namespace, class, parameter types, cv/ref qualifiers, and sometimes ABI tags. Compare the declaration visible to the caller with the intended interface.
+
+Ask whether the call is compiled conditionally or whether a stale generated header declared an older signature.
+
+### Step 2: Inspect candidate definitions
+
+Use the platform’s symbol tool on object files and libraries. There are four common outcomes:
+
+| Observation | Likely cause | Next action |
+|---|---|---|
+| No candidate library contains the definition | Source omitted, feature disabled, dead build target | Fix target sources/configuration |
+| Object contains matching definition, final link omits object | Link line or archive extraction issue | Fix dependency/order or explicit anchor |
+| Object contains a similar but differently mangled definition | Declaration/definition or ABI mismatch | Include canonical header; align flags and signatures |
+| Dynamic library exports it, loader cannot find/version it | Search path, soname/import, visibility, or version issue | Inspect runtime dependency resolution |
+
+### Step 3: Check archive extraction
+
+An object file named directly on the link line normally participates. A static archive is searched according to linker rules and may contribute only members needed to resolve unresolved symbols at that point. GNU-like linkers traditionally process archives left to right:
+
+```sh
+c++ main.o -lconsumer -lprovider
+```
+
+can work when `consumer` needs `provider`, while the reverse order can fail. Linker groups or repeated libraries handle cycles on some toolchains, but better component boundaries avoid them.
+
+### Step 4: Separate symbol resolution from ODR correctness
+
+If the symbol exists and the build succeeds, do not conclude that all TUs agreed. A changed struct layout, packing pragma, inline body, or macro can produce a silent ODR/ABI fault.
+
+A useful clean-room test is:
+
+1. record every compile and link command;
+2. remove stale build artifacts using the build system’s safe clean mechanism;
+3. rebuild with uniform flags;
+4. inspect preprocessed output for disagreeing TUs;
+5. compare symbol and layout diagnostics where available;
+6. enable LTO or relevant sanitizers in CI as additional detectors, not proofs.
+
+### A realistic ODR failure
+
+Assume a feed-handler library and executable share:
+
+```cpp
+struct Update {
+    std::uint32_t instrument;
+    std::uint32_t quantity;
+#if defined(BOOK_CAPTURE_TIMESTAMP)
+    std::uint64_t capture_ns;
+#endif
+};
+```
+
+Only the library is rebuilt with `BOOK_CAPTURE_TIMESTAMP`.
+
+- The library compiles with `sizeof(Update)` commonly 16 on an ABI aligning `std::uint64_t` to 8 bytes.
+- The stale executable commonly assumes 8.
+- The linker sees the same function symbol if layout is not encoded in the name.
+- An array stride, by-value copy, or field access can now disagree.
+
+The exact sizes are ABI-dependent; use `static_assert` only when the external protocol or ABI truly requires a layout, and assert offsets/alignment as well as size. Better, serialize through a stable wire representation and ensure all C++ components rebuild when the interface changes.
+
+This bug threatens correctness and tail latency: corruption may trigger rare error handling, allocator activity, or process failure. Do not frame ODR discipline as compile-time housekeeping.
+
+---
+
+## 1.12 Static and Dynamic Libraries — Role-specific
+
+Libraries package compiled code; they do not change the C++ ODR. Two copies of a prohibited definition remain invalid even if they arrived through different libraries.
+
+### Static archives
+
+A static library (`.a` on many Unix-like platforms, often `.lib` on Windows) is commonly an archive of object files plus an index. Traditional linkers extract an archive member when it satisfies an unresolved reference.
+
+This creates a registration trap:
+
+```cpp
+// venue_x.cpp
+namespace {
+const bool registered = register_venue("X");
+}
+```
+
+If the object file contains no symbol requested by the rest of the link, the archive member may never be extracted, so the initializer never appears in the executable. Solutions include:
+
+- reference an explicit registration function;
+- generate and call a registry table;
+- request whole-archive/force-load behavior for a tightly scoped library.
+
+The flags are linker-specific. Explicit registration is usually easier to reason about and test. Whole-archive can increase binary size and introduce duplicate definitions.
+
+Static linking can provide:
+
+- a self-contained component version in the executable;
+- no runtime search for that library;
+- opportunities for dead stripping and, with suitable LTO, cross-component optimization.
+
+It can cost:
+
+- larger on-disk and memory footprint across multiple processes;
+- relinking/redeploying to patch a dependency;
+- license or platform restrictions;
+- duplicated library state if several static copies enter different shared objects;
+- archive-order and hidden-registration surprises.
+
+“Static calls are always direct” is not guaranteed. Interposition, code model, function pointers, visibility, and linker choices matter. Inspect the final binary.
+
+### Dynamic/shared libraries
+
+A shared object (`.so`, `.dylib`, or `.dll`, depending on platform) is mapped and connected by a loader. The details differ sharply:
+
+- ELF systems commonly use GOT/PLT mechanisms and may support symbol interposition.
+- Mach-O uses its own binding and stub machinery.
+- Windows DLLs commonly use import tables and explicit export/import controls.
+
+Position-independent code, relocation, symbol lookup, lazy/eager binding, and library search paths are platform mechanisms, not C++ rules.
+
+| Dimension | Static archive in executable | Shared library |
+|---|---|---|
+| Version selected | Usually fixed at link/rebuild | Selected under loader and deployment rules |
+| Startup | No load of that separate shared object | Mapping, relocation, constructors, and binding may add work |
+| First call | No lazy dynamic binding for that library | May pay lazy-binding cost on configurations that use it |
+| Code sharing | Each linked artifact has its own code pages | Read-only pages can often be shared across processes |
+| Optimization boundary | LTO may cross it if compatible IR is available | Normally an ABI boundary |
+| Patch model | Relink and redeploy consumers | Replace compatible library independently |
+| Main risk | duplication, archive extraction, rebuild scope | ABI/version skew, search path, exported surface |
+
+For a low-latency process, a defensible policy is:
+
+1. identify which components lie on startup and hot-call paths;
+2. decide whether independent replacement is required;
+3. pin exact dependency versions and loader paths;
+4. force eager binding or warm calls if the platform supports it and first-hit jitter matters;
+5. measure process startup, first call, steady-state distribution, page faults, and instruction footprint;
+6. retain a rollback path.
+
+Fully static executables are not universally available or desirable. Some operating-system services, runtime components, security update models, and licenses constrain them.
+
+### ABI is the shared-library contract
+
+Source compatibility is insufficient. Changing any of these can break existing consumers:
+
+- exported function signature or calling convention;
+- class size, alignment, data-member order, or base classes;
+- virtual function set or order under an ABI;
+- exception or RTTI boundary expectations;
+- allocator/runtime ownership across the boundary;
+- inline implementation or template instantiation compiled into consumers;
+- standard-library type layout or compiler ABI mode.
+
+A C-shaped boundary with opaque handles and explicit create/destroy functions reduces, but does not eliminate, ABI risk. The interface still needs versioning, ownership, threading, error, and lifetime rules.
+
+---
+
+## 1.13 Language Linkage, Name Mangling, and `extern "C"` — Role-specific
+
+C++ permits overloaded functions, namespaces, member functions, and templates. A linker symbol therefore needs some ABI-specific way to distinguish source-level entities. Most native C++ ABIs use **name mangling**.
+
+For example, an Itanium C++ ABI toolchain might encode:
+
+```cpp
+namespace book {
+void publish(int);
+void publish(double);
+}
+```
+
+as two different symbol strings. MSVC uses a different scheme. C++23 does not specify either spelling. Compatibility requires agreement on compiler ABI, target architecture, calling conventions, standard-library ABI, and relevant options—not merely using the same function declaration.
+
+### Language linkage is a language property
+
+`extern "C"` specifies C language linkage for function types and function names in the cases defined by the standard:
+
+```cpp
+extern "C" int book_start() noexcept;
+```
+
+A typical implementation emits a stable C-style external name rather than its C++ mangling. It does not:
+
+- make the body compile as C;
+- permit function overloading at that exported name;
+- specify every platform calling-convention detail;
+- create a portable C ABI for C++ classes, exceptions, or standard-library types;
+- force dynamic-symbol export on every platform.
+
+The body may use C++ internally:
+
+```cpp
+extern "C" int book_start() noexcept {
+    try {
+        // Construct C++ objects and initialize the service.
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+```
+
+Catch exceptions at a C-facing boundary. Whether a particular unwinder can cross frames compiled as C is an ABI matter; C callers have no portable C++ exception contract. `noexcept` plus internal translation to an error code makes the interface explicit.
+
+### A portable header shared with C
+
+```c
+#ifndef BOOK_API_H
+#define BOOK_API_H
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-void init(void);
+
+struct book_handle;
+
+int book_create(struct book_handle** out);
+void book_destroy(struct book_handle* handle);
+
 #ifdef __cplusplus
 }
 #endif
+
+#endif
 ```
 
-Rules and limits:
-- Only **one** function of a given name may have C linkage — **no overloading**, since there's nothing to encode the difference into.
-- C linkage applies to function *types* too, so a function pointer passed to a C API strictly should be `extern "C"` typed. In practice most compilers are lenient; strictly it matters for callbacks.
-- Class member functions cannot have C linkage. To expose C++ objects to C, hand out opaque `void*`/struct pointers and free functions.
-- **Exceptions must not propagate through an `extern "C"` frame** into C code — the C frames have no unwind tables. Wrap every C-callable entry point in `try { … } catch(...) { return ERROR; }`. `noexcept` on the boundary turns escapes into `std::terminate`, which is at least deterministic.
-- `extern "C"` does **not** change linkage in the internal/external sense, and does not disable C++ semantics *inside* the function — you can still use templates, RAII, and exceptions internally.
+The opaque `book_handle` hides C++ layout. The implementation must still specify:
 
-This is also the mechanism behind plugin systems: export a single `extern "C" Plugin* create_plugin();` factory whose name is stable across compilers, and do everything else through a C++ abstract interface (whose vtable layout you must then keep stable — a separate ABI hazard).
+- which function allocates and frees the handle;
+- whether null is accepted;
+- thread-safety and reentrancy;
+- error-code meanings;
+- version negotiation;
+- whether callbacks may block or throw;
+- ownership of buffers and strings.
 
----
+On Windows, an export annotation may also be required. On ELF, visibility settings or a version script can control export. Those are separate from language linkage.
 
-## 1.11 Static and Dynamic Libraries
+### Diagnose a mangled-name failure
 
-### Static libraries (`.a`, `.lib`)
+When an undefined symbol contains a long encoded name:
 
-An archive — essentially a `tar` of object files with a symbol index. **The linker does not link the whole archive.** It processes inputs left to right, maintaining a set of undefined symbols; on reaching an archive it pulls in *only those members that resolve a currently-undefined symbol*, then moves on.
+1. demangle it using the platform tool;
+2. compare the result with the intended declaration;
+3. inspect candidate libraries for the exact encoded or demangled symbol;
+4. check architecture and ABI tags;
+5. check that the library is actually included and visible;
+6. only then change link order or libraries.
 
-Consequences, all of them interview-frequent:
-- **Link order matters.** `g++ main.o -la -lb` works if `a` needs `b`; the reverse fails with undefined references. Fixes: correct ordering, repeat the library, or `-Wl,--start-group … -Wl,--end-group` for circular dependencies (slower — it iterates).
-- **The static initialization trap.** An object file that only contains self-registering globals (`static Registrar r;`) resolves no undefined symbol, so it is *never pulled in* and the registration silently doesn't happen. Fix with `-Wl,--whole-archive` (GNU) / `-force_load` (Apple) / `/WHOLEARCHIVE` (MSVC), or reference something in that object explicitly.
-- Unused members are never even copied, so the linker naturally strips dead code at object granularity. `-ffunction-sections -fdata-sections -Wl,--gc-sections` refines this to function granularity.
-
-### Dynamic/shared libraries (`.so`, `.dylib`, `.dll`)
-
-Loaded at run time by the dynamic loader (`ld.so`). Must be built **position-independent** (`-fPIC`) so the code works at any load address; calls to exported functions go through the **PLT** (procedure linkage table) and data through the **GOT** (global offset table), resolved lazily by default (`LD_BIND_NOW`/`-Wl,-z,now` forces eager binding — better for security and latency determinism, worse for startup).
-
-|  | Static | Dynamic |
-|---|---|---|
-| Binary size | Larger executable, no external deps | Smaller executable; library shared across processes (one physical copy of `.text` in RAM) |
-| Startup | Fastest — nothing to resolve | Loader must map, relocate, resolve symbols |
-| Call cost | Direct call, fully inlinable via LTO | Indirect via PLT/GOT; no cross-boundary inlining |
-| Deployment | Single self-contained artifact | Version skew, "DLL hell", `LD_LIBRARY_PATH`/`rpath` issues |
-| Updates | Relink everything | Drop in a new `.so`, if ABI-compatible |
-| Security fixes | Rebuild all consumers | Patch one file (major argument for distros) |
-| Symbol collisions | Detected at link | Can be resolved at load in surprising ways (interposition) |
-
-**ABI compatibility** is the whole game for shared libraries: you may not change class layout, virtual function order, inline function bodies, default arguments, or exported signatures without a soname bump. Linux encodes this in the **soname** (`libfoo.so.2`) with a symlink chain `libfoo.so → libfoo.so.2.3.1`. Symbol versioning (`GLIBC_2.34`) lets a single `.so` export multiple incompatible versions of one symbol.
-
-**Loading modes:** implicit (link time, `-lfoo`) vs explicit (`dlopen`/`dlsym`, `LoadLibrary`/`GetProcAddress`). `dlsym` requires a stable, unmangled symbol name → `extern "C"` factory functions (§1.10).
-
-**Windows specifics** worth naming: symbols are not exported by default; you need `__declspec(dllexport)` when building and `__declspec(dllimport)` when consuming (the usual macro dance), or a `.def` file. Building a DLL also produces an *import library* (`.lib`) that the linker consumes. And each DLL may link its own CRT — allocating in one DLL and freeing in another with mismatched CRTs corrupts the heap, which is why cross-DLL interfaces should never pass ownership of raw allocations.
+`extern "C"` is not a general cure for linker errors. It deliberately removes overloading at the boundary and should be used for C interoperability or a deliberately stable entry point.
 
 ---
 
-## 1.12 Symbol Visibility and Weak Symbols
+## 1.14 Symbol Visibility and Weak Symbols — Deep dive
 
-### Visibility
+**Symbol visibility** is an object-format and platform concept controlling whether a definition is exposed outside a shared object and, on some systems, whether it can be preempted. It is not C++ scope or linkage.
 
-ELF visibility controls whether a symbol in a shared object is exported to other modules.
+On common ELF toolchains:
 
-| Visibility | Meaning |
+- default visibility exposes a symbol to dynamic lookup and may allow interposition;
+- hidden visibility keeps it within the shared object;
+- protected and internal modes have additional platform-specific semantics.
+
+Mach-O and PE/COFF provide different controls. Attributes such as:
+
+```cpp
+__attribute__((visibility("default")))
+```
+
+and flags such as `-fvisibility=hidden` are compiler extensions, not C++23 syntax. Windows commonly uses `__declspec(dllexport)` and `__declspec(dllimport)`.
+
+### Why reduce the exported surface?
+
+An explicit export allowlist can:
+
+- prevent accidental ABI commitments;
+- reduce dynamic symbol and relocation work;
+- enable direct binding or optimization for internal calls on some toolchains;
+- reduce collision and interposition risk;
+- make compatibility review tractable.
+
+It can also break runtime lookup, plugins, RTTI, exception matching, or cross-library type identity if a required symbol or type metadata becomes hidden. Export the complete intended boundary and test it as a separately built consumer.
+
+Visibility affects potential latency through named mechanisms—dynamic lookup, indirection, relocation, and optimization barriers—but the size of the effect is binary- and platform-specific. Compare symbol tables, relocations, disassembly, startup traces, and latency measurements before claiming a win.
+
+### Weak symbols are not the ODR
+
+Many object formats/toolchains support **weak definitions**. A strong definition can override a weak one without the ordinary duplicate-definition diagnostic. An unresolved weak reference may have a null/zero result. Syntax and semantics vary by platform:
+
+```cpp
+// GNU/Clang extension; not portable C++23.
+extern "C" void optional_probe() __attribute__((weak));
+
+void maybe_probe() {
+    if (optional_probe != nullptr) {
+        optional_probe();
+    }
+}
+```
+
+Typical uses include optional hooks, default embedded interrupt handlers, and toolchain emission of coalescible inline/template material. COMDAT selection provides related deduplication mechanisms.
+
+Hazards:
+
+- the winner among several weak definitions can depend on toolchain and link order;
+- a weak reference may not cause a static archive member to be extracted;
+- interposition can prevent assumptions about which body is called;
+- behavior differs across ELF, Mach-O, and PE/COFF;
+- weak machinery does not legalize conflicting C++ definitions.
+
+If two inline definitions differ, “the linker chose one weak copy” describes a possible implementation outcome, not a valid program. The ODR remains the correctness rule.
+
+For latency-sensitive optional instrumentation, a weak hook can remove an explicit registration system, but the branch, interposition, and deployment ambiguity may be worse than a stable function pointer initialized at startup. Measure both and prefer the mechanism with an explicit lifecycle.
+
+---
+
+## 1.15 Engineering Choices for a Low-Latency Build — Role-specific
+
+The build model becomes useful when it guides decisions rather than trivia.
+
+### Choice 1: Move a hot function into a header?
+
+**Condition:** profiling and generated code show call overhead or missed constant propagation on an important path.
+
+**Potential benefit:** body visibility enables per-TU inlining and specialization without LTO.
+
+**Costs:** more parsing, larger rebuild fan-out, possible code growth, ABI behavior compiled into every consumer, and stricter exposure to macro-driven ODR disagreement.
+
+**Alternative:** keep it out of line and enable compatible LTO or profile-guided optimization.
+
+**Success measure:** benchmark end-to-end latency distribution on the intended CPU; inspect call removal and instruction footprint. Roll back if p99/p99.9 or build time worsens.
+
+### Choice 2: Hide most shared-library symbols?
+
+**Condition:** the library has a small, controlled external API.
+
+**Potential benefit:** smaller exported surface, fewer preemptible calls, less relocation/symbol work, and better optimization on supported platforms.
+
+**Costs:** explicit export annotations/version scripts; risk of hiding plugin, RTTI, exception, or factory symbols.
+
+**Success measure:** ABI test against an independently compiled consumer; compare dynamic symbol/relocation counts, startup, and hot-call code generation.
+
+### Choice 3: Prefer static linking for a trading service?
+
+**Condition:** reproducible deployment and first-hit predictability matter more than independent library replacement, and platform/licensing constraints permit it.
+
+**Potential benefit:** dependency versions are baked into one artifact; no dynamic lookup for statically included components; LTO opportunities.
+
+**Costs:** larger artifacts, duplicated pages across processes, relink/redeploy for security fixes, possible duplicated state, archive extraction surprises.
+
+**Success measure:** deployment reproducibility plus cold-start, warmed steady-state, page-fault, RSS, and tail-latency measurements. Keep the dynamic build as rollback if operational cost grows.
+
+### Choice 4: Use compile-time configuration to change layout?
+
+Usually do not do this across component boundaries. If unavoidable:
+
+- generate one configuration header;
+- make every TU and dependent library consume it;
+- encode a version or layout signature at the boundary;
+- force complete rebuilds when it changes;
+- add `static_assert` checks for externally specified properties;
+- reject mismatched versions during startup.
+
+The benefit may be smaller or feature-specialized objects. The cost is combinatorial binary variants and silent ODR/ABI risk. A runtime branch outside the hot loop is often a safer trade.
+
+### Choice 5: Add LTO?
+
+LTO can optimize across source-file and static-library boundaries when compatible IR is present. It can improve inlining, devirtualization, constant propagation, and dead removal. It can also increase link time and memory, alter layout, expose latent ODR bugs, and grow or shrink code in workload-dependent ways.
+
+Treat ThinLTO, full LTO, and vendor variants as toolchain modes, not language features. Compare clean/incremental build cost, binary size, symbols, instruction-cache behavior, and latency. Preserve non-LTO builds in CI because toolchain diversity catches different assumptions.
+
+---
+
+## 1.16 Recall and Practice — Core
+
+### Recall card
+
+- A TU is independently compiled preprocessed source; ordinary headers are textually included.
+- Include guards prevent repeated inclusion within one preprocessing run, not across the program.
+- Declarations let a TU type-check; required definitions make the complete program valid.
+- ODR violations can be loud link failures or silent undefined behavior with no required diagnostic.
+- Scope controls lookup; linkage controls identity across declarations; storage duration controls storage; lifetime controls object existence; visibility controls platform-level export.
+- `inline` permits repeated ODR definitions. Call inlining is an optimizer choice.
+- Object files, symbols, relocations, archives, shared objects, mangling, and weak definitions are common ABI/toolchain mechanisms, not C++ abstract-machine requirements.
+- Static archives extract members under linker rules; unreferenced self-registration can disappear.
+- Dynamic libraries add an ABI and loader boundary. Warm-up and eager binding can move work, but only measurement establishes latency.
+- `extern "C"` specifies language linkage; it does not export a symbol everywhere or make C++ classes into a portable C ABI.
+
+### Common interview traps
+
+| Trap | Better answer |
 |---|---|
-| `default` | Exported; **can be interposed** (preempted by a definition loaded earlier) |
-| `protected` | Exported, but references *within* the defining module always bind locally — no self-interposition |
-| `hidden` | Not exported; usable within the module only. Still has external linkage for the static linker. |
-| `internal` | Hidden plus a promise it's never called from another module (rarely used, ABI-specific) |
+| “Each header is compiled once.” | Each conventional TU preprocesses and parses included headers; PCH/modules can change the implementation. |
+| “`static` means one thing.” | At namespace scope it commonly gives internal linkage; at block scope it gives static storage duration; as a class member it has another role. |
+| “The linker checks types.” | The compiler checks visible declarations; the linker usually operates on ABI names and metadata. Some mismatches mangle differently, others do not. |
+| “Include guards enforce the ODR.” | They prevent repeat inclusion within one TU. Cross-TU validity is still governed by the ODR. |
+| “Inline functions are faster.” | The specifier changes definition rules; inspect optimization and measure call-site performance. |
+| “Static linking removes all indirection.” | It removes dynamic lookup for that component; final calls still depend on code generation, pointers, visibility, and ABI. |
+| “A successful link proves one valid definition.” | Some ODR violations require no diagnostic and link successfully. |
+| “`extern "C"` is the C ABI.” | It supplies C language linkage; calling convention, layout, export, ownership, and error rules remain platform/interface concerns. |
 
-Default on ELF is `default`, i.e. **everything is exported** — the opposite of Windows. This is bad: huge dynamic symbol tables (slower load, larger binaries), accidental API surface, and interposition preventing optimization.
+### Prediction and diagnosis questions
 
-Best practice for a library:
-```
--fvisibility=hidden -fvisibility-inlines-hidden
-```
-then explicitly export your API:
+1. `api.hpp` declares `int parse(const char*)`, while `api.cpp` defines `int parse(char*)` without including the header. Why can both source files compile, and what is the likely link result?
+2. A header defines `int limit = 100;` and is included by ten TUs. Which rule is violated? Give two valid designs with different identity semantics.
+3. A header defines `const int limit = 100;`. Why does this usually avoid a duplicate external symbol in C++, and why might comparing `&limit` across TUs surprise you?
+4. Two TUs see different members in the same class because one defines a feature macro. Why is a clean link not reassuring?
+5. Explain `static int counter` inside a function using scope, linkage, storage duration, lifetime, and initialization timing.
+6. A plugin registers through a namespace-scope object. It works as a direct object input but disappears when placed in a static archive. Predict the linker’s reasoning and propose a deterministic fix.
+7. A shared-library function causes one latency spike on its first call. Name at least three mechanisms to investigate and one measurement for each.
+8. Why can changing only a function’s return type be especially dangerous if its implementation does not include the canonical header?
+9. Compare a header-visible hot function with an out-of-line function plus LTO. What evidence would decide between them?
+10. A DLL/shared object exposes a C++ class containing `std::string`. List the ABI assumptions this leaks and redesign the boundary.
+11. Why can hidden visibility improve optimization on one platform yet break an exception or RTTI boundary?
+12. Distinguish a weak symbol from a C++ inline definition. Why does the former not repair an ODR violation?
+
+### Code-reading exercise
+
 ```cpp
-#define API __attribute__((visibility("default")))     // or __declspec(dllexport)
-class API Widget { ... };
-API int process(Widget&);
+// counter.hpp
+#ifndef BOOK_COUNTER_HPP
+#define BOOK_COUNTER_HPP
+
+inline int next_id() {
+    static int id = 0;
+    return ++id;
+}
+
+#endif
 ```
-This is the portable-macro pattern every real library uses (`FOO_EXPORT`). Note `-fvisibility-inlines-hidden` also shrinks binaries substantially by not exporting inline member functions — safe unless you compare function *addresses* across module boundaries.
 
-**Interposition** is why `default` visibility costs performance: because a `default`-visibility function could be replaced at load time (that's how `LD_PRELOAD` malloc-replacement works), the compiler cannot inline calls to it even within the same library, and must route them through the PLT. `hidden` or `protected` restores direct calls.
+TU A and TU B both include the header. A call in TU A returns `1`; the next call in TU B returns `2`, because the valid external inline function has one function-local static object across the program.
 
-Watch out for **type identity across module boundaries**: `dynamic_cast`, `typeid`, and exception catching compare RTTI by *pointer* to type_info name on most Itanium-ABI platforms (with a string-comparison fallback). If a class's typeinfo is `hidden` in two libraries, each has its own copy, and `catch (MyError&)` in one library will *not* catch an exception thrown by the other. **Rule: types used across module boundaries — especially exception types and polymorphic bases — must have `default` visibility.** This is one of the highest-value obscure facts to know.
-
-### Weak symbols
-
-A **weak** symbol may be overridden by a strong definition without a duplicate-symbol error; if no definition exists at all, a weak *reference* resolves to null rather than failing the link.
+Now change the function to:
 
 ```cpp
-__attribute__((weak)) void hook() { /* default no-op */ }   // weak definition
-extern __attribute__((weak)) void optional_feature();       // weak reference
-if (optional_feature) optional_feature();                   // null check is legal and required
+static inline int next_id() {
+    static int id = 0;
+    return ++id;
+}
 ```
 
-Uses:
-- **Default implementations** overridable by the application (classic in embedded/RTOS: weak ISR handlers).
-- **Optional dependencies** — call a function if the library happened to be loaded.
-- **The compiler's own use**: template instantiations, inline functions, and vtables are emitted as **weak (COMDAT/`linkonce_odr`)** symbols so duplicates across TUs collapse instead of colliding. This is the actual implementation of the ODR-3 exemption in §1.6 — and the reason ODR violations there are silent: the linker's job is precisely to discard "duplicates" without comparing them.
+The namespace-scope `static` gives the function internal linkage. Each TU has its own function and local static, so the first call in each TU returns `1`. This is a semantic identity change, not an optimization tweak.
 
-Rules and hazards:
-- Strong beats weak; among multiple weak definitions, the choice is unspecified (in practice: first encountered).
-- Weak symbols disable some optimizations, since the definition visible at compile time may not be the one used.
-- Not portable to Windows in the same form (Windows uses `/ALTERNATENAME` and COMDAT selection).
-- Interaction with static libraries is subtle: a weak *reference* does not cause an archive member to be pulled in, so linking order can decide whether the feature is "present."
+The examples are single-threaded. Concurrent increments would create a data race; thread-safe initialization of the local static does not make later `++id` operations atomic.
 
----
+### Hands-on build exercise
 
-## Key Interview Questions
+Using the `quote.hpp`, `quote.cpp`, and `main.cpp` example:
 
-1. **What is a translation unit, and why can two TUs disagree about a type without any error?** — TU = source + expanded includes; the compiler never compares TUs, and the linker sees only mangled names, so layout disagreements are IFNDR.
-2. **What does `inline` actually do?** — Relaxes the ODR to permit one definition per TU with linker deduplication; inlining as an optimization is a separate, heuristic decision.
-3. **Why does `static const int` in a header behave differently in C and C++?** — In C++ namespace-scope `const` has internal linkage; in C it's external, so headers would produce duplicate symbols.
-4. **Explain the static initialization order fiasco and two fixes.** — Cross-TU dynamic init order is unspecified; fix with function-local statics (Construct On First Use) or `constinit`/constant initialization.
-5. **Why does link order matter for static libraries but not object files?** — Archives contribute only members that resolve currently-undefined symbols, processed left to right.
-6. **Why do self-registering objects vanish when moved into a static library?** — Nothing references them, so their object file is never extracted; needs `--whole-archive` or an explicit reference.
-7. **What is name mangling and why is `extern "C"` needed?** — Signature encoding for the linker; `extern "C"` disables it for C interop and `dlsym`, at the cost of overloading.
-8. **Why can't you catch an exception thrown by another shared library sometimes?** — Type identity relies on RTTI symbol identity; `-fvisibility=hidden` on the exception type gives each module its own typeinfo.
-9. **What is the difference between linkage, scope, storage duration, and visibility?** — Entity identity across declarations; source region of lookup; memory lifetime; loader-level export control. Independent axes.
-10. **Why is `-fvisibility=hidden` recommended for shared libraries?** — Smaller symbol tables, faster loading, defined API surface, and enables direct calls/inlining by removing interposition.
-11. **When would you choose static over dynamic linking?** — Deterministic deployment, best startup and call performance, whole-program optimization; give up shared-memory savings and independent security patching.
-12. **What are the 9 phases of translation, and name one observable consequence of the ordering.** — E.g. line splicing before comment removal makes a trailing `\` in a `//` comment swallow the next line.
+1. Preprocess `main.cpp`. Locate the included `Quote` definition and the `spread` declaration.
+2. Compile both TUs separately. Inspect defined and unresolved symbols with the platform’s symbol tool.
+3. Link only `main.o`. Explain the undefined reference from declaration, definition, and relocation perspectives.
+4. Link both objects. Confirm the program prints `3`.
+5. Add a second ordinary definition of `spread` in `main.cpp`. Record the diagnostic and explain the ODR violation without relying on its exact wording.
+6. Put an inconsistent inline definition behind different per-TU macros. Observe that a successful link does not make it valid.
+7. Build a static archive containing `quote.o`; test how link order affects your toolchain.
+8. If supported, build a shared library and compare its exported symbols, relocations, first-call behavior, and steady-state disassembly with the static form.
 
----
+### Before Chapter 2
 
-## Common Traps
+You should now be able to look at a declaration and answer:
 
-- **Believing `inline` controls inlining.** It controls linkage and ODR.
-- **Assuming `#pragma once` is always safe.** Symlinks/hard links/duplicate build roots can defeat file identity.
-- **Forgetting that inconsistent `-D` flags are ODR violations,** not just build hygiene — debug/release mixing corrupts memory.
-- **Using `static` for a function in a header** and expecting a single shared function-local `static` counter. You get one per TU.
-- **Bare `#if FEATURE` with a typo'd name** silently evaluating to false; use `#if defined(...)` and `-Wundef`.
-- **Macro double-evaluation** (`MAX(i++, j)`) and missing parentheses (`SQ(1+2)`).
-- **Most vexing parse:** `Widget w();` is a function declaration.
-- **Expecting cross-TU dynamic initialization order to be defined.** It isn't; only within-TU order is.
-- **Returning a reference/pointer to an automatic object.**
-- **Assuming `extern "C"` functions can be overloaded** or that exceptions may cross them.
-- **Anonymous-namespace types leaking into inline/template signatures** → ODR violation with identical tokens.
-- **Assuming a class type is complete after a forward declaration** — no `sizeof`, no members, no by-value use.
-- **Forward-declaring `std::string`/`std::vector` yourself** instead of including the real header.
-- **Assuming symbols are hidden by default on Linux** as they are on Windows.
-- **Passing ownership of allocations across DLL boundaries** with different CRTs.
+- what entity it declares or defines;
+- where the name is in scope;
+- what linkage gives the entity its identity;
+- what storage duration applies;
+- whether another TU must supply a definition;
+- which disagreement could survive the build.
 
----
-
-## Compact Recall Summary
-
-**Model.** Source + includes → preprocessed **TU** → object file → linker → program. 9 translation phases; the fusion of "textual include" and "independent compilation" produces every hazard in this chapter.
-
-**Preprocessor.** Token-level, type-blind, scope-blind. Guards (`#pragma once` or prefixed `#ifndef`), `#`/`##` need double indirection, `__VA_OPT__` for variadics, `-Wundef` against typo'd `#if`. Prefer `constexpr`/templates/`if constexpr`.
-
-**Declaration vs definition.** Declaration = name + type; definition = the entity. Incomplete types allow pointers/references only. Declare in headers, define once — except classes, `inline` entities, and templates.
-
-**ODR.** One definition per TU; exactly one per program for non-inline entities; identical token sequences and identical name resolution for the multi-definition-permitted set. Violations of the third clause are **IFNDR** — silent. Root causes: flag skew, ABI mixing, anonymous-namespace leakage.
-
-**Linkage.** none / internal (`static`, anonymous namespace, namespace-scope `const` in C++) / external / module. Independent of scope, storage duration, and visibility.
-
-**Storage duration.** automatic / static / thread / dynamic. Static init = zero-init + constant-init (load time), then dynamic init (ordered within a TU, unspecified across TUs) → fiasco → Construct On First Use, thread-safe since C++11.
-
-**`inline`.** ODR exemption + COMDAT/weak emission + linker dedup. Enables cross-TU inlining by making bodies visible. `inline` variables (C++17) give header-only globals. `static` in a header is not a substitute.
-
-**Mangling.** Signature → flat symbol name; ABI-specific (Itanium vs MSVC). `extern "C"` disables it for C interop, `dlsym`, and plugin ABIs; costs overloading and forbids escaping exceptions.
-
-**Libraries.** Static archives contribute only needed members (link order matters; self-registration breaks). Shared objects need `-fPIC`, resolve through PLT/GOT, and demand ABI stability (soname, symbol versioning).
-
-**Visibility.** ELF defaults to exporting everything; use `-fvisibility=hidden` plus explicit export macros — but keep exception types and polymorphic bases at `default` visibility or RTTI identity breaks across modules. Weak symbols enable defaults, optional deps, and are the mechanism by which template/inline duplicates are silently collapsed.
+Chapter 2 assumes this separation when it examines types and conversions across function and binary boundaries.

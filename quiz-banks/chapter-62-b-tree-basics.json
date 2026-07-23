@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The mismatch is node size versus I/O granularity: a tiny 2-way node wastes a whole 8 KB page, and log2 of a billion is about 30 serialized random reads. Balancing bounds height but does nothing about the fanout-of-2 problem.",
-      "sourceAnchor": "621-why-in-memory-search-trees-fail-on-disk",
+      "sourceAnchor": "621-the-btree-model-and-its-invariants--core",
       "difficulty": "application"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "AVL/red-black trees bound height via rotations, minimizing comparisons and node count. On disk the cost that matters is page transfers; fanout is still 2 and each rotation dirties several scattered pages, so the wrong cost function is being optimized.",
-      "sourceAnchor": "622-tree-balancing-avl-and-red-black-and-why-they-are-wrong-for-disk",
+      "sourceAnchor": "621-the-btree-model-and-its-invariants--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Postgres pages are 8 KB (BLCKSZ), the atom for heap pages, B-tree pages, buffer-pool slots, and WAL full-page images. InnoDB uses 16 KB and SQLite 4 KB, but Postgres's constant is 8 KB.",
-      "sourceAnchor": "623-the-block-is-the-unit-of-io",
+      "sourceAnchor": "625-page-layout-fanout-and-a-worked-capacity-calculation--core",
       "difficulty": "recall"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An HDD random read waits for the head to seek (~5-10 ms) and for the sector to rotate underneath (~2-4 ms at 7200 RPM), totalling ~8-12 ms. Sequential transfer afterward is fast, which is why random I/O is roughly 100x costlier per byte.",
-      "sourceAnchor": "624-disk-and-ssd-primer-random-io-is-the-enemy",
+      "sourceAnchor": "626-height-caching-and-the-cost-model--core",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A downlink is a BlockNumber; to follow it the engine asks the buffer manager whether that block is resident, reading it from the file on a miss. A raw memory pointer would be meaningless after restart since the file is remapped.",
-      "sourceAnchor": "625-addressing-on-disk-page-id-plus-offset",
+      "sourceAnchor": "625-page-layout-fanout-and-a-worked-capacity-calculation--core",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A B-tree generalizes a BST node from one key and two children to up to m-1 sorted keys and m children filling a page, giving high fanout and shallow height. Leaf-only values describe the B+tree refinement, not the core idea.",
-      "sourceAnchor": "626-from-bst-to-b-tree-the-core-idea",
+      "sourceAnchor": "621-the-btree-model-and-its-invariants--core",
       "difficulty": "recall"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because a B+tree keeps values only in leaves, internal nodes hold only separators and pack more per page, so fanout is higher and the tree shallower. Linked leaves also turn range scans and ORDER BY into a leaf walk without re-descent.",
-      "sourceAnchor": "627-b-tree-versus-btree",
+      "sourceAnchor": "6211-btree-versus-other-access-methods--role-specific",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A B+tree stores all values, in Postgres the (key, heap TID) pairs, in the leaves; internal pages are pure routing structure. This is why every lookup descends fully to a leaf even when the key equals a separator.",
-      "sourceAnchor": "627-b-tree-versus-btree",
+      "sourceAnchor": "6211-btree-versus-other-access-methods--role-specific",
       "difficulty": "recall"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Leaves are sorted and linked, so a range scan descends once to the first matching leaf and then walks sibling links sequentially until the upper bound is passed, rather than re-entering the internal levels per result.",
-      "sourceAnchor": "628-linked-leaves-and-range-scans",
+      "sourceAnchor": "622-point-lookup-and-range-scan--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The right-links are the backbone of the Lehman and Yao B-link algorithm: a reader that arrives during a split can move right to find keys that moved, avoiding path locks. They serve both ordered scans and high-concurrency navigation.",
-      "sourceAnchor": "628-linked-leaves-and-range-scans",
+      "sourceAnchor": "622-point-lookup-and-range-scan--core",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "B-trees grow and shrink exclusively at the root, so every root-to-leaf path lengthens or shortens together and all leaves stay at the same depth. This is how balance is maintained without rotations.",
-      "sourceAnchor": "629-the-b-tree-hierarchy-root-internal-leaf",
+      "sourceAnchor": "621-the-btree-model-and-its-invariants--core",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Usable space is ~8152 bytes after headers; a bigint entry is ~20 bytes (4-byte line pointer, 8-byte index-tuple header, 8-byte key), giving ~407 packed entries, or ~366 at the default 90 percent leaf fillfactor.",
-      "sourceAnchor": "6210-fanout-branching-factor-and-occupancy",
+      "sourceAnchor": "625-page-layout-fanout-and-a-worked-capacity-calculation--core",
       "difficulty": "recall"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Fanout is usable bytes divided by bytes per entry, so it scales inversely with key width: an int4 gives ~500, a bigint ~400, a 40-byte text key ~156. Lower fanout means more levels for the same row count.",
-      "sourceAnchor": "6210-fanout-branching-factor-and-occupancy",
+      "sourceAnchor": "625-page-layout-fanout-and-a-worked-capacity-calculation--core",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With fanout ~400 and ~367 keys per leaf, capacity at height 4 is ~400^3 * 367 which is ~23 billion, so a billion rows fits in 4 levels. A million rows is ~3 levels and a trillion ~5.",
-      "sourceAnchor": "6211-worked-example-height-for-a-billion-keys",
+      "sourceAnchor": "626-height-caching-and-the-cost-model--core",
       "difficulty": "recall"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because branching is base-hundreds, each ~1000x more rows adds a single level: 1M is ~3 levels, 1B ~4, 1T ~5. This near-constant height is why an indexed lookup cost barely changes with table size.",
-      "sourceAnchor": "6211-worked-example-height-for-a-billion-keys",
+      "sourceAnchor": "626-height-caching-and-the-cost-model--core",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A separator is a boundary value, not a lookupable entry: keys below go one way and keys at or above go another. In a B+tree the same value can appear both as a leaf entry and as a copied-up separator used purely for routing.",
-      "sourceAnchor": "6212-separator-keys-and-high-keys-how-routing-works",
+      "sourceAnchor": "628-deep-dives-keys-bulk-build-and-validation--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The high key is an upper bound on a page's keys, roughly the first key of the right sibling. If a search key exceeds it, a concurrent split moved the target right, so the reader follows the right-link instead of failing, enabling lock-light concurrency.",
-      "sourceAnchor": "6212-separator-keys-and-high-keys-how-routing-works",
+      "sourceAnchor": "628-deep-dives-keys-bulk-build-and-validation--deep-dive",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Comparisons are information-theoretically bounded at about log2 N (roughly 4 pages times 9 in-page steps). The B-tree does not cut comparisons; it moves them onto already-loaded pages and slashes the number of slow page transfers.",
-      "sourceAnchor": "6213-lookup-complexity-why-base-b-beats-base-2",
+      "sourceAnchor": "626-height-caching-and-the-cost-model--core",
       "difficulty": "trap"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "log2 of the fanout is about 8.6 for fanout 400, and each level is a serialized random read costing microseconds to milliseconds. So log400 of a billion is ~4 reads versus log2's ~30, an ~8x difference on the critical path.",
-      "sourceAnchor": "6213-lookup-complexity-why-base-b-beats-base-2",
+      "sourceAnchor": "626-height-caching-and-the-cost-model--core",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Each node is a sorted array, so the engine binary-searches the separators (Postgres's _bt_binsrch) to pick the child interval, descends, and repeats to a leaf. Descent is serialized because the child cannot be known until the current node is searched.",
-      "sourceAnchor": "6214-the-lookup-algorithm-descent-and-in-node-binary-search",
+      "sourceAnchor": "622-point-lookup-and-range-scan--core",
       "difficulty": "recall"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The B-tree leaf yields a TID, not the row; Postgres then fetches the heap page and checks MVCC visibility. So a point query costs index levels plus one heap read, unless an index-only scan on an all-visible page skips the heap.",
-      "sourceAnchor": "6214-the-lookup-algorithm-descent-and-in-node-binary-search",
+      "sourceAnchor": "622-point-lookup-and-range-scan--core",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Each non-root node holds at least ceil(m/2) children, i.e. is at least ~half full. Without this floor, deletes could leave one-key nodes and degenerate the tree; the minimum keeps fanout at least ~m/2 and height logarithmic even after arbitrary deletions.",
-      "sourceAnchor": "6215-occupancy-invariants-the-b-tree-of-order-m",
+      "sourceAnchor": "621-the-btree-model-and-its-invariants--core",
       "difficulty": "recall"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Order m bounds children at m; minimum degree t bounds keys between t-1 and 2t-1, so m equals 2t and t equals ceil(m/2). Both parameterize the same B-tree, and interviewers may use either convention.",
-      "sourceAnchor": "6215-occupancy-invariants-the-b-tree-of-order-m",
+      "sourceAnchor": "621-the-btree-model-and-its-invariants--core",
       "difficulty": "trap"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A B+tree leaf must retain every key, so the separator inserted into the parent is a copy of the right half's first key. An internal node's median is a pure separator, so it is moved up and removed from the child.",
-      "sourceAnchor": "6216-node-splits-on-insert",
+      "sourceAnchor": "623-insertion-and-splitting--core",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A split can cascade up to the root, costing O(height) pages, and a root split adds a level. But the overwhelming majority of inserts fit in the target leaf without splitting, so amortized cost is O(1).",
-      "sourceAnchor": "6216-node-splits-on-insert",
+      "sourceAnchor": "623-insertion-and-splitting--core",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "On underflow, the classic algorithm first tries to borrow (rotate) a key from an adjacent sibling that has more than the minimum; if none does, it merges the node with a sibling and removes the parent's separator, which may underflow the parent and recurse.",
-      "sourceAnchor": "6217-node-merges-and-rebalancing-on-delete",
+      "sourceAnchor": "624-deletion-redistribution-and-merge--core",
       "difficulty": "recall"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "nbtree deliberately skips borrow and merge on normal deletes because they would require multi-page top-down locking that fights the B-link design. Underfull pages persist; only completely empty pages are unlinked and recycled by VACUUM, so bloat needs REINDEX.",
-      "sourceAnchor": "6217-node-merges-and-rebalancing-on-delete",
+      "sourceAnchor": "624-deletion-redistribution-and-merge--core",
       "difficulty": "trap"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "When splitting, nbtree stores only the shortest prefix that still separates the two halves as the pivot, so internal pages hold more separators per page. Higher internal fanout means a shallower tree for the same data.",
-      "sourceAnchor": "6218-postgresql-nbtree-internals",
+      "sourceAnchor": "629-postgresql-nbtree-a-labeled-case-study--skippable-reference",
       "difficulty": "recall"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Borrow and merge require atomically locking a node, a sibling, and the parent up the tree, exactly the contention the B-link design removes. Postgres trades the half-full guarantee for lock-light MVCC-friendly writes, accepting bloat that VACUUM and REINDEX address.",
-      "sourceAnchor": "6219-why-postgres-rarely-merges-vacuum-and-page-splits",
+      "sourceAnchor": "629-postgresql-nbtree-a-labeled-case-study--skippable-reference",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Fillfactor (default 90 for B-trees) sets how tightly leaves are packed at build/insert time. A value of 100 packs leaves fully, ideal for read-only or append-only monotonic keys where nothing will be inserted between existing entries.",
-      "sourceAnchor": "6220-fillfactor-deduplication-and-index-bloat",
+      "sourceAnchor": "629-postgresql-nbtree-a-labeled-case-study--skippable-reference",
       "difficulty": "recall"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "In a 4-level index the root and upper internals are a few megabytes and live permanently in shared_buffers, so only the leaf page and the heap page are typically physical reads. Height barely grows with data, so this holds across sizes.",
-      "sourceAnchor": "6221-practical-numbers-levels-caching-and-latency",
+      "sourceAnchor": "626-height-caching-and-the-cost-model--core",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A hash index answers equality in about O(1) but supports no ranges, ordering, or sorting. The B-tree serves equality, ranges, ORDER BY, prefixes, and uniqueness from one structure with predictable 3-5 level height and cached upper levels, so it is the sensible default.",
-      "sourceAnchor": "6222-b-tree-versus-hash-and-other-access-methods",
+      "sourceAnchor": "6211-btree-versus-other-access-methods--role-specific",
       "difficulty": "application"
     }
   ]

@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A heap node's pointers are virtual addresses that become garbage after restart or in another process. On-disk formats therefore address data by page id plus offset, use fixed-size pages, and add explicit lengths, versions, and checksums.",
-      "sourceAnchor": "631-why-databases-define-their-own-on-disk-formats",
+      "sourceAnchor": "634-explicit-encoding-not-native-layout--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because pages are a fixed size, page N begins at byte N times the page size, so the conversion is arithmetic with no lookup. That O(1) addressing is the main reason formats use fixed-size pages.",
-      "sourceAnchor": "632-page-id-and-offset-addressing",
+      "sourceAnchor": "633-files-pages-records-and-stable-ids--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Values up to 126 bytes use a 1-byte header instead of the 4-byte form, saving three bytes each. On a wide table of short text columns this materially reduces on-disk size and raises fanout.",
-      "sourceAnchor": "634-variable-size-data-and-length-prefixed-strings",
+      "sourceAnchor": "634-explicit-encoding-not-native-layout--core",
       "difficulty": "application"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The 4-byte varlena header stores the length in 30 bits, capping a single attribute at 2^30 minus 1, just under 1 GB. TOAST lets values approach that limit despite the 8 KB page by moving them out-of-line.",
-      "sourceAnchor": "634-variable-size-data-and-length-prefixed-strings",
+      "sourceAnchor": "634-explicit-encoding-not-native-layout--core",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A clear bit in the null bitmap means the column is null and occupies no data bytes at all. Because it is absent, every later column's offset shifts, so the bitmap must be consulted to locate subsequent columns.",
-      "sourceAnchor": "635-bit-packed-data-booleans-flags-and-null-bitmaps",
+      "sourceAnchor": "6310-postgresql-18-physical-format-reference--skippable",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The bitmap of one bit per column follows the fixed header only when HEAP_HASNULL is set; a row with no nulls omits it entirely and pays zero bitmap bytes.",
-      "sourceAnchor": "635-bit-packed-data-booleans-flags-and-null-bitmaps",
+      "sourceAnchor": "6310-postgresql-18-physical-format-reference--skippable",
       "difficulty": "recall"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Alignment padding is inserted before a column whose boundary is not met, exactly as in a C struct. Ordering largest-alignment-first eliminates the gaps, here shrinking the tuple data from 24 to 16 bytes.",
-      "sourceAnchor": "636-alignment-and-padding-in-on-disk-records",
+      "sourceAnchor": "634-explicit-encoding-not-native-layout--core",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Fixed-width fields have constant offsets, but once a variable field appears its width is data-dependent, so every following field's offset depends on the earlier lengths. Postgres caches offsets only up to the first variable or nullable column.",
-      "sourceAnchor": "637-separating-fixed-and-variable-parts",
+      "sourceAnchor": "635-a-slotted-page-and-its-invariants--core",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "PostgreSQL uses an 8 KB block (BLCKSZ) and InnoDB a 16 KB page by default. Page size trades B-tree fanout against bytes read per point lookup and the torn-write window.",
-      "sourceAnchor": "638-fixed-size-pages-as-the-unit-of-io",
+      "sourceAnchor": "633-files-pages-records-and-stable-ids--core",
       "difficulty": "recall"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Line pointers grow downward from just after the header while tuples pack upward from the page end, leaving a contiguous free gap between the two pointers. This lets variable-size records coexist with only internal fragmentation.",
-      "sourceAnchor": "6310-slotted-pages",
+      "sourceAnchor": "635-a-slotted-page-and-its-invariants--core",
       "difficulty": "recall"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The slot number is a stable indirection: sliding a cell during compaction updates the slot's offset while its number is unchanged, so indexes pointing at (block, slot) stay correct. A raw byte offset would require rewriting every reference on each move.",
-      "sourceAnchor": "6310-slotted-pages",
+      "sourceAnchor": "635-a-slotted-page-and-its-invariants--core",
       "difficulty": "trap"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Free space is the contiguous gap between pd_lower (the end of the slot array) and pd_upper (the start of the cell area). Inserting a tuple grows pd_lower down and pd_upper up until they meet.",
-      "sourceAnchor": "639-the-page-header",
+      "sourceAnchor": "635-a-slotted-page-and-its-invariants--core",
       "difficulty": "recall"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because the page size is always a multiple of 256, its low 8 bits are zero and hold the layout version; an 8 KB version-4 page reads 0x2004. On read Postgres validates both size and version.",
-      "sourceAnchor": "639-the-page-header",
+      "sourceAnchor": "635-a-slotted-page-and-its-invariants--core",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The 2-bit lp_flags encodes UNUSED (free), NORMAL (points at a live tuple), REDIRECT (points at another line pointer for HOT chains), and DEAD (tuple dead, space reclaimable). These states drive deletion and HOT.",
-      "sourceAnchor": "6311-the-postgresql-heap-page-in-full",
+      "sourceAnchor": "6310-postgresql-18-physical-format-reference--skippable",
       "difficulty": "recall"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Heap pages leave the special space empty, so pd_special equals the page size. B-tree pages store BTPageOpaqueData there, including the left/right sibling block numbers that thread leaves for range scans.",
-      "sourceAnchor": "6311-the-postgresql-heap-page-in-full",
+      "sourceAnchor": "6310-postgresql-18-physical-format-reference--skippable",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "t_xmin and t_xmax record the transactions that inserted and deleted a version; an update stamps the old xmax and writes a new tuple whose predecessor's t_ctid points forward. Both versions coexist until VACUUM reclaims the dead one.",
-      "sourceAnchor": "6312-the-heap-tuple-header",
+      "sourceAnchor": "6310-postgresql-18-physical-format-reference--skippable",
       "difficulty": "recall"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Each row costs a 4-byte line pointer plus a 23-byte header MAXALIGN'd up to 24, about 28 bytes total. This dominates very narrow rows and caps tuples per 8 KB page near 291.",
-      "sourceAnchor": "6312-the-heap-tuple-header",
+      "sourceAnchor": "6310-postgresql-18-physical-format-reference--skippable",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Key cells carry only routing information (a separator key plus a child pointer) in internal nodes, while key-value cells carry the actual payload (a row or TID) in leaves. The same slotted-page container holds both, which is why the levels share a format.",
-      "sourceAnchor": "6313-cell-layout-key-cells-and-key-value-cells",
+      "sourceAnchor": "635-a-slotted-page-and-its-invariants--core",
       "difficulty": "recall"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Slotted-page fragmentation is always internal to a page: the holes left by deleted cells are reclaimable by sliding live cells together. It never becomes the un-coalescable external fragmentation of a general heap allocator.",
-      "sourceAnchor": "6314-deletion-fragmentation-and-free-space",
+      "sourceAnchor": "635-a-slotted-page-and-its-invariants--core",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Sliding live cells together updates only the offset stored inside each slot; the slot number that indexes and sibling links hold is unchanged. Without the slot layer, compaction would have to find and rewrite every reference into the page.",
-      "sourceAnchor": "6315-defragmentation-and-compaction",
+      "sourceAnchor": "635-a-slotted-page-and-its-invariants--core",
       "difficulty": "trap"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "When a tuple exceeds about 2 KB, TOAST compresses toastable columns and, if still too large, writes the value as chunks in pg_toast.pg_toast_<oid>, replacing the column with an 18-byte pointer. This keeps the visible row small while allowing ~1 GB values.",
-      "sourceAnchor": "6316-toast-oversized-attribute-storage",
+      "sourceAnchor": "6310-postgresql-18-physical-format-reference--skippable",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "EXTENDED, the default, first compresses a value and moves it out-of-line only if it still does not fit. PLAIN forbids both, EXTERNAL skips compression for fast substring access, and MAIN prefers keeping the compressed value inline.",
-      "sourceAnchor": "6316-toast-oversized-attribute-storage",
+      "sourceAnchor": "6310-postgresql-18-physical-format-reference--skippable",
       "difficulty": "recall"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A magic like SQLite's \"SQLite format 3\\0\" or Parquet's \"PAR1\" lets a reader instantly confirm the format and reject foreign files. Combined with a version number, it gates parsing and enables backward compatibility.",
-      "sourceAnchor": "6317-versioning-and-magic-numbers",
+      "sourceAnchor": "638-versioning-migration-and-validation--core",
       "difficulty": "recall"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A checksum is detection only: it flags a torn or bit-rotted page on read but cannot reconstruct it. Recovering a torn page requires full-page writes in the WAL, which overwrite the page with a known-good image during replay.",
-      "sourceAnchor": "6318-page-checksums",
+      "sourceAnchor": "637-checksums-torn-writes-and-recovery--core",
       "difficulty": "trap"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The FNV-1a-based checksum mixes in the block number, so a page written to the wrong location fails verification even if its bytes are internally consistent. It cannot catch in-memory corruption, which occurs before the checksum is stamped.",
-      "sourceAnchor": "6318-page-checksums",
+      "sourceAnchor": "637-checksums-torn-writes-and-recovery--core",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An 8 KB page covers 2 to 16 sectors, but hardware atomicity is only per sector, so a crash mid-write leaves some sectors new and some old. The resulting self-inconsistent page is what full-page writes exist to recover.",
-      "sourceAnchor": "6319-the-torn-page-problem-and-full-page-writes",
+      "sourceAnchor": "637-checksums-torn-writes-and-recovery--core",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With full_page_writes on, the first modification of a page after a checkpoint stores a full image (an FPI) in the WAL. On recovery, replaying the FPI overwrites the torn on-disk page with a consistent image, after which later deltas apply safely.",
-      "sourceAnchor": "6319-the-torn-page-problem-and-full-page-writes",
+      "sourceAnchor": "637-checksums-torn-writes-and-recovery--core",
       "difficulty": "recall"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "InnoDB writes each page twice, first to a doublewrite area and then to its home location, so a torn final page can be restored from the intact doublewrite copy on recovery. It achieves the same guarantee as full-page writes via a dedicated region rather than the WAL.",
-      "sourceAnchor": "6320-other-formats-sqlite-innodb-and-parquet",
+      "sourceAnchor": "6310-postgresql-18-physical-format-reference--skippable",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "SQLite's fixed big-endian integers and defined record encoding make its file identical on any machine, a stated design goal. Postgres writes host-native byte order and its varlena header bit-tests depend on endianness, so files cannot move between differing architectures.",
-      "sourceAnchor": "6320-other-formats-sqlite-innodb-and-parquet",
+      "sourceAnchor": "6310-postgresql-18-physical-format-reference--skippable",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Prefix-truncated separators, short varlena headers, tight null bitmaps, and good column ordering all pack more cells per page, raising fanout and lowering tree height. That reduces the number of page reads for a point lookup.",
-      "sourceAnchor": "6321-endianness-alignment-cost-fanout-and-space",
+      "sourceAnchor": "634-explicit-encoding-not-native-layout--core",
       "difficulty": "application"
     }
   ]

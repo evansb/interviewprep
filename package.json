@@ -17,6 +17,7 @@
   "dependencies": {
     "@astrojs/starlight": "latest",
     "astro": "latest",
+    "github-slugger": "2.0.0",
     "sharp": "latest"
   },
   "devDependencies": {

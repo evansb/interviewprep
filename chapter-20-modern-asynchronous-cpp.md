@@ -1,365 +1,1002 @@
 # Chapter 20 — Modern Asynchronous C++
 
-*Interview-focused revision notes. The theme: the standard library's asynchrony story is three generations deep — `future`/`promise` (allocating, blocking, un-composable), senders/receivers (structured, allocation-free, composable), and coroutines gluing them to the kernel's async I/O. Knowing why each generation exists is the interview.*
+Asynchronous code separates starting an operation from observing its completion. Correctness depends on four contracts: who owns the operation state, how completion communicates a value/error/cancellation, where continuation code runs, and when every referenced object may be destroyed.
+
+This chapter uses standard C++23. Futures, promises, packaged tasks, `std::async`, stop tokens, and `std::jthread` are standard. C++23 has no standard executor, scheduler, sender/receiver library, event loop, or asynchronous socket API; those sections explain transferable models and label framework pseudocode explicitly. Chapter 19 owns coroutine language mechanics. Chapter 24 owns mutexes, condition variables, blocking waits, and worker-pool synchronization.
 
 ---
 
-## 20.1 Futures and Promises
+## Why this matters — Core
 
-A **future** is a handle to a value that does not exist yet; a **promise** is the write end that will eventually supply it. Together they form a one-shot, thread-safe, single-producer/single-consumer channel carrying either a value or an exception.
+“Asynchronous” does not mean parallel, non-blocking, or low latency. Deferred work may execute synchronously in the waiter. A future may block its caller. A coroutine suspends only if its awaiter says so. An event loop can resume a continuation inline and let one long handler delay every operation behind it.
 
-```cpp
-std::promise<int> p;
-std::future<int> f = p.get_future();          // exactly once per promise
-std::thread t([&p]{ p.set_value(compute()); });
-int v = f.get();                              // blocks until ready; RETHROWS if set_exception
-t.join();
-```
-
-### The shared state
-
-The mechanism is a heap-allocated **shared state** holding: the value or `exception_ptr`, a ready flag, a mutex and condition variable, and a reference count (the promise and the future each hold one). This structure is the source of every criticism of the design:
-
-- **One allocation per operation.** `std::promise`'s constructor allocates; there is no allocator support that any implementation honours meaningfully (the allocator-taking constructors were removed in C++17).
-- **Synchronization on every access.** `get()`/`wait()` take a lock and wait on a condvar — a futex round trip and a park/unpark (Ch. 24 §24.16) when the value is not ready, ~1–5 µs. Even the ready case pays an atomic and a lock.
-- **`get()` blocks.** There is no way to attach a continuation. `then`, `when_all`, `when_any` were specified in the Concurrency TS and never merged; that gap is what senders/receivers (§20.5) exist to fill.
-
-### Semantics worth knowing precisely
-
-- `future::get()` is **one-shot** and *moves* the value out; calling it twice throws `std::future_error(future_already_retrieved)`. `std::shared_future` allows multiple retrievals and copies, returning `const T&`.
-- **Destroying a `promise` without setting it** stores a `broken_promise` exception, so the waiting `get()` throws rather than hanging. This is the correct design and worth citing.
-- `wait_for`/`wait_until` return `future_status::{ready, timeout, deferred}`. `deferred` only ever appears for `std::async(launch::deferred)` (§20.3) and is a classic quiz item: a deferred future's `wait_for(0s)` returns `deferred` immediately and *never* becomes ready without a `get()`.
-- `set_value` and `set_exception` may be called only once; a second call throws `promise_already_satisfied`. `set_value_at_thread_exit` defers the release until TLS destructors have run — a rarely-used but correct tool when the produced value references thread-local state.
-- The `future`/`promise` pair establishes a **happens-before** edge (Ch. 25 §25.11): everything sequenced before `set_value` is visible after `get()` returns.
-
-### When to use it
-
-| Use | Avoid |
-|---|---|
-| One-shot handoff between threads at a low rate (startup, shutdown, RPC-like request) | Anything on a hot path — the allocation plus futex cost dwarfs the work |
-| Propagating an exception across a thread boundary | Streams of events — futures are single-shot; use a queue (Ch. 26) |
-| Simple fan-in with a small fixed number of results | Composition/continuation — the standard `future` has none |
-
-Low-latency practice: replace with a preallocated slot plus an atomic flag and, if a wait is genuinely needed, `std::atomic<T>::wait`/`notify_one` (C++20) — which is futex-backed but with no allocation and no mutex — or a spin-then-park (Ch. 24 §24.15). Folly's `Future`/`SemiFuture` and Seastar's `future` are the production alternatives that add continuations and, in Seastar's case, allocation-free chaining on a thread-per-core reactor.
+The most damaging failures are lifetime failures: a callback captures a dead object, a promise disappears without producing a value, cancellation destroys a coroutine frame while the kernel still owns its buffer, or shutdown stops the executor before queued completions run. The performance model follows the same flow. Each handoff can allocate state, enqueue work, wake a thread, cross into the kernel, transfer cache lines, or wait behind earlier tasks. A sound design names those boundaries and bounds the queues before trying to optimize them.
 
 ---
 
-## 20.2 Packaged Tasks
+## 90-second screen — Core
 
-`std::packaged_task<R(Args...)>` wraps a callable so that invoking it stores the result into an associated shared state instead of returning it.
+Five facts:
 
-```cpp
-std::packaged_task<int(int,int)> task([](int a, int b){ return a + b; });
-std::future<int> f = task.get_future();
-task(2, 3);                      // runs HERE, on whatever thread calls it
-assert(f.get() == 5);
+1. A `promise`/`future` pair refers to a one-shot shared state that becomes ready with a value or exception. The standard specifies behavior, not a mutex, condition variable, refcount layout, or fixed allocation count.
+2. `future::get()` waits, returns or rethrows, and invalidates that `future`. Calling it without a valid state violates a precondition. `shared_future::get()` can be called repeatedly.
+3. Destroying or otherwise releasing the last reference to a shared state created by `std::async` may wait for an unfinished associated thread. Ordinary promise- and packaged-task-created future states do not gain that special wait-on-release rule.
+4. Cancellation in standard C++ is cooperative. `request_stop()` publishes a request; the operation must poll it or register a callback and still define what happens to partial work and in-flight I/O.
+5. Blocking a thread, suspending a coroutine, and describing work are different. A future wait blocks; `co_await` may suspend; a sender-like description does nothing until connected and started.
+
+Two decisions:
+
+- Use futures for coarse, one-shot result transfer when blocking retrieval and weak composition are acceptable. Use a callback/reactor or coroutine framework when many operations must wait without dedicating one thread each.
+- Before permitting cancellation or timeout, choose an ownership protocol: exactly one terminal completion, no use after cancellation, and no destruction until the external operation has either completed or acknowledged cancellation.
+
+---
+
+## 20.1 Synchronous, concurrent, and asynchronous execution — Core
+
+A synchronous function completes before returning:
+
+```text
+caller ── call ──► operation ── value/error ──► caller continues
 ```
 
-It is precisely `promise` + callable, with the exception plumbing done for you: if the callable throws, the exception is captured into the shared state via `set_exception`. That is its whole value proposition — it is the adapter between "a thing to run" and "a thing to wait on".
+An asynchronous initiation function returns before the operation completes:
 
-### The canonical use — a thread pool
+```text
+caller ── start ──► operation state ── submit ──► execution context / OS
+   │                                                        │
+   └── continues or waits ◄── completion queue ◄── result ──┘
+```
+
+Concurrency means lifetimes overlap. Parallelism means work actually executes at the same time on different processing resources. An asynchronous operation can have neither: `std::launch::deferred` starts only when a waiter forces it, on that waiting thread.
+
+| Model | Caller after initiation | Where work runs | Typical use | Main failure |
+|---|---|---|---|---|
+| Direct call | Continues after result | Calling thread | Short local computation | Caller latency includes all work |
+| Future + worker | May block later | Worker chosen separately | Coarse one-shot task | Shared-state and wait lifetime |
+| Callback event loop | Returns to loop | Loop or worker context | Many I/O operations | Callback lifetime/reentrancy |
+| Coroutine I/O | Returns when suspended | Resumption context chosen by awaiter/framework | Blocking-shaped async flow | Frame and in-flight operation lifetime |
+| Sender-like description | Nothing until started | Scheduler/execution context in composition | Structured async composition | Operation-state ownership and completion contract |
+
+### The three verbs
+
+Keep these distinct:
+
+- **Block:** the current thread cannot do useful work until a condition changes. `future::get`, `future::wait`, and `jthread::join` can block.
+- **Suspend:** a coroutine saves enough state to continue later and returns control to its caller/executor. Suspension is governed by the awaiter and is not guaranteed at every `co_await`.
+- **Describe:** a lazy operation graph records what should happen. No resource is committed until the graph is started, unless a particular framework says otherwise.
+
+There is also **polling**: repeatedly check readiness while retaining the thread. Busy polling trades a core and memory traffic for avoiding a park/wake transition. Periodic polling adds detection delay. Chapter 24 owns the spin-versus-park mechanics.
+
+### Completion is a protocol
+
+Every asynchronous API needs answers to:
+
+1. What owns the operation state?
+2. How many terminal completions are permitted?
+3. Can initiation complete inline before it returns?
+4. On which execution context does the callback/continuation run?
+5. What happens when the operation is cancelled?
+6. How are overload and queue saturation reported?
+7. Which objects must remain alive through completion?
+
+An API that says only “calls you later” is incomplete. “Later” might be inline due to cached data, on a worker, on a reactor, or never if shutdown discards the queue.
+
+---
+
+## 20.2 Tasks, shared state, and result channels — Core
+
+A **task** is a unit of work plus a completion contract. The completion can carry:
+
+- a value, possibly no value for `void`;
+- an error, commonly an `exception_ptr` or error value;
+- cancellation/stopped as a distinct outcome or a designated error.
+
+Standard futures use a shared state with value-or-exception readiness. They do not have a distinct cancelled result. A library may represent cancellation by an exception, error code, or separate channel.
+
+```text
+producer handle                 shared state                 consumer handle
+promise / packaged_task ─────► [not ready]
+                                  │
+                     set_value ───┤──► [value, ready] ─────► future::get
+                 set_exception ───┤──► [exception, ready] ─► future::get rethrows
+                  producer dies ──┘──► [broken_promise] ───► future::get rethrows
+```
+
+The state has a lifetime independent of either handle. A producer may die while a consumer remains; the broken-promise rule makes that abandonment observable. A future may be moved to another scope while the state remains alive.
+
+### Standard guarantee versus implementation
+
+| Property | C++23 guarantee | Common but not guaranteed |
+|---|---|---|
+| One state holds readiness and value/exception | Yes | Exact object layout |
+| Producer and waiter can synchronize through readiness | Yes | Mutex + condition variable |
+| `promise` supports uses-allocator construction | Yes | One heap allocation |
+| `packaged_task` owns a callable and state association | Yes | Separate allocation for each |
+| Waiting may block | Yes | Particular OS primitive such as futex |
+
+The allocator-aware `promise` constructors allow the shared-state allocation strategy to use a supplied allocator. `std::packaged_task` allocator support was removed in C++17 and is absent in C++23. None of this gives a portable allocation count: an implementation can combine or split internal state, and a supplied allocator can itself choose any storage strategy.
 
 ```cpp
-template <class F>
-auto ThreadPool::submit(F&& f) -> std::future<std::invoke_result_t<F>> {
-    using R = std::invoke_result_t<F>;
-    auto task = std::make_shared<std::packaged_task<R()>>(std::forward<F>(f));
-    auto fut  = task->get_future();
-    queue_.push([task]{ (*task)(); });    // std::function needs a COPYABLE callable
-    return fut;
+#include <cassert>
+#include <future>
+#include <memory>
+
+int main() {
+    std::promise<int> promise{
+        std::allocator_arg, std::allocator<int>{}
+    };
+    auto future = promise.get_future();
+    promise.set_value(42);
+    assert(future.get() == 42);
 }
 ```
 
-The `shared_ptr` in that snippet is the detail interviewers look for: `packaged_task` is **move-only**, and pre-C++23 `std::function` requires a copy-constructible target, so the task must be wrapped to be storable in a `std::function`-based queue. C++23's **`std::move_only_function`** removes the need (and `std::copyable_function`, C++26, is the copyable counterpart with fixed const-correctness). Using `std::move_only_function<void()>` in the queue eliminates one `shared_ptr` allocation and one atomic refcount pair per task.
+For latency reasoning, instrument the actual implementation. Typical costs include state allocation, atomic/reference-state traffic, a producer-to-consumer cache transfer, and a park/wake if the consumer waits. A ready result can avoid parking but still pays state access and indirection.
 
-### Cost accounting for that submit path
+---
 
-Per submitted task, the naive implementation pays: one `make_shared` (control block + task), one shared-state allocation inside `packaged_task`, one lambda-to-`std::function` allocation if the closure exceeds the SOO buffer (Ch. 18 §18.10), a mutex acquisition on the queue, and a condvar notify — easily 200–500 ns before any work happens, plus the wakeup latency of the worker. That is why HFT thread pools do not look like this: they use a bounded lock-free MPMC ring (Ch. 26 §26.5) of fixed-size POD task descriptors, workers busy-poll on isolated cores, and results are written into caller-owned preallocated slots. `packaged_task` is a correctness convenience, not a latency tool.
+## 20.3 Futures and promises — Core
 
-| | `packaged_task` | `promise` directly | `move_only_function` + manual slot |
+`std::promise<T>` is the producer handle; `std::future<T>` is the one-consumer handle:
+
+```cpp
+#include <cassert>
+#include <future>
+#include <thread>
+
+int main() {
+    std::promise<int> promise;
+    std::future<int> future = promise.get_future();
+
+    std::thread producer{[p = std::move(promise)]() mutable {
+        p.set_value(42);
+    }};
+
+    assert(future.get() == 42);
+    assert(!future.valid());
+    producer.join();
+}
+```
+
+The synchronization associated with making the state ready and successfully waiting for it makes producer-side effects sequenced before readiness visible after the wait. Chapter 25 owns the happens-before derivation.
+
+### Retrieval and validity
+
+`future::valid()` reports whether the handle refers to a shared state. These operations require a valid state:
+
+- `get()` waits if necessary, returns/moves the value or rethrows the stored exception, then releases the future's state;
+- `wait()` blocks until ready;
+- `wait_for(duration)` and `wait_until(time_point)` return a readiness status.
+
+Calling `get()` a second time violates the `valid()` precondition. The standard does not require a `future_error` diagnostic for that misuse, though an implementation may provide one. This differs from `promise::get_future()` called twice: that operation is specified to throw `future_error` with `future_errc::future_already_retrieved`.
+
+`std::shared_future<T>` is copyable and permits multiple `get()` calls. For non-reference `T`, `get()` returns `const T&`; consumers must not use that reference after the shared state dies. Sharing a future enables multiple readers but adds shared ownership and does not make the referred-to `T` safe for mutation.
+
+### Waiting, polling, and deferred status
+
+`wait_for`/`wait_until` can report:
+
+- `ready`: a value or exception is stored;
+- `timeout`: the deadline elapsed before readiness;
+- `deferred`: the state represents deferred `std::async` work that has not been forced.
+
+A zero-duration wait is a poll. Polling in a tight loop consumes execution capacity and repeatedly touches shared state. Sleeping between polls reduces traffic but adds detection latency. A blocking wait yields execution to the implementation/OS but pays wake-up and scheduling delay. Choose from the latency budget and core-ownership model; do not infer a universal winner.
+
+Deferred status requires special handling. Repeated `wait_for(0s)` does not start deferred work. Call `get()` or `wait()` to execute it on the calling thread, or avoid a deferred launch policy when polling semantics are required.
+
+### Errors and abandonment
+
+```cpp
+#include <cassert>
+#include <future>
+#include <system_error>
+
+int main() {
+    std::future<int> future;
+    {
+        std::promise<int> promise;
+        future = promise.get_future();
+    } // promise abandoned its state
+
+    try {
+        (void)future.get();
+        assert(false);
+    } catch (const std::future_error& error) {
+        assert(error.code() ==
+               std::make_error_code(
+                   std::future_errc::broken_promise));
+    }
+}
+```
+
+Destroying a promise before satisfying its state stores a broken-promise exception and makes the state ready. This prevents an otherwise permanent wait.
+
+Other one-shot errors are distinct:
+
+| Misuse/event | Specified result |
+|---|---|
+| `promise::get_future()` twice | `future_already_retrieved` |
+| `promise::set_value` or `set_exception` after satisfaction | `promise_already_satisfied` |
+| Producer promise abandoned before readiness | Consumer receives `broken_promise` |
+| `future` operation requiring a state when `valid()==false` | Preconditions violated; some operations specify/encourage diagnostics, but do not rely on one for second `get()` |
+| Task callable throws through packaged task or async | Exception stored and rethrown by `get()` |
+
+`set_value_at_thread_exit` and `set_exception_at_thread_exit` store the result but make the state ready only when the producing thread exits. They are specialized lifetime tools, not lower-latency variants.
+
+### Shared ownership does not mean shared mutation
+
+Converting with `future.share()` transfers the state into a `shared_future`; the original future becomes invalid. Copies of the shared future can wait independently and repeatedly observe the same result. This is useful for a startup value consumed by several threads:
+
+```cpp
+#include <cassert>
+#include <future>
+
+int main() {
+    std::promise<int> promise;
+    std::shared_future<int> shared =
+        promise.get_future().share();
+    std::shared_future<int> second = shared;
+
+    promise.set_value(42);
+    assert(shared.get() == 42);
+    assert(second.get() == 42);
+    assert(shared.get() == 42); // repeatable
+}
+```
+
+For `shared_future<T>`, repeated `get()` returns a reference to the stored value (except for `void` and reference-specialized details). The shared state keeps that value alive, but it does not serialize writes through a mutable object reachable from `T`. Publish immutable results or provide separate synchronization for mutable state.
+
+The same distinction applies to exceptions. Every observer rethrows the stored exception from its own `get()`. Catching in one consumer does not consume it for the others.
+
+Moving handles also matters during shutdown. A moved-from promise or future has no state; destruction of that empty handle does not abandon the state. The handle that received the move now owns the corresponding producer or consumer responsibility. Review moves as ownership transfers, not as copies of a channel endpoint.
+
+### When futures fit
+
+Futures fit coarse one-shot handoffs, startup work, and exception transport where a blocking collection point is natural. They fit streams poorly: a state is one-shot, standard `future` has no continuation API, and repeated task submission typically repeats state management and queueing.
+
+For a high-rate path, compare against a bounded, preallocated queue or result slot owned by the participating threads. Chapter 26 owns non-blocking queue protocols; Chapter 24 owns blocking worker coordination.
+
+---
+
+## 20.4 Packaged tasks — Core
+
+`std::packaged_task<R(Args...)>` associates a callable with a future shared state. Invoking the task runs the callable on the invoking thread and stores either its return value or thrown exception.
+
+```cpp
+#include <cassert>
+#include <future>
+
+int main() {
+    std::packaged_task<int(int, int)> task{
+        [](int a, int b) { return a + b; }
+    };
+    std::future<int> result = task.get_future();
+
+    task(20, 22); // synchronous invocation here
+    assert(result.get() == 42);
+}
+```
+
+The wrapper does not schedule itself. A thread pool can enqueue the packaged task, but the pool, queue, wake-up, and shutdown policy are separate components.
+
+`packaged_task` is move-only. A queue storing `std::function<void()>` cannot directly own a move-only packaged task because `std::function` requires a copyable target. C++23 `std::move_only_function<void()>` can represent a move-only queued callable:
+
+```cpp
+#include <cassert>
+#include <deque>
+#include <future>
+#include <utility>
+
+int main() {
+    std::deque<std::packaged_task<int()>> queue;
+    queue.emplace_back([] { return 42; });
+    auto result = queue.front().get_future();
+
+    auto work = std::move(queue.front());
+    queue.pop_front();
+    work();
+    assert(result.get() == 42);
+}
+```
+
+C++23 `std::move_only_function<void()>` is another possible queue element when heterogeneous move-only callables need one erased type. It removes the need to make the callable artificially copyable through `shared_ptr`, but it does not remove the future shared state, queue node/storage, or wake-up costs. `move_only_function` itself may allocate depending on target and implementation; it has no standard small-buffer guarantee. Shipping-library support for this C++23 facility must be checked independently of compiler language mode.
+
+Calling `get_future()` more than once on one packaged task throws `future_already_retrieved`. Calling an invalid or already-invoked task without a reset throws `future_error` as specified for no state or already-satisfied state. `reset()` abandons the old state if it was not ready and gives the task a fresh state; an old consumer can then observe `broken_promise`. It does not reuse the old future.
+
+### Submission-path accounting
+
+A packaged-task worker design may include:
+
+```text
+submitter
+  ├─ construct callable
+  ├─ create shared result state
+  ├─ allocate/reserve queue storage
+  ├─ publish queue entry (cache-line transfer)
+  └─ notify/doorbell worker
+worker
+  ├─ wait or poll
+  ├─ dequeue
+  ├─ invoke callable
+  └─ publish result / wake waiter
+```
+
+No standard facility bounds that queue. A latency-sensitive pool needs an overload policy: reject, block submitter, drop, or apply backpressure upstream. Unbounded queues convert overload into growing queueing delay and memory consumption.
+
+---
+
+## 20.5 `std::async` and launch policies — Core
+
+`std::async` combines callable storage, a shared state, and an implementation-selected execution mechanism:
+
+```cpp
+#include <future>
+
+int compute();
+
+std::future<int> result =
+    std::async(std::launch::async, compute);
+```
+
+| Policy | C++23 semantics | Consequence |
+|---|---|---|
+| `launch::async` | Invokes on a new thread of execution | Eager concurrency; resource acquisition can fail |
+| `launch::deferred` | Stores work until a non-timed wait/get forces it on that caller thread | No concurrency unless caller creates it elsewhere |
+| Default policy | Permits implementation to select async or deferred | Timing and resource behavior are not fixed |
+
+Specify a policy when correctness, progress, or latency depends on it. The default can be reasonable only when either permitted behavior is acceptable.
+
+The function and arguments are materialized into owned state according to the C++23 `async` rules. Use `std::ref`/`std::cref` to request reference semantics, and then prove the referred object outlives execution—including deferred execution that may happen much later.
+
+### The last-release wait
+
+A precise model is:
+
+- an invocation using the async policy has an associated thread;
+- completion of that thread synchronizes with the first successful wait on the shared state or with the last function that releases the shared state, whichever occurs first;
+- therefore releasing the last reference to an unfinished async-created state may wait for the associated thread.
+
+The destructor of a temporary future is the common trap:
+
+```cpp
+#include <chrono>
+#include <future>
+#include <thread>
+
+void work() {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+}
+
+int main() {
+    static_cast<void>(std::async(std::launch::async, work));
+    // The temporary future is the last owner at the semicolon, so this
+    // statement does not finish until the associated work is complete.
+}
+```
+
+Do not universalize this into “every future destructor blocks.” States produced by a promise or packaged task have no async-associated-thread last-release rule. A deferred task has no running associated thread to join. A ready async task needs no remaining wait. A state converted to `shared_future` can have several owners, so the relevant event is release of the last reference, not the spelling of one particular destructor.
+
+This rule also defeats a naive timeout-and-abandon design:
+
+```cpp
+auto future = std::async(std::launch::async, slow_operation);
+if (future.wait_for(deadline) == std::future_status::timeout) {
+    return; // destruction may now wait for slow_operation anyway
+}
+```
+
+`std::async` offers no cancellation handle. If bounded shutdown is a requirement, design the operation around `jthread`/stop tokens, an explicit executor task with owned state, or an I/O API that supports cancellation. A timed wait alone does not bound destruction.
+
+### Exceptions and resources
+
+An exception escaping the callable is stored in the shared state and rethrown by `get()`. If an async-only launch cannot start the new thread, `async` can throw `std::system_error` with the specified resource-unavailable condition. With both async and deferred permitted, the implementation has more freedom.
+
+No pool, affinity, queue, or thread reuse is mandated. A common implementation creates a thread for async launch, but that is not a portable scheduling contract. Measure thread creation, stack/TLS setup, queueing, and interference on the deployment library.
+
+Use `async` for a small number of coarse independent tasks when its lifetime semantics are acceptable. It is a poor substrate for high-rate task submission, continuation graphs, bounded queues, or cooperative cancellation.
+
+---
+
+## 20.6 Callbacks, event loops, and continuations — Core
+
+A callback API stores a callable and invokes it when an operation reaches a terminal state:
+
+```cpp
+// Framework-neutral shape, not a standard C++ async API.
+async_read(socket, buffer,
+           [state](error_code error, std::size_t bytes) {
+               state->on_read(error, bytes);
+           });
+```
+
+C++23 supplies the language and callable wrappers, but not `async_read` or an event loop. The framework contract must say whether the callback can run inline, which thread/context invokes it, and whether it is invoked exactly once.
+
+### Lifetime first
+
+A callback stored beyond the initiating call must not capture automatic variables by reference unless another invariant keeps them alive. Common ownership choices are:
+
+- move values into the callback;
+- retain shared state with `shared_ptr`, accepting allocation/refcount traffic and possible cycles;
+- store operation records in a context-owned pool and identify them with stable handles;
+- use structured parent-child ownership that destroys children only after completion.
+
+Capturing `this` does not extend the object's lifetime. Capturing a `shared_ptr<this>` does, but a callback stored by the same object can form a cycle. Chapter 18 owns capture mechanics; Chapter 9 owns ownership handles.
+
+### Inline completion and reentrancy
+
+An operation may already be complete when initiated. If the API invokes the callback inline, user code can reenter before the initiating function restores its invariants:
+
+```text
+object::start()
+  ├─ sets state = starting
+  ├─ async_op(callback)
+  │    └─ callback runs inline → object::on_complete()
+  └─ sets state = pending       ← overwrites completed state
+```
+
+Either the API guarantees deferred delivery, or the caller must establish a callback-safe state before initiation. A “never inline” guarantee costs at least an enqueue/context turn even for immediately available results. That is a semantic/latency trade-off, not merely style.
+
+### Event-loop queueing
+
+An event loop typically:
+
+1. accepts operation submissions;
+2. waits for I/O/timers or polls them;
+3. enqueues completions;
+4. invokes callbacks/continuations.
+
+If callbacks run inline on the loop thread, they must complete within the loop's service budget. One long callback creates head-of-line blocking: later ready operations wait in the completion queue. Offloading work to workers adds another queue, wake-up, cache transfer, and return path.
+
+Track queue depth, age of oldest item, handler duration, overload drops/rejections, and wakeups. Average handler duration is insufficient when one outlier delays all peers.
+
+### Continuations and composition
+
+A continuation says “after A completes, start B using A's result.” Standard `future` in C++23 has no `.then`, `when_all`, or `when_any`. Composition therefore requires explicit callbacks, blocking waits, coroutines supplied by a framework, or a nonstandard sender/task library.
+
+Callback nesting can be flattened by named state-machine steps. The essential invariant is exactly one transition from pending to one terminal channel:
+
+```text
+pending ── success ──► value
+   ├────── failure ──► error
+   └── cancellation ─► stopped
+
+No terminal state may transition again.
+```
+
+Cancellation racing with normal completion must arbitrate this transition. The loser still may need to release kernel or queue resources, but must not invoke user completion twice.
+
+### Worked completion race
+
+Suppose a timer expires while a socket read becomes ready:
+
+```text
+reactor thread                         timeout thread
+read completion dequeued              request cancellation
+        │                                      │
+        ├── tries pending → value              ├── tries pending → stopped
+        │                                      │
+        └── exactly one transition succeeds ───┘
+
+after user delivery:
+  drain/cancel any remaining external record
+  release buffer and operation state only when no external reference remains
+```
+
+Exactly-once delivery and safe reclamation are separate. A state flag can decide which user outcome wins, but the losing kernel completion may still carry an operation pointer. Reusing that slot immediately creates an ABA-like stale-completion bug: an old event can be mistaken for a new operation. A reactor may use generations, reference ownership, or a quarantine/drain phase; the chosen mechanism must match the external API.
+
+The winner should usually enqueue or invoke one terminal continuation. It must not run both an error callback and a cancellation callback for the same logical operation. Metrics can still record the losing race, such as “timeout requested but operation completed first,” without producing a second user completion.
+
+---
+
+## 20.7 Cooperative cancellation — Core
+
+Standard C++ does not provide safe preemptive thread termination. `std::stop_source`, `std::stop_token`, and `std::stop_callback` provide a shared cooperative request:
+
+```cpp
+#include <atomic>
+#include <cassert>
+#include <stop_token>
+
+int main() {
+    std::stop_source source;
+    std::stop_token token = source.get_token();
+    std::atomic<int> callbacks{0};
+
+    std::stop_callback callback{
+        token, [&] { callbacks.fetch_add(1); }
+    };
+
+    assert(source.request_stop());
+    assert(token.stop_requested());
+    assert(callbacks.load() == 1);
+    assert(!source.request_stop()); // already requested
+}
+```
+
+The standard specifies observable synchronization and callback behavior, not a public memory order or internal reference-count representation.
+
+`request_stop()` succeeds only for the first effective request and invokes registered callbacks synchronously as part of the request. If a callback is registered after stop was already requested, construction invokes it before registration completes. A stop callback should therefore be short and safe on whichever thread requests stop. It must not let an exception escape: `request_stop()` is `noexcept`, so an escaping callback exception terminates the process.
+
+Polling `stop_requested()` works for loops with natural checkpoints. A blocked operation needs a wake/cancel bridge: a stop callback can notify a condition variable, signal an event-loop wakeup, or call a framework cancellation function. Notification alone is not the predicate; Chapter 24 covers stop-aware condition-variable waiting.
+
+### `jthread` lifetime
+
+`std::jthread` joins in its destructor. If joinable, its destructor first requests stop and then joins:
+
+```cpp
+#include <atomic>
+#include <thread>
+
+int main() {
+    std::atomic<int> iterations{0};
+
+    {
+        std::jthread worker{
+            [&](std::stop_token stop) {
+                while (!stop.stop_requested()) {
+                    ++iterations;
+                    std::this_thread::yield();
+                }
+            }
+        };
+    } // request_stop, then join
+}
+```
+
+The join is still an unbounded blocking operation unless the worker is guaranteed to reach a cancellation point. A worker stuck in an uninterruptible external call can make `jthread` destruction hang. RAII prevents accidental detach/terminate; it does not prove prompt shutdown.
+
+### Cancellation is not rollback
+
+A stop request does not undo partial effects. Each operation needs a cancellation boundary:
+
+- before publication, temporary state can often be discarded;
+- after publishing an order/message, cancellation may require compensating action;
+- during a file write, abandoning can leave a partial durable record;
+- during I/O, the kernel may complete successfully while cancellation is being submitted.
+
+Define whether cancellation means “do not start,” “best effort to interrupt,” or “suppress user delivery after completion.” These are different contracts.
+
+### Shutdown order
+
+A robust execution context normally shuts down in this order:
+
+1. stop accepting new work;
+2. request cancellation of owned operations;
+3. keep the execution context alive;
+4. drain normal and cancellation completions;
+5. destroy operation/coroutine state only after external references are gone;
+6. stop and join execution threads.
+
+Stopping the loop before draining cancellation acknowledgements strands state that only the loop can release.
+
+---
+
+## 20.8 Execution contexts, schedulers, and backpressure — Core
+
+An **execution context** owns resources that make progress: threads, an event loop, a timer structure, I/O registrations, and work queues. A **scheduler** is a handle or policy used to place work on a context. C++23 does not standardize a general scheduler/executor API, so exact vocabulary varies across libraries.
+
+The placement question changes correctness:
+
+- Does a continuation run inline on the completing thread?
+- Is it queued onto a specific context?
+- Can it migrate between threads?
+- Does per-connection state require serialization?
+- What happens after the context begins shutdown?
+
+It also changes latency:
+
+```text
+producer
+  │ enqueue + publish
+  ▼
+ready queue ── queue wait ──► worker wake/dequeue
+                                  │
+                                  ▼
+                              user work
+                                  │
+                                  ▼
+                           completion enqueue
+```
+
+End-to-end latency includes service time plus queueing at every stage. Adding workers can improve throughput while worsening cache locality and tail latency. A single-threaded reactor avoids data races for reactor-owned state but can suffer head-of-line blocking. Per-core contexts improve locality but require explicit cross-core routing and ownership.
+
+### A compositional latency budget
+
+For one submitted operation, reason in stages:
+
+```text
+Ttotal =
+    Tstate/setup
+  + Tsubmission_queue
+  + Twake_or_poll
+  + Tservice
+  + Texternal_wait
+  + Tcompletion_queue
+  + Tcontinuation
+```
+
+This is an accounting identity, not a prediction that the terms are independent. Queueing grows with burst load; waking changes cache residency; external completions may arrive in batches; a continuation may enqueue more work. Measure timestamps at boundaries using a clock and instrumentation appropriate to the deployment, while accounting for the instrumentation overhead.
+
+For an operation already ready in cache, queueing it to preserve non-reentrancy can dominate useful work. For a network operation, external wait may dominate typical latency while queue backlog dominates the tail during bursts. Optimizing `Tservice` alone cannot repair an overloaded completion queue.
+
+Batching also cuts two ways. Processing several submissions or completions per loop turn amortizes doorbells/system calls and improves throughput. A large batch lets the first context monopolize the loop and increases wait time for other queues. Set a service quota or time budget, then verify fairness and tail behavior under asymmetric load.
+
+### Backpressure is part of the API
+
+When a queue is full, choose:
+
+- reject and return an error;
+- block the producer;
+- drop according to a documented policy;
+- coalesce replaceable work;
+- propagate demand upstream.
+
+An unbounded queue is not “no policy”; it is a policy that spends memory and latency until failure. Size a bounded queue from burst assumptions, service capacity, and recovery behavior, then measure occupancy and item age.
+
+### Primitive decision table
+
+| Need | Facility/model | Blocks, suspends, or describes | Important boundary |
 |---|---|---|---|
-| Allocation | Shared state (+ wrapper) | Shared state | Optional/none |
-| Exception capture | Automatic | Manual `set_exception` | Manual |
-| Where it runs | Wherever it is invoked | Wherever you call `set_value` | Wherever invoked |
-| Composability | None | None | Yours to define |
+| One result/exception | `promise` + `future` | Wait blocks | One-shot shared state |
+| Callable producing a future | `packaged_task` | Invocation runs on caller/worker; retrieval blocks | Scheduling external |
+| Coarse independent work | `async(launch::async, ...)` | Retrieval/last release may block | No cancellation/context control |
+| Cooperative thread shutdown | `stop_token` + `jthread` | Request does not block; join does | Worker must reach stop point |
+| Many I/O waits | Callback reactor | Callback delivery | Owner/context must survive |
+| Blocking-shaped async I/O | Framework coroutine task | Coroutine may suspend | Frame survives external operation |
+| Lazy composed work | Non-C++23 sender model | Describes until started | Operation state survives completion |
+| Repeated hot-path handoff | Bounded queue/slot | Policy-dependent | Capacity and ownership explicit |
 
-Two further specifics: `packaged_task::reset()` creates a *fresh* shared state so the task can be run again (the old future is not reused), and `make_ready_at_thread_exit` mirrors `set_value_at_thread_exit`. Also note `packaged_task<void()>` is legal and common.
-
----
-
-## 20.3 `std::async`
-
-`std::async` runs a callable and returns a `std::future` for its result. It is the highest-level facility and the one with the most sharp edges.
-
-```cpp
-auto f = std::async(std::launch::async, work, arg);   // ALWAYS specify the policy
-```
-
-### The launch policies
-
-| Policy | Behavior |
-|---|---|
-| `launch::async` | **Must** run on a new thread of execution, starting eagerly. |
-| `launch::deferred` | Lazy: nothing runs until `get()`/`wait()`, and then it runs **on the calling thread**. |
-| Default (`async \| deferred`) | Implementation chooses — and may choose deferred based on load. |
-
-**Never use the default.** With `async|deferred` the implementation may defer, in which case:
-
-- Your "parallel" code runs sequentially on the consumer thread.
-- If you never call `get()`, the work **never runs at all**.
-- `wait_for(0s)` returns `future_status::deferred` forever, so a polling loop spins without progress. The correct idiom for polling is to check for `deferred` explicitly and force execution.
-
-### The destructor that blocks
-
-The most notorious behavior in the standard library: a `future` returned by `std::async` has a destructor that **blocks until the task completes** (it joins). Futures from `promise::get_future` and `packaged_task::get_future` do *not*.
-
-```cpp
-std::async(std::launch::async, slow_work);   // temporary future destroyed at the ';'
-                                             // → this line BLOCKS until slow_work finishes
-{
-    auto f1 = std::async(std::launch::async, a);   // runs
-    auto f2 = std::async(std::launch::async, b);   // runs
-}   // ~f2 blocks, then ~f1 blocks — but a and b DID overlap
-```
-The first form is the killer: an unnamed `std::async` result is fully synchronous. Scott Meyers' *Effective Modern C++* Item 38 covers the asymmetry; the rationale is that without it, a task could outlive objects it referenced. This inconsistency (only `async`'s futures join) is widely regarded as a design defect, and P0701-era proposals to fix it went nowhere.
-
-### Other hazards
-
-- **No thread pool is mandated.** `launch::async` requires a new *thread of execution*; libstdc++ and libc++ create a fresh `std::thread` per call — roughly 10–30 µs of `clone()`, stack mmap, and TLS setup, plus a page fault on first stack touch. MSVC uses the Windows thread pool. So `std::async` per work item is a throughput disaster on Linux.
-- **Arguments are decay-copied** into the shared state (like `std::thread`), so references require `std::ref`, and a `std::ref` to a stack object plus a deferred policy is a dangling recipe.
-- **No cancellation, no continuation, no executor.** You cannot say where it runs, nor stop it.
-- Exceptions propagate through `get()`, which is genuinely convenient and is `async`'s one clear advantage over raw `std::thread` (where an escaping exception calls `std::terminate`).
-
-**Interview position:** `std::async` is acceptable for a handful of coarse, independent, blocking operations in non-latency-critical code (parallel config loading, a startup warmup). For anything else use a real pool (`std::jthread` workers, TBB, Taskflow, or a hand-rolled pinned pool), and for parallel *algorithms* use execution policies (Ch. 14 §14.12), which target a proper scheduler.
+Latches, barriers, semaphores, mutexes, and condition variables are blocking synchronization tools covered in Chapter 24. Atomics and happens-before are covered in Chapter 25.
 
 ---
 
-## 20.4 Cooperative Cancellation
+## 20.9 Worked diagnosis: a shutdown that times out but still hangs — Core
 
-C++20 added `<stop_token>`: `std::stop_source`, `std::stop_token`, `std::stop_callback`, integrated with `std::jthread`.
-
-**Cooperative** is the operative word. There is no way to preemptively kill a thread in standard C++ (`pthread_cancel` exists but leaves C++ objects undestroyed and is effectively unusable with RAII, exceptions, or any allocator holding a lock). Cancellation is a *request* that the target polls or reacts to.
+Consider:
 
 ```cpp
-std::jthread t([](std::stop_token st) {
-    while (!st.stop_requested()) { do_work(); }
-});
-// t's destructor calls request_stop() then join() — this is why jthread exists
-```
-
-### The pieces
-
-- **`std::stop_source`** — the requesting end. `request_stop()` is idempotent, thread-safe, and returns whether *this* call performed the transition.
-- **`std::stop_token`** — the observing end. `stop_requested()`, `stop_possible()`. Copyable, cheap, shares a refcounted control block with the source.
-- **`std::stop_callback`** — an RAII object registering a callback fired on `request_stop()`. This is the mechanism for waking a *blocked* thread rather than a polling one:
-
-```cpp
-std::stop_callback cb(st, [&]{ cv.notify_all(); });     // or write to an eventfd / close a socket
-```
-
-The subtle rules: if stop was *already* requested when the `stop_callback` is constructed, the callback runs **immediately on the constructing thread**; the `stop_callback` destructor blocks if the callback is concurrently executing on another thread (but returns immediately if it is executing on *this* thread, preventing self-deadlock); and callbacks run on whatever thread calls `request_stop()`, so they must be short and non-blocking.
-
-### Condition variables
-
-`std::condition_variable_any::wait(lock, token, pred)` is the stop-aware overload — it returns `false` if stop was requested, and internally uses a `stop_callback` to notify. Plain `std::condition_variable` has **no** stop-token overload; that asymmetry (`_any` works with any lockable and takes the token) is a common gotcha.
-
-### `jthread` vs `thread`
-
-| | `std::thread` | `std::jthread` (C++20) |
-|---|---|---|
-| Destructor if joinable | `std::terminate()` | `request_stop()` then `join()` |
-| Stop token | None | Passed as first argument if the callable accepts one |
-| Detach | Yes | Yes (then the destructor does nothing) |
-
-`jthread` should be the default: the `std::thread`-terminates-on-destruction rule is a landmine, and the automatic stop-then-join gives a correct shutdown sequence for free.
-
-### Beyond C++20
-
-`std::stop_token` is the cancellation vocabulary for **senders/receivers** (§20.5): `std::execution::get_stop_token(receiver)` retrieves the token from the receiver's environment, so cancellation propagates down an operation graph without threading a parameter through every layer. C++26 generalizes it with `std::inplace_stop_source`/`inplace_stop_token` — the same semantics with **no allocation and no atomic refcount**, intended for exactly the case where a stop source is owned by a structured scope and cannot outlive it. That distinction (shared/refcounted vs in-place/borrowed) is the low-latency answer here.
-
-For I/O, the practical cancellation mechanisms are: `io_uring`'s `IORING_OP_ASYNC_CANCEL`, closing/shutting down the descriptor, an `eventfd` in the readiness set, or a timeout on the wait — a `stop_callback` is the C++ glue that triggers one of them.
-
----
-
-## 20.5 Senders and Receivers
-
-`std::execution` (P2300, **C++26**) is the standard's asynchronous execution model, developed as `stdexec`/libunifex. It replaces the future model with a *lazy, composable, allocation-free* description of work.
-
-### The three concepts
-
-- **Sender** — a *description* of asynchronous work that has not started. Composing senders builds a graph; nothing executes.
-- **Receiver** — the continuation, with exactly three completion channels: `set_value(vs...)`, `set_error(e)`, `set_stopped()`.
-- **Operation state** — the object produced by `connect(sender, receiver)`, holding all the storage the operation needs. It is **immovable**, created in place by the caller, and `start(op)` begins the work.
-
-```cpp
-using namespace std::execution;
-sender auto s = just(42)
-              | then([](int x){ return x * 2; })
-              | continues_on(pool.get_scheduler())
-              | then([](int x){ return process(x); });
-auto [result] = std::this_thread::sync_wait(s).value();   // the only blocking point
-```
-
-The key architectural claim: because the whole graph is known before `start`, the operation state for the *entire* pipeline is one composed object whose size the compiler computes at compile time. It can be a member, a stack object, or slab-allocated. Contrast `std::future`, where every `then` is a separate heap-allocated shared state with its own atomics.
-
-| | `std::future` model | Sender/receiver model |
-|---|---|---|
-| When work starts | Eagerly at creation | On `start(op)` — lazy |
-| Allocation | One shared state per stage | Zero required; state is one composed object |
-| Synchronization | Mutex + condvar per stage | None required if the graph is single-threaded |
-| Composition | Absent from the standard | `then`, `let_value`, `when_all`, `upon_error`, `into_variant`, … |
-| Error channel | `exception_ptr` only | Typed errors, plus a distinct **stopped** channel |
-| Cancellation | None | `get_stop_token` from the receiver environment |
-| Where it runs | Unspecified/implementation choice | Explicit via **schedulers** |
-
-### Schedulers and structure
-
-A **scheduler** is a lightweight handle to an execution context; `schedule(sched)` returns a sender that completes on that context. `starts_on`/`continues_on` place work. Standard contexts include `run_loop` and (C++26) `std::execution::parallel_scheduler`. Custom schedulers are where the low-latency value is: a pinned single-thread-per-core reactor, or a busy-polling `io_uring` context, plugs in as a scheduler and the rest of the code is unchanged.
-
-Two further pieces to name:
-
-- **`sync_wait`** is the only sanctioned blocking bridge from sender-land back to ordinary code; it is what a `main()` or a test uses.
-- **Customization via `get_env`/queries** rather than ADL: receivers carry an *environment* answering queries like `get_stop_token`, `get_scheduler`, `get_allocator`. This is how cancellation and allocator propagation reach deep into a graph without changing signatures. P2300 moved away from `tag_invoke` to member-function customization late in the process — worth mentioning if asked about the design history.
-- **`counting_scope`/`async_scope`** (companion papers) provide *structured concurrency*: a scope that guarantees all spawned work has completed before it exits, making lifetimes provable rather than hoped-for.
-
-### Honest assessment for interviews
-
-The model's compile-time type composition means excellent codegen — a fully synchronous pipeline can optimize to straight-line code — but also large types, slow compiles, and error messages that were the loudest objection during standardization. Implementations: NVIDIA's `stdexec` (production-usable today, header-only, C++20), Meta's `libunifex` (the predecessor), and Boost.Asio's very different but conceptually related completion-token/executor design. Knowing that Asio's `awaitable`/`use_awaitable` and P2300's senders solve the same problem with different vocabularies is the level of familiarity expected.
-
----
-
-## 20.6 Coroutine-Based Asynchronous I/O
-
-The synthesis: coroutines (Ch. 19 §19.7–§19.9) give you suspendable functions; an I/O reactor gives you a reason to suspend. Together they let you write blocking-shaped code that never blocks a thread.
-
-```cpp
-task<void> handle(Socket sock) {
-    char buf[4096];
-    for (;;) {
-        std::size_t n = co_await sock.async_read(buf, sizeof buf);   // suspends, no thread blocked
-        if (n == 0) co_return;
-        co_await sock.async_write(buf, n);
+class Snapshotter {
+public:
+    void start() {
+        future_ = std::async(std::launch::async, [this] {
+            write_snapshot(); // may block in filesystem I/O
+        });
     }
-}
-```
 
-### How the awaiter connects to the kernel
-
-The awaiter for `async_read` is where all the machinery lives:
-
-```cpp
-struct ReadAwaiter {
-    bool await_ready() const noexcept { return false; }             // or true, if data is already buffered
-    void await_suspend(std::coroutine_handle<> h) {
-        op_.handle = h;                                              // remember who to resume
-        io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-        io_uring_prep_recv(sqe, fd_, buf_, len_, 0);
-        io_uring_sqe_set_data(sqe, &op_);                            // user_data carries the handle
-        // submission happens here or is batched by the loop
+    bool shutdown(std::chrono::milliseconds timeout) {
+        return future_.wait_for(timeout) == std::future_status::ready;
     }
-    std::size_t await_resume() { if (op_.res < 0) throw std::system_error(-op_.res, ...); return op_.res; }
+
+private:
+    void write_snapshot();
+    std::future<void> future_;
 };
 ```
 
-The event loop then drains completions and resumes:
+The function can return `false` at the deadline, but destroying `Snapshotter` then destroys the last future referring to an unfinished async-associated thread. That release may wait for `write_snapshot`. The timeout did not bound shutdown.
+
+There is a second bug: the callable captures `this`. If the object could be destroyed without waiting, the task would use a dangling pointer. The blocking last-release rule happens to mask that lifetime bug in some paths; it is not a sound ownership mechanism.
+
+### Redesign
+
+Move snapshot state into an operation object whose lifetime is independent of the service object. Run work on an owned `jthread` or executor that accepts a stop token. Make the I/O operation itself bounded or cancellable; a token cannot interrupt an arbitrary blocking filesystem call.
+
+```text
+Snapshotter owns OperationState
+   ├─ immutable input / output handle
+   ├─ stop_source
+   ├─ terminal status: pending/value/error/stopped
+   └─ worker/executor ownership
+
+shutdown(deadline):
+   1. stop new snapshots
+   2. request_stop
+   3. wait only until deadline
+   4. if unfinished, retain OperationState in a shutdown owner
+   5. keep executor alive until operation really completes
+   6. report deadline miss without destroying referenced state
+```
+
+Step 4 is the key: bounded caller waiting and operation lifetime are separate. “Abandon” must transfer ownership somewhere that can finish cleanup; it cannot mean destroy live state.
+
+If the filesystem API cannot cancel or bound its call, the system cannot guarantee a bounded process shutdown while also guaranteeing clean completion in-process. Options include accepting an unbounded join, isolating work in a process with an external termination/durability protocol, or choosing an I/O API with explicit cancellation. State that limit rather than hiding it behind `wait_for`.
+
+### Latency accounting
+
+For a snapshot off the trading path, measure:
+
+- submission allocation and queue depth;
+- delay until worker start;
+- time in serialization versus system calls;
+- cancellation-request-to-completion time;
+- shutdown deadline misses;
+- whether completion runs on a latency-sensitive core.
+
+The benefit of asynchronous snapshotting is isolation of caller service time, not elimination of work. CPU, memory bandwidth, filesystem queues, and cache interference remain shared unless architecture isolates them.
+
+---
+
+## 20.10 Sender/receiver composition — Role-specific / Reference
+
+C++23 does not contain standard senders, receivers, schedulers, `then`, `when_all`, or `sync_wait`. The model is still useful because several libraries use related ideas and because it exposes what futures lack.
+
+A sender-like object describes possible completion signatures and how work will be connected. A receiver supplies terminal channels:
+
+```text
+sender description
+      │ connect(receiver)
+      ▼
+operation state ── start ──► execution
+                                ├─ set_value(...)
+                                ├─ set_error(error)
+                                └─ set_stopped()
+```
+
+The operation state must remain alive from `start` until one terminal completion finishes. Starting it and immediately destroying it is the sender equivalent of destroying a callback state too early.
+
+Framework pseudocode:
 
 ```cpp
-while (running) {
-    io_uring_submit_and_wait(&ring, wait_nr);          // or peek, for busy-polling
-    unsigned head; io_uring_cqe* cqe;
-    io_uring_for_each_cqe(&ring, head, cqe) {
-        auto* op = static_cast<Op*>(io_uring_cqe_get_data(cqe));
-        op->res = cqe->res;
-        op->handle.resume();                            // returns when the coroutine suspends again
+// Pseudocode: not a C++23 standard API.
+auto pipeline =
+    schedule(io_scheduler)
+    | then(read_request)
+    | then(parse_request)
+    | let_value(query_service)
+    | continues_on(reply_scheduler)
+    | then(send_reply);
+
+auto operation = connect(std::move(pipeline), receiver);
+start(operation); // operation must remain alive through completion
+```
+
+Composition answers three questions absent from plain futures:
+
+- where each continuation runs;
+- how value, error, and stopped channels flow;
+- how cancellation and environment information propagate through the graph.
+
+Laziness can let a library represent the graph and operation state compactly. It does not guarantee zero allocation, immovable state, inlining, or a particular queue. Concrete sender types, captured values, scheduler implementation, and type erasure determine those costs. Measure the built operation, not the vocabulary.
+
+For C++23 production code, use the documented API/version of the selected library. Do not paste future-standard examples under `std::execution` and assume a shipping C++23 standard library provides them.
+
+---
+
+## 20.11 Coroutine-based asynchronous I/O — Role-specific
+
+Coroutines provide suspend/resume control flow; they do not provide I/O, scheduling, cancellation, or lifetime ownership. A framework must connect an awaiter to an event source and own the coroutine task appropriately. Chapter 19 explains frames and the awaiter protocol; this section follows the external operation.
+
+Framework pseudocode:
+
+```cpp
+// Pseudocode: task and Socket are framework types, not C++23 facilities.
+task<void> serve(Socket socket, std::stop_token stop) {
+    std::array<std::byte, 4096> buffer;
+
+    while (!stop.stop_requested()) {
+        auto result = co_await socket.async_read(buffer);
+        if (result.eof()) co_return;
+        co_await process_and_reply(socket, buffer.first(result.size()));
     }
-    io_uring_cq_advance(&ring, count);
 }
 ```
 
-Two structural points: `await_ready()` returning `true` for an already-satisfiable read is the **fast path** that avoids the suspend entirely (data already in a user-space buffer, or a completed `io_uring` op), and `handle.resume()` runs the continuation *inline on the loop thread*, so a long-running continuation stalls every other connection — the standard event-loop hazard.
+At a read suspension:
 
-### Model comparison
+```text
+coroutine frame
+  ├─ socket/task state
+  ├─ buffer
+  ├─ stop token
+  └─ continuation handle
+         │ registered in operation state
+         ▼
+reactor/kernel operation
+  ├─ buffer address/length
+  ├─ completion identity
+  └─ pending/completed/cancel state
 
-| Model | Thread cost | Latency profile | Complexity |
-|---|---|---|---|
-| Thread per connection (blocking) | 8 KB–8 MB stack + kernel task each | Good at low counts; scheduler and context-switch bound (1–3 µs) at high counts | Lowest |
-| Callback reactor (`epoll` + callbacks) | One thread per core | Very good | Callback hell; state machines by hand |
-| Coroutine reactor (`epoll`/`io_uring`) | One thread per core, ~100–300 B frame per connection | Same as callbacks plus ~5–20 ns resume | Linear code, hard debugging |
-| Busy-poll + kernel bypass (Ch. 47) | One pinned core, 100% CPU | Sub-microsecond, no syscall | Highest |
+Required lifetime:
+[ frame and buffer [ submitted operation ... terminal completion ] ]
+```
 
-### Getting it right
+The frame cannot be destroyed merely because stop was requested. The kernel/reactor may still hold the buffer address and completion identity.
 
-- **Lifetime.** The coroutine frame must outlive the in-flight kernel operation. If the coroutine is destroyed while an `io_uring` SQE references its buffer or its handle, the completion resumes a dead frame. Cancellation therefore requires `IORING_OP_ASYNC_CANCEL` plus waiting for the cancellation *completion* before destroying — this is the single hardest correctness issue in coroutine I/O, and it is what structured concurrency (`async_scope`, §20.5) exists to enforce.
-- **Buffers must be stable across suspension**: locals that live across a `co_await` are in the frame and stable; anything captured by reference is not (Ch. 19 §19.8). `io_uring` **registered buffers** and registered files (`IORING_REGISTER_BUFFERS`, Ch. 34) remove the per-op pinning cost.
-- **`await_transform` on the task's promise** is how a framework injects the scheduler and the stop token, so `co_await` in user code carries context automatically.
-- **Batching.** The `io_uring` submission queue is the natural batching point: submit once per loop iteration rather than per operation, turning N syscalls into one. With `IORING_SETUP_SQPOLL` a kernel thread polls the SQ and the syscall disappears entirely; with `IORING_SETUP_IOPOLL` completions are polled rather than interrupt-driven. That trade — burning a core to eliminate a ~1–2 µs syscall (Ch. 34 §34.5) — is the standard low-latency question here.
-- **Allocation.** Every connection handler is a coroutine frame; HALO will not elide it because the handle escapes into the ring. Use a promise-level `operator new` over a pool sized to the frame (Ch. 19 §19.9) so the steady state is allocation-free and frames stay page-local.
+### Completion versus cancellation race
 
-**Ecosystem:** Boost.Asio (`awaitable<T>`, `co_spawn`, `use_awaitable`) is the mature production answer; `liburing` directly for the lowest level; `libunifex`/`stdexec` for the sender-based version; Seastar and Folly's coroutines for whole-application frameworks. For genuinely latency-critical trading paths, note the honest conclusion: coroutine I/O is a *throughput and clarity* win for many connections, while the tick-to-trade path is typically a single busy-polling loop over a kernel-bypass ring (Ch. 47) with no coroutines at all — because the indirect resume, the frame's cache footprint, and the loss of inlining are measurable at that scale.
+Suppose cancellation and read readiness occur concurrently:
+
+1. stop callback submits cancellation;
+2. read completes successfully before cancellation takes effect;
+3. cancellation completion reports “not found” or equivalent;
+4. user code must receive exactly one terminal outcome;
+5. both external completions may still require bookkeeping before state destruction.
+
+Use an operation-state machine or framework contract that arbitrates delivery:
+
+```text
+pending
+  ├─ read wins ─────► delivered_value
+  ├─ error wins ────► delivered_error
+  └─ cancel wins ───► delivered_stopped
+
+external references may reach zero only after all required completion records drain
+```
+
+Destroying on the first observed event can be too early if a second queued completion still points to the operation record. Reference ownership, generation-checked handles, or reactor-owned slots can solve this, but the proof is framework-specific.
+
+### Resumption context
+
+An I/O completion can:
+
+- resume the coroutine inline on the reactor thread;
+- enqueue it on the same context for later;
+- transfer it to another scheduler.
+
+Inline resume avoids a queue turn but permits reentrancy and lets a long continuation stall the reactor. Enqueueing adds queueing and cache-transfer cost but establishes a cleaner scheduling boundary. Cross-thread resume requires synchronized publication and often moves the coroutine frame's cache footprint.
+
+### I/O correctness
+
+Completion does not imply a whole protocol message. Reads and writes can be partial; EOF and errors need separate handling. Buffers must remain stable across suspension. Timeouts and cancellation are races with ordinary completion, not deletion commands.
+
+Allocation is framework-dependent. A coroutine frame may be dynamically allocated, embedded, pooled, or in some cases elided under language rules. Do not promise allocation elision. A fixed operation pool can improve steady-state behavior but needs bounded capacity, exhaustion policy, stable handles, and proof that slots are not reused before late completions drain.
+
+### Linux `io_uring` example — Deep dive
+
+`io_uring` is Linux-specific and outside standard C++. A framework can place an operation pointer/index in submission user data and recover it from the completion queue. Cancellation uses additional asynchronous requests and completions; exact result codes and race handling are part of the Linux API contract.
+
+SQPOLL can let a kernel thread poll submissions and can reduce application submission system calls in some states/configurations. It consumes CPU and does not erase completion processing, queueing, or all kernel transitions. Permissions, kernel version, ring flags, workload, and batching affect behavior. Measure syscall counts, polling CPU, queue occupancy, and end-to-end latency on the deployed kernel.
+
+Do not place platform calls in a generic awaiter without defining:
+
+- ownership of the frame, operation record, file/socket, and buffer;
+- behavior for short results and retryable errors;
+- exactly-once user completion;
+- cancellation acknowledgement and late completion;
+- context shutdown/drain order;
+- bounded operation capacity.
 
 ---
 
-## Key Interview Questions
+## 20.12 One operation in four models — Reference
 
-1. **What is in a `std::future`'s shared state, and what does that cost?** — Value or `exception_ptr`, ready flag, mutex, condvar, refcount; one heap allocation per operation and a futex round trip to wait.
-2. **What happens if a `promise` is destroyed without being satisfied?** — The shared state gets a `broken_promise` exception, so the waiting `get()` throws instead of hanging.
-3. **Difference between `future` and `shared_future`?** — `future::get()` is one-shot and moves the value; `shared_future` is copyable and returns `const T&` to many consumers.
-4. **Why did `future::then` never make it into the standard?** — Continuations require an executor/scheduler concept the standard lacked; the Concurrency TS design was superseded by senders/receivers (P2300).
-5. **Why does a thread-pool `submit` often wrap the `packaged_task` in a `shared_ptr`?** — `packaged_task` is move-only and pre-C++23 `std::function` requires a copyable target; `std::move_only_function` (C++23) removes the wrapper.
-6. **What does `std::async` with the default policy do wrong?** — It may defer, so "parallel" work runs serially on the consumer, never runs if `get()` is never called, and `wait_for` reports `deferred` forever.
-7. **Why does `std::async(f);` as a statement block?** — The temporary future's destructor joins the task. Only `std::async`-produced futures behave this way.
-8. **How many threads does `std::async(launch::async, ...)` create?** — Implementation-defined but on libstdc++/libc++ one fresh `std::thread` per call, roughly 10–30 µs of setup.
-9. **Why is there no preemptive thread cancellation in C++?** — Killing a thread mid-stack leaves destructors unrun and locks held; cancellation must be cooperative via `stop_token`.
-10. **How do you cancel a thread that is blocked rather than polling?** — A `std::stop_callback` that performs the wakeup: `notify_all`, write to an `eventfd`, `shutdown()` the socket, or submit an `io_uring` cancel.
-11. **What are the `stop_callback` ordering rules?** — Runs immediately on the constructing thread if stop was already requested; its destructor blocks while it runs elsewhere but not when it is running on the same thread.
-12. **Why does only `condition_variable_any` have a stop-token overload?** — The token integration needs a `stop_callback` around an arbitrary lockable; plain `condition_variable` is restricted to `unique_lock<mutex>` and was left alone.
-13. **Why prefer `std::jthread`?** — Its destructor requests stop and joins, instead of `std::terminate`, and it injects the `stop_token`.
-14. **What are the three receiver completion channels?** — `set_value`, `set_error`, `set_stopped` — cancellation is a first-class outcome, not an error.
-15. **Why are senders lazy, and why does that eliminate allocation?** — Nothing runs until `start`, so the whole graph's storage is known at compile time and composes into one immovable operation state that can live on the stack.
-16. **What is an operation state and why is it immovable?** — The storage `connect` produces for one execution; receivers and awaiters hold pointers into it, so moving it would invalidate them.
-17. **How does cancellation propagate in the sender model?** — `get_stop_token(get_env(receiver))` — the environment carries it, so no signature threading; C++26 adds `inplace_stop_token` for the non-allocating case.
-18. **What does `await_ready()` returning `true` buy you?** — It skips the suspend entirely — the fast path when data is already buffered or the operation completed synchronously.
-19. **What is the hardest correctness problem in coroutine I/O?** — Frame lifetime versus in-flight kernel operations; you must cancel and wait for the cancellation completion before destroying the coroutine.
-20. **How do you make a coroutine-based server allocation-free in steady state?** — A promise-level pooled `operator new`/`operator delete`, since HALO cannot elide a frame whose handle escapes into the completion ring.
-21. **When does `io_uring` eliminate the syscall entirely?** — With `IORING_SETUP_SQPOLL`, where a kernel thread polls the submission queue — trading a core for the ~1–2 µs syscall cost.
-22. **Would you put coroutines on the tick-to-trade path?** — Generally no: the indirect resume, frame cache footprint, and lost inlining are measurable; a single busy-poll loop over a kernel-bypass ring wins. Coroutines win on throughput and clarity for many connections.
+The same “read, parse, reply” workflow exposes different ownership:
+
+| Model | Sketch | Composition | Waiting | State owner |
+|---|---|---|---|---|
+| Promise/future | worker sets promise; caller gets future | Manual, usually blocking between steps | `get` blocks | Shared state |
+| Callback | `read(..., on_read)` then callback starts parse/reply | Explicit continuation chain/state machine | Event loop waits | Callback/operation record |
+| Coroutine framework | `co_await read; co_await reply` | Structured control flow | Coroutine suspends | Task/frame + reactor op |
+| Sender-like framework | `read | then(parse) | let_value(reply)` | Declarative graph | Lazy until start; optional blocking bridge | Connected operation state |
+
+Illustrative shapes:
+
+```cpp
+// Standard promise/future shape.
+std::promise<Result> promise;
+auto future = promise.get_future();
+submit([p = std::move(promise)]() mutable {
+    try {
+        p.set_value(read_parse_reply());
+    } catch (...) {
+        p.set_exception(std::current_exception());
+    }
+});
+Result result = future.get(); // blocks
+```
+
+```cpp
+// Callback-framework pseudocode.
+async_read(socket, [state](error_code error, Bytes bytes) {
+    if (error) return state->finish_error(error);
+    async_reply(socket, parse(bytes),
+                [state](error_code reply_error) {
+                    state->finish(reply_error);
+                });
+});
+```
+
+```cpp
+// Coroutine-framework pseudocode.
+auto bytes = co_await async_read(socket);
+auto reply = parse(bytes);
+co_await async_reply(socket, reply);
+```
+
+```cpp
+// Sender-framework pseudocode; not standard C++23.
+auto work = async_read(socket)
+          | then(parse)
+          | let_value([&](auto reply) {
+                return async_reply(socket, reply);
+            });
+```
+
+The promise form is the only sketch based solely on standard result-channel facilities, though `submit` is still an application executor. The other forms need a framework. Their performance cannot be ranked from syntax alone: count state allocation, queue turns, scheduling, system calls, buffer copies, and contention for the concrete implementation.
 
 ---
 
-## Common Traps
+## 20.13 Common traps — Reference
 
-- **Calling `future::get()` twice** — throws `future_already_retrieved`; use `shared_future`.
-- **Using `std::promise`/`future` in a hot loop** — an allocation plus mutex/condvar per handoff.
-- **Storing a `packaged_task` in a `std::function`** — move-only; needs `shared_ptr` or C++23 `move_only_function`.
-- **`std::async` with the default launch policy** — may defer, silently serializing or never running.
-- **An unnamed `std::async(...)` expression statement** — the temporary future's destructor blocks; the call is synchronous.
-- **Polling a deferred future with `wait_for(0s)`** — returns `deferred` forever; no progress.
-- **Passing references to `std::async`/`std::thread` without `std::ref`** — arguments are decay-copied; and with `std::ref` plus deferral, they dangle.
-- **Expecting `std::async` to use a thread pool** — it does not on Linux implementations.
-- **Assuming `stop_requested()` interrupts a blocked call** — it does not; you need a `stop_callback` that performs a wakeup.
-- **Long or blocking work inside a `stop_callback`** — it runs on the thread that called `request_stop()`.
-- **Destroying a `stop_callback` while it runs on another thread** — the destructor blocks; a lock held across it can deadlock.
-- **Using `std::thread` and forgetting to join** — `std::terminate` in the destructor.
-- **Expecting a sender pipeline to have started** — senders are lazy; without `start`/`sync_wait`/`spawn` nothing runs.
-- **Moving an operation state** — it is immovable by design.
-- **Blocking inside a receiver's `set_value`** — it runs on the completing context, stalling the scheduler.
-- **Destroying a coroutine with an in-flight `io_uring` operation** — the completion resumes a freed frame.
-- **Buffers or state captured by reference in a coroutine** — not in the frame; dangling across suspension.
-- **Doing long work in a resumed continuation on the event-loop thread** — head-of-line blocking for every other connection.
-- **Assuming `epoll`/`io_uring` readiness means a full message** — short reads are normal (Ch. 34 §34.19); frame explicitly.
+| Trap | Violated contract | Repair |
+|---|---|---|
+| Calling `future::get()` twice | First get invalidates the future | Check ownership; use `shared_future` for repeated reads |
+| Expecting second `get()` to throw a specific error | Invalid-state precondition violated | Do not make the call |
+| Dropping an unsatisfied promise | Consumer receives broken promise | Complete value/exception or make abandonment intentional |
+| Treating `packaged_task` as a scheduler | Invocation runs wherever task is called | Supply an explicit executor/worker |
+| Ignoring `future_status::deferred` | Timed polling never starts work | Force with wait/get or choose policy explicitly |
+| Timing out then destroying async future | Last release may still wait | Use cancellable owned operation state |
+| Capturing a local/`this` in stored callback | Callback outlives referent | Move state, share ownership carefully, or use context-owned slots |
+| Assuming callback is never inline | Reentrancy breaks initiating invariant | Establish state first or require queued-delivery contract |
+| Unbounded executor queue | Overload becomes queueing delay/memory growth | Bound and define backpressure |
+| Stop request treated as completed cancellation | Work/kernel reference may remain active | Wait for terminal completion/acknowledgement |
+| Destroying `jthread` whose worker cannot stop | Destructor joins indefinitely | Make blocking operations interruptible/bounded |
+| Destroying coroutine frame after submitting cancel | Late completion still references frame/op | Drain required completions before destruction |
+| Resuming long coroutine inline on reactor | Head-of-line blocking | Budget continuation or enqueue/offload |
+| Assuming lazy sender means no allocation | Representation is implementation/type dependent | Inspect and measure concrete pipeline |
+| Using future sender APIs as C++23 standard | Facility does not exist in C++23 | Label framework/version and isolate dependency |
 
 ---
 
-## Compact Recall Summary
+## Recall and practice
 
-**Futures/promises.** A heap-allocated shared state carrying a value or `exception_ptr` plus a mutex, condvar, and refcount. One-shot; `get()` moves and rethrows; `shared_future` for many consumers. Destroying an unsatisfied promise yields `broken_promise` rather than a hang. Establishes happens-before. No continuations, no cancellation, no allocator control — which is exactly why senders exist.
+### Recall card
 
-**`packaged_task`.** Callable + promise with automatic exception capture; move-only, so pre-C++23 pools wrap it in a `shared_ptr` to fit `std::function`. `std::move_only_function` (C++23) fixes that. The full naive submit path costs 200–500 ns before any work runs; real low-latency pools use a lock-free ring of POD descriptors and caller-owned result slots.
+1. Async separates initiation from completion; it does not imply parallelism or absence of blocking.
+2. Shared future state has specified value/exception/readiness semantics but unspecified storage and synchronization representation.
+3. `future::get()` is one-shot; broken producer state becomes a ready `broken_promise` exception.
+4. A packaged task captures callable results but does not schedule itself.
+5. Explicit async/deferred policy controls progress; releasing the last unfinished async-associated state may wait.
+6. Cancellation is cooperative and races with completion. Request, terminal delivery, external-reference drainage, and destruction are separate events.
+7. Execution contexts own progress resources and queues; scheduler placement, queue capacity, and shutdown order are part of correctness.
+8. Coroutine I/O requires the frame, buffer, and operation record to survive until the reactor/kernel no longer references them.
 
-**`std::async`.** Always pass `launch::async`; the default may defer, serializing the work or never running it. The returned future's destructor **joins** — unique to `async` — so an unnamed result is a synchronous call. One OS thread per call on libstdc++/libc++ (~10–30 µs). Fine for a few coarse blocking tasks; wrong for anything else.
+### Questions
 
-**Cancellation.** Cooperative only. `stop_source` requests, `stop_token` observes, `stop_callback` reacts — the callback is how you wake a *blocked* target (`notify_all`, `eventfd`, `shutdown`, `io_uring` cancel). Runs on the requesting thread, so keep it short. `condition_variable_any` has the stop-aware `wait`; plain `condition_variable` does not. `jthread` = stop-then-join destructor and automatic token injection. C++26 `inplace_stop_token` gives the same semantics allocation-free.
+1. Give an example of asynchronous execution that is not parallel, and one of blocking retrieval from asynchronously produced work.
+2. Which properties of a future shared state are standard guarantees, and which common implementation details must be measured?
+3. Contrast second `future::get`, second `promise::get_future`, producer abandonment, and second `set_value`.
+4. Why does `packaged_task` solve exception/result capture but not scheduling or backpressure?
+5. Under exactly which ownership/readiness conditions can release of an async-created shared state wait?
+6. How does inline callback completion create reentrancy, and what two API designs avoid the broken invariant?
+7. Why is `request_stop()` not evidence that an I/O buffer or coroutine frame can be destroyed?
+8. Compare a single-threaded reactor and a worker pool using queueing, locality, head-of-line blocking, and data-race risk.
+9. What does a sender-like operation state own between `connect/start` and terminal completion, and why is this not a C++23 standard API?
+10. Redesign a timed async shutdown when the underlying system call cannot be cancelled or bounded.
 
-**Senders/receivers** (P2300, C++26). A sender describes work; `connect(sender, receiver)` yields an immovable operation state; `start` runs it. Three channels: value, error, **stopped**. Lazy composition means the entire pipeline's storage is a single compile-time-sized object — zero allocations, no per-stage mutex, explicit placement via schedulers, cancellation and allocators carried in the receiver's environment. `sync_wait` is the blocking bridge. Cost: large types, slow compiles, hostile diagnostics. `stdexec` and `libunifex` are the usable implementations today; Asio's executors/completion tokens solve the same problem differently.
+### Code-reading puzzle
 
-**Coroutine I/O.** `await_suspend` stashes the handle in the operation's `user_data` and submits an SQE; the loop drains completions and calls `resume()` inline. `await_ready() == true` is the no-suspend fast path. Frame lifetime versus in-flight kernel ops is the central hazard — cancel and await the cancellation before destroying. Keep buffers in the frame (by value), batch submissions per loop iteration, use registered buffers/files, consider `SQPOLL` to erase the syscall, and pool frame allocation because HALO cannot elide an escaping handle. Coroutine reactors win on throughput and readability at high connection counts; the tick-to-trade path stays a busy-polling kernel-bypass loop.
+```cpp
+std::future<void> launch(Service& service) {
+    return std::async(std::launch::async, [&service] {
+        service.flush(); // may block
+    });
+}
+
+void stop(Service& service) {
+    auto future = launch(service);
+    if (future.wait_for(std::chrono::milliseconds{10}) ==
+        std::future_status::timeout) {
+        return;
+    }
+}
+```
+
+Can `stop` take longer than its stated wait duration? What lifetime prevents `service` from being destroyed too early in this exact function, and why does that accidental coupling fail as a general cancellation design?
+
+### Design exercise
+
+Design shutdown for a single-threaded I/O context with one coroutine-like operation per connection and a background snapshot worker:
+
+1. stop admission of new work;
+2. request cancellation of reads, writes, timers, and snapshot work;
+3. define exactly-one value/error/stopped delivery under completion races;
+4. keep buffers, operation records, and task frames alive through late completions;
+5. drain the context and join owned threads;
+6. report a deadline miss without destroying live state.
+
+Draw the ownership graph and terminal-state transitions. State which steps block a thread, suspend a coroutine, enqueue work, or only request cancellation. Define queue capacity/exhaustion, the behavior of an uncancellable snapshot system call, and the measurements that validate queueing and cancellation latency.
+
+### Next prerequisite
+
+Chapter 21 assumes that queues, slots, and operation records are data structures with explicit ownership and capacity. Before continuing, be able to separate the logical task from its storage, result channel, execution context, and lifetime; those distinctions determine which representation is safe and cache-efficient.

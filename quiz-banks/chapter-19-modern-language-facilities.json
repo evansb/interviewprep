@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`std::move` is defined as `static_cast<remove_reference_t<T>&&>(t)`; it changes the expression's value category so a `T&&` overload can be selected, and emits nothing. The 'swap with a default-constructed object' answer is the popular misconception — that behaviour, when it happens, comes from the move constructor a class author wrote, not from `move`. Nothing in the language marks an object as moved-from either; 'valid but unspecified' is a library convention.",
-      "sourceAnchor": "191-move-semantics",
+      "sourceAnchor": "191-language-baselines-and-feature-test-macros--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Value category is a property of expressions, not of declared types: the expression `s` names an object, so it is an lvalue and binds to `const std::string&`, silently copying. The 'declared type wins' answer is exactly the confusion the rule exists to catch — you must write `consume(std::move(s))`. Whether `consume` is a template changes nothing here, since `s` is still an lvalue when the argument is deduced.",
-      "sourceAnchor": "191-move-semantics",
+      "sourceAnchor": "191-language-baselines-and-feature-test-macros--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`vector` growth uses `std::move_if_noexcept`, which yields an lvalue when the move can throw, so the copy constructor is chosen and the old buffer stays intact as a rollback. The 'downgrade to basic guarantee' answer is the tempting one: it sounds like a reasonable trade, but the standard mandates the strong guarantee for `push_back`, so the library pays with copies instead. Nothing is rejected at compile time — copy-constructible is enough.",
-      "sourceAnchor": "191-move-semantics",
+      "sourceAnchor": "191-language-baselines-and-feature-test-macros--core",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 3,
       "explanation": "A user-declared destructor suppresses the implicit move constructor and move assignment; the copy operations remain available, so overload resolution silently picks them and an `std::move` becomes a deep copy. The 'deleted, so it fails to compile' answer is the comforting version and is wrong — suppressed is not deleted, which is precisely why this regression is invisible and expensive.",
-      "sourceAnchor": "191-move-semantics",
+      "sourceAnchor": "191-language-baselines-and-feature-test-macros--core",
       "difficulty": "trap"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 2,
       "explanation": "C++17 redefined a prvalue as an initializer rather than an object, so `NM(42)` describes how to build the object at `n`'s address and no temporary is materialized. The 'only at -O2' answer conflates guaranteed elision with the optimization it replaced: this is a language rule, observable through deleted constructors and in force even at `-O0`. Pre-C++17 the code was indeed ill-formed, which is what the 'ill-formed in every standard' answer overgeneralises from.",
-      "sourceAnchor": "192-guaranteed-copy-elision",
+      "sourceAnchor": "191-language-baselines-and-feature-test-macros--core",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Guaranteed elision applies when the return operand is a prvalue of the return type — the constructor runs directly in the caller's return slot. Returning a named local is NRVO, which is permitted but never required, so it is the tempting near-miss. Returning a by-value parameter can never be NRVO'd at all, since the ABI puts parameters in the caller's frame, and `return std::move(w)` actively disables NRVO.",
-      "sourceAnchor": "192-guaranteed-copy-elision",
+      "sourceAnchor": "191-language-baselines-and-feature-test-macros--core",
       "difficulty": "recall"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 3,
       "explanation": "NRVO requires the return operand to be the *name* of a local; `std::move(s)` is a cast expression, so the compiler can no longer construct `s` in the return slot and must move-construct instead. The 'redundant but harmless' answer is the one most candidates pick — it costs a real move constructor call, which is why `-Wpessimizing-move` exists. There is no dangling here: the move constructor transfers ownership correctly.",
-      "sourceAnchor": "192-guaranteed-copy-elision",
+      "sourceAnchor": "191-language-baselines-and-feature-test-macros--core",
       "difficulty": "trap"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Since C++11 the return operand is first treated as an rvalue when it names a local or (as widened by C++20's P1825) a by-value parameter, so the move constructor is selected without any `std::move`. The copy answer is the pre-C++11 behaviour and the most common stale belief. Reusing the parameter's storage as the return slot is impossible under the SysV ABI, where parameters live in the caller's frame at an address the callee does not choose.",
-      "sourceAnchor": "192-guaranteed-copy-elision",
+      "sourceAnchor": "191-language-baselines-and-feature-test-macros--core",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Before C++17 the desugaring required `__begin` and `__end` to be the same type, which forced every range to produce a real end iterator; allowing heterogeneous types is what let `views` return cheap sentinels and is the enabler for C++20 ranges. The `auto&&` loop-variable option is the tempting distractor — `auto&&` is indeed the right generic choice for proxies, but it was always spellable and was not a C++17 rule change.",
-      "sourceAnchor": "193-range-based-for-loops",
+      "sourceAnchor": "192-range-based-for-loops--core",
       "difficulty": "recall"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Lifetime extension binds the temporary that `__range` is initialized from, not the intermediate `get_object()` temporary, which is destroyed at the end of the init-statement — leaving `__range` referring to freed storage. C++23's P2718 extends all temporaries in the range initializer and fixes this, which makes the 'well-defined' option the version-confusion trap. Note the answer flips the actual risk: a by-value `name()` is the *safe* case, since that prvalue is the one extended.",
-      "sourceAnchor": "193-range-based-for-loops",
+      "sourceAnchor": "192-range-based-for-loops--core",
       "difficulty": "trap"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`*__begin` is a prvalue for `vector<bool>::reference` and for transformed views, and a non-const lvalue reference cannot bind a prvalue, so the loop fails to compile; `auto&&` collapses to whatever the dereference actually yields. The 'silently copies' answer confuses `auto&` with plain `auto` — `auto&` is the form that never copies, which is why the two are so easy to mix up.",
-      "sourceAnchor": "193-range-based-for-loops",
+      "sourceAnchor": "192-range-based-for-loops--core",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 3,
       "explanation": "The compiler introduces a hidden object `e` initialized from the initializer and each name designates one of `e`'s subobjects — which is why you cannot apply `static` or attributes to them individually. The 'ordinary local variables' answer is the intuitive reading and drives the mistake of expecting lambda capture to work in C++17. The `get<i>` route is the tuple-like protocol; a plain struct with public members uses the member-binding case instead.",
-      "sourceAnchor": "194-structured-bindings",
+      "sourceAnchor": "193-structured-bindings--core",
       "difficulty": "recall"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 2,
       "explanation": "The tuple-like path needs `tuple_size<E>::value` to be a complete type, `tuple_element<i, E>::type` for each name's type, and a `get<i>` found as a member or by ADL. The 'make members public' option describes a different protocol that is tried only when the tuple-like one does not apply, and it additionally requires all members to live in the same class — it does not subsume anything.",
-      "sourceAnchor": "194-structured-bindings",
+      "sourceAnchor": "193-structured-bindings--core",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The `auto` qualifier applies to the hidden object `e`, so the entire `pair` is copied every iteration and the names alias that copy; `const auto&` is the fix. The 'names are references so it's free' answer is the widespread misconception — the names are indeed references, but they refer to the copy, not to the node. Nothing is moved out either; the range elements are untouched lvalues.",
-      "sourceAnchor": "194-structured-bindings",
+      "sourceAnchor": "193-structured-bindings--core",
       "difficulty": "trap"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 3,
       "explanation": "The four relational operators are synthesized from `<=>`, and the special rule for a *defaulted* `<=>` also implicitly declares a defaulted `==`, so all six work here. The 'write `==` separately' answer is right for a user-written `<=>` and wrong for a defaulted one — that is the whole distinction being tested. `==` is never rewritten through `<=>`, because equality is often far cheaper than ordering.",
-      "sourceAnchor": "195-three-way-comparison",
+      "sourceAnchor": "194-three-way-comparison--core",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Partial ordering is precisely the category admitting unordered pairs, and IEEE-754 makes every comparison with NaN unordered — hence `std::partial_ordering::unordered`. The `-0.0`/`+0.0` option describes equal-but-distinguishable values, which is the definition of *weak* ordering, so it is the neighbouring-concept distractor; it is also not why `double` is partial. `std::strong_order` is the tool that imposes a total order for deterministic sorting.",
-      "sourceAnchor": "195-three-way-comparison",
+      "sourceAnchor": "194-three-way-comparison--core",
       "difficulty": "recall"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "For `a == b` the compiler now considers the rewritten reversed candidate `b == a` as well as the ordinary ones, so a heterogeneous pair of overloads that was previously unique can tie. This is the single most common C++17-to-C++20 migration break. The hidden-friend option describes a style recommendation that mitigates the problem, not a language requirement; nothing forces `operator==` to be a friend.",
-      "sourceAnchor": "195-three-way-comparison",
+      "sourceAnchor": "194-three-way-comparison--core",
       "difficulty": "trap"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Equality is never rewritten in terms of `<=>`; the implicit `operator==` appears only as a side effect of *defaulting* `<=>`, and a hand-written one gets no such treatment. The 'strong ordering is enough' answer is tempting because a strong order does mathematically determine equality — but the committee deliberately declined that inference so you never pay ordering cost for an equality test. The return type and `constexpr` are irrelevant to the rule.",
-      "sourceAnchor": "195-three-way-comparison",
+      "sourceAnchor": "194-three-way-comparison--core",
       "difficulty": "application"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 1,
       "explanation": "A named module interface is compiled semantically, so its macros are private to it and importing it neither injects nor receives macro definitions — one of the main ODR wins. Header units are the deliberate exception, since their whole purpose is to bridge existing headers, and that is the fact the 'propagate exactly as with #include' answer inverts. There is no `export #define` directive in any standard.",
-      "sourceAnchor": "196-modules",
+      "sourceAnchor": "196-modules--core",
       "difficulty": "recall"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 3,
       "explanation": "The module win comes from reading a compiled BMI instead of re-lexing and re-parsing header text; instantiation still happens per importer, so a build already dominated by instantiation barely moves. `extern template` remains the tool for that cost. The 'pre-instantiated in the BMI' option is the appealing inverse — exporting a template does not instantiate it, and if it did the speedup would be larger, not smaller.",
-      "sourceAnchor": "196-modules",
+      "sourceAnchor": "196-modules--core",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 2,
       "explanation": "A BMI is a compiler-internal serialization with no standardized format; a different compiler, a different version of the same compiler, or a different flag set can all invalidate it, so source is the distribution artifact. The 'portable except for optimization flags' answer understates the problem by one large step — cross-compiler portability was never on the table. Mixing `import` and `#include` in a consumer is fine.",
-      "sourceAnchor": "196-modules",
+      "sourceAnchor": "196-modules--core",
       "difficulty": "trap"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The three `co_` keywords in the body are the sole trigger; the compiler then looks up a promise type through `coroutine_traits` for the declared return type. The return-type answer reverses cause and effect: a suitable `promise_type` is a *requirement* for a coroutine to compile, but a function returning such a type with an ordinary body is just an ordinary function. There is no `coroutine` keyword in the language.",
-      "sourceAnchor": "197-coroutines",
+      "sourceAnchor": "197-coroutines--role-specific",
       "difficulty": "recall"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 3,
       "explanation": "The frame holds only the coroutine's own state, not a call stack, so there is nowhere to save the helper's activation record across a suspension — suspension points must appear lexically in the coroutine body. The handle-passing answer is plausible because a handle really can be passed anywhere, but a handle only lets you `resume` or `destroy`, never suspend from a nested frame. Stackful fibers are the model that allows suspending at any call depth.",
-      "sourceAnchor": "197-coroutines",
+      "sourceAnchor": "197-coroutines--role-specific",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 1,
       "explanation": "The frame holds exactly the state that must survive a suspension plus the machinery to resume — which is why frames are typically tens to hundreds of bytes rather than kilobytes. 'Every local' is close but wrong in a way that matters: the compiler proves which locals span a suspend point and leaves the rest in registers or on the real stack. The return object lives in the caller, not the frame.",
-      "sourceAnchor": "198-coroutine-promise-types-and-frames",
+      "sourceAnchor": "197-coroutines--role-specific",
       "difficulty": "recall"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Only by-value parameters are copied into the frame; a reference parameter stores just the reference, and the argument temporary is destroyed when the calling full-expression ends — which is typically before the coroutine ever resumes. The lifetime-extension answer is the sharpest trap: `const&` extension applies to a temporary bound directly to a *local* reference variable, and never propagates through a function parameter. Reference parameters are legal, just dangerous.",
-      "sourceAnchor": "198-coroutine-promise-types-and-frames",
+      "sourceAnchor": "197-coroutines--role-specific",
       "difficulty": "trap"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Suspending at the final point freezes the frame so its promise still holds the return value; the price is that ownership transfers to you and someone must call `handle.destroy()`, which is the classic coroutine leak. The `unhandled_exception` answer inverts the order: exceptions are handled before `final_suspend` is reached. `return_value` likewise runs when `co_return` executes, before the final suspend point.",
-      "sourceAnchor": "198-coroutine-promise-types-and-frames",
+      "sourceAnchor": "197-coroutines--role-specific",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Returning a `coroutine_handle<>` from `await_suspend` makes the resume a tail call rather than a nested `resume()` invocation, so the machine stack does not grow per link; `std::noop_coroutine()` terminates the chain. The pooling answer addresses frame *locality*, a genuine but unrelated concern — it changes where frames live, not how deep the resume recursion goes. Making `await_ready` true would simply run everything eagerly and defeat the design.",
-      "sourceAnchor": "198-coroutine-promise-types-and-frames",
+      "sourceAnchor": "197-coroutines--role-specific",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 3,
       "explanation": "`initial_suspend` is evaluated after the return object is built, and its choice determines lazy versus eager start — generators and structured-concurrency tasks want lazy, fire-and-forget tasks want eager. The allocation answers are the tempting ones because both concern 'when work happens', but the frame is allocated before the promise is even constructed, well ahead of `initial_suspend`, so neither variant changes allocation timing or placement.",
-      "sourceAnchor": "198-coroutine-promise-types-and-frames",
+      "sourceAnchor": "197-coroutines--role-specific",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 2,
       "explanation": "`true` keeps the coroutine suspended; `false` cancels the suspension so execution continues into `await_resume` without returning to the resumer. The 'skip straight to await_resume' option is subtly wrong in a load-bearing way: the state has already been spilled into the frame by the time `await_suspend` runs, so the suspension machinery was entered — only the transfer of control is skipped. Failure signalling is done by throwing from `await_resume`, not by this return value.",
-      "sourceAnchor": "199-coroutine-suspension-and-allocation",
+      "sourceAnchor": "197-coroutines--role-specific",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Elision requires the compiler to prove the frame's lifetime is strictly nested within the caller's, which in practice means inlining plus non-escape; storing the handle in a scheduler queue defeats it immediately. The custom `operator new` answer inverts the relationship — supplying one is the deterministic *alternative* when elision cannot be relied on, and it certainly does not license stack placement. There is no standard-mandated size threshold; HALO is an optimization, and Clang implements it far more aggressively than GCC.",
-      "sourceAnchor": "199-coroutine-suspension-and-allocation",
+      "sourceAnchor": "197-coroutines--role-specific",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Reflect (`^^`) produces an opaque constant-expression handle over types, members, namespaces and expressions, and splice (`[: :]`) turns one back into a grammatical construct — everything happens during constant evaluation, so runtime cost is zero by construction. The `type_info` answer is the tempting one because reflection sounds like a runtime facility; it is exactly the opposite, which is why it replaces `magic_enum` and Boost.PFR rather than RTTI. Code injection is separate follow-on work, not what splicing is.",
-      "sourceAnchor": "1914-static-reflection",
+      "sourceAnchor": "1910-contracts-and-static-reflection--outside-the-c23-baseline--reference",
       "difficulty": "recall"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 1,
       "explanation": "A suspend stores the state index, spills live values into the frame, and returns; the resume is an indirect call through the frame's resume pointer, which the branch predictor handles worse than a direct call — and heap-allocated frames are poorly co-located, so the cache miss often dominates. The kernel-entry option is what makes thread switches cost microseconds and is exactly what coroutines avoid; there is no kernel involvement and no atomic on the state index at all.",
-      "sourceAnchor": "199-coroutine-suspension-and-allocation",
+      "sourceAnchor": "197-coroutines--role-specific",
       "difficulty": "application"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A generator resumes a coroutine to produce each element and cannot rewind, so it is an input range and the yielded reference is invalidated by the next `++`. The `forward_range` answer is the common wish and is what makes people reach for `sort` on a generator; multi-pass would require replaying the coroutine, which the model cannot do. Being a view and being a range are not alternatives — `std::generator` is both.",
-      "sourceAnchor": "1910-stdgenerator",
+      "sourceAnchor": "197-coroutines--role-specific",
       "difficulty": "recall"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Manual delegation forwards each value up through every enclosing generator, so N elements at depth D cost O(N·D) resumes; `elements_of` lets the generator hold an explicit handle stack and resume the innermost coroutine, restoring O(1) amortized per element. The memory answer is wrong in the same direction people hope: every recursive invocation still has its own frame, so peak memory remains O(depth). Pass count is unaffected.",
-      "sourceAnchor": "1910-stdgenerator",
+      "sourceAnchor": "197-coroutines--role-specific",
       "difficulty": "application"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`Self&&` on a deduced parameter is a forwarding reference, so a const lvalue caller deduces `Self = const S&` and `std::forward<Self>(self).v` produces a `const T&` — one function replacing the four cv/ref-qualified overloads. The `const S` (by-value) answer describes what happens only when the parameter is written `this Self self`, which is a different, deliberately supported declaration; deduction never silently strips the reference here.",
-      "sourceAnchor": "1911-deducing-this",
+      "sourceAnchor": "198-explicit-object-parameters-deducing-this--core",
       "difficulty": "application"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 3,
       "explanation": "The parameter must come first and the function may be neither `static` nor `virtual`, which is why deducing `this` replaces CRTP rather than dynamic dispatch. The 'cannot be a template' answer inverts the feature's main use case — templating on `Self` is exactly what collapses the four overloads. Base classes are fine and in fact central: `Self` deducing to the *derived* type in a base's member is the CRTP-without-CRTP trick, and also the infinite-recursion hazard.",
-      "sourceAnchor": "1911-deducing-this",
+      "sourceAnchor": "198-explicit-object-parameters-deducing-this--core",
       "difficulty": "recall"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 2,
       "explanation": "An explicit object parameter removes `this` entirely, so unqualified non-static member names do not resolve and every access must be spelled `self.v` — which is why existing macros referencing `this` break on conversion. The 'lookup still works' answer is the natural expectation given the function is still a member, and it is precisely the trap; membership governs access control here, not implicit object lookup.",
-      "sourceAnchor": "1911-deducing-this",
+      "sourceAnchor": "198-explicit-object-parameters-deducing-this--core",
       "difficulty": "trap"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`constinit` is the missing middle: it diagnoses any initializer that is not a constant expression, yet unlike `constexpr` it does not imply `const`, so the object remains writable. The `constexpr` answer is the natural first guess and fails on exactly one point — `constexpr` on a variable implies `const`, so the increment will not compile. `const` says nothing about initialization timing, and `inline` only controls linkage and duplicate definitions.",
-      "sourceAnchor": "1912-constant-initialization-and-constinit",
+      "sourceAnchor": "199-constinit-and-constant-initialization--core",
       "difficulty": "application"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 3,
       "explanation": "The thread-safe-statics guarantee is implemented as a guard byte: after initialization the fast path is one acquire load and a predictable branch, cheap but not free and not removable, whereas a `constinit` global has no guard at all. The `__cxa_guard_acquire` answer is the near-miss — that call happens only on the losing path when the guard shows the object is uninitialized, not on every call. Function-local statics carry no reference count.",
-      "sourceAnchor": "1912-constant-initialization-and-constinit",
+      "sourceAnchor": "199-constinit-and-constant-initialization--core",
       "difficulty": "trap"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 1,
       "explanation": "The fatal conflation was checking with assumption: in `ignore` mode the optimizer could treat a precondition as true, so flipping a build flag turned a wrong contract into undefined behaviour. P2900 separates the two — contracts never license assumption, and `[[assume(expr)]]` (C++23) is the explicit, UB-if-false tool. Result naming does exist in P2900, but it is a syntactic addition, not the reason for the C++20 removal; and P2900 has contracts inherited by overriding virtuals rather than non-inheritable.",
-      "sourceAnchor": "1913-contracts",
+      "sourceAnchor": "1910-contracts-and-static-reflection--outside-the-c23-baseline--reference",
       "difficulty": "recall"
     }
   ]

@@ -99,7 +99,11 @@ test('hand-authored quiz banks meet the authoring standards', async () => {
 test('generated navigation covers every chapter once', async () => {
   const rootChapters = (await readdir(root)).filter((file) => /^chapter-\d{2}-.+\.md$/.test(file));
   const topics = await readFile(path.join(root, 'TOPICS.md'), 'utf8');
-  const groupCount = (topics.match(/^##\s+/gm) || []).length;
+  const groupCount = topics
+    .split(/^##\s+/m)
+    .slice(1)
+    .filter((section) => /^-\s+\*\*Chapter\s+/m.test(section))
+    .length;
   const moduleUrl = new URL('../src/generated/navigation.mjs', import.meta.url);
   const { sidebar } = await import(`${moduleUrl.href}?t=${Date.now()}`);
   assert.equal(sidebar.length, groupCount);

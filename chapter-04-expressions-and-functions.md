@@ -1,867 +1,1461 @@
 # Chapter 4 — Expressions and Functions
 
-*Interview-focused revision notes. The theme: an expression is not just a value — it has a category, a sequencing relationship to its neighbours, and a set of rules deciding which function it calls. Every question in this chapter reduces to one of those three: what kind of thing is this, when does it happen relative to that, and which overload wins.*
+Expressions are where C++’s type system, lifetime rules, and optimizer contract meet. A single line may perform conversions, create a temporary, mutate an object, and select one function from dozens of candidates. If any two of those events are ordered incorrectly—or not ordered at all—the result can change between builds or become undefined.
+
+For a low-latency engineer, this is not language-lawyer decoration. Value categories decide whether a call copies, moves, or constructs directly in place. Lookup and overload resolution decide whether a hot call is visible to the optimizer. Undefined behavior lets the optimizer discard paths that source-level intuition says should execute. The calling convention then determines which source-level abstractions survive at a non-inlined binary boundary.
+
+This chapter builds three decision procedures:
+
+1. classify and sequence an expression before predicting its result;
+2. perform lookup, viability checking, and overload ranking before naming the called function;
+3. separate standard C++ call semantics from compiler, ABI, and processor costs.
+
+**Prerequisites:** Chapter 2’s conversions and `decltype`; Chapter 3’s object representation. Chapter 5 owns the full object-lifetime model.
+
+## 90-second screen
+
+- Every expression has a type and a value category. A named variable expression is an lvalue even when the variable’s declared type is `T&&`.
+- Precedence and associativity determine parsing, not runtime order. `f() + g()` does not promise that `f` runs first.
+- Two conflicting accesses to the same memory location are undefined when they are unsequenced and at least one modifies it. Since C++17, function-argument evaluations are indeterminately sequenced, but their order remains unspecified.
+- Undefined behavior imposes no requirements. Unspecified behavior chooses among permitted outcomes without documentation. Implementation-defined behavior chooses and documents an outcome.
+- A function call is resolved in stages: name lookup, candidate construction, viability, conversion ranking, then tie-breakers. Return type alone cannot overload a function.
+- ADL augments an unqualified call with functions from namespaces and classes associated with its arguments. Qualification disables that customization route.
+- `constexpr` permits constant evaluation; it does not require it. `consteval` requires it. `constinit` applies to static or thread storage and requires static initialization.
+- Templates preserve a callable’s concrete type and therefore give inlining the best chance. `std::function` owns a copyable target behind type erasure and may allocate.
+- **Decision:** isolate side effects into statements when evaluation order matters. A clearer expression normally generates the same code and removes an entire correctness question.
+- **Decision:** judge parameter passing twice—first by source semantics and ownership, then by measured code at the actual inlining and ABI boundary.
 
 ---
 
-## 4.1 Value Categories
+## 4.1 Expressions, Operators, and Operands — Core
 
-Every expression in C++ has two independent properties: a **type** and a **value category**. The category answers two questions — *does this expression have identity (a stable address you could take)?* and *can it be moved from (is its resource safe to steal)?*
+An **expression** is a computation that has a type and a value category and may have side effects. Operators combine operand expressions; function calls and conversions are expressions too. The reliable way to read a dense expression is:
 
 ```
-              has identity?
-                yes        no
-        ┌───────────────┬──────────────┐
-moveable│    xvalue     │   prvalue    │   ← together: rvalue
-   yes  │               │              │
-        ├───────────────┼──────────────┤
-    no  │    lvalue     │  (not used)  │
-        └───────────────┴──────────────┘
-        └─── glvalue ───┘
+tokens
+  │ precedence + associativity
+  ▼
+expression tree
+  │ type rules + conversions + overload resolution
+  ▼
+typed operations
+  │ sequencing rules
+  ▼
+permitted runtime evaluations
 ```
 
-- **lvalue** — has identity, cannot be implicitly moved from. Named variables, `*p`, `a[i]`, a function call returning `T&`, string literals.
-- **prvalue** ("pure rvalue") — no identity, moveable. Literals (except string literals), `a + b`, a call returning `T` by value, `T{}`, a lambda expression.
-- **xvalue** ("expiring value") — has identity, moveable. `std::move(x)`, a call returning `T&&`, `a[i]` on an rvalue array, member access on an xvalue.
-- **glvalue** = lvalue ∪ xvalue (things with identity). **rvalue** = prvalue ∪ xvalue (things you may move from).
+Do not skip a layer. In particular, the shape of the tree does not generally impose a traversal order.
 
-The single most useful reframing: **a prvalue is not an object.** Since C++17 a prvalue is an *initializer* — a recipe for producing an object — and no object exists until the prvalue is **materialized** (Ch. 5 §5.7). This is what made guaranteed copy elision work: `T x = T(T(T()));` involves exactly one object because the nested prvalues never produce temporaries to elide.
+### Parse first; order later
 
-### Traps and named-rvalue confusion
+Precedence answers which operator owns which operand. Associativity resolves operators at the same precedence level.
 
 ```cpp
-void sink(std::string&& s) {
-    consume(s);              // s is an LVALUE here — its type is rvalue-ref, its category is lvalue
-    consume(std::move(s));   // correct: converts to xvalue
+#include <cassert>
+
+int main() {
+    int a = 2;
+    int b = 3;
+    int c = 4;
+
+    assert(a + b * c == 14);        // parsed as a + (b * c)
+
+    int x = 0;
+    int y = 0;
+    x = y = 7;                      // parsed as x = (y = 7)
+    assert(x == 7 && y == 7);
 }
 ```
-**A named rvalue reference is an lvalue.** *Type* and *category* are orthogonal; the rule exists so a parameter isn't silently moved from twice. This is the most common value-category interview question and it catches experienced people.
 
-`std::move` is a cast, nothing more: `static_cast<remove_reference_t<T>&&>(x)`. It moves nothing and emits no code. `std::forward<T>` is a conditional cast that preserves category (Ch. 17). `decltype` distinguishes categories: `decltype(x)` on a name gives the declared type; `decltype((x))` — with the extra parens, making it an expression — gives `T&` for an lvalue and `T&&` for an xvalue (Ch. 2 §2.17).
+This says nothing about whether arbitrary operands are evaluated left-to-right. Multiplication binds more tightly than addition, but in `f() + g() * h()` the language does not generally require `f`, `g`, and `h` to run in textual order.
 
-### Why it matters at the ABI level
+Parentheses change grouping, not the sequencing rules of the grouped operator:
 
-Value category selects the overload, which selects whether a copy or a move happens, which for a `std::vector` member is the difference between a heap allocation plus a `memcpy` and three pointer assignments. On a hot path, an accidental lvalue where you meant an xvalue is a silent allocation. Prvalues under guaranteed elision are the only zero-cost case: the callee constructs directly into the caller's storage via the hidden return-slot pointer (§4.17), so there is no object to move at all.
+```cpp
+auto result = (f() + g()) * h();   // f() versus g() is still not ordered
+```
 
-Bit-fields, and *only* bit-fields, are lvalues whose address cannot be taken — a reminder that "lvalue" means *identity*, not *addressable* (Ch. 3 §3.4).
+### Built-in and overloaded operators
+
+Before applying most built-in operators, C++ performs conversions: lvalue-to-rvalue conversion, array/function decay, integral promotions, and the usual arithmetic conversions. Those conversions help explain surprising types:
+
+```cpp
+#include <cstdint>
+#include <type_traits>
+
+int main() {
+    std::uint8_t a = 200;
+    std::uint8_t b = 100;
+    auto sum = a + b;
+
+    static_assert(std::is_same_v<decltype(sum), int>);
+    return sum == 300 ? 0 : 1;
+}
+```
+
+Both small integers are promoted to `int`; the addition is not eight-bit arithmetic. The eventual assignment back to `uint8_t`, if any, is a separate conversion.
+
+An operator may instead name an overloaded function. Candidate construction and overload resolution then choose that function. Operator notation retains the sequencing rule associated with that operator. Function notation follows call rules:
+
+```cpp
+// Assuming operator<<(Stream&, Value) is overloaded:
+stream << make_value();             // left operand is sequenced before right
+operator<<(stream, make_value());   // ordinary function-call argument ordering
+```
+
+These forms can call the same function yet offer different ordering guarantees.
+
+### Operator rules worth keeping active
+
+| Construct | Governing rule | Likely cost | Interview trap |
+|---|---|---|---|
+| `a + b`, `a * b` | Usual conversions; operands generally unsequenced | Depends on type; overloaded forms are calls | Reading textual order as evaluation order |
+| `a && b`, `a \|\| b` | Left first; right conditionally evaluated | A branch or branchless code chosen by compiler | Expecting overloaded `&&`/`\|\|` to short-circuit |
+| `cond ? a : b` | Condition first; only selected arm evaluated | Control dependency; type formed from both arms | Assuming unselected arm’s type is irrelevant |
+| `a, b` | Built-in comma sequences left before right | Usually none beyond operands | Confusing comma operator with commas separating call arguments |
+| `p[i]` | Defined as `*(p + i)` for built-in operands | Address calculation and load/store | `i[p]` is also valid built-in syntax |
+| `a = b` | Right operand before left operand since C++17 | Store plus operand work | Believing right associativity itself supplies the order |
+| `a && b` when overloaded | A function call; no short-circuit | Call/inline cost and both arguments evaluated | Transferring built-in short-circuit semantics to overloads |
+
+Overloaded `operator&&`, `operator||`, and `operator,` do not acquire the built-in operators’ conditional evaluation behavior. Avoid them when a reader could infer short-circuiting.
+
+### A low-latency reading rule
+
+Count mechanisms, not punctuation. `book[lookup(symbol)].update(parse(packet))` may contain two unpredictable searches, bounds policy, a temporary, several conversions, and an allocation hidden in an overload. Split the line while investigating:
+
+```cpp
+const auto id = lookup(symbol);
+const auto update = parse(packet);
+book[id].update(update);
+```
+
+This establishes explicit full-expression boundaries. It also makes profiling and disassembly attribution easier. Compilers can inline and reschedule across these statements when the as-if rule permits; readability need not add runtime work.
 
 ---
 
-## 4.2 Expression Sequencing
+## 4.2 Value Categories — Core
 
-**Sequencing** defines the ordering of *value computations* (working out what an expression denotes) and *side effects* (writes to objects, I/O, atomic ops). C++11 replaced the old "sequence point" model with a partial order:
+A value category describes how an expression relates to an object or function. The useful interview model has two axes: does the expression identify something, and may its resources be reused?
 
-- **A is sequenced-before B** — every effect of A completes before any effect of B starts.
-- **A and B are indeterminately sequenced** — one precedes the other, but which is unspecified. They do not interleave.
-- **A and B are unsequenced** — no ordering at all; they may interleave freely.
+```
+                         has identity?
+                    yes                  no
+             ┌────────────────┬────────────────┐
+may be moved │    xvalue      │    prvalue     │
+from         │  std::move(x)  │  T{}, a + b    │
+             ├────────────────┼────────────────┤
+not treated  │    lvalue      │   no named     │
+as expiring  │  x, *p, a[i]   │   category     │
+             └────────────────┴────────────────┘
+                 glvalue ─────┘
+             └──────── rvalue row ─────────────┘
+```
 
-The critical rule: **if two side effects on the same scalar object are unsequenced, or a side effect is unsequenced relative to a value computation using that object, the behaviour is undefined.**
+- An **lvalue** is a glvalue that is not an xvalue: a named object, `*p`, `a[i]`, a string literal, or a call returning `T&`.
+- An **xvalue** is a glvalue denoting an object whose resources may be reused: `std::move(x)`, a call returning `T&&`, or member access through an xvalue object.
+- A **prvalue** initializes an object or computes an operand value: most literals, arithmetic results, `T{}`, and a call returning `T`.
+- A **glvalue** (generalized lvalue) is an lvalue or xvalue; it identifies an object or function.
+- An **rvalue** is a prvalue or xvalue; it participates in overloads that may consume resources.
 
-### What is guaranteed
+“Has identity” is not exactly “its address can be taken.” A bit-field is an lvalue but cannot be the operand of ordinary address-of.
 
-| Construct | Guarantee |
-|---|---|
-| `;` (full expression) | Everything sequenced-before the next statement |
-| `&&`, `\|\|` | Left operand fully sequenced-before right; short-circuits |
-| `,` (comma operator) | Left sequenced-before right |
-| `?:` | Condition sequenced-before the selected branch |
-| `a[i]`, `a->b`, `a.b` | Postfix expression sequenced-before the subscript/member (C++17) |
-| `<<` / `>>` (C++17) | Left sequenced-before right — makes `cout << f() << g()` ordered |
-| `=`, `+=` (C++17) | **Right** operand sequenced-before left; assignment's side effect sequenced-after both |
-| `new T(expr)` (C++17) | Allocation sequenced-before evaluation of the initializer |
-| Function call | All argument evaluations **indeterminately sequenced** relative to each other; each is complete before the body runs |
-| `+`, `-`, `*`, `<`, arbitrary binary ops | **Unsequenced** — operands may interleave |
+### Type and category are independent
 
-C++17 (P0145) was a major cleanup: it ordered `a[i]`, member access, shifts, and assignment, and it made function-argument evaluation *indeterminately* sequenced rather than unsequenced, which means arguments can no longer interleave. That last change is what makes `f(make_unique<A>(), make_unique<B>())` leak-free in C++17 — before it, the compiler could allocate both raw pointers, then run both constructors, and a throw in the second leaked the first.
-
-### The classic UB cases
+The expression consisting of a variable’s name is normally an lvalue. This includes a variable declared as an rvalue reference:
 
 ```cpp
-i = i++ + 1;        // UB pre-C++17; well-defined C++17 (RHS before LHS assignment)... 
-                    // but i = ++i + i++; is still UB (two unsequenced modifications)
-f(i++, i++);        // UNSPECIFIED order, and pre-C++17 UB; C++17: indeterminately sequenced,
-                    // still UB — two modifications of i unsequenced w.r.t. each other? No:
-                    // indeterminately sequenced means NOT unsequenced, so C++17 makes it
-                    // unspecified-which-order but defined.
-a[i] = i++;         // C++17: defined (RHS first). Pre-C++17: UB.
-cout << i << i++;   // C++17: defined and ordered left-to-right.
+#include <string>
+#include <utility>
+
+void consume(const std::string&);  // observes
+void consume(std::string&&);       // may take resources
+
+void relay(std::string&& message) {
+    consume(message);              // message is an lvalue expression
+    consume(std::move(message));   // cast to an xvalue
+}
 ```
-The safe interview answer is not to recite which C++17 rescued — it's to say **write it as two statements**, because the reader can't know the standard version and the compiler will produce identical code. `-Wsequence-point` (GCC) and `-Wunsequenced` (Clang) catch the obvious cases; UBSan does not, because these are compile-time-detectable, not runtime.
 
----
+`std::move` does not move anything. It is a cast that enables overload resolution to select operations accepting an rvalue. The selected constructor or function performs the transfer. Applying it to a `const T` produces `const T&&`, which usually cannot bind to a move constructor taking `T&&`; a copy overload may win instead.
 
-## 4.3 Order of Evaluation
-
-Sequencing (§4.2) is the formal machinery; *order of evaluation* is the practical consequence: which of several subexpressions the compiler actually runs first, and what you may rely on.
-
-**Function arguments have unspecified evaluation order.** Not undefined — *unspecified*, meaning the implementation picks one of a set of valid orders and need not document or be consistent about it. In practice: GCC and Clang on x86-64 SysV evaluate **right-to-left** (arguments are pushed/assigned in reverse), MSVC also right-to-left, but this changes with inlining and is not a contract.
+This distinction is easy to test:
 
 ```cpp
-log(next_seq(), next_seq());     // which sequence number lands in which parameter? Unspecified.
-```
-This bites in trading code where argument expressions have side effects: `send(alloc_id(), timestamp())` may record a timestamp *before* the id, or after.
+#include <type_traits>
+#include <utility>
 
-### Chained calls
+int main() {
+    int value = 1;
+    int&& ref = 2;
+
+    static_assert(std::is_lvalue_reference_v<decltype((value))>);
+    static_assert(std::is_lvalue_reference_v<decltype((ref))>);
+    static_assert(std::is_rvalue_reference_v<decltype((std::move(value)))>);
+}
+```
+
+For an unparenthesized id-expression, `decltype(name)` reports the declared type. For a general expression, `decltype((expression))` reports `T&` for an lvalue, `T&&` for an xvalue, and `T` for a prvalue.
+
+### Materialization and direct construction
+
+Since C++17, class prvalues are used to initialize their result objects directly when the rules require guaranteed copy elision. In:
 
 ```cpp
-obj.set_a(f()).set_b(g());   // C++17: obj.set_a(f()) fully sequenced-before .set_b(g())
-                             // ...but f() and g() ordering relative to the OTHER call's object
-                             // expression was the pre-C++17 hazard
+struct Snapshot {
+    int sequence;
+};
+
+Snapshot make_snapshot() {
+    return Snapshot{42};
+}
+
+int main() {
+    Snapshot s = make_snapshot();
+}
 ```
-C++17's "postfix expression sequenced-before arguments" rule is what makes fluent/builder interfaces and `std::cout` chains behave as written.
 
-### Initializer lists
+the returned prvalue initializes `s` directly; the language does not first require a separate temporary and then a move. When a glvalue is needed—for example, to bind a reference—a **temporary materialization conversion** materializes a temporary and produces an xvalue denoting it. Chapter 5 treats the lifetime consequences in full.
 
-Braced-init-lists are the exception worth memorizing: **elements of a braced-init-list are evaluated strictly left-to-right**, sequenced.
+### Category, rule, cost, trap
 
-```cpp
-std::vector<int> v{f(), g()};       // f() before g() — GUARANTEED
-foo(f(), g());                      // unspecified order
-Widget w{f(), g()};                 // left-to-right — guaranteed
-```
-This is a genuine reason to prefer braces when argument expressions have side effects, and it is a good "non-obvious detail" answer.
-
-### Why the freedom exists
-
-Unspecified argument order lets the compiler schedule for register pressure and latency: it can evaluate the expensive, high-latency subexpression first so its result is ready while the cheap one computes, filling the pipeline (Ch. 27). Fixing the order would cost real performance in numeric code. The committee has repeatedly declined to specify it for exactly this reason, while fixing the cases (`new`, assignment, shifts, subscript) where the freedom bought nothing and caused bugs.
-
-**Interview framing:** *"Is `f(i++, i++)` undefined or unspecified in C++17?"* — the modifications are indeterminately sequenced (each argument's evaluation is complete before the other starts), so it is no longer UB, but which value each parameter receives is unspecified. Pre-C++17 it was UB. Getting that distinction right signals precision.
-
----
-
-## 4.4 Undefined, Unspecified, and Implementation-Defined Behavior
-
-These three are conflated constantly; an interviewer will ask you to separate them.
-
-| Category | Definition | Documented? | Can vary run to run? | Example |
+| Category | Typical source | What it enables | Low-latency consequence | Trap |
 |---|---|---|---|---|
-| **Undefined (UB)** | No requirements at all. The standard imposes nothing on the entire program. | No | Yes — and retroactively | Signed overflow, null deref, OOB access, data race |
-| **Unspecified** | The implementation picks from a set of valid behaviours. | No | Yes | Argument evaluation order, `<` on unrelated pointers, padding byte values |
-| **Implementation-defined** | Unspecified, but the implementation **must document** its choice. | **Yes** | No | `sizeof(int)`, `char` signedness, right-shift of negative values (until C++20), `>>` on signed |
-| **Erroneous (C++26)** | Well-defined-but-wrong: a specific incorrect value, diagnosable, no time travel. | Partially | Yes | Reading an uninitialized automatic variable (P2795) |
-| **Ill-formed, NDR** | The program is invalid but the compiler need not diagnose it | — | — | ODR violations (Ch. 1 §1.6) |
+| lvalue | named object, `*p`, `T&` return | observation or mutation through identity | usually selects copy/borrow overload | declared `T&&` does not make a named expression an rvalue |
+| xvalue | `std::move(x)`, `T&&` return | destructive transfer | may replace allocation/copy with handle transfer | moved-from object remains alive; its documented state still matters |
+| prvalue | literal, `T{}`, by-value return | direct initialization/materialization | guaranteed elision may remove transfer entirely | saying “the optimizer might elide” understates guaranteed cases |
 
-### Why UB is worse than "unpredictable result"
+Use category reasoning to predict overloads, not machine instructions. A move of a fixed-size array wrapper may still copy every element. A move of a vector usually transfers a small control block, subject to allocator rules. Measure the selected operation’s implementation.
 
-The compiler is entitled to assume UB never happens, and it propagates that assumption **backwards through the program**:
+---
+
+## 4.3 Expression Sequencing — Core
+
+Sequencing is a partial order over evaluations. An evaluation includes value computations and initiation of side effects. The three relationships are:
+
+- **sequenced before:** every relevant evaluation in A precedes every relevant evaluation in B;
+- **indeterminately sequenced:** either A precedes B or B precedes A, but they do not interleave;
+- **unsequenced:** neither is ordered before the other.
+
+Within one thread, if a side effect on a memory location is unsequenced relative to another side effect on the same location, or relative to a value computation using an object occupying that location, the behavior is undefined. The safe interview test is: identify the same scalar, find the two accesses, and prove a sequencing edge.
+
+### Sequencing map
+
+| Construct | C++23 guarantee |
+|---|---|
+| one full-expression followed by the next | first is sequenced before second |
+| built-in `&&`, `\|\|` | left before right; right may be skipped |
+| built-in comma operator | left before right |
+| conditional `?:` | condition before the selected arm |
+| braced initializer clauses | left-to-right |
+| assignment and compound assignment | right operand before left operand; store after operand value computations |
+| subscript `a[b]` | `a` before `b` |
+| shift/insertion expression `a << b`, `a >> b` | `a` before `b` |
+| postfix expression in a call | before every argument and default argument |
+| different function-argument initializations | indeterminately sequenced relative to one another |
+| operands of most arithmetic/comparison operators | unsequenced |
+
+The comma in `f(a(), b())` separates arguments; it is not the comma operator. No left-to-right guarantee follows.
+
+### Compiler-prediction snippets
+
+Predict the status before predicting the numeric result:
 
 ```cpp
-int f(int* p) {
-    int x = *p;              // if p were null this would be UB...
-    if (p == nullptr) return -1;   // ...so the compiler DELETES this check
-    return x;
+int i = 0;
+i = i++ + 1;          // defined since C++17
+```
+
+The right operand of assignment is evaluated before the left, including the post-increment’s side effect. The final value is `1`.
+
+```cpp
+int i = 0;
+int x = ++i + i++;    // undefined: the two modifications are unsequenced
+```
+
+The operands of built-in `+` are unsequenced. Parentheses around either operand would not fix this; separate statements would.
+
+```cpp
+int i = 0;
+record(i++, i++);     // defined since C++17; which parameter receives 0 is unspecified
+```
+
+Each argument initialization completes before the other begins, so the modifications do not conflict unsequenced. The implementation may choose either order.
+
+```cpp
+int i = 0;
+buffer[i] = i++;      // defined since C++17: right operand before left operand
+```
+
+Even where modern C++ defines an expression, prefer two statements when a reviewer must remember the standard version to validate it.
+
+### Full expressions are useful fences in the abstract machine
+
+The end of an expression statement, a controlling expression, an initializer, and several other grammar contexts form a **full-expression** boundary. Evaluations of one full-expression are sequenced before the next:
+
+```cpp
+const auto slot = next_slot();  // full-expression 1
+const auto now = read_clock();  // full-expression 2
+publish(slot, now);             // full-expression 3
+```
+
+This does not create a hardware memory fence and says nothing about other threads. It provides single-thread abstract-machine order. The optimizer may rearrange instructions if no observable behavior changes.
+
+---
+
+## 4.4 Order of Evaluation — Core
+
+Sequencing states legal relationships; **order of evaluation** asks which permitted relationship an implementation chooses. The key distinction is:
+
+> “Not specified which goes first” is not the same as “unsequenced.”
+
+Function arguments illustrate it:
+
+```cpp
+#include <array>
+
+int next_id();
+long read_timestamp();
+void submit(int, long);
+
+void send_one() {
+    submit(next_id(), read_timestamp());
 }
 ```
-This is "time travel": the consequence appears *before* the offending operation, and code you wrote is silently removed. The canonical real-world instance is the Linux kernel's `tun_chr_poll` CVE-2009-1897, where exactly this deletion of a null check produced an exploitable bug. Similarly, a loop with signed-overflow UB may be assumed to terminate, and a function whose every path is UB may be compiled to nothing at all (Clang emits `ud2`).
 
-The lesson to state: **UB is not "whatever the hardware does."** Reasoning about UB in terms of machine behaviour is the mistake; it is a contract violation with the optimizer.
+Both argument evaluations finish before the function body starts, and one finishes before the other starts. C++23 does not specify which one happens first. If the timestamp must correspond to the allocated ID, make the order explicit:
 
-### Tooling
+```cpp
+const int id = next_id();
+const long timestamp = read_timestamp();
+submit(id, timestamp);
+```
 
-- **UBSan** (`-fsanitize=undefined`) — runtime detection of overflow, misalignment, null deref, bad enum/bool values, OOB (with `-fsanitize=bounds`). ~20% slowdown; run it in CI, not production.
-- **ASan** (`-fsanitize=address`) — heap/stack/global overflow, use-after-free, ~2× slowdown.
-- **TSan** — data races (Ch. 25).
-- **`-fwrapv`** makes signed overflow defined (two's complement wrap), and **`-ftrapv`** traps it. Both cost optimizations — `-fwrapv` in particular defeats loop-strength-reduction and some vectorization, because the compiler can no longer assume `i` doesn't wrap.
-- **`-fno-strict-aliasing`, `-fno-delete-null-pointer-checks`** — what the kernel uses to disable specific UB-based optimizations wholesale.
+Do not infer argument order from register order in an ABI, from current disassembly, or from one compiler’s behavior. Inlining and optimization can change the chosen order without changing the ABI.
 
-**Low-latency angle:** signed loop counters are *faster* than unsigned ones precisely because signed overflow is UB, so the compiler can promote a 32-bit induction variable to 64-bit without emitting wraparound handling. `for (int i = 0; i < n; ++i)` vectorizes where `for (unsigned i = ...)` may not. That is a real, measurable, counterintuitive answer.
+### Ordered alternatives
+
+Braced initializer clauses are evaluated left-to-right:
+
+```cpp
+#include <array>
+
+int first();
+int second();
+
+auto values() {
+    return std::array{first(), second()};  // first() before second()
+}
+```
+
+A comma fold is also ordered because it uses the built-in comma operator:
+
+```cpp
+template<class... Actions>
+void run_in_order(Actions&&... actions) {
+    (actions(), ...);                      // left-to-right
+}
+```
+
+Use these guarantees because they express the intended structure, not as tricks to compress side effects.
+
+### Fluent calls and stream chains
+
+Since C++17, the postfix expression in a call is sequenced before its arguments. Combined with operator sequencing, this gives intuitive behavior to chains such as:
+
+```cpp
+builder.set_price(read_price()).set_size(read_size());
+stream << header() << payload();
+```
+
+The first member call completes before evaluation of the second call’s argument. In the stream expression, the left insertion is sequenced before the right operand of the next insertion. This guarantee applies to operator notation; spelling the overloaded operation as an ordinary function call reintroduces ordinary argument-order rules.
+
+### Why unspecified order exists
+
+The freedom can help a compiler manage register pressure or schedule independent work. That does not make it a dependable optimization. If two argument expressions communicate through mutable state, their order is part of program logic and must be expressed explicitly.
+
+For low-latency code, unspecified order is especially dangerous around sequence counters, timestamp reads, logging, allocator state, and enqueue operations. Bugs may survive tests because a particular compiler consistently chooses one order until an unrelated change alters inlining.
 
 ---
 
-## 4.5 Common Sources of Undefined Behavior
+## 4.5 Undefined, Unspecified, and Implementation-Defined Behavior — Core
 
-A checklist worth having ordered by how often it actually appears in production C++:
+These labels define different contracts. A strong answer states what the standard requires, whether documentation is required, and what code may assume.
 
-**Memory and lifetime**
-- Use-after-free, use-after-move-then-read-of-unspecified-state (the latter is *not* UB — moved-from standard types are valid but unspecified; reading them is legal, assuming a particular value is a bug).
-- Dangling references: returning a reference to a local, a `string_view` into a temporary (Ch. 13), a lambda capturing by reference and outliving the capture (Ch. 18).
-- Out-of-bounds access, including `v[v.size()]` and `&v[0]` on an empty vector (`v.data()` is the fix).
-- Deleting through a base pointer without a virtual destructor (Ch. 6 §6.13).
-- Mismatched `new`/`delete[]`, `malloc`/`delete`.
+| Category | Standard’s contract | Must implementation document it? | May a program rely on one outcome? | C++23 example |
+|---|---|---:|---:|---|
+| **undefined behavior** | imposes no requirements after the program violates the rule | no | no | signed overflow, out-of-bounds access, data race |
+| **unspecified behavior** | permits one of a stated set of possibilities | no | no | order of function arguments; which identical string literals share storage |
+| **implementation-defined behavior** | permits a choice and requires documentation | yes | only for the documented implementation | signedness of plain `char`; sizes/ranges of fundamental integer types |
+| **ill-formed, diagnostic required** | program violates a diagnosable rule | compiler must issue at least one diagnostic | no executable meaning follows from the standard | ambiguous overload |
+| **ill-formed, no diagnostic required** | program is invalid but diagnosis is not required | no | no | many cross-translation-unit ODR violations |
 
-**Arithmetic**
-- **Signed integer overflow** (Ch. 2 §2.4). Unsigned wraps — defined.
-- Division by zero, and `INT_MIN / -1` (overflows the quotient; on x86 raises `#DE` and crashes).
-- Shift by ≥ width, or by a negative amount. `x << 32` for 32-bit `x` is UB, and x86's shift instructions mask the count to 5 bits so it silently yields `x`.
-- Conversion of an out-of-range floating value to an integer type.
+Unspecified behavior is not a weaker form of UB. Every permitted unspecified outcome remains within the language contract. The optimizer cannot use it as proof that a supposedly impossible path never occurs. Implementation-defined behavior is also valid behavior; portability requires checking the implementation’s documentation.
 
-**Pointers and types**
-- Strict-aliasing violations (Ch. 3 §3.8), misaligned access (Ch. 3 §3.3), null dereference — *including* `memcpy(nullptr, nullptr, 0)`, which is UB despite the zero length.
-- Pointer arithmetic outside an array (Ch. 3 §3.10).
-- Reading an inactive union member (Ch. 5 §5.13), outside the common initial sequence.
-- Reading an indeterminate value (Ch. 3 §3.2) — erroneous, not UB, in C++26.
+### Why UB changes apparently earlier code
 
-**Control and initialization**
-- Falling off the end of a value-returning function. The compiler may assume the path is unreachable and delete the branch leading to it; Clang emits nothing and execution runs into the next function. `-Wreturn-type` should be an error in every build.
-- Infinite loop with no side effects (C++11–C++23: UB because the compiler may assume forward progress; a `while(1){}` spin loop needs an atomic or a volatile read, or `std::this_thread::yield`). This surprises people writing spin waits.
-- Recursion depth exceeding the stack — not formally UB-by-name but unbounded in effect.
-- Static initialization order fiasco (Ch. 5 §5.10) — unspecified order, UB if you read an unconstructed object.
+Consider this intentionally invalid function:
 
-**Concurrency**
-- Any data race (Ch. 25 §25.1). Two unsynchronized accesses, at least one a write.
-- Recursive locking of a non-recursive mutex, unlocking a mutex you don't own.
+```cpp
+int load_or_default(const int* p) {
+    const int value = *p;       // UB if p is null
+    if (p == nullptr) {
+        return -1;
+    }
+    return value;
+}
+```
 
-**Library contract violations**
-- Passing an invalid iterator, invalidated by a prior mutation (Ch. 11 §11.8).
-- Calling `.front()`/`.back()`/`.top()` on an empty container.
-- Violating a comparator's strict-weak-ordering requirement — `std::sort` with a bad comparator reads out of bounds and corrupts memory, not merely producing a wrong order. This is a favourite question: *why does an invalid comparator crash rather than misorder?* Because libstdc++'s introsort omits a bounds check in the partition inner loop, relying on the sentinel property that a valid ordering guarantees.
+The abstract machine reaches the dereference before the check. A conforming execution cannot take the null path without already encountering UB, so an optimizer may reason that `p` is non-null and remove the check. This is not the compiler reordering a hardware fault past a branch. It is the compiler optimizing only the executions for which the language gives the program meaning.
 
-The strong-candidate framing: UB clusters into *lifetime*, *bounds*, *arithmetic*, *aliasing*, and *concurrency*, and each has a corresponding sanitizer. Naming the sanitizer for each class is worth as much as listing the cases.
+The repair is to validate before the operation:
+
+```cpp
+int load_or_default(const int* p) {
+    if (p == nullptr) {
+        return -1;
+    }
+    return *p;
+}
+```
+
+### Common sources of undefined behavior
+
+Most production UB falls into a small number of families:
+
+| Family | Examples | Why low-latency code is exposed | Useful defense |
+|---|---|---|---|
+| lifetime | dangling reference, use-after-free, view into a temporary | pools, intrusive structures, async callbacks | ownership review; ASan; lifetime-focused tests |
+| bounds | bad pointer arithmetic, invalidated iterator, `v[v.size()]` | unchecked access and hand-written parsers | span-based APIs; fuzzing; ASan/UBSan |
+| arithmetic | signed overflow, divide by zero, invalid shift count | fixed-width counters and bit manipulation | range proofs; checked arithmetic; UBSan |
+| alignment/aliasing | misaligned typed access, invalid type punning | packed wire formats and SIMD buffers | `memcpy`, `std::bit_cast`, alignment contracts |
+| initialization | reading an indeterminate value | reused buffers and partial decoding | value initialization; definite-write checks |
+| control flow | falling off a value-returning function | warning suppressed in “impossible” path | treat warnings as errors; explicit unreachable policy |
+| concurrency | data race, invalid mutex use | busy polling and shared state | atomics/locks with documented protocol; TSan |
+| library precondition | invalid comparator, empty-container `front()`, invalid iterator | unchecked standard algorithms | encode preconditions; debug libraries; tests |
+
+Two nearby cases are often mislabeled:
+
+- A moved-from standard-library object is generally valid but in an unspecified state unless a stronger postcondition is documented. Reading it is not automatically UB; assuming a particular value may be a logic error.
+- Unsigned integer arithmetic wraps modulo \(2^N\). Signed overflow is UB. Converting a signed value to an unsigned type is defined modulo \(2^N\), but that does not make a preceding signed overflow valid.
+
+### Optimizer flags and sanitizers
+
+Sanitizers are diagnostic implementations, not changes to the standard contract:
+
+- AddressSanitizer catches many out-of-bounds and use-after-free errors.
+- UndefinedBehaviorSanitizer instruments selected arithmetic, alignment, bounds, and type rules.
+- ThreadSanitizer detects many data races.
+
+They do not prove absence of UB, and sanitizer builds materially perturb layout and timing. Run them in tests and CI, not as a latency benchmark.
+
+Compiler switches such as GCC/Clang `-fwrapv` or `-fno-strict-aliasing` are implementation options that alter or restrict optimization assumptions for that build. They are not portable C++ language rules. If a system adopts one, record it in the build contract and test every production configuration.
 
 ---
 
-## 4.6 Function Overload Resolution
+## 4.6 Function Declarations, Definitions, and Calls — Core
 
-Overload resolution runs in three phases, and confusing them is the source of most "why did it pick *that*?" surprises.
+A function declaration introduces its name and type. A definition supplies its body. A call performs lookup and overload resolution, initializes parameters from arguments, executes the body, and initializes the result from the return operand.
+
+```cpp
+#include <cstdint>
+
+namespace feed {
+
+struct Message {
+    std::uint32_t sequence;
+};
+
+bool valid(const Message&) noexcept;       // declaration
+
+bool valid(const Message& m) noexcept {    // definition
+    return m.sequence != 0;
+}
+
+} // namespace feed
+```
+
+Declarations for the same function must agree on the function type and relevant specifiers. Parameter names need not match and are not part of the function type. Top-level cv-qualification on a by-value parameter does not distinguish overloads:
+
+```cpp
+void inspect(int);
+void inspect(const int);  // redeclaration of the same function, not an overload
+```
+
+By contrast, `const` inside a pointed-to or referred-to type matters:
+
+```cpp
+void inspect(int*);
+void inspect(const int*); // distinct overload
+```
+
+`noexcept` is part of a function type since C++17, which matters to pointers and templates, but two otherwise identical non-template functions cannot be overloaded solely on `noexcept`. Return type alone also cannot distinguish overloads because a call’s context does not generally participate in choosing the function.
+
+### Definitions, `inline`, and the ODR
+
+A non-inline function normally has one definition in the program. An `inline` function or function template may be defined identically in multiple translation units, which is why definitions appear in headers. The `inline` keyword is primarily an ODR/linkage facility; it does not command machine-code inlining. Conversely, compilers may inline functions that lack the keyword.
+
+At a call site, the optimizer can only inline a body it can see or recover through link-time optimization. That affects performance, not source semantics. A direct non-inlined call has an ABI boundary; an inlined call has no calling convention at runtime.
+
+### The call sequence
 
 ```
-1. Name lookup      → assemble candidate set (ordinary lookup + ADL §4.7)
-2. Viability filter → discard candidates whose parameters can't be initialized
-                      from the arguments, or whose constraints fail (C++20)
-3. Best match       → rank the viable ones by conversion sequence
+source: process(make_message(), policy)
+          │
+          ├─ lookup "process"
+          ├─ build and rank overload candidates
+          ├─ evaluate postfix expression
+          ├─ initialize arguments (relative order may be unspecified)
+          ├─ initialize parameters
+          ├─ execute selected body
+          └─ initialize result object / bind result reference
 ```
 
-**Name lookup happens first and is not influenced by the arguments' suitability.** If a derived class declares *any* function named `f`, it hides *all* base-class `f`s regardless of signature — the base overloads are never in the candidate set. `using Base::f;` reintroduces them. Same for an inner-scope declaration hiding an outer one.
+Default arguments participate at the call site after a declaration is selected. They do not create extra overloads.
 
-### Ranking conversion sequences
+---
 
-Each argument gets an implicit conversion sequence, ranked:
+## 4.7 Parameters, Arguments, and Return Values — Core
 
-| Rank | Category | Examples |
+An **argument** is an expression at the call site. A **parameter** is the function-local entity initialized from it. Pick a parameter form from ownership and mutation semantics first:
+
+| Intent | Common parameter form | Caller-visible consequence |
 |---|---|---|
-| 1 | **Exact match** | Identity, lvalue-to-rvalue, array/function-to-pointer decay, qualification conversion (`T*`→`const T*`) |
-| 2 | **Promotion** | `char`/`short`→`int`, `float`→`double`, unscoped enum→underlying (Ch. 2 §2.2) |
-| 3 | **Conversion** | Any other standard conversion: `int`→`double`, `int`→`bool`, `Derived*`→`Base*`, `T*`→`void*`, pointer-to-bool |
-| 4 | **User-defined conversion** | One converting constructor **or** one conversion operator — never two chained |
-| 5 | **Ellipsis** | `...` — always worst |
+| consume a small scalar/value | `T` | independent local value |
+| read a large object without ownership | `const T&` | borrow; caller must keep object alive for call |
+| mutate caller-owned object | `T&` | non-null borrow with visible mutation |
+| optional borrow | `T*` / `const T*` | null can encode absence |
+| take ownership | owning handle by value | transfer is explicit at call site |
+| read contiguous sequence | `std::span<const T>` | pointer plus extent; no ownership |
+| generic perfect forwarding | `T&&` in a deduced context | preserves argument category; template-only tool |
 
-A candidate wins only if it is **no worse for every argument and strictly better for at least one**. If no candidate satisfies that, the call is **ambiguous** — a hard error, not a coin flip.
+“Pass everything by `const&`” is not a performance policy. A small scalar passed by reference may force an address to exist, add an aliasing possibility, and inhibit optimization when the call does not inline. A large object passed by value may copy. The right threshold is ABI- and type-dependent, and ownership may dominate byte count.
 
-```cpp
-void f(int);
-void f(double);
-f(3.0f);     // float→double is a promotion (rank 2); float→int is a conversion (rank 3) → f(double)
-f('a');      // char→int is a promotion → f(int)
-f(3u);       // unsigned→int and unsigned→double are BOTH rank-3 conversions → AMBIGUOUS
-```
-That third line is the classic trap and worth being able to produce on demand.
+### Sink parameters
 
-### Tie-breakers, in order
-
-1. Better conversion sequence for some argument (above).
-2. **Non-template beats template specialization.** `template<class T> void g(T);` loses to `void g(int);` for `g(1)`.
-3. **More specialized template wins** (partial ordering of function templates): `g(T*)` beats `g(T)`.
-4. For constrained functions (C++20), **more-constrained wins** via subsumption (Ch. 17 §17.14).
-5. Non-`explicit` constructors only, in copy-initialization contexts.
-
-### Details that separate candidates
-
-- **Return type is not part of overload resolution.** You cannot overload on it. (Except via a conversion-operator-returning proxy, the `end()`-sentinel trick, or `auto`-deduced return in a template.)
-- **`const`/ref-qualifiers on the implicit object parameter participate**: `f() &`, `f() &&`, `f() const` are ranked like any other argument (Ch. 6 §6.7). This is how `optional::value() &&` can return `T&&`.
-- **A perfect-forwarding constructor `template<class T> Widget(T&&)` beats the copy constructor** for a non-const lvalue `Widget`, because `T&&` deduces `Widget&` (exact match) while the copy ctor needs a qualification conversion to `const Widget&`. This is the single most notorious overload bug in modern C++, fixed by constraining with `requires !std::same_as<std::remove_cvref_t<T>, Widget>` or `enable_if`.
-- **`0` is both an int and a null-pointer constant** — `f(int)` vs `f(char*)` with `f(0)` is ambiguous in spirit and resolved to `f(int)` in practice; `nullptr` (Ch. 2 §2.11) exists to kill this.
-- **`long` vs `long long` vs `size_t`** overloads produce endless ambiguity in 64-bit code because `size_t` is `unsigned long` on LP64 but `unsigned long long` on Windows.
-
-**Debug tooling:** `-fverbose-asm` won't help; the practical technique is to induce a deliberate error (call with a `struct{}` argument) so the compiler prints the full candidate set with rejection reasons, or use `-Wconversion` and Compiler Explorer.
-
----
-
-## 4.7 Argument-Dependent Lookup
-
-**ADL** (Koenig lookup) says: for an unqualified function call, the candidate set includes not only names found by ordinary lookup, but also names in the **associated namespaces** of the argument types.
+If a function always stores a value, taking by value and moving into storage is often a clean interface:
 
 ```cpp
-namespace lib { struct S{}; void f(S); }
-lib::S s;
-f(s);          // finds lib::f via ADL — no using-directive, no qualification
-```
+#include <string>
+#include <utility>
 
-**Associated entities** of a type include: its own namespace; for a class, its base classes' namespaces and the namespaces of its template arguments; for enums, the enclosing namespace; for pointers/arrays, those of the pointee. Note `std::vector<MyType>` associates both `std` and `MyType`'s namespace.
+class Order {
+public:
+    explicit Order(std::string symbol)
+        : symbol_(std::move(symbol)) {}
 
-### Why it exists
-
-Without ADL, `a + b` for a user-defined type would require the operator to be in scope or qualified — and you cannot qualify an operator in infix form. `std::cout << x` works only because ADL finds `operator<<` in `std`. Every operator overload in existence depends on ADL.
-
-### The `std::swap` two-step
-
-```cpp
-template <class T> void algo(T& a, T& b) {
-    using std::swap;   // brings std::swap into scope as a FALLBACK
-    swap(a, b);        // unqualified → ADL finds a better user swap if one exists
-}
-```
-Writing `std::swap(a, b)` qualified *disables* ADL and forces the generic version, which for a type with an efficient custom swap is a real performance loss. This idiom generalizes to `begin`/`end`/`size` and is the pre-C++20 answer; **C++20 CPOs** (`std::ranges::swap`, `std::ranges::begin`) encapsulate the two-step so users can't get it wrong — a customization point object is a function *object*, so it is not itself found by ADL and cannot be hijacked.
-
-### Hidden friends
-
-Declaring an operator as a `friend` *defined inside* the class makes it findable **only** by ADL:
-
-```cpp
-struct Money {
-    friend Money operator+(Money, Money) { /*...*/ }   // hidden friend
+private:
+    std::string symbol_;
 };
 ```
-It is invisible to ordinary lookup, so it never pollutes the overload set for unrelated calls. Benefits: dramatically smaller candidate sets (a real **compile-time** win in template-heavy code), no accidental matches via implicit conversions, and no ambiguity with other namespaces' operators. This is the modern recommended way to write operators and a strong signal in an interview.
 
-### Failure modes
+An rvalue caller can construct the parameter directly and then move once into the member; an lvalue caller copies into the parameter and moves once. Separate `const T&` and `T&&` overloads may save a move but increase interface and code size. Choose after measuring the actual type and call mix.
 
-- **Unexpected hijacking:** an argument in namespace `N` drags all of `N`'s overloads into consideration. Adding a function to your namespace can break distant code.
-- **ADL does not apply** when ordinary lookup finds a class member, a variable, or a block-scope function declaration — the whole ADL step is disabled if ordinary lookup finds a non-function or a class member.
-- **Fundamental types have no associated namespaces**, so `f(1)` never uses ADL.
-- **`std::` overloads for standard types** are why `swap(v1, v2)` on vectors works unqualified.
+### Returning values and references
 
----
-
-## 4.8 Default Arguments
-
-A default argument supplies a value when the caller omits a trailing parameter. The substitution happens **at the call site, at compile time**, using the declaration visible there.
+Return by value is the default for produced objects. Guaranteed copy elision applies when a prvalue of the return type initializes the result:
 
 ```cpp
-void f(int a, int b = 10, int c = a);   // ERROR: c = a — parameters are not in scope as values
-void g(int a = 1, int b);               // ERROR: defaults must be trailing
-```
-
-### The rules that matter
-
-- **Defaults are per-declaration, not per-function**, and accumulate across declarations in a scope:
-  ```cpp
-  void f(int a, int b);
-  void f(int a, int b = 5);   // legal — adds a default
-  ```
-  Different translation units can see different defaults for the same function. This is an **ODR-adjacent hazard**: the header declares `f(int = 1)`, a `.cpp` redeclares `f(int = 2)`, and calls in different TUs pass different values with no diagnostic (Ch. 1 §1.6).
-
-- **Default arguments are evaluated at each call**, in the caller's context, so `void log(Time t = now())` calls `now()` per call — usually what you want, and a common source of confusion with Python's evaluate-once semantics.
-
-- **Virtual functions use the STATIC type's default.** This is the big one:
-  ```cpp
-  struct B { virtual void f(int x = 1) { print(x); } };
-  struct D : B { void f(int x = 2) override { print(x); } };
-  B* p = new D;  p->f();     // calls D::f but prints 1 — B's default
-  ```
-  The vtable dispatches the *body*; the default comes from the static type at the call site. **Never give a virtual function a default argument.** Clang-tidy flags this.
-
-- **Defaults are not part of the function type**, so a function pointer to `void f(int = 1)` has type `void(*)(int)` and calling through it requires the argument.
-
-- **Access control still applies:** a default argument that names a private member is checked at the call site.
-
-### Default arguments versus overloads
-
-| | Default arguments | Overloads |
-|---|---|---|
-| Binary size | One function | One per signature — template-instantiation-like bloat |
-| Address-taking | Single address, full arity | Distinct addresses |
-| Virtual | Broken (static-type default) | Works |
-| Differing behaviour per arity | Cannot | Can |
-| ABI stability | **Adding a default is source-compatible but callers bake the value in** — changing it requires recompiling every caller | Adding an overload is ABI-additive |
-
-That last row is the low-latency/library answer: **a default argument's value is part of the caller's code**, so a shipped `.so` that changes a default silently keeps the old behaviour for un-recompiled clients. Libraries with strict ABI policies (Qt, Abseil) prefer overloads.
-
----
-
-## 4.9 Function Pointers
-
-A function pointer stores a code address. Its type includes the full signature; there is no decay to `void*` (formally — POSIX requires `dlsym`'s round-trip to work, which is a documented extension).
-
-```cpp
-int  add(int, int);
-int (*fp)(int, int) = add;   // & is optional — function-to-pointer decay (Ch. 2 §2.15)
-int  r = fp(1, 2);           // * is optional too
-using Fn = int(*)(int, int);
-```
-Read declarations "inside-out from the identifier": `int (*f)(int)` is *f is a pointer to a function taking int returning int*; `int *f(int)` is *f is a function returning int\**. `cdecl` and C++11 alias templates (`using Fn = int(*)(int);`) exist because the syntax is genuinely bad.
-
-**`noexcept` is part of the type since C++17.** `void(*)() noexcept` converts to `void(*)()` but not the reverse. This broke code that stored `noexcept` callbacks in non-`noexcept`-typed tables.
-
-### Performance: the indirect-call cost
-
-An indirect call must resolve its target before the front end can fetch the next instructions. The CPU predicts it via the **BTB** (branch target buffer) / indirect-branch predictor:
-
-- **Monomorphic call site** (same target every time) — predicted correctly, cost ≈ a direct call, maybe 1–2 cycles extra.
-- **Polymorphic, alternating targets** — mispredict, ~15–20 cycle pipeline flush (Ch. 27 §27.11) plus a likely I-cache miss at the new target.
-- **Never inlined** unless the compiler can prove the target (constant propagation, devirtualization, or LTO). This is the true cost: not the indirect jump but the **lost inlining** and therefore lost constant folding across the boundary.
-
-The low-latency conclusions: prefer templates/`if constexpr` for compile-time-known dispatch (Ch. 17); if you must dispatch at runtime, sort work by handler so each call site stays monomorphic (a batching win); consider a `switch` over a small enum, which compiles to a jump table but with a *predictable* index pattern, or to a branch tree the predictor handles better. Speculative-execution mitigations (retpolines, IBRS — Ch. 27 §27.18) make indirect calls dramatically more expensive on affected kernels/builds, sometimes 30+ cycles; that is a genuinely non-obvious detail.
-
-Function pointers are trivially copyable and register-passable, unlike `std::function` (§4.11) — which is why C callback APIs use `(void* ctx, fn)` pairs.
-
----
-
-## 4.10 Pointers to Members
-
-A pointer to member is **not an address** — it is an *offset* (for data members) or a dispatch recipe (for member functions). It must be combined with an object.
-
-```cpp
-struct S { int a; int b; void f(int); };
-
-int  S::*pd = &S::b;        // pointer to data member
-void (S::*pf)(int) = &S::f; // pointer to member function
-
-S s; S* ps = &s;
-s.*pd  = 1;                 //  .*  on an object
-ps->*pf(3);                 // WRONG — precedence!
-(ps->*pf)(3);               // correct: ->* binds looser than ()
-```
-`.*` and `->*` are the lowest-precedence operators most people never use, hence the mandatory parentheses.
-
-### Representation and cost
-
-| Kind | Typical Itanium ABI representation | Size (x86-64) |
-|---|---|---|
-| Data member pointer | byte offset, `-1` for null | 8 bytes |
-| Non-virtual member function | code address + `this`-adjustment | 16 bytes |
-| Virtual member function | vtable index (odd-tagged ptr) + adjustment | 16 bytes |
-| Under multiple inheritance | same 16 bytes, adjustment non-zero | 16 |
-| MSVC, unknown class (incomplete type) | up to **24 bytes** — MSVC sizes them by inheritance model | varies |
-
-Key facts: a pointer-to-member-function is **twice the size of a normal function pointer**, and calling through one emits a runtime test ("is this virtual?") on the low bit under the Itanium ABI — a branch plus a possible vtable load. That is why they are essentially absent from hot paths. MSVC's `/vmg`, `/vmb` flags change the representation and are an ABI landmine when an incomplete type is used.
-
-**`&S::f` requires the `&` and the qualified name** — unlike free functions, there is no decay, and `S::f` alone is ill-formed.
-
-### Where they earn their keep
-
-- **`std::invoke` and `std::bind`** normalize member-pointer calls (§4.11).
-- **Projections in C++20 ranges**: `std::ranges::sort(v, {}, &Order::price)` — the member pointer is a projection, and because it's a compile-time constant the compiler inlines it to an offset load. This is the modern, zero-cost use.
-- **Compile-time reflection substitutes** — building serialization tables from `&S::field` lists.
-- **Member offsets without `offsetof`** for non-standard-layout types (Ch. 3 §3.11), though this is nonportable.
-
-Pointers to members convert **upward is backwards**: a `Base::*` converts *to* a `Derived::*` (safe: a Derived contains a Base subobject), not the other way. This inverted-variance rule is a nice question.
-
----
-
-## 4.11 Callable Wrappers and `std::invoke`
-
-A **Callable** is anything usable with `f(args...)` — function pointers, function references, lambdas, objects with `operator()`, and member pointers. The last of these has a *different call syntax*, and that inconsistency is what `std::invoke` exists to erase.
-
-**INVOKE semantics** (`std::invoke`, C++17, `constexpr` since C++20):
-
-```cpp
-std::invoke(f, args...);            // f(args...)
-std::invoke(&S::mem_fn, obj, a);    // obj.mem_fn(a)
-std::invoke(&S::mem_fn, ptr, a);    // ptr->mem_fn(a)
-std::invoke(&S::mem_fn, ref_wrap,a);// ref_wrap.get().mem_fn(a)
-std::invoke(&S::data, obj);         // obj.data
-```
-This is the rule that `std::thread`, `std::bind`, `std::function`, `std::async`, and every algorithm taking a callable already used since C++11 — `invoke` just exposed it. `std::invoke_result_t<F, Args...>` and `std::is_invocable_v<F, Args...>` are the corresponding traits (replacing the removed `result_of`).
-
-C++23 adds **`std::invoke_r<R>`** (explicit return type, for discarding or converting) and **`std::bind_back`**; C++20 added `std::bind_front`.
-
-### The wrapper hierarchy
-
-| Type | Owns? | Type-erased? | Allocates? | Call cost | Since |
-|---|---|---|---|---|---|
-| Function pointer | no | no | no | indirect call | — |
-| Lambda / functor | n/a | no | no | **inlined** when the type is known | C++11 |
-| **`std::function<R(A)>`** | yes (copies) | yes | **maybe** (SOO for small, else heap) | indirect call + possible cache miss | C++11 |
-| **`std::move_only_function`** | yes | yes | maybe | same, no copy requirement | **C++23** |
-| **`std::copyable_function`** | yes | yes | maybe | same, correct const-propagation | **C++26** |
-| **`std::function_ref<R(A)>`** | **no** | yes | **never** | one indirect call, 2 pointers | **C++26** |
-| `std::reference_wrapper` | no | no | no | free | C++11 |
-
-`std::function`'s three costs, in order of importance for low latency:
-1. **Type erasure defeats inlining** — the call is always indirect (§4.9).
-2. **Heap allocation** if the callable exceeds the small-object buffer (typically 16 bytes in libstdc++, 24 in libc++ — enough for *two* captured pointers in libstdc++, so capturing `this` plus one more thing may allocate). Ch. 18 §18.10.
-3. **Extra indirection / cache miss** to reach the heap-stored callable, plus a virtual-ish dispatch through the manager pointer.
-
-Also: `std::function` requires the callable to be **copy-constructible** — which is why you cannot store a lambda capturing `unique_ptr` in one, and why `move_only_function` was added. And `std::function::operator()` is `const` but invokes a non-const callable — a const-correctness hole `copyable_function` fixes.
-
-**Rule of thumb:** on a hot path, take callables as a **template parameter** (`template<class F> void for_each(F&&)`) so they inline; use `function_ref`/`std::function` only at genuine type-erasure boundaries (plugin registries, deferred work queues), and preallocate. For stored callbacks in a trading engine, a `void(*)(void*)` + context pointer pair, or a fixed-size inline-storage delegate, is the standard hand-rolled answer.
-
----
-
-## 4.12 Compile-Time Function Evaluation
-
-Moving work from run time to compile time is free latency, and the ladder of facilities has grown steadily.
-
-| Keyword | Meaning | Since |
-|---|---|---|
-| `const` | Immutable; *may* be a constant expression if initialized by one | — |
-| **`constexpr` (variable)** | Must be usable in a constant expression; initialized at compile time | C++11 |
-| **`constexpr` (function)** | *May* run at compile time if arguments permit; otherwise runs at runtime | C++11 |
-| **`consteval`** | **Immediate function** — must produce a constant; calling it at runtime is an error | C++20 |
-| **`constinit`** | Guarantees **constant initialization** (no dynamic init) without implying `const` | C++20 |
-| `if consteval` | Branch on whether we're in a constant evaluation | C++23 |
-| `std::is_constant_evaluated()` | Same, as a function (careful: always true inside `if constexpr`) | C++20 |
-
-`constexpr` on a function is a **permission, not an obligation**. `constexpr int f(int n)` called with a runtime `n` simply runs at runtime. To *force* compile-time evaluation, assign to a `constexpr` variable, use it as a template argument, or make it `consteval`.
-
-### Evolution of what's allowed
-
-- **C++11**: a single `return` statement. Painfully restrictive; everything was recursive.
-- **C++14**: loops, local variables, multiple statements, mutation of locals. The version that made `constexpr` usable.
-- **C++17**: `if constexpr`, `constexpr` lambdas, `constexpr` on static member functions implied for `inline`.
-- **C++20**: `try`/`catch` (may not throw), virtual calls, dynamic allocation **that is freed within the same evaluation** (transient allocation), `std::vector` and `std::string` usable at compile time (libstdc++ 12+), `constexpr` destructors, `union` active-member switching.
-- **C++23**: `static constexpr` in constexpr functions, non-literal variables in constexpr functions if not evaluated, relaxed `goto`/label rules, `constexpr` `std::unique_ptr` (C++23), and `if consteval`.
-- **C++26**: `constexpr` exceptions that actually propagate, `constexpr` placement new, static reflection (Ch. 19 §19.14).
-
-Still forbidden everywhere: `reinterpret_cast`, `goto` (until C++23), reading uninitialized memory, undefined behaviour of any kind (**UB is a hard compile error in a constant expression** — which makes `constexpr` a UB detector: `static_assert(f(x) == y)` will fail to compile on signed overflow).
-
-### The low-latency uses
-
-- **Lookup tables built at compile time** — a `constexpr std::array<uint8_t, 256>` CRC or decode table lands in `.rodata`, costs zero startup time, and avoids the static-initialization-order fiasco entirely (Ch. 5 §5.10).
-- **Compile-time parsing of protocol schemas / format strings** — `std::format`'s C++20 compile-time format-string checking is `consteval` machinery.
-- **`constinit`** on globals guarantees no dynamic initializer runs, which means no guard variable, no thread-safe-statics lock, and no init-order dependency. In a latency-sensitive daemon this is the correct annotation for every non-trivial global.
-- **Compile-time hashing** of symbol strings to integer IDs, so the hot path compares integers.
-
-**Cost:** compile-time evaluation is interpreted by the compiler's constant evaluator and is *slow* — orders of magnitude slower than the generated code. Heavy `constexpr` work is a real build-time regression (Ch. 44), and `-fconstexpr-ops-limit` / `-fconstexpr-steps` exist because evaluators bail out.
-
----
-
-## 4.13 Standard Attributes
-
-Attributes carry information to the compiler without changing the language's semantics — with two exceptions (`[[noreturn]]`, `[[carries_dependency]]`) that genuinely do.
-
-| Attribute | Effect | Since |
-|---|---|---|
-| `[[noreturn]]` | Function never returns; caller's post-call code is unreachable. Enables better codegen and silences warnings. **Returning anyway is UB.** | C++11 |
-| `[[deprecated("msg")]]` | Warning on use | C++14 |
-| `[[fallthrough]]` | Suppresses the implicit-fallthrough warning in a `switch` | C++17 |
-| `[[nodiscard]]` / `[[nodiscard("why")]]` | Warn if the return value is discarded. Apply to `empty()`, factory functions, `expected`, and anything whose ignored result is a bug. | C++17 / C++20 |
-| `[[maybe_unused]]` | Suppresses unused warnings (parameters, NDEBUG-only variables) | C++17 |
-| `[[likely]]` / `[[unlikely]]` | Branch-probability hint on a statement or label | **C++20** |
-| `[[no_unique_address]]` | Empty members may occupy zero bytes (Ch. 3 §3.4) | C++20 |
-| `[[assume(expr)]]` | The compiler may assume `expr`; false ⇒ UB | **C++23** |
-| `[[indeterminate]]` | Opts a variable out of C++26 erroneous-behaviour zeroing | C++26 |
-
-Unknown attributes must be **ignored** (not an error) since C++17, which is what makes vendor attributes (`[[gnu::...]]`, `[[clang::...]]`, `[[msvc::...]]`) portable to write.
-
-### `[[likely]]`/`[[unlikely]]` — the low-latency detail
-
-```cpp
-if (rc != 0) [[unlikely]] { handle_error(); }
-```
-These do **not** change branch *prediction* — the hardware predictor learns from runtime behaviour and ignores your annotation. What they change is **code layout**: the compiler moves the unlikely block out of line (to a cold section, `.text.unlikely`), so the hot path is contiguous. The win is **instruction-cache density and front-end bandwidth**, not prediction (Ch. 27 §27.15, Ch. 41 §41.17). Overusing them makes things worse; PGO (Ch. 40 §40.9) measures the truth and beats hand annotation nearly always. GCC's older `__builtin_expect` / `__builtin_expect_with_probability` are equivalent, and `likely()`/`unlikely()` macros in the kernel are the same idea.
-
-`[[assume(x)]]` is the sharpest tool here: it lets you assert alignment, ranges, or non-nullness so the compiler drops checks and vectorizes. It is also the easiest way to introduce silent UB — an assumption that is ever false poisons the whole function. Prefer `std::assume_aligned` and `__builtin_unreachable()`-with-a-checked-assert-in-debug patterns. Note `[[assume]]` must not have side effects; the expression is *not evaluated*.
-
-`[[nodiscard]]` deserves emphasis for error-code-based designs (Ch. 10 §10.9): marking `std::expected`-returning functions `[[nodiscard]]` converts a whole class of silently-ignored-error bugs into compile warnings.
-
----
-
-## 4.14 Return-Type Deduction
-
-Three distinct mechanisms, frequently conflated.
-
-**1. Trailing return type (C++11)** — moves the return type after the parameters so it can name them:
-```cpp
-template <class T, class U>
-auto add(T t, U u) -> decltype(t + u);       // parameters are in scope here
-```
-
-**2. `auto` return-type deduction (C++14)** — deduce from the `return` statements, using **template argument deduction rules**, which means `auto` **strips references and top-level cv**:
-```cpp
-auto f() { static int x; return x; }       // returns int  — copies!
-auto& g() { static int x; return x; }      // returns int&
-decltype(auto) h() { static int x; return x; }   // int (name → declared type)
-decltype(auto) k() { static int x; return (x); } // int&  — parens make it an expression!
-```
-
-**3. `decltype(auto)` (C++14)** — deduce using `decltype` rules, which *preserve* reference-ness and are sensitive to parentheses (Ch. 2 §2.17). This is the tool for perfect-forwarding wrappers:
-```cpp
-template <class F, class... A>
-decltype(auto) timed(F&& f, A&&... a) {
-    ScopedTimer t;
-    return std::invoke(std::forward<F>(f), std::forward<A>(a)...);  // preserves T, T&, T&&
+struct Quote {
+    int bid;
+    int ask;
+};
+
+Quote make_quote(int bid, int ask) {
+    return Quote{bid, ask};       // direct initialization of result object
 }
 ```
-Without `decltype(auto)` this wrapper silently copies every reference-returning function's result — a common and expensive bug.
 
-### Rules and constraints
+Named return value optimization (NRVO) for `return local;` is permitted, not universally guaranteed:
 
-- Multiple `return` statements must deduce **identically**: `auto f(bool b){ if(b) return 1; return 2.0; }` is an error, not a common-type computation.
-- A recursive `auto` function must have a non-recursive `return` **before** the recursive one, so the type is known.
-- **A function with a deduced return type cannot be forward-declared usefully** — the definition must be visible to call it. This kills `auto` returns in headers-as-interfaces and PIMPL boundaries (Ch. 44 §44.14), and it means deduced returns are **not** an ABI-stable interface.
-- Deduced return types **cannot be virtual** (the vtable slot needs a known type).
-- `auto` returning by value from an expression involving a `string_view` or reference member is the standard dangling-return trap: `auto substr(...)` returning a view into a temporary.
+```cpp
+Quote make_quote(int bid, int ask) {
+    Quote q{bid, ask};
+    return q;                     // NRVO candidate
+}
+```
 
-C++20 adds **abbreviated function templates** (`auto f(auto x)`), and constrained `auto` (`std::integral auto f()`), which constrains the deduced type.
+Do not write `return std::move(q);` merely to “help.” It prevents NRVO because the operand is no longer the name of the local. If elision does not happen, return rules already allow a move from eligible local objects.
 
-**Interview framing:** *"When do you need `decltype(auto)`?"* — when writing a generic wrapper that must return exactly what the wrapped call returns, including references; `auto` would decay it to a value and silently copy or dangle.
+Returning `T&`, `const T&`, `T&&`, pointer, view, or iterator returns a relationship to an existing object. The function must make the lifetime contract explicit:
+
+```cpp
+const Quote& bad_quote() {
+    Quote q{100, 101};
+    return q;                     // intentionally invalid: dangling reference
+}
+```
+
+Reference returns can avoid copies, but they can also expose aliasing and make synchronization or lifetime someone else’s problem. A by-value result that is directly constructed is often both safer and cheaper.
+
+### Exceptions and `noexcept`
+
+`noexcept` is a promise: if an exception escapes, `std::terminate` is called. It can enable library choices such as moving rather than copying elements during some container reallocations, but it is not a generic speed annotation. Mark a function `noexcept` when its contract truly cannot propagate an exception. On a low-latency path, separately account for all potential throwing operations and any allocation they imply.
 
 ---
 
-## 4.15 C Variadic Functions
+## 4.8 Namespaces and Name Lookup — Core
+
+Lookup determines what a name denotes before overload ranking asks which candidate is best. The compiler does not search the whole program for a function that happens to accept the arguments.
+
+### Unqualified and qualified lookup
+
+An unqualified name such as `publish` is searched in the applicable scopes. Broadly, lookup starts locally and moves outward; once a declaration set is found in a scope, outer scopes do not simply merge in. A qualified name such as `market::publish` searches the named scope according to qualified-lookup rules.
+
+```cpp
+void route(double);
+
+void example() {
+    void route(int);   // hides the outer route during ordinary lookup
+    route(1.5);        // calls route(int) after conversion
+}
+```
+
+Class members show the same hiding effect:
+
+```cpp
+struct Base {
+    void update(int);
+    void update(double);
+};
+
+struct Derived : Base {
+    using Base::update;
+    void update(const char*);
+};
+```
+
+Without the `using` declaration, the derived declaration named `update` hides the base overload set during lookup, regardless of parameter types.
+
+### Namespace tools
+
+- A namespace alias shortens a stable qualification: `namespace chrono = std::chrono;`.
+- A using-declaration imports selected names: `using std::swap;`.
+- A using-directive makes all names from a namespace available to lookup and is too broad for public headers.
+- An unnamed namespace gives names internal linkage within a translation unit; it is suitable for implementation-only helpers in a `.cpp`.
+- An inline namespace supports source-level versioning while allowing members to be found through the enclosing namespace. ABI effects depend on the implementation’s mangling and library policy.
+
+Declarations must generally be visible before use in a translation unit. Headers, modules, and forward declarations control that visibility. Lookup does not wait for a later definition.
+
+### Lookup is often the real bug
+
+When a candidate says “overload resolution picked the wrong overload,” first ask whether the expected function entered the candidate set. Hiding, qualification, two-phase template lookup, and missing ADL are lookup problems. Ranking cannot select a function it never sees.
+
+---
+
+## 4.9 Function Overloading and Overload Resolution — Core
+
+**Overloading** gives one name to distinct functions. **Overload resolution** selects the best viable function for a particular call. Keep the stages separate:
+
+```
+                    ┌────────────────────┐
+unqualified name ──▶│ ordinary lookup    │
+arguments ─────────▶│ + ADL if applicable│
+                    └─────────┬──────────┘
+                              ▼
+                    ┌────────────────────┐
+                    │ candidate functions│
+                    └─────────┬──────────┘
+                              ▼
+                    ┌────────────────────┐
+                    │ viable?            │
+                    │ arity, defaults,   │
+                    │ conversions,       │
+                    │ constraints        │
+                    └──────┬───────┬─────┘
+                         no│       │yes
+                           ▼       ▼
+                       discard   rank implicit
+                                 conversion sequences
+                                      │
+                                      ▼
+                           unique best candidate?
+                              │              │
+                             yes             no
+                              ▼              ▼
+                           selected       ill-formed
+```
+
+### What may be overloaded
+
+Parameter-type differences can distinguish overloads. Top-level cv on by-value parameters, return type alone, default arguments, parameter names, and `noexcept` alone cannot.
+
+Member functions can additionally be distinguished by cv/ref qualifiers:
+
+```cpp
+struct Cache {
+    int& value() &;
+    const int& value() const &;
+    int value() &&;
+};
+```
+
+The implicit object argument participates in viability and ranking. Here, an lvalue, const lvalue, and temporary select different interfaces.
+
+### Viability and conversion ranking
+
+A viable candidate has a suitable number of parameters, can initialize every parameter from its corresponding argument, and satisfies its associated constraints. For each argument, the compiler ranks an implicit conversion sequence:
+
+| Broad rank | Typical examples |
+|---|---|
+| exact match | identity; qualification adjustment; array/function decay |
+| promotion | `short` to `int`; `float` to `double` |
+| conversion | `int` to `double`; `Derived*` to `Base*`; pointer to `bool` |
+| user-defined conversion | converting constructor or conversion function plus allowed standard conversions |
+| ellipsis | match through C-style `...` |
+
+A candidate is better only when it is no worse for every argument and better for at least one, followed by detailed standard tie-breakers. There is no “add the conversion costs and choose the smallest total” rule.
+
+```cpp
+void send(int);
+void send(double);
+
+void examples() {
+    send(1);       // exact match: send(int)
+    send(1.0f);    // promotion to double beats conversion to int
+    // send(1u);   // may be ambiguous: both are conversions of the same rank
+}
+```
+
+When equally good conversion sequences remain, rules involving non-template functions, template partial ordering, and constraints may select a winner:
+
+```cpp
+#include <concepts>
+
+template<class T>
+void encode(T);
+
+template<std::integral T>
+void encode(T);
+
+void encode(int);
+
+void use() {
+    encode(1);       // non-template exact match wins
+    encode(1L);      // constrained template is more specialized here
+}
+```
+
+Constraints do not repair a worse conversion sequence. First compare conversions under the overload rules; use constraint subsumption and other tie-breakers where applicable.
+
+### User-defined conversions and constructor hijacking
+
+Only one user-defined conversion is permitted in an implicit conversion sequence. A generic forwarding overload can be unexpectedly competitive:
+
+```cpp
+#include <concepts>
+#include <type_traits>
+#include <utility>
+
+class Token {
+public:
+    Token(const Token&) = default;
+
+    template<class T>
+        requires (!std::same_as<std::remove_cvref_t<T>, Token>)
+    explicit Token(T&& value) {
+        initialize(std::forward<T>(value));
+    }
+
+private:
+    template<class T>
+    void initialize(T&&);
+};
+```
+
+Without the constraint, a non-const `Token` lvalue can match `T&&` as `Token&` exactly, potentially beating `const Token&`. Constrain forwarding constructors so they do not absorb copy/move or unrelated operations.
+
+### Interview decision procedure
+
+For any puzzling call, write:
+
+1. the declarations found by ordinary lookup;
+2. candidates added by ADL;
+3. why each candidate is or is not viable;
+4. the conversion sequence for every argument;
+5. the first tie-breaker that distinguishes the survivors.
+
+If no unique best candidate exists, the program is ill-formed. Compilers do not choose arbitrarily.
+
+---
+
+## 4.10 Argument-Dependent Lookup — Core
+
+Argument-dependent lookup (ADL) augments ordinary lookup for an **unqualified function call**. It searches namespaces and classes associated with the argument types. This lets an operation live beside the type it customizes:
+
+```cpp
+#include <utility>
+
+namespace orderbook {
+
+struct Level {
+    int price;
+};
+
+void swap(Level& a, Level& b) noexcept {
+    std::swap(a.price, b.price);
+}
+
+} // namespace orderbook
+
+void rebalance(orderbook::Level& a, orderbook::Level& b) {
+    using std::swap;
+    swap(a, b);     // ADL finds orderbook::swap; std::swap is the fallback
+}
+```
+
+Writing `std::swap(a, b)` would disable ADL and therefore bypass the custom overload. The two-step pattern supplies a standard fallback while allowing a type-local customization.
+
+### Associated entities and hidden friends
+
+Associated sets are derived from argument types, including relevant class, base-class, template-argument, and enclosing-namespace information. The exact rules are detailed, but the design rule is compact: define non-member operations in the same namespace as their types.
+
+A friend defined inside a class can be found by ADL even when ordinary namespace lookup would not find it:
+
+```cpp
+struct Price {
+    int ticks;
+
+    friend bool operator==(Price, Price) = default;
+    friend void normalize(Price& p) {
+        if (p.ticks < 0) p.ticks = 0;
+    }
+};
+
+void clean(Price& p) {
+    normalize(p);   // found through ADL
+}
+```
+
+This **hidden friend** technique keeps an overload from entering unrelated calls while preserving natural syntax for the associated type.
+
+### ADL traps
+
+- A qualified call such as `orderbook::swap(a, b)` does not use ADL.
+- ADL only helps with unqualified function-call syntax; it is not a general “search near the type” rule.
+- Certain ordinary-lookup results, including a class member, a block-scope function declaration, or a non-function declaration, suppress ADL.
+- Adding an unconstrained function in a type’s namespace can affect distant call sites because it joins their candidate sets.
+
+ADL is compile-time machinery and has no direct runtime cost. Its performance consequence is indirect: it selects the implementation that may or may not allocate, inline, or satisfy `noexcept`.
+
+---
+
+## 4.11 Default Arguments — Core
+
+A default argument is substituted at the call site using declarations visible there. It is not part of the function type and does not create a second function.
+
+```cpp
+namespace risk {
+
+bool accept(int quantity, int limit = 100);  // declaration seen by caller
+
+bool accept(int quantity, int limit) {       // no repetition needed
+    return quantity <= limit;
+}
+
+} // namespace risk
+```
+
+Defaults normally appear on trailing parameters. Declarations in the same scope can add defaults to an accumulated set, but a visible default cannot be redefined, even to the same token sequence. A default expression is evaluated each time the call omits that argument.
+
+### Static binding with virtual dispatch
+
+Default selection uses the static type and declaration visible at the call site; virtual dispatch then chooses the final overrider:
+
+```cpp
+struct Base {
+    virtual int sample(int depth = 1) = 0;
+};
+
+struct Derived : Base {
+    int sample(int depth = 4) override {
+        return depth;
+    }
+};
+
+int read(Base& source) {
+    return source.sample();    // calls Derived::sample with argument 1
+}
+```
+
+This split is legal and surprising. Avoid default arguments on virtual functions. Put a non-virtual wrapper with the default in the base interface, then delegate to a virtual implementation with an explicit argument.
+
+### Defaults versus overloads
+
+Prefer a default when omitted and explicit forms mean one stable operation and the default is cheap to express at the call site. Prefer overloads when the omitted case needs different construction, when ABI evolution matters, or when the default expression would expose details in every caller.
+
+Changing a default in a shared-library header requires recompiling callers; old binaries retain the old argument because it was embedded at their call sites.
+
+---
+
+## 4.12 Return-Type Deduction — Core
+
+Three related syntaxes solve different problems:
+
+```cpp
+template<class T, class U>
+auto add(T a, U b) -> decltype(a + b) {  // trailing return type
+    return a + b;
+}
+
+auto by_value() {                         // auto deduction
+    static int x = 0;
+    return x;                             // returns int
+}
+
+decltype(auto) exactly() {                // decltype rules
+    static int x = 0;
+    return (x);                           // returns int&
+}
+```
+
+- A **trailing return type** lets the type refer to parameters and can make template signatures easier to parse.
+- An `auto` return uses template-deduction-like rules and normally drops top-level references and cv-qualification.
+- `decltype(auto)` applies `decltype` rules to the return expression and can preserve a reference.
+
+Parentheses matter for `decltype(auto)`:
+
+```cpp
+decltype(auto) a() {
+    static int x = 0;
+    return x;       // decltype(x) is int
+}
+
+decltype(auto) b() {
+    static int x = 0;
+    return (x);     // decltype((x)) is int&
+}
+```
+
+Use `decltype(auto)` for a generic forwarding wrapper only when returning exactly the underlying result—including a reference—is the intended lifetime contract:
+
+```cpp
+#include <functional>
+#include <utility>
+
+template<class F, class... Args>
+decltype(auto) call(F&& f, Args&&... args) {
+    return std::invoke(
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+```
+
+All non-discarded `return` statements participating in `auto` deduction must deduce a compatible single type under the deduction rules; the compiler does not invent a common type for `int` and `double` returns. A function with a deduced return type generally must have its definition available before a use that needs the type. Virtual functions cannot have deduced return types.
+
+Explicit return types are often better at API and ABI boundaries: they document the contract, avoid accidental reference/value changes, and let declarations stand independently of definitions.
+
+---
+
+## 4.13 Compile-Time Function Evaluation — Role-specific
+
+The core distinction is obligation:
+
+| Facility | Meaning through C++23 | Does every call run at compile time? |
+|---|---|---:|
+| `constexpr` function | may participate in constant expressions | no |
+| `consteval` function | every potentially evaluated call must produce a constant expression | yes |
+| `constinit` variable | static/thread-storage variable must have static initialization | not a function; no constness implied |
+| `if consteval` | selects code depending on manifest constant evaluation | only the chosen branch for that evaluation |
+
+```cpp
+#include <cstdint>
+
+constexpr std::uint32_t mix(std::uint32_t x) noexcept {
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    return x;
+}
+
+consteval std::uint32_t protocol_tag(std::uint32_t version) {
+    return mix(version);
+}
+
+static_assert(mix(7) != 0);
+constexpr auto tag = protocol_tag(3);
+```
+
+Calling `mix(runtime_value)` at runtime is valid. Calling `protocol_tag(runtime_value)` is ill-formed.
+
+Constant evaluation rejects an evaluation that would perform a forbidden operation, including UB on the evaluated path. That makes it useful for validated lookup tables and protocol constants, but it is not a general proof that runtime inputs are safe.
+
+### Cost model
+
+Compile-time computation can remove startup work, guarantee static initialization, and expose constants to optimization. It also consumes compiler time and memory, may enlarge object files when tables are emitted, and can multiply across template instantiations. Measure clean-build time and binary size as well as runtime latency.
+
+`constinit` is valuable for global or thread-local state that must avoid dynamic initialization:
+
+```cpp
+#include <cstdint>
+
+constinit std::uint64_t packets_seen = 0;  // mutable, but statically initialized
+```
+
+It does not make concurrent access safe and does not make the variable `const`.
+
+---
+
+## 4.14 Standard Attributes — Role-specific
+
+Standard attributes attach narrowly specified information to declarations or statements. They are not a portable replacement for profiling, contracts, or control flow.
+
+| Attribute | Since | Practical meaning |
+|---|---:|---|
+| `[[noreturn]]` | C++11 | function does not return normally; returning is UB |
+| `[[deprecated("reason")]]` | C++14 | implementation should diagnose a use |
+| `[[fallthrough]]` | C++17 | documents intentional switch fallthrough |
+| `[[nodiscard]]` | C++17 | implementation should diagnose a discarded result |
+| `[[maybe_unused]]` | C++17 | suppresses unused diagnostics for a legitimate entity |
+| `[[likely]]`, `[[unlikely]]` | C++20 | hints which execution path is likely |
+| `[[no_unique_address]]` | C++20 | permits a member to overlap other storage where rules allow |
+| `[[assume(expr)]]` | C++23 | optimizer may assume expression is true at that point |
+
+`[[nodiscard]]` is useful on error- or status-bearing results:
+
+```cpp
+enum class PublishResult { sent, queue_full };
+
+[[nodiscard("queue_full must be handled")]]
+PublishResult publish() noexcept;
+```
+
+`[[likely]]` and `[[unlikely]]` may influence code layout and static branch-probability decisions. They do not program the processor’s dynamic branch predictor. Profile-guided optimization uses measured behavior and is usually stronger evidence.
+
+`[[assume]]` is a correctness boundary:
+
+```cpp
+int lookup(const int* table, int index) {
+    [[assume(table != nullptr)]];
+    [[assume(index >= 0)]];
+    return table[index];
+}
+```
+
+The assumption expressions are not evaluated. If an assumption is false where the statement is reached, behavior is undefined. Use it only after a separately enforced invariant, and keep debug/test assertions that validate that invariant. Replacing a necessary check with `[[assume]]` trades correctness margin for optimization opportunity.
+
+Vendor attributes and calling-convention annotations are implementation extensions. Isolate them behind portability macros and verify generated code on each supported compiler.
+
+---
+
+## 4.15 Function Pointers — Core
+
+A function pointer stores the address of a function with a compatible type:
+
+```cpp
+#include <cstdint>
+
+using Handler = void (*)(std::uint32_t) noexcept;
+
+void on_trade(std::uint32_t) noexcept {}
+
+void dispatch(Handler handler, std::uint32_t sequence) noexcept {
+    handler(sequence);
+}
+
+int main() {
+    dispatch(&on_trade, 42);
+}
+```
+
+The address-of operator is optional because a function expression converts to a pointer in this context, but writing `&on_trade` makes intent visible. `noexcept` participates in the pointer type; a pointer to a non-throwing function converts to a corresponding potentially-throwing function pointer, not vice versa.
+
+An overloaded name needs a target type or cast to select one overload:
+
+```cpp
+void parse(int);
+void parse(double);
+
+using Parser = void (*)(int);
+Parser p = &parse;       // target type selects parse(int)
+```
+
+### Runtime consequence
+
+A call through a runtime function pointer is an indirect call unless optimization proves the target. Indirection can prevent inlining and can be harder for the processor’s branch predictor when targets vary. The real comparison must name the workload:
+
+- one stable target may predict well;
+- many data-dependent targets can produce indirect-branch misses;
+- a small `switch` may inline bodies but increase code size and instruction-cache pressure;
+- link-time optimization may constant-propagate a pointer and remove the indirection.
+
+Measure cycles or time distributions together with branch-miss and instruction-cache evidence on the deployment target. A function pointer itself neither allocates nor owns context. C APIs therefore commonly pair one with `void* context`; the programmer must enforce the context’s type and lifetime.
+
+---
+
+## 4.16 Pointers to Members — Deep dive
+
+A pointer to member is not an ordinary address. It identifies a member relative to an object of a compatible class, and its representation is implementation-defined.
+
+```cpp
+#include <functional>
+
+struct Level {
+    int quantity;
+
+    int value() const noexcept {
+        return quantity;
+    }
+};
+
+int main() {
+    int Level::* data = &Level::quantity;
+    int (Level::*method)() const noexcept = &Level::value;
+
+    Level level{12};
+    int a = level.*data;
+    int b = (level.*method)();
+
+    Level* p = &level;
+    int c = p->*data;
+    int d = (p->*method)();
+
+    return a + b + c + d == 48 ? 0 : 1;
+}
+```
+
+Parentheses around a member-function-pointer call are required by the grammar. Inheritance can require adjustment of the object pointer, which is one reason member-function pointers may be larger than plain function pointers on common ABIs. Do not serialize them, cast them to integers as an interchange format, or assume a byte layout.
+
+`std::invoke` hides the syntactic split between ordinary callables, member-function pointers, and data-member pointers.
+
+---
+
+## 4.17 Callable Wrappers and `std::invoke` — Core
+
+A **callable** may be a function, function pointer, pointer to member, lambda closure, or class with `operator()`. The wrapper determines ownership, type erasure, allocation risk, and inlining opportunity.
+
+| Form | Owns callable? | Type erased? | Allocation | Inlining opportunity |
+|---|---:|---:|---|---|
+| template parameter `F` | according to how stored | no | none imposed | strongest; concrete type visible |
+| function pointer | no context ownership | yes, to signature | none | indirect unless target proven |
+| `std::reference_wrapper<F>` | no | no | none | good when template sees `F` |
+| `std::function<R(Args...)>` | yes, copyable target | yes | may allocate; small-object strategy is not guaranteed | generally indirect through wrapper |
+| `std::move_only_function<R(Args...)>` | yes, target may be move-only | yes | may allocate | generally indirect through wrapper |
+| project-specific non-owning function view | no | yes | normally none by design | generally indirect; lifetime external |
+
+`std::move_only_function` is C++23. A `function_ref`-style view is not a standard-library facility through C++23; several libraries provide one. Its main risk is dangling because it borrows the callable.
+
+### `std::invoke` as the common call operation
+
+```cpp
+#include <functional>
+#include <utility>
+
+template<class F, class... Args>
+decltype(auto) invoke_once(F&& f, Args&&... args) {
+    return std::invoke(
+        std::forward<F>(f),
+        std::forward<Args>(args)...
+    );
+}
+```
+
+`std::invoke` handles ordinary call syntax and the special object syntax required by member pointers. `std::is_invocable`, `std::invocable`, and related facilities let generic code constrain that operation.
+
+### Hot-path choice
+
+Use a template when the call site can remain generic and code-size growth is acceptable:
+
+```cpp
+template<class Predicate>
+int scan(const int* begin, const int* end, Predicate predicate) {
+    int matches = 0;
+    for (; begin != end; ++begin) {
+        matches += predicate(*begin) ? 1 : 0;
+    }
+    return matches;
+}
+```
+
+The predicate’s concrete type is visible, so its body can inline into the loop. The trade-off is one instantiation per relevant callable type, increasing build time and possibly `.text` size.
+
+Use `std::function` when stored heterogeneous, copyable callables and a stable signature are worth type erasure. Its standard contract does not promise a particular small-buffer size or no allocation for a given lambda. If allocation is forbidden, enforce that with a wrapper whose capacity and overflow behavior are part of your project contract, then test allocation counts.
+
+---
+
+## 4.18 C Variadic Functions — Deep dive
+
+C-style variadic functions use `...` and `<cstdarg>`. The callee receives no language-level type list or count for the variadic tail:
 
 ```cpp
 #include <cstdarg>
-int sum(int count, ...) {
-    va_list ap; va_start(ap, count);
-    int s = 0;
-    for (int i = 0; i < count; ++i) s += va_arg(ap, int);   // TYPE MUST BE CORRECT
-    va_end(ap);
-    return s;
+
+int sum_ints(int count, ...) {
+    va_list args;
+    va_start(args, count);
+
+    int result = 0;
+    for (int i = 0; i < count; ++i) {
+        result += va_arg(args, int);
+    }
+
+    va_end(args);
+    return result;
 }
 ```
 
-The mechanism: arguments after the named ones are placed per the ABI (SysV x86-64: first six integer args in registers, first eight floats in SSE registers, the rest on the stack; a variadic call must set `AL` to the number of SSE registers used). `va_list` on SysV is a struct with a register-save-area pointer and offsets, which is why `va_list` is not portably copyable — use `va_copy`.
+The caller and callee must agree out of band on number and types. Supplying the wrong type to `va_arg` is generally UB. Default argument promotions apply: `float` is passed as `double`, and `bool`, `char`, and `short` undergo integral promotion, normally to `int`. Therefore retrieving those unpromoted types is wrong.
 
-### Why it is dangerous
+`va_list` may be an array or structured ABI object rather than a plain pointer. Use `va_copy` when a second traversal is needed, and pair every successful `va_start`/`va_copy` with `va_end`.
 
-- **No type checking.** `va_arg(ap, int)` on a `double` reads garbage from the wrong register class.
-- **Default argument promotions apply**: `float`→`double`, `char`/`short`/`bool`→`int`. So `va_arg(ap, float)` is *always* wrong; `va_arg(ap, char)` likewise.
-- **Passing a non-trivial class type through `...` is conditionally-supported and usually UB.** Passing `std::string` to `printf("%s")` compiles and prints garbage — hence `-Wformat` and `std::format`.
-- **No way to know how many arguments there are** — you need a count, a sentinel, or a format string. A `NULL` sentinel must be cast (`(char*)NULL`) on platforms where `NULL` is `0` and `int` is narrower than a pointer.
-- **Security:** format-string vulnerabilities (`printf(user_input)`) are the classic remote-code-execution primitive via `%n`.
+C variadics remain necessary at some C and operating-system boundaries. Keep them behind a typed C++ façade. For formatting, a mismatched format string can turn the same missing type information into memory corruption or a security vulnerability. Enable the compiler’s format diagnostics where supported; those diagnostics are an implementation feature layered over an unsafe language mechanism.
 
-`-Wformat=2 -Wformat-security` gives compilers `printf`-family type checking, extendable to your own functions with `[[gnu::format(printf, 1, 2)]]`.
-
-### Replacements
-
-| Need | Modern tool |
-|---|---|
-| Type-safe variable arity | Variadic templates (§4.16) |
-| Formatting | **`std::format`/`std::print`** (C++20/23) — compile-time-checked format strings, type-safe, no promotions (Ch. 16 §16.3) |
-| Runtime-varying formatting | `std::vformat` with `std::format_args` |
-| Homogeneous list | `std::initializer_list`, `std::span` |
-
-`...` retains one important non-variadic use: **as a worst-match overload in SFINAE**, where `f(...)` is the fallback that loses to every other candidate (Ch. 17 §17.11), and in `catch(...)`.
-
-**Low-latency note:** variadic functions cannot be inlined as effectively (the register-save-area prologue spills all argument registers to the stack — a real cost, visible in `printf`'s prologue), which is one more reason `std::format` with a fully-templated implementation is faster than `printf` when the format string is constant. The counterpoint: `std::format` costs compile time and code size per call site (Ch. 17 §17.22), and `printf` on a well-tuned libc is very fast; the actual low-latency answer is that neither belongs on the hot path — you log binary and format offline (Ch. 16 §16.5).
+Do not use C variadics for a new internal interface. Variadic templates preserve types and can validate arity and constraints at compile time.
 
 ---
 
-## 4.16 C++ Variadic Templates
+## 4.19 C++ Variadic Templates — Core
+
+A parameter pack represents zero or more template arguments. A pack expansion repeats a pattern:
 
 ```cpp
-template <class... Ts>              // template parameter pack
-void log(Ts&&... args) {            // function parameter pack (here, forwarding refs)
-    (std::cout << ... << args);     // fold expression (C++17)
+#include <utility>
+
+template<class F, class... Args>
+decltype(auto) forward_call(F&& f, Args&&... args) {
+    return std::forward<F>(f)(
+        std::forward<Args>(args)...
+    );
 }
 ```
 
-A **parameter pack** holds zero or more template arguments/parameters. `sizeof...(Ts)` yields the count (compile-time). **Pack expansion** — the trailing `...` — repeats a pattern once per element, comma-separated.
+`Args` is a template parameter pack; `args` is a function parameter pack. `sizeof...(Args)` gives the count at compile time. The expansion forwards each element, but the argument evaluations of the resulting function call still have unspecified relative order.
 
-```cpp
-f(args...);                    // f(a1, a2, a3)
-f(g(args)...);                 // f(g(a1), g(a2), g(a3))
-f(std::forward<Ts>(args)...);  // perfect forwarding (Ch. 17 §17.17)
-Base<Ts>...                    // in a base-clause: inherit from each
-```
+### Fold expressions
 
-### Fold expressions (C++17)
+Fold expressions reduce a pack with an operator:
 
-Before C++17, reduction required recursive instantiation — one template instantiation per element, with the compile-time and error-message cost that implies.
-
-| Form | Expansion | Empty pack |
+| Form | Association | Empty-pack behavior |
 |---|---|---|
-| `(... op pack)` | left fold: `((a1 op a2) op a3)` | ill-formed (except `&&`,`\|\|`,`,`) |
-| `(pack op ...)` | right fold: `(a1 op (a2 op a3))` | same |
-| `(init op ... op pack)` | binary left fold | `init` |
-| `(pack op ... op init)` | binary right fold | `init` |
+| `(... op pack)` | unary left fold | only certain operators have defined identities |
+| `(pack op ...)` | unary right fold | same restriction |
+| `(init op ... op pack)` | binary left fold | yields `init` for empty pack |
+| `(pack op ... op init)` | binary right fold | yields `init` for empty pack |
 
-Only `&&` (→`true`), `||` (→`false`), and `,` (→`void()`) have defaults for the empty pack; everything else needs the binary form. `(cond && ...)` short-circuits, which matters when the operands have side effects.
-
-### Idioms worth having ready
+Only unary folds over `&&`, `||`, and comma have built-in empty-pack identities (`true`, `false`, and `void()`, respectively). Supply an initial value for arithmetic reductions:
 
 ```cpp
-(f(args), ...);                                   // call f on each, left to right — GUARANTEED order
-                                                  // (comma fold is sequenced)
-(v.push_back(args), ...);
-auto total = (0 + ... + args);
-bool all_pos = (... && (args > 0));
+#include <utility>
 
-// pre-C++17 expander trick, still seen:
-int dummy[] = {0, (f(args), 0)...};  (void)dummy;  // braced-init-list ⇒ left-to-right (§4.3)
+template<class... Values>
+auto sum(Values... values) {
+    return (0 + ... + values);
+}
 
-// indexing a pack
-template <std::size_t I, class... Ts>
-using nth_t = std::tuple_element_t<I, std::tuple<Ts...>>;
+template<class... Actions>
+void run(Actions&&... actions) {
+    (std::forward<Actions>(actions)(), ...); // comma sequences left-to-right
+}
 ```
-C++26 adds **pack indexing** (`Ts...[I]`, `args...[I]`) natively, removing the `tuple_element` dance — worth naming.
 
-### Costs and failure modes
+### Cost and correctness
 
-- **Order of pack expansion in a function call is unspecified** (§4.3) — `f(g(args)...)` does not guarantee left-to-right. Use a comma fold or a braced-init-list when order matters.
-- **Instantiation cost:** each distinct pack produces a distinct instantiation. Recursive variadic implementations are O(N) instantiations deep and are a major compile-time sink; fold expressions and `if constexpr` flattened much of this (Ch. 17 §17.22).
-- **Code bloat:** a variadic `emplace_back` generates a function per argument-type combination — real `.text` growth, real I-cache pressure. This is the argument for type-erasing at the boundary and templating only the thin inner layer.
-- Packs must be the **last** template parameter for deduction to work in most cases; a pack followed by a deducible parameter is a common error.
-- **Empty packs** are legal and routinely break constructors (`Widget(Ts&&...)` with zero args competes with the default constructor).
+Variadic templates are type-safe, but not automatically cheap:
 
-**Where they shine on hot paths:** `emplace_back`/`make_unique`-style perfect forwarding (constructing in place, no temporary — Ch. 9), compile-time dispatch tables, and heterogeneous logging where the fold builds a fixed-layout binary record with no allocation and no format parsing at runtime.
+- each distinct argument-type sequence can produce a separate instantiation;
+- code size can harm instruction-cache locality;
+- forwarding can preserve references that later dangle if a callee stores them;
+- an unconstrained pack may absorb calls intended for a more specific overload;
+- pack expansion into call arguments does not establish left-to-right order;
+- zero-length packs are valid and must be handled intentionally.
+
+Use a template pack in a thin hot layer when static types enable validation and inlining. Consider type erasure at a colder boundary to control code size. Confirm the trade-off with build-time measurements, binary section sizes, and representative instruction-cache behavior.
 
 ---
 
-## 4.17 Calling Conventions and Parameter Passing
+## 4.20 Calling Conventions and Parameter Passing — Deep dive
 
-The **ABI** (application binary interface) specifies where arguments go, who saves which registers, how the stack is aligned, and how returns work. On Linux/macOS x86-64 that is **System V AMD64** (Ch. 41 §41.5); Windows x64 differs materially.
+The C++ standard specifies parameter initialization and observable behavior. It does not specify argument registers, stack-frame shape, name mangling, or binary compatibility. Those belong to an **application binary interface** (ABI) selected by platform, compiler, architecture, and build options.
 
-### System V AMD64, essentials
+### Common implementation models, not language guarantees
 
-```
-Integer/pointer args:  RDI, RSI, RDX, RCX, R8, R9   then stack (right-to-left push)
-SSE/float args:        XMM0–XMM7                    then stack
-Return:                RAX (+RDX for 128-bit), XMM0 (+XMM1)
-Callee-saved:          RBX, RBP, R12–R15            (must be preserved)
-Caller-saved:          everything else, incl. all XMM
-Stack alignment:       16 bytes at the CALL instruction
-Red zone:              128 bytes below RSP usable by leaf functions without adjusting RSP
-Variadic:              AL = number of vector registers used
-```
+| Property | x86-64 System V family | Microsoft x64 | AArch64 procedure-call family |
+|---|---|---|---|
+| early integer/pointer arguments | commonly six general registers | commonly four general registers | commonly eight general registers |
+| early floating/vector arguments | separate vector-register classification | positional register rules | vector/floating registers with aggregate rules |
+| caller-provided home/shadow area | not the Microsoft 32-byte rule | 32-byte shadow space | ABI-specific stack rules |
+| red zone | commonly 128 bytes in user space | none | generally none |
+| aggregate passing | classification by chunks/classes | size and type rules differ | includes homogeneous floating aggregates |
 
-| | System V (Linux/macOS) | Microsoft x64 |
+This table is orientation only. Operating systems may modify a base architecture ABI; compiler options and vector types add exceptions. Read the ABI document for the exact target and inspect generated code.
+
+### Source semantics before register counting
+
+At a non-inlined boundary, common ABIs often pass small trivial aggregates in registers and larger or non-trivial class objects indirectly or through memory. “Sixteen bytes or less always goes in registers” is not a portable rule: field types, alignment, triviality, and target classification matter.
+
+Large or otherwise indirectly returned objects commonly use a hidden pointer to caller-provided result storage. This implementation technique aligns naturally with copy elision, but the language guarantee is direct initialization of the result object—not a particular hidden-register protocol.
+
+References are commonly implemented as addresses, but the standard does not say a reference occupies storage or has pointer representation. Passing a small integer as `const int&` can therefore be worse than passing it by value at an uninlined boundary, while inlining may erase the distinction.
+
+### Passing guidance with conditions
+
+| Situation | Default source-level choice | Verify at the boundary |
 |---|---|---|
-| Integer arg registers | 6 (RDI RSI RDX RCX R8 R9) | **4** (RCX RDX R8 R9) |
-| Float arg registers | 8 | 4, and int/float share *positions* |
-| Shadow space | none | **32 bytes** reserved by caller |
-| Red zone | 128 bytes | **none** |
-| Callee-saved | RBX RBP R12–R15 | + RSI, RDI, XMM6–XMM15 |
+| small scalar or small cheap value | by value | register use, alias freedom, code size |
+| large read-only object | `const T&` | pointer chasing, lifetime, cache locality |
+| function stores an owned value | by value then move, or explicit overloads | caller mix, move cost, allocation count |
+| optional object | pointer or vocabulary type | null checks and ownership |
+| contiguous borrowed input | span/view | lifetime and bounds representation |
+| generic immediate callable | forwarding reference/template | inlining and instantiation growth |
+| stable erased callback boundary | owning or borrowing wrapper by contract | allocation, indirect-branch behavior, lifetime |
 
-### How aggregates are passed — the part that matters
+The low-latency claim must name the boundary. “By value is faster” might be true for a two-word trivial type across a visible direct call. It may be false for a non-trivial type, a register-starved call, or an ABI that classifies the aggregate into memory. Benchmark with production optimization, inlining policy, and representative call-site distribution.
 
-A class type is classified field-by-field into eight-byte "chunks":
-- **≤ 16 bytes and trivially copyable** → passed in **up to two registers** (INTEGER/SSE class per chunk).
-- **> 16 bytes**, or containing unaligned/mixed classes → passed **in memory** (copied to the stack by the caller).
-- **Non-trivial for the purposes of calls** (user-provided or virtual copy/move constructor, or a non-trivial destructor) → passed **by invisible reference**: the caller constructs a temporary and passes its address. Ch. 3 §3.5.
+### Calling-convention extensions
 
-That last rule is the highest-value ABI fact in C++:
+Spelling such as `__vectorcall`, `__attribute__((sysv_abi))`, or vendor register-preservation attributes is implementation-specific. Such annotations can be necessary for foreign-function interfaces, JIT stubs, interrupts, or hand-written assembly. They are not standard C++23 and must be isolated, documented, and tested at both sides of the boundary.
+
+Tail-call optimization is also an implementation choice, not a C++ guarantee. Matching calling conventions, compatible return paths, and absence of pending cleanup commonly help. A destructor that must run after a call can prevent replacement of `call; return` with a jump.
+
+---
+
+## 4.21 Worked Reasoning: Predict, Select, Then Cost — Core
+
+Consider a publication API:
 
 ```cpp
-struct A { int x, y; };                              // 8 bytes  → one register
-struct B { int x, y; ~B(){} };                       // 8 bytes  → MEMORY. The destructor costs you the register.
-std::unique_ptr<T> p;                                // 8 bytes  → MEMORY, not a register
+#include <cstdint>
+#include <functional>
+#include <utility>
+
+namespace feed {
+
+struct Update {
+    std::uint64_t sequence;
+};
+
+void publish(const Update&, int channel);
+void publish(Update&&, int channel);
+
+} // namespace feed
+
+int choose_channel();
+feed::Update decode();
+
+template<class Observer>
+void process(Observer&& observer) {
+    feed::Update update = decode();
+    std::invoke(std::forward<Observer>(observer), update.sequence);
+    publish(std::move(update), choose_channel());
+}
 ```
-**`std::unique_ptr` is not zero-overhead across a non-inlined function boundary** — it has a non-trivial destructor, so it is passed by address, unlike a raw pointer. Inside a translation unit with inlining, the cost vanishes; across an ABI boundary it is real, and it is *the* answer to "is `unique_ptr` really zero-cost?" (Ch. 9 §9.11).
 
-Returns: a large or non-trivial return value uses the **hidden return-slot pointer** in RDI (shifting all other arguments right one register) — the mechanism that makes RVO/NRVO work by construction (Ch. 10 §10.1). The callee constructs the object directly in the caller's storage.
+Question: which `publish` is called, in what order are its argument expressions evaluated, and what latency claims are justified?
 
-### Passing guidance
+### Step 1: lookup
 
-| Situation | Pass as |
-|---|---|
-| Small trivially copyable (≤16 B) | **by value** — register, and enables optimization |
-| Large, read-only | `const T&` |
-| Sink / will be stored | **by value, then `std::move`** (one move for lvalues, zero for rvalues) |
-| Needs both lvalue and rvalue efficiency in a template | `T&&` forwarding reference |
-| Non-owning contiguous data | `std::span<const T>` / `std::string_view` (Ch. 13) |
-| Optional out-parameter | pointer (nullable), not a reference |
+The call is unqualified. Ordinary lookup finds no local `publish` in the shown scopes. ADL examines `feed::Update`, finds namespace `feed`, and adds both `feed::publish` overloads.
 
-Reference parameters compile to pointers, so `const int&` for an `int` is a **pessimization**: it forces a memory round trip and blocks constant propagation when not inlined. `const std::string&` on a hot path is worse — it invites a temporary `std::string` construction (heap allocation) at every call site given a `const char*`; `std::string_view` is the fix.
+### Step 2: viability and ranking
 
-Other calling conventions worth naming: `__attribute__((fastcall/regparm))` (x86-32 legacy), `__vectorcall` (MSVC, passes vectors in registers), `[[gnu::preserve_all]]`/`preserve_most` (Clang, for cold paths and JIT stubs), and `__attribute__((sysv_abi))` for interop. **Tail calls** (Ch. 41 §41.9) matter for dispatch loops: the compiler can only turn `return f(x);` into a `jmp` if there are no non-trivial destructors pending and the ABIs match, which is why RAII objects in scope silently disable tail-call optimization.
+`std::move(update)` is an xvalue of type `feed::Update`. Both overloads are viable: an xvalue can bind to `const Update&` or `Update&&`. Binding to `Update&&` is the better reference binding, so the rvalue-reference overload wins. `std::move` itself transfers nothing; the selected `publish` decides what happens.
+
+### Step 3: sequencing and order
+
+The postfix expression denoting `publish` is sequenced before its arguments. The two argument initializations—`std::move(update)` and `choose_channel()`—are indeterminately sequenced relative to each other. Their order is unspecified.
+
+`std::move(update)` is only a cast and has no mutation by itself, so the unspecified order is harmless in this version. If the first argument were `prepare(update)` and `choose_channel()` also read or modified `update`, explicit statements would be required to establish intended order.
+
+### Step 4: lifetime
+
+`update` remains alive until `process` exits. Passing it as an xvalue permits the callee to move from it. Any later use must respect the moved-from state. The observer received `update.sequence` by value before the call, so that scalar is independent of later moves.
+
+### Step 5: cost
+
+No defensible cycle count follows from the source:
+
+- `decode()` may allocate or may construct directly into `update`;
+- `Observer` is a template parameter, so `std::invoke` can inline if the body is visible;
+- `publish` may inline, or may cross an ABI boundary;
+- the move overload may transfer handles, copy bytes, enqueue by reference, or allocate;
+- `choose_channel()` may dominate the call.
+
+A defensible optimization experiment would record allocation count, inspect whether observer and publish calls inline, measure representative latency percentiles, and sample indirect-branch and instruction-cache events if callable dispatch is suspected. The rollback is the clearer untuned implementation if no stable improvement appears.
 
 ---
 
-## 4.18 Namespaces and Name Lookup
+## Recall and Practice — Core
 
-Namespaces partition names to prevent collisions; **name lookup** is the algorithm that turns an identifier in source into a declaration.
+### Recall card
 
-### The two lookup kinds
+- Parse with precedence and associativity; predict execution with sequencing. They answer different questions.
+- Type and value category are independent. Named variables are lvalue expressions; `std::move` casts to an xvalue.
+- Since C++17, class prvalues can initialize result objects directly in guaranteed-elision cases.
+- Conflicting unsequenced accesses to the same memory location are UB. Function arguments are indeterminately sequenced but have unspecified order.
+- UB supplies no outcome to reason about. Unspecified behavior stays within a valid set. Implementation-defined behavior must be documented.
+- Calls resolve as lookup/ADL → candidates → viability/constraints → conversion ranking → tie-breakers.
+- Qualification disables ADL. Hidden friends deliberately depend on ADL.
+- Defaults are inserted at call sites and bind statically; virtual dispatch remains dynamic.
+- `auto` normally returns a value; `decltype(auto)` can preserve a reference and its lifetime hazard.
+- `constexpr` permits compile-time execution; `consteval` requires it; `constinit` requires static initialization.
+- Templates maximize visibility and specialization but can grow code. Type erasure controls interface shape but usually introduces indirect dispatch and may allocate.
+- Registers and stack slots are ABI facts, never standard C++ guarantees.
 
-- **Qualified lookup** (`N::f`, `obj.f`, `Class::f`) — search only the named scope and, for classes, its bases. Disables ADL.
-- **Unqualified lookup** — search progressively outward: block scope → enclosing blocks → function/class scope (including base classes) → enclosing namespaces → global namespace. **Stops at the first scope containing the name** — including a name of a completely wrong kind. Then, for function calls, ADL (§4.7) is added.
+### Common interview traps
 
-The "stops at the first hit" rule is what produces **name hiding**:
+1. “Left associative” does not mean “evaluated left-to-right.”
+2. `std::move(const_object)` commonly copies because the move overload needs non-const `T&&`.
+3. `f(i++, i++)` is not UB in C++17 and later, but which parameter gets which value is unspecified.
+4. An unspecified outcome is not permission for arbitrary behavior.
+5. A hidden base overload is absent from the candidate set; conversion ranking cannot recover it.
+6. `std::function` does not promise a standard small-buffer capacity or allocation-free construction.
+7. A default argument on a virtual call comes from the static type.
+8. `return std::move(local);` can inhibit NRVO.
+9. `[[assume]]` does not validate a condition; a false assumption creates UB.
+10. ABI register counts do not dictate source-level argument evaluation order.
+
+### Interview questions
+
+1. For `a() + b() * c()`, separate parsing from evaluation order. What is guaranteed?
+2. Why is a named `T&&` parameter an lvalue, and when should it be cast back to an xvalue?
+3. Classify `x`, `std::move(x)`, `T{}`, `*p`, and a function call returning `T&`.
+4. Explain why `f(i++, i++)` and `++i + i++` have different status in C++23.
+5. Distinguish undefined, unspecified, implementation-defined, and ill-formed behavior using one example each.
+6. Why may a compiler remove a null check that appears after a dereference?
+7. Walk through lookup, viability, and ranking for overloads `f(int)`, `f(double)`, and `template<class T> f(T)`.
+8. Why does `using std::swap; swap(a, b);` customize correctly while `std::swap(a, b)` may not?
+9. How can a forwarding constructor hijack copying, and which constraint prevents it?
+10. Why should virtual functions avoid default arguments?
+11. When does `decltype(auto)` preserve a reference that `auto` would discard, and what lifetime obligation follows?
+12. Compare a template callable, function pointer, `std::function`, and `std::move_only_function` for ownership, allocation, inlining, and code size.
+13. Why is retrieving a `float` with `va_arg(args, float)` incorrect?
+14. Does expanding a parameter pack into a function call evaluate elements left-to-right? How can a comma fold establish order?
+15. Defend passing a two-word type by value without claiming that every ABI passes it in registers.
+
+### Code-reading exercise
+
 ```cpp
-struct Base   { void f(int); void f(double); };
-struct Derived: Base { void f(const char*); };
-Derived d;  d.f(1);           // ERROR — Base::f is HIDDEN, no int overload visible
-// fix: `using Base::f;` inside Derived
+#include <string>
+#include <utility>
+
+void use(const std::string&);
+void use(std::string&&);
+
+std::string make();
+
+void test() {
+    std::string a = make();       // A
+    use(a);                       // B
+    use(std::move(a));            // C
+
+    const std::string b = make();
+    use(std::move(b));            // D
+}
 ```
-This applies to variables shadowing outer variables (`-Wshadow`), to a member hiding a namespace-scope function, and to a `using`-declaration's interaction with overloads.
 
-### Namespace facilities
+Predict the selected overload at B, C, and D. Then state what can be concluded about object construction at A without seeing `make`’s body, and what cannot be concluded about allocation from the overload choices alone.
 
-```cpp
-namespace a::b::c { ... }              // nested definition, C++17
-namespace fs = std::filesystem;        // alias
-using namespace std;                   // using-DIRECTIVE — makes names findable (never in a header)
-using std::vector;                     // using-DECLARATION — introduces one name; preferred
-inline namespace v2 { ... }            // members visible in the enclosing namespace
-namespace { ... }                      // unnamed: internal linkage (Ch. 1 §1.7)
-```
+### Design exercise
 
-**Unnamed namespaces** are the modern replacement for file-static: they give internal linkage to *types* as well as functions and variables, which `static` cannot do. Every helper in a `.cpp` should live in one — it prevents ODR violations and lets the linker discard unused code (Ch. 40 §40.20).
+Design a hot-path callback API that supports:
 
-**Inline namespaces** are the ABI-versioning mechanism: libstdc++'s `std::__cxx11` (the C++11 `std::string` ABI break) and `std::__1` in libc++ are inline namespaces, so `std::string` resolves to `std::__1::basic_string<...>` in the mangled name (Ch. 1 §1.10) while reading as `std::string` in source. Two libraries built against different versions produce different mangled symbols and fail to link — which is exactly the desired outcome, versus silently linking incompatible layouts. That is the strongest answer to "how would you version an ABI?" (Ch. 44 §44.17).
+- immediate calls with inlinable lambdas;
+- stored move-only handlers;
+- a cold plugin boundary with a stable C-compatible signature;
+- a strict no-allocation rule after initialization.
 
-**`using namespace std;` at namespace scope in a header** is the canonical sin: it injects thousands of names into every including TU, causing ambiguities that appear only when some *other* header is added, and breaking `std::` additions (adding `std::size` in C++17 broke code with a global `size`). At function scope in a `.cpp` it is defensible.
+Choose a callable representation for each boundary. State ownership and lifetime, how capacity failure is reported, where indirect calls remain, how code-size growth is bounded, and which measurements would validate the design.
 
-### Lookup subtleties worth knowing
+### Prerequisites for Chapter 5
 
-- **Two-phase lookup in templates** (Ch. 17 §17.8): non-dependent names bind at *definition*; dependent names at *instantiation*, via ADL only. This is why `this->member` and `typename`/`template` disambiguators are needed, and why MSVC's historical lack of two-phase lookup made code non-portable.
-- **Point of declaration** is *after* the declarator: `int x = x;` is self-initialization with an indeterminate value, not a reference to the outer `x`.
-- **Class-scope lookup includes base classes** and is done before enclosing namespaces — a base member hides a namespace-scope name of the same name.
-- **Ambiguity across `using namespace`** is a hard error only at the point of use, so adding a using-directive can break far-away code.
-- **`::f` forces global scope**, useful to escape a member or a hijacking overload.
-- **Modules (C++20, Ch. 19 §19.6)** change this materially: names are not injected by textual inclusion, so lookup depends on explicit `export`, which finally makes header hygiene structural rather than conventional.
-
----
-
-## Key Interview Questions
-
-1. **What are the five value categories and how do the two axes define them?** — identity × moveability: lvalue (identity, no move), prvalue (no identity, move), xvalue (both); glvalue = identity, rvalue = moveable.
-2. **Is a named `T&&` parameter an lvalue or an rvalue?** — An lvalue. Type and value category are orthogonal; you must `std::move` it again to move from it.
-3. **What did C++17 change about evaluation order?** — Ordered `=`, `[]`, `.`, `<<`/`>>`, and `new`'s allocation-vs-initializer; made function arguments indeterminately (not un-) sequenced, which fixed the `f(make_unique<A>(), make_unique<B>())` leak.
-4. **Is argument evaluation order undefined or unspecified?** — Unspecified; braced-init-list elements, by contrast, are guaranteed left-to-right.
-5. **Distinguish undefined, unspecified, and implementation-defined behaviour.** — No requirements at all / a choice from a valid set / a documented choice. Only UB can travel backwards and delete your code.
-6. **Why can UB delete a null check you wrote before the dereference?** — The compiler assumes UB never occurs, so a later dereference proves the pointer non-null everywhere in the function.
-7. **Why is a signed loop counter sometimes faster than an unsigned one?** — Signed overflow is UB, so the compiler may widen the induction variable and skip wraparound handling, enabling vectorization.
-8. **Walk through overload resolution.** — Name lookup builds candidates (ordinary + ADL), viability filters, then conversion-sequence ranking; ties broken by non-template > template, more-specialized template, more-constrained.
-9. **Why does a perfect-forwarding constructor hijack the copy constructor?** — `T&&` deduces `Widget&`, an exact match, beating the copy ctor's qualification conversion to `const Widget&`. Constrain it.
-10. **What is ADL and why is `using std::swap; swap(a,b);` written that way?** — ADL adds the argument types' namespaces to the candidate set; qualifying `std::swap` would disable ADL and force the generic version. C++20 CPOs encapsulate this.
-11. **What is a hidden friend and why prefer it?** — A friend defined in-class, findable only by ADL: smaller overload sets, faster compiles, no accidental conversions.
-12. **Why should a virtual function never have a default argument?** — The default comes from the static type at the call site while the body dispatches dynamically.
-13. **What is the real cost of an indirect call?** — Not the jump, but lost inlining plus a possible BTB mispredict (~15–20 cycles) and I-cache miss; retpoline mitigations make it far worse.
-14. **How big is a pointer-to-member-function and why?** — 16 bytes under Itanium: code address or vtable index plus a `this`-adjustment, with a runtime virtual/non-virtual test on call.
-15. **What does `std::invoke` add over `f(args...)`?** — Uniform INVOKE semantics that also handle member pointers and `reference_wrapper`; the rule `std::thread`/`bind`/`function` already used.
-16. **What are `std::function`'s three costs?** — Type erasure blocks inlining; heap allocation when the callable exceeds the small buffer; an extra indirection/cache miss. Plus a copy-constructibility requirement (`move_only_function` in C++23 fixes that).
-17. **`constexpr` vs `consteval` vs `constinit`?** — May be compile-time / must be compile-time / must be constant-*initialized* without being const.
-18. **What do `[[likely]]`/`[[unlikely]]` actually do?** — Code layout (cold-block outlining), not hardware prediction; PGO usually beats them.
-19. **When do you need `decltype(auto)`?** — In forwarding wrappers, to return exactly what the wrapped call returns including references; `auto` would decay and copy.
-20. **Why is a struct with a destructor passed differently from an identical one without?** — Non-trivial destructor ⇒ passed by invisible reference under SysV, not in registers. This is why `unique_ptr` isn't free across ABI boundaries.
-21. **What is an inline namespace for?** — ABI versioning: `std::__1`/`__cxx11` change the mangled name so incompatible builds fail to link instead of silently corrupting.
-
----
-
-## Common Traps
-
-- **Treating a named rvalue reference as an rvalue** — one missing `std::move` turns a move into a copy.
-- **`std::move` on a `const` object** — yields `const T&&`, binds to the copy constructor, silently copies.
-- **Assuming left-to-right function argument evaluation.** Unspecified; only braced-init-lists guarantee it.
-- **`i = i++ + ++i`-style expressions** — write two statements; version-dependent legality is not worth arguing about.
-- **Believing UB means "whatever the hardware does."** It means the optimizer may reason backwards and delete code.
-- **Empty infinite loop without a side effect** — forward-progress UB; a spin wait needs an atomic/volatile read or a yield.
-- **`std::sort` with a non-strict-weak comparator** — reads out of bounds and corrupts memory, not merely misorders.
-- **A derived-class member hiding all base overloads** — needs `using Base::f;`.
-- **Unconstrained `template<class T> Widget(T&&)`** hijacking the copy constructor.
-- **Overloading on `int` vs `double` and calling with `unsigned`** — ambiguous.
-- **Default arguments on virtual functions** — static type supplies the value.
-- **Changing a default argument in a shipped library** — callers baked the old value in; requires recompilation.
-- **Qualifying `std::swap`** and losing the user's efficient overload.
-- **Adding a function to your namespace** and breaking distant ADL-dependent calls.
-- **`va_arg(ap, float)` or `va_arg(ap, char)`** — default argument promotions make these always wrong.
-- **Passing a `std::string` to `printf("%s")`** — compiles, prints garbage; use `std::format`.
-- **`std::function` in a hot path** — hidden allocation past ~16 bytes of captures and no inlining.
-- **`const std::string&` parameters** — a `const char*` argument allocates at every call site; use `string_view`.
-- **`const int&` parameters** — forces memory, blocks constant propagation.
-- **Forgetting `(obj->*pmf)(args)` parentheses** — `->*` binds looser than the call.
-- **`auto` return types in headers/PIMPL boundaries** — the definition must be visible, and they can't be virtual.
-- **Relying on pack-expansion order in a function call** — unspecified; use a comma fold.
-- **`using namespace std;` in a header** — mass name injection and future-standard breakage.
-- **`[[assume(expr)]]` with an expression that can be false** — silent, unbounded UB.
-- **Falling off the end of a non-void function** — the compiler may delete the path entirely.
-
----
-
-## Compact Recall Summary
-
-**Value categories.** Two axes: identity and moveability. lvalue = identity only; prvalue = moveability only and, since C++17, *not an object at all* until materialized; xvalue = both. Named rvalue references are lvalues. `std::move` is a cast that emits no code; `decltype((x))` adds a reference.
-
-**Sequencing.** Unsequenced ⇒ UB if two side effects touch the same scalar. C++17 ordered `=` (right before left), `[]`, `.`, `<<`/`>>`, `new`'s allocation, and made call arguments *indeterminately* sequenced — which is what makes `f(make_unique<A>(), make_unique<B>())` safe. Argument order remains unspecified; braced-init-lists are guaranteed left-to-right.
-
-**Behaviour classes.** UB = no requirements, propagates backwards, deletes code. Unspecified = a valid choice, undocumented. Implementation-defined = a documented choice. C++26 adds *erroneous* for uninitialized reads. Sanitizers map one-to-one onto UB classes: UBSan (arithmetic/alignment/enums), ASan (bounds/lifetime), TSan (races).
-
-**Overload resolution.** Lookup (ordinary + ADL) → viability → conversion ranking (exact > promotion > conversion > user-defined > ellipsis, at most one user-defined conversion) → tie-breakers (non-template, more specialized, more constrained). Return type never participates; name hiding removes base overloads entirely.
-
-**ADL.** Unqualified calls also search the argument types' namespaces — the reason operator overloading works at all. `using std::swap;` then unqualified `swap`; C++20 CPOs automate it. Hidden friends (in-class friend definitions) are ADL-only, cutting overload-set size and compile time.
-
-**Defaults and pointers.** Default arguments are baked into the caller (ABI hazard) and are taken from the *static* type for virtuals. Function pointers cost lost inlining plus BTB pressure; pointers to members are 16 bytes with a virtual/non-virtual runtime test. `std::invoke` unifies all callables; `std::function` costs erasure + possible allocation; prefer template parameters on hot paths, `function_ref` (C++26) at boundaries.
-
-**Compile time.** `constexpr` = may; `consteval` = must; `constinit` = constant-initialized, not const. C++14 made `constexpr` usable, C++20 added allocation/`vector`/`string`/virtuals, C++23 `if consteval`. UB is a hard error in constant evaluation. Use it for tables, format checking, and killing dynamic initialization.
-
-**Attributes.** `[[nodiscard]]` for error-returning APIs, `[[likely]]` for *layout* not prediction, `[[assume]]` as a loaded gun, `[[noreturn]]` and `[[no_unique_address]]` as the two that change semantics. Unknown attributes are ignored since C++17.
-
-**Deduction and variadics.** `auto` return strips references (use `decltype(auto)` in wrappers); deduced returns can't be virtual or forward-declared. C variadics have no type checking and apply default promotions — replaced by variadic templates and `std::format`. Fold expressions (C++17) replaced recursive instantiation; only `&&`/`||`/`,` have empty-pack defaults; pack indexing arrives in C++26; instantiation count and code bloat are the real costs.
-
-**ABI.** SysV x86-64: six integer + eight SSE argument registers, 16-byte stack alignment, 128-byte red zone. Aggregates ≤16 bytes go in registers, but **any non-trivial copy/move/destructor forces passing by invisible reference** — the reason `unique_ptr` is not free at a non-inlined boundary. Large/non-trivial returns use a hidden return-slot pointer, which is the machinery behind guaranteed elision. Pass small trivially-copyable types by value; use `span`/`string_view` for non-owning data; RAII objects in scope disable tail calls.
-
-**Lookup.** Unqualified lookup stops at the first scope containing the name, of any kind — hence hiding. Unnamed namespaces are the modern `static` and cover types too. Inline namespaces are how ABIs are versioned (`std::__1`). Never `using namespace std;` in a header. Templates use two-phase lookup; modules replace injection with explicit export.
+Chapter 5 assumes you can classify lvalues, xvalues, and prvalues; explain temporary materialization and direct result construction; distinguish sequencing from evaluation order; and trace how parameter binding and return form affect an object’s lifetime.

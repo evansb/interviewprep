@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`std::array` is a plain aggregate over a raw array and holds nothing else, which is why `sizeof(std::array<int,8>) == 32` and why it can be `memcpy`'d, placed in shared memory, or used as a C++20 NTTP. The 'array plus a size member' answer is the tempting one — the size is a template parameter, known at compile time, so there is nothing to store. There is no allocator and no indirection: the elements *are* the object.",
-      "sourceAnchor": "111-stdarray",
+      "sourceAnchor": "113-stdarray-fixed-count-inline-elements--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Default-initializing an aggregate of trivial type initializes nothing, so reading `a[0]` reads garbage; the empty braces value-initialize and zero everything. 'Both are zero' is the common belief and comes from confusing block scope with namespace scope, where static storage duration would zero-initialize either way. The braces are the whole difference here, not decoration.",
-      "sourceAnchor": "111-stdarray",
+      "sourceAnchor": "113-stdarray-fixed-count-inline-elements--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The zero-size specialization is one of the concrete wins over `T[N]`, where `int x[0]` is ill-formed and only compiles as a GNU extension. It behaves as a proper empty range — the iterators compare equal — but `front()` and `back()` still dereference nothing and are UB, which is the part people forget once they hear 'it's valid'. `data()` is permitted to return null.",
-      "sourceAnchor": "111-stdarray",
+      "sourceAnchor": "113-stdarray-fixed-count-inline-elements--core",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "libstdc++, libc++, and MSVC all use pointer triples, from which `size()` and `capacity()` are subtractions. The size/capacity pair is the tempting distractor because it occupies the same 24 bytes and is how people imagine the class — but it costs an extra add on every dereference, which is exactly why pointers won. Allocators are typically empty and take no space via EBO.",
-      "sourceAnchor": "112-stdvector",
+      "sourceAnchor": "114-stdvector-the-contiguous-dynamic-default--core",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The direct- vs copy-initialization difference is the whole story, and it makes `emplace_back(new T)` a leak hazard: if the growth allocation throws, the raw pointer is never adopted, so prefer `emplace_back(std::make_unique<T>())`. The copy-constructible answer is the seductive one — `push_back` has a `T&&` overload and works fine with `std::move`d unique_ptrs, so copyability is not the obstacle.",
-      "sourceAnchor": "112-stdvector",
+      "sourceAnchor": "114-stdvector-the-contiguous-dynamic-default--core",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The proxy reference is the defect: it cannot be bound to `bool&`, there is no addressable `bool` to point at, and `auto` silently captures the proxy so the value changes underneath you. The `bool*` answer is self-contradictory once you see it — you cannot take the address of a single bit, which is precisely why the proxy exists. Use `vector<char>`, `vector<uint8_t>`, or `std::bitset`.",
-      "sourceAnchor": "112-stdvector",
+      "sourceAnchor": "114-stdvector-the-contiguous-dynamic-default--core",
       "difficulty": "trap"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Self-referencing insertion is explicitly required to work, and implementations achieve it by constructing into the new buffer first and only then destroying and deallocating the old one; `v.insert(v.begin(), v.back())` is required to work for the same reason. The dangling-reference answer describes what would happen with a naive implementation and is exactly what the guarantee rules out. Note this does *not* protect a `T* p = v.data()` you cached yourself.",
-      "sourceAnchor": "112-stdvector",
+      "sourceAnchor": "114-stdvector-the-contiguous-dynamic-default--core",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Geometric growth with k=2 makes the sum 1+2+4+…+2^(i−1) always one short of the next request 2^i, so the freed blocks can never be recycled and the allocation walks forward through the address space; k<φ fixes that, but only for allocators that coalesce. The move-count answer is stated backwards — total moves are n·k/(k−1), so k=2 does 2n and k=1.5 does 3n, meaning the larger factor moves *less*. Neither factor is standardized; only amortized O(1), which any constant factor above 1 satisfies.",
-      "sourceAnchor": "113-vector-growth-and-capacity",
+      "sourceAnchor": "115-vector-growth-capacity-and-failure-cost--core",
       "difficulty": "recall"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`reserve(n)` is specified to give capacity *at least* n and implementations give exactly n, so asking for `size()+1` every iteration defeats geometric growth entirely and reallocates on every push. The 'same as plain push_back' answer assumes `reserve` shares `push_back`'s growth policy, which is the precise misconception — `push_back` grows geometrically, `reserve` grows to order. Reserve once, up front, with the final count.",
-      "sourceAnchor": "113-vector-growth-and-capacity",
+      "sourceAnchor": "115-vector-growth-capacity-and-failure-cost--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`clear()` runs destructors and sets size to zero; it never touches capacity, and neither does `pop_back` or `resize` down. The `shrink_to_fit` answer is the most tempting because it is *usually* honored — but it is an explicitly non-binding request, and even when honored it allocates a fresh buffer, copies, and invalidates everything. `v = std::vector<T>{};` is the modern release idiom.",
-      "sourceAnchor": "113-vector-growth-and-capacity",
+      "sourceAnchor": "115-vector-growth-capacity-and-failure-cost--core",
       "difficulty": "trap"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`size()` is still 0 after `reserve`, so `v[0]` writes into raw, unconstructed storage — undefined behavior that happens to 'work' for `int` and corrupts things for non-trivial types. The value-initializing answer confuses `reserve` with `resize`, which is exactly the distinction being tested: `reserve` touches capacity, `resize` touches size. No compiler diagnoses this; `operator[]` is unchecked by design.",
-      "sourceAnchor": "113-vector-growth-and-capacity",
+      "sourceAnchor": "115-vector-growth-capacity-and-failure-cost--core",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This asymmetry is `deque`'s defining property and the single most-asked exam point about it: the elements themselves never move on an end insertion, but the map of chunk pointers may be reallocated, which is what the iterators depend on. 'Both valid' is the near-miss — a `deque` iterator carries four pointers including the map node, so a map reallocation breaks it. Note a *middle* insert or erase invalidates everything, references included.",
-      "sourceAnchor": "114-stddeque",
+      "sourceAnchor": "116-stddeque-end-growth-with-stable-references--core",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The map-of-chunks layout is what buys O(1) at both ends *and* O(1) random access, at the price of two dependent loads and a real integer division — libstdc++ uses a 512-byte chunk, so K = max(1, 512/sizeof(T)) is often not a power of two and the shift optimization does not apply. The linked-chunks answer is tempting because it explains O(1) end insertion, but it would forfeit the O(1) indexing the standard requires.",
-      "sourceAnchor": "114-stddeque",
+      "sourceAnchor": "116-stddeque-end-growth-with-stable-references--core",
       "difficulty": "recall"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Avoiding the reallocation spike is the actual design rationale: a growing `deque` allocates one small chunk at a time and never has two copies of the data live. The `push_front` answer is doubly wrong — a stack never needs front insertion, and `stack<T, std::vector<T>>` not only compiles but is usually *faster* than the default because iteration and back access avoid the chunk indirection. `vector::push_back` is amortized O(1), not O(log n).",
-      "sourceAnchor": "114-stddeque",
+      "sourceAnchor": "116-stddeque-end-growth-with-stable-references--core",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The asymptotics compare the wrong operations: the O(1) insert only applies once you already hold the iterator, and getting there is a chain of pointer-chasing loads where the next address is unknown until the current node arrives, defeating the prefetcher and giving zero memory-level parallelism. The 'renumbering' answer invents a mechanism — `size()` is a single stored counter, updated in O(1). Vector's insert really does shift the tail; it is just extremely fast at it.",
-      "sourceAnchor": "115-stdlist-and-stdforward_list",
+      "sourceAnchor": "117-stdlist-and-stdforward_list--core-skippable-after-selection",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Every removal is `erase_after` and every insertion `insert_after` precisely because you cannot get from a node to the one before it, and `before_begin()` exists to give you a handle 'before' the first element so front insertion still works. The `push_front` answer inverts it: front operations are the *cheap* ones on a singly-linked list. The payoff is 8 bytes per node and `sizeof(std::forward_list<T>) == 8`.",
-      "sourceAnchor": "115-stdlist-and-stdforward_list",
+      "sourceAnchor": "117-stdlist-and-stdforward_list--core-skippable-after-selection",
       "difficulty": "recall"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Splice relinks nodes and nothing else, so the element never moves in memory and the iterator keeps pointing at the same node — it simply belongs to the destination list afterwards, a guarantee unique to `list::splice`. The 'invalidated' answer is the intuitive guess and is what makes splice special. Note the *range* overload is O(1) only within one list; across lists it is O(distance) because `size()` must be maintained.",
-      "sourceAnchor": "115-stdlist-and-stdforward_list",
+      "sourceAnchor": "117-stdlist-and-stdforward_list--core-skippable-after-selection",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The three-way split is the design point: the checked form reports overflow via an exception, the `try_` form via a null return with no exception machinery, and the unchecked form removes even the branch for a hot path that has already proven capacity. The 'falls back to the heap' answer describes small-vector optimization, not `inplace_vector` — the whole premise here is that no allocation ever happens, which is why overflow must be an error rather than a growth event.",
-      "sourceAnchor": "116-stdinplace_vector-and-fixed-capacity-vectors",
+      "sourceAnchor": "119-fixed-capacity-inline-sequences-in-c23--role-specific",
       "difficulty": "recall"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The elements live inside the object, so there is no pointer to steal — moving means touching every element, which is the main price paid for zero indirection and zero allocation. The 'O(1) when trivially copyable' answer confuses cheapness with complexity: a trivial `inplace_vector` move is a fast `memcpy`, but it still copies `size` elements and grows linearly with `N`. That is why `inplace_vector` is wrong for large `N` or containers-of-containers.",
-      "sourceAnchor": "116-stdinplace_vector-and-fixed-capacity-vectors",
+      "sourceAnchor": "119-fixed-capacity-inline-sequences-in-c23--role-specific",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "After a byte-wise relocation the copied `data_` still points at the *old* object's inline buffer, so the moved container reads freed storage — the classic SVO implementation bug, and the reason `llvm::SmallVector` compares `BeginX` against `getFirstEl()` instead of storing a self-pointer and `folly` tags its types `IsRelocatable`. The 'memcpy copies the pointer too' answer is exactly the wrong intuition: copying the pointer value is precisely the problem, since the address it holds is not relocated with it.",
-      "sourceAnchor": "117-small-vector-optimization",
+      "sourceAnchor": "1110-small-vector-optimization--role-specific",
       "difficulty": "trap"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "SVO exists for 'usually small, occasionally unbounded'; when the maximum is genuinely bounded, the heap arm is dead weight that costs a discrimination branch and blocks trivial copyability, so the fixed-capacity container is strictly better. The small-vector answer is tempting because it also avoids allocating at these sizes — but it still carries the machinery for the case that can never occur. `inplace_vector` never falls back to the heap; overflow is an error, by design.",
-      "sourceAnchor": "117-small-vector-optimization",
+      "sourceAnchor": "1110-small-vector-optimization--role-specific",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The tail is shifted up by one slot by move-assignment, so every element from the insertion point onward now lives in different storage than before, while the prefix is untouched. 'Only `end()`' is the near-miss for people who remember that reallocation is the killer and stop there — the elements move even when the buffer does not. Reallocation widens this to *everything*, which is the case worth reserving against.",
-      "sourceAnchor": "118-container-iterator-invalidation",
+      "sourceAnchor": "112-correctness-first-invalidation-and-exception-boundaries--core",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Algorithms only see iterators — they have no handle on the container and cannot change its size, so `remove_if` can only shuffle survivors forward and hand you the boundary. That is why the erase-remove idiom passes the returned iterator to `v.erase(it, v.end())`, and why `std::erase_if(v, pred)` (C++20) exists to make the whole thing one correct call. The 'size has shrunk' answers are the classic bug: the container still reports the old size and the tail holds moved-from junk.",
-      "sourceAnchor": "118-container-iterator-invalidation",
+      "sourceAnchor": "112-correctness-first-invalidation-and-exception-boundaries--core",
       "difficulty": "trap"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An index is not a memory address, so nothing a container does to its storage can invalidate it; adding a generation counter turns a stale handle into a detectable error instead of a use-after-free, and indices are smaller and shareable across processes. The `deque` answer overstates a real guarantee — references survive insertion at the *ends* only, and a middle insert or erase invalidates them. `reserve` only defers the problem until capacity is exceeded, and `list` buys stability at the cost of an allocation and a dependent load per element.",
-      "sourceAnchor": "118-container-iterator-invalidation",
+      "sourceAnchor": "112-correctness-first-invalidation-and-exception-boundaries--core",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Erasing shifts the tail down, so the erased position and everything after it is invalidated and incrementing the dead iterator is UB, not merely a skipped element. The 'skips one element' answer is the tempting one because that *is* the symptom of the analogous bug on node-based containers where the iterator survives — here the iterator does not survive at all. For a `vector` the erase-remove idiom or `std::erase_if` is also O(n) rather than O(n²).",
-      "sourceAnchor": "118-container-iterator-invalidation",
+      "sourceAnchor": "112-correctness-first-invalidation-and-exception-boundaries--core",
       "difficulty": "application"
     }
   ]

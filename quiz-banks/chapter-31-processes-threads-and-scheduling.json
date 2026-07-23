@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`task_struct` holds pointers to the shared resource structures, but the saved registers and the per-task kernel stack are embedded and private — that is exactly what makes a switch between two threads still a real context switch. The descriptor table is the most tempting wrong pick because it feels per-thread when you think about file positions, but `CLONE_FILES` shares one `files_struct` across the whole thread group, which is why one thread's `close()` is visible to all of them.",
-      "sourceAnchor": "311-processes-and-address-spaces",
+      "sourceAnchor": "311-tasks-sharing-and-states--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The naming is inverted between POSIX and the kernel: what POSIX calls a PID is the kernel's `tgid`, and what POSIX calls a TID is the kernel's `pid`. So `getpid()` returning 4210 is the TGID shared by every thread, while `gettid()` returning 4217 is this task's own kernel `pid`. The swapped version is the standard confusion — it would imply threads each report a different `getpid()`, which is precisely the LinuxThreads defect NPTL fixed.",
-      "sourceAnchor": "311-processes-and-address-spaces",
+      "sourceAnchor": "311-tasks-sharing-and-states--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Linux load average is the decayed count of tasks in `R` *plus* `D`, so uninterruptible sleepers — an NFS mount, a failing disk, a kernel-mutex convoy — inflate load with zero CPU use. Interruptible sleep is the tempting alternative but is deliberately excluded, otherwise every idle blocked server would show enormous load. Zombies and stopped tasks are not counted at all; a zombie holds only a `task_struct` and a PID.",
-      "sourceAnchor": "312-process-states",
+      "sourceAnchor": "311-tasks-sharing-and-states--core",
       "difficulty": "application"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`TASK_UNINTERRUPTIBLE` means exactly that the sleep will not be broken by pending signals; the check happens on the path back toward user mode, which the task never reaches. `SIGKILL` is not maskable at all, so the notion of an automatic mask is wrong even though it sounds like a plausible kernel protection. The diagnostic is `cat /proc/<pid>/stack` or `echo w > /proc/sysrq-trigger`, and the cause is usually storage or a stuck kernel lock that your process cannot recover from.",
-      "sourceAnchor": "312-process-states",
+      "sourceAnchor": "311-tasks-sharing-and-states--core",
       "difficulty": "trap"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The second-order cost is what people miss: `fork` marks writable private PTEs read-only in *both* processes, so the parent takes COW faults on its own working set after the call returns, landing the damage on the parent's critical path. The version that stops at the page-table copy is tempting because the stall figure is right, but it wrongly implies the parent is unaffected afterwards. And `fork` is O(mapped pages), not O(1) — COW avoids copying page *contents*, not page *tables*.",
-      "sourceAnchor": "313-fork-and-copy-on-write",
+      "sourceAnchor": "3111-process-lifecycle--reference",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`fork` clones only the caller; every other thread simply does not exist in the child, and whatever mutex they happened to hold at the instant of the call stays held with no owner to release it — a `malloc` call in the child then deadlocks. The shared-address-space answer describes `vfork`, not `fork`, which is why it reads plausibly. `pthread_atfork` is only a partial mitigation and the problem is widely considered unfixable in general.",
-      "sourceAnchor": "313-fork-and-copy-on-write",
+      "sourceAnchor": "3111-process-lifecycle--reference",
       "difficulty": "recall"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Handlers must be reset because the code implementing them is gone once the address space is replaced, but the mask and pending set live in the kernel and survive along with the PID, PPID, PGID and SID. Keeping handlers is the tempting answer because `exec` genuinely does not create a new process — but process identity surviving is a different thing from user-space code surviving. Ignored signals also stay ignored, since `SIG_IGN` needs no code.",
-      "sourceAnchor": "314-exec-and-process-replacement",
+      "sourceAnchor": "3111-process-lifecycle--reference",
       "difficulty": "recall"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is a race window, not a semantic bug: between `socket()` returning and `fcntl(F_SETFD)` executing, another thread can fork and exec, and the child inherits a descriptor whose close-on-exec bit was not yet set. The fix is the atomic variant — `socket(SOCK_CLOEXEC)`, and likewise `open(O_CLOEXEC)`, `pipe2`, `accept4`, `epoll_create1`. The file-description answer is wrong in a subtle and appealing way: `FD_CLOEXEC` is genuinely a descriptor-level flag, which is why `dup` does not carry it over.",
-      "sourceAnchor": "314-exec-and-process-replacement",
+      "sourceAnchor": "3111-process-lifecycle--reference",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Explicitly setting `SIG_IGN` on `SIGCHLD` (like `SA_NOCLDWAIT`) tells the kernel to reap automatically, which means there is nothing left for `wait*` to collect and it reports `ECHILD`. The idea that ignoring merely suppresses the notification is the natural reading of \"ignore\" and is exactly wrong here — this is one of the few places where `SIG_IGN` has a semantic effect beyond discarding the signal. Auto-reaping and status collection are mutually exclusive: pick one.",
-      "sourceAnchor": "315-process-reaping-zombies-and-orphans",
+      "sourceAnchor": "3111-process-lifecycle--reference",
       "difficulty": "trap"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`SIGCHLD` is a standard (non-realtime) signal, so pending instances collapse to one bit: three children exiting while the handler runs produces a single delivery and two unreaped zombies unless the handler drains until `waitpid` returns zero or negative. The `EINTR` answer is plausible because handlers and `EINTR` genuinely interact, but `WNOHANG` makes the call non-blocking and there is nothing to interrupt. The handler must also save and restore `errno`.",
-      "sourceAnchor": "315-process-reaping-zombies-and-orphans",
+      "sourceAnchor": "3111-process-lifecycle--reference",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`CLONE_VM` shares the `mm_struct` while `CLONE_THREAD` is what joins the thread group and gives a common TGID, so setting the first without the second yields tasks that share memory yet are distinct \"processes\" to userspace — exactly the `vfork` and sandbox case. The inverted pairing is impossible in practice for a different reason than it looks: `CLONE_SIGHAND` requires `CLONE_VM`, and `CLONE_THREAD` requires `CLONE_SIGHAND`, so a thread group over separate address spaces cannot be constructed.",
-      "sourceAnchor": "316-linux-clone-and-task-sharing",
+      "sourceAnchor": "311-tasks-sharing-and-states--core",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`pthread_create` passes `CLONE_CHILD_CLEARTID`, so on exit the kernel zeroes the registered word and performs a `FUTEX_WAKE` on that address — `join` is therefore just a futex wait, with no polling and no signal involvement. The manager-thread answer is a real mechanism, but it belongs to LinuxThreads, which NPTL specifically eliminated. Note also that `CLONE_THREAD` suppresses `SIGCHLD` to the parent entirely, so signal-based joining is not available.",
-      "sourceAnchor": "316-linux-clone-and-task-sharing",
+      "sourceAnchor": "311-tasks-sharing-and-states--core",
       "difficulty": "recall"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "After `setsid()` the child *is* the session leader, and only a session leader can acquire a controlling terminal — so forking again and letting the leader exit permanently forecloses that possibility, and also orphans the daemon so `init` reaps it. Claiming the second fork makes it a session leader inverts the point: that is what `setsid()` already did, and it is the condition the second fork exists to undo. Under `systemd`, `Type=simple` services should skip all of this and stay in the foreground.",
-      "sourceAnchor": "317-process-groups-sessions-and-daemons",
+      "sourceAnchor": "3111-process-lifecycle--reference",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`migration/N` sits in the stop scheduler class at FIFO 99 and preempts everything, which is exactly why the guidance is to place your own RT threads in the 40s–80s and stay below it. `ksoftirqd` is the most tempting alternative because it genuinely does preempt polling threads and is a real jitter source on NIC-heavy boxes — but it runs as an ordinary fair-class task, so it loses to any RT priority. `kswapd0` and `khugepaged` cause multi-millisecond stalls without any RT priority at all.",
-      "sourceAnchor": "318-kernel-and-user-threads",
+      "sourceAnchor": "318-waitwake-and-kernel-contexts--reference",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "N:1 multiplexes many user threads onto one kernel task, so the userspace scheduler has no second task to run when the one it owns enters an uninterruptible syscall, and there is no way to occupy a second core. Expensive creation and per-thread kernel stacks are real properties, but of the 1:1 model — that inversion is the trap. A `CR3` reload never happens here at all, since every user thread lives in one address space.",
-      "sourceAnchor": "318-kernel-and-user-threads",
+      "sourceAnchor": "318-waitwake-and-kernel-contexts--reference",
       "difficulty": "recall"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The futex design puts the lock word in user memory, so the uncontended acquire is a single atomic compare-exchange with no kernel transition at all; only when the compare fails does the thread pay ~2–8 µs for `FUTEX_WAIT`. The short-circuited-syscall answer is the most seductive because it also ends with \"no wait\" — but any syscall entry alone costs 40–350 ns, which already exceeds the quoted figure. Adaptive spinning exists in glibc but is a contended-case strategy, not the reason the fast path is cheap.",
-      "sourceAnchor": "319-linux-nptl",
+      "sourceAnchor": "3111-process-lifecycle--reference",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Static TLS in the main executable resolves to a single `mov %fs:offset`, as cheap as a global, but a dynamically loaded module cannot know its offset at link time and must go through the general-dynamic model's `__tls_get_addr` helper. `-ftls-model=initial-exec` on hot libraries removes the call; `local-exec` is faster still but is valid only in the executable. The heap/page-fault answer is tempting because dynamic TLS blocks really are allocated lazily, but a fault would be a one-time cost, not a permanent per-access multiplier.",
-      "sourceAnchor": "319-linux-nptl",
+      "sourceAnchor": "3111-process-lifecycle--reference",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The default is `PTHREAD_INHERIT_SCHED`, so the policy and priority you carefully stored in the attribute object are silently discarded and the new thread copies the creator's — which is `SCHED_OTHER` unless the creator was already RT. This is the canonical \"have you actually used this API\" question. Scope is a real attribute, but Linux only supports `PTHREAD_SCOPE_SYSTEM` anyway; detach state and guard size have nothing to do with scheduling class.",
-      "sourceAnchor": "3110-pthreads",
+      "sourceAnchor": "3110-threads-in-practice-stacks-attributes-and-alternatives--role-specific",
       "difficulty": "trap"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Priority inheritance is a mutex *attribute* in POSIX and `std::mutex` exposes no attribute surface at all, which is on its own a sufficient reason to drop to pthreads in a real-time process. Absolute-deadline acquisition looks like a gap but `std::timed_mutex::try_lock_until` provides it; predicate-form `wait` and `std::shared_mutex` cover the other two. Stack size, affinity and scheduling policy at creation time are the other genuine gaps in the C++ interface.",
-      "sourceAnchor": "3110-pthreads",
+      "sourceAnchor": "3110-threads-in-practice-stacks-attributes-and-alternatives--role-specific",
       "difficulty": "recall"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The guard is one `PROT_NONE` page by default, and `sub $65536, %rsp` followed by a touch near the new top of frame can jump clean over it into whatever is mapped below, corrupting instead of faulting. `-fstack-clash-protection` makes the compiler probe each page as the frame extends, guaranteeing the guard is hit. The claim that the guard is above the stack inverts the layout — it is placed at the low end, which is where a downward-growing stack arrives.",
-      "sourceAnchor": "3111-thread-stacks-and-guard-pages",
+      "sourceAnchor": "311-tasks-sharing-and-states--core",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Each non-main stack is a fixed 8 MiB `mmap` region, but RSS grows only with pages actually touched — typically one or two pages, 4–12 KiB per thread. The real cost is address-space consumption plus a minor page fault of 0.5–2 µs on each new stack page's first touch, which is why a thread that first recurses deeply under load pays a burst of faults at the worst moment. glibc does cache freed stacks for reuse, but that reduces `mmap` calls, not the virtual footprint of live threads.",
-      "sourceAnchor": "3111-thread-stacks-and-guard-pages",
+      "sourceAnchor": "311-tasks-sharing-and-states--core",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The stackful/stackless distinction is exactly this: a fiber swaps a whole stack so any depth of call chain can suspend, whereas a coroutine is a compiler-generated state machine that can only suspend from its own body. The switch-cost answer is a true statement about coroutines (~2–10 ns, often inlined away) attached to the wrong subject — fibers pay 20–100 ns for a register swap, so it is the coroutine that is faster. A fiber also does not avoid allocation; it needs a whole stack up front.",
-      "sourceAnchor": "3112-fibers-and-user-space-scheduling",
+      "sourceAnchor": "313-scheduling-classes--core",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The kernel knows only about the carrier task; when it blocks, every fiber multiplexed onto it stops, and there is no timer interrupt that can preempt a fiber back into the scheduler because fiber switching is purely cooperative. This is why fiber runtimes must intercept every blocking operation. The auto-conversion answer describes what a mature runtime like Go's does *by wrapping the call sites*, not something that happens to a raw `read()` — the interception is the work, not a property of fibers.",
-      "sourceAnchor": "3112-fibers-and-user-space-scheduling",
+      "sourceAnchor": "313-scheduling-classes--core",
       "difficulty": "trap"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The kernel's own work is 1–3 µs, but the evicted L1/L2 and polluted branch predictors leave the thread running degraded for 10–100 µs after it resumes — an order of magnitude more, and invisible in any counter that only measures switch duration. The 1–3 µs figure is the tempting answer precisely because it is the number people measure. The `CR3` and XSAVE costs are real but are sub-microsecond contributions to the direct half.",
-      "sourceAnchor": "3113-context-switches",
+      "sourceAnchor": "312-context-switches--core",
       "difficulty": "recall"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "SMT contention degrades you without ever taking the CPU away — the sibling hyperthread shares the physical core's front end and execution resources continuously, so the symptom is elevated CPI with a switch count of exactly zero. That signature is what rules out the alternatives: throttling and involuntary preemption both show up as context switches, and migration is impossible for a thread pinned to one CPU. The fixes are disabling SMT or isolating both siblings and leaving one idle.",
-      "sourceAnchor": "3113-context-switches",
+      "sourceAnchor": "312-context-switches--core",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The update is `vruntime += delta_exec × (NICE_0_WEIGHT / task_weight)`, so a heavier (lower-nice) task divides by a larger weight and its virtual clock runs slower — and since CFS always runs the smallest `vruntime`, it wins the tree more often. Each nice level is roughly a 1.25× weight change, about 10% of CPU. The direct-proportion version reaches the right conclusion by exactly inverted reasoning, which is the trap: if `vruntime` grew faster for a favoured task it would be selected *less*.",
-      "sourceAnchor": "3114-linux-fair-scheduling",
+      "sourceAnchor": "313-scheduling-classes--core",
       "difficulty": "trap"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`cpu.max` is a hard quota: once the group exhausts `quota` within a `period`, every task in it is stopped until the period rolls over, which is a multi-millisecond stall that looks like a GC pause and shows low average utilization — the single most common cause of mysterious container tail latency. `cpu.weight` is the tempting sibling knob, but it distributes *shares* proportionally and never stops a group when spare capacity exists. The scheduler tunables affect wakeup ordering, not periodic hard stalls.",
-      "sourceAnchor": "3114-linux-fair-scheduling",
+      "sourceAnchor": "313-scheduling-classes--core",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`SCHED_FIFO` has no quantum at all: same-priority tasks run in FIFO order and the running one is displaced only by a strictly higher priority task, a block, or an explicit yield. Round-robin among equals with a 100 ms quantum is `SCHED_RR` — swapping the two policies' behaviour is the classic error this question targets. The RT throttle does interrupt them, but it forces time to *non-RT* work rather than rotating the two RT threads against each other.",
-      "sourceAnchor": "3115-real-time-scheduling-policies",
+      "sourceAnchor": "313-scheduling-classes--core",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`sched_rt_period_us` is 1,000,000 and `sched_rt_runtime_us` is 950,000, so RT tasks get 95% of each second per CPU and the remaining 5% — about 50 ms — is forcibly handed to non-RT work. The diagnostic signature is a *perfectly periodic* 1 Hz stall of tens of milliseconds, which people chase for days. The exemption answer is appealing because throttling and quanta both sound like time-slicing, but throttling is a class-wide budget that covers FIFO precisely because FIFO has no quantum of its own.",
-      "sourceAnchor": "3115-real-time-scheduling-policies",
+      "sourceAnchor": "313-scheduling-classes--core",
       "difficulty": "recall"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Priority 99 is where `migration/N` and the watchdog live, so an application thread that spins there can prevent stop-machine work and lockup detection from ever running and hang the box; the guidance is to pick something in the 40s–80s. The throttle answer is tempting because it correctly describes the *consequence* of a spinning RT thread, but the throttle is a global budget that applies at every RT priority — 99 does not exempt you from it, it just puts you above the kernel threads that would otherwise clean up after you.",
-      "sourceAnchor": "3115-real-time-scheduling-policies",
+      "sourceAnchor": "313-scheduling-classes--core",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The order is strict and fixed: `stop_sched_class` (which is `migration/N`), then `dl_sched_class` for `SCHED_DEADLINE`, then `rt_sched_class` for FIFO and RR, then `fair_sched_class` for CFS/EEVDF, then idle. Putting deadline ahead of stop is the most plausible slip because `SCHED_DEADLINE` genuinely does outrank FIFO and RR — but nothing outranks stop-machine, which is the whole reason it exists as a separate class.",
-      "sourceAnchor": "3116-scheduler-run-queues-and-wakeup-latency",
+      "sourceAnchor": "314-wakeup-latency--core",
       "difficulty": "recall"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`wake_affine` deliberately trades run-queue depth against cache locality and places the wakee near the waker, which is usually right and occasionally piles a producer and consumer onto one core or bounces a thread across NUMA nodes. Pinning removes the heuristic from the equation entirely. Wakeup granularity is a real tunable but governs whether the wakee *preempts* the current task, not which CPU it lands on; autogroup groups tasks by session for weight purposes and does not pin anything.",
-      "sourceAnchor": "3116-scheduler-run-queues-and-wakeup-latency",
+      "sourceAnchor": "314-wakeup-latency--core",
       "difficulty": "application"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Affinity is a per-task bitmask and the syscall's first argument is a TID, so passing a TGID happens to name the main thread — whose TID equals the TGID — and silently pins that one thread only. `taskset -p` has the same failure mode. To cover a whole process you must iterate `/proc/<pid>/task/*`. The call does not fail, which is what makes this insidious: it succeeds and you believe you are pinned.",
-      "sourceAnchor": "3117-cpu-affinity",
+      "sourceAnchor": "315-affinity-and-topology--core",
       "difficulty": "trap"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "First-touch allocation binds each page to the node where it was first written, and nothing moves it afterwards just because the thread did — the working set becomes permanently remote at 1.4–2× access latency. The correct order is pin, then allocate and touch, then start work. Automatic migration on next access is the appealing wrong answer because Linux does have NUMA balancing, but it is a sampling heuristic operating over seconds, not a per-access guarantee you can design around.",
-      "sourceAnchor": "3117-cpu-affinity",
+      "sourceAnchor": "315-affinity-and-topology--core",
       "difficulty": "application"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Under interleaved enumeration the first N logical CPUs are one thread of every core and CPUs N..2N-1 are their siblings in the same order, so CPU 0 and CPU N are the two hyperthreads of one physical core — they share L1, L2, µop cache and execution ports, giving a 1.2–2× slowdown with no context switch to explain it. The cross-socket answer is a reasonable guess for a high-numbered CPU under *sequential* enumeration, which is why you must read `lscpu -e` or `thread_siblings_list` rather than assume either scheme.",
-      "sourceAnchor": "3118-cpu-topology-aware-pinning",
+      "sourceAnchor": "315-affinity-and-topology--core",
       "difficulty": "application"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Tickless operation is conditional, not absolute: the moment a second task becomes runnable on that CPU — a stray kernel thread is enough — the tick returns at full rate, so the fix is to find what else landed there. `rcu_nocbs` is a genuine companion boot parameter and belongs on the line, but omitting it offloads nothing while still leaving `nohz_full` functional, so it does not explain a full-rate tick. The expected reading on a correctly isolated CPU is around 1/s, not 1000/s.",
-      "sourceAnchor": "3119-core-isolation",
+      "sourceAnchor": "316-isolation-housekeeping-and-polling--core",
       "difficulty": "application"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 0,
       "explanation": "System Management Interrupts are taken by firmware below the operating system, can last 100 µs to 1 ms, and no kernel setting removes them — checking for them is the strong answer to \"I isolated everything and still see spikes.\" The RT throttle is a real 50 ms-per-second hazard but produces a perfectly periodic 1 Hz stall of tens of milliseconds, not a sporadic 200 µs one, and `isolcpus` specifically removes the CPU from the balancer's domains. `rcu_nocbs` moves callbacks *off* the isolated CPU onto housekeeping cores.",
-      "sourceAnchor": "3119-core-isolation",
+      "sourceAnchor": "316-isolation-housekeeping-and-polling--core",
       "difficulty": "trap"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Isolation only relocates work; if the cores absorbing it are too few, `ksoftirqd` starts running, the backlog grows, and eventually the kernel places that work on an isolated core because nothing else can make progress — you get the jitter back, having done all the tuning. Two to four housekeeping cores on a 32-core box is typical. The `irqbalance` answer names a real hazard, but the daemon overwrites affinities whenever it is left enabled, not as a reaction to load; you disable it explicitly.",
-      "sourceAnchor": "3120-housekeeping-cpus",
+      "sourceAnchor": "315-affinity-and-topology--core",
       "difficulty": "application"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 0,
       "explanation": "You pay a real syscall for the privilege of going to the back of the FIFO queue at your priority, letting every other same-priority task run first — the opposite of what a spinner wants. `_mm_pause()` is the correct instruction: it frees SMT execution resources, cuts power, and avoids the memory-ordering machine clear when the awaited value finally changes. The throttle answer is wrong on mechanism: the throttle accounts RT *runtime* consumed, and yielding does not spend budget faster.",
-      "sourceAnchor": "3121-busy-polling-versus-blocking",
+      "sourceAnchor": "316-isolation-housekeeping-and-polling--core",
       "difficulty": "application"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A voluntary switch means the task blocked of its own accord, so on a supposedly lock-free path it is the signature of hidden blocking: `malloc` taking an arena lock or calling `mmap`, `std::cout` taking a locale lock and issuing `write`, a page touched for the first time, or a `std::vector` growing. Throttling is the tempting alternative because it does stall an RT thread — but being preempted by the kernel is recorded as an *involuntary* switch, which is the distinction the counter exists to draw. Detect with `perf trace` or `bpftrace` on `sys_enter` filtered to the hot thread.",
-      "sourceAnchor": "3122-real-time-scheduling-operational-hazards",
+      "sourceAnchor": "313-scheduling-classes--core",
       "difficulty": "trap"
     }
   ]

@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Plan selection is the optimizer's job: it estimates costs from statistics gathered by ANALYZE and chooses, for example, an Index Scan over a Seq Scan. The execution and storage engines merely run the chosen plan.",
-      "sourceAnchor": "612-dbms-architecture-the-layers",
+      "sourceAnchor": "612-dbms-layers-and-query-flow--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The engine sits behind a narrow record/cursor interface, which is exactly why MySQL can swap InnoDB/MyRocks and MongoDB moved to WiredTiger. The SQL standard deliberately leaves the storage format unspecified.",
-      "sourceAnchor": "612-dbms-architecture-the-layers",
+      "sourceAnchor": "612-dbms-layers-and-query-flow--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Postgres is process-per-connection: the postmaster forks one backend per client, and all backends attach to shared memory (shared_buffers, WAL buffers, lock tables). This is why a pooler like PgBouncer is needed at scale.",
-      "sourceAnchor": "613-the-postgresql-process-model",
+      "sourceAnchor": "6110-postgresql-as-a-reference-not-the-definition--role-specific",
       "difficulty": "recall"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "shared_buffers is a fixed region of shared memory serving as the buffer pool; because backends are separate processes, sharing the cache requires it to live in shared memory with explicit lightweight locks.",
-      "sourceAnchor": "613-the-postgresql-process-model",
+      "sourceAnchor": "6110-postgresql-as-a-reference-not-the-definition--role-specific",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The distinction is the location of the authoritative copy, driven by the ~100 ns / ~50-100 us / ~10 ms gap between DRAM, NVMe, and disk. Disk-based engines use on-disk structures that minimize block transfers; in-memory engines can use pointer-rich structures.",
-      "sourceAnchor": "614-memory--versus-disk-based-dbms",
+      "sourceAnchor": "614-rows-columns-memory-and-authority--core",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A stored pointer would be meaningless after restart because the data is not mapped at a fixed address. On-disk structures therefore address data by page id + offset, which shapes all of file formats and B-tree implementation.",
-      "sourceAnchor": "614-memory--versus-disk-based-dbms",
+      "sourceAnchor": "614-rows-columns-memory-and-authority--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Redis uses AOF (the write-ahead log) plus RDB (snapshots). Durability is a knob (appendfsync always/everysec/no), independent of the storage medium: an in-memory store can be fully durable and a disk store can lose data.",
-      "sourceAnchor": "615-durability-in-memory-based-stores",
+      "sourceAnchor": "618-wal-copy-on-write-checkpoints-and-durability--core",
       "difficulty": "recall"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because an fsync costs tens to hundreds of microseconds, flushing per write caps throughput at the device's sync rate. Group commit amortizes one fsync over many writes, trading a small potential-loss window for throughput.",
-      "sourceAnchor": "615-durability-in-memory-based-stores",
+      "sourceAnchor": "618-wal-copy-on-write-checkpoints-and-durability--core",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A query over a few of many columns reads only those columns; adjacent same-type values compress dramatically (RLE, dictionary, delta); and dense typed arrays enable batched SIMD execution. The cost is expensive single-row insert/update.",
-      "sourceAnchor": "616-row--versus-column-oriented-storage",
+      "sourceAnchor": "614-rows-columns-memory-and-authority--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because each column is stored contiguously and separately, a single-row insert becomes N appends and a single-row read gathers N scattered values back into a tuple. Point updates are especially costly, which is why column stores are usually append-mostly.",
-      "sourceAnchor": "616-row--versus-column-oriented-storage",
+      "sourceAnchor": "614-rows-columns-memory-and-authority--core",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "xmin/xmax record the inserting and deleting transactions, and t_ctid links to the next version of the row. Postgres never overwrites in place on update; both versions coexist and visibility rules pick the right one, which is why VACUUM is needed.",
-      "sourceAnchor": "617-row-oriented-data-layout-the-postgres-heap-tuple",
+      "sourceAnchor": "615-pages-data-files-and-index-indirection--core",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A tuple's TID is (page, line-pointer index), exposed as ctid. Indexes point at the line pointer, not raw bytes, so intra-page compaction only moves tuples and rewrites line pointers, leaving index entries valid.",
-      "sourceAnchor": "617-row-oriented-data-layout-the-postgres-heap-tuple",
+      "sourceAnchor": "615-pages-data-files-and-index-indirection--core",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Core Postgres is a row store; columnar comes from outside the heap via the pluggable table-AM (Citus columnar), foreign data wrappers over Parquet, or an external engine like DuckDB. You cannot turn a row store columnar with an index.",
-      "sourceAnchor": "618-column-oriented-data-layout-in-practice",
+      "sourceAnchor": "614-rows-columns-memory-and-authority--core",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Per-block min/max statistics let the engine prune whole blocks (row groups / granules) that cannot match a predicate, reading far less data. It is the same sparse-index idea used by B-tree internal levels.",
-      "sourceAnchor": "618-column-oriented-data-layout-in-practice",
+      "sourceAnchor": "614-rows-columns-memory-and-authority--core",
       "difficulty": "recall"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Volcano execution pulls one tuple per next() per operator, costing a virtual call per tuple. Vectorized execution processes batches (e.g. 1024 values), amortizing dispatch and enabling SIMD. It is independent of on-disk layout, though it pairs well with columns.",
-      "sourceAnchor": "619-distinctions-hybrids-and-vectorized-execution",
+      "sourceAnchor": "614-rows-columns-memory-and-authority--core",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "PAX keeps a group of rows together but stores each column contiguously within the group, gaining columnar compression and scan behavior while keeping a group's data local. Parquet and ORC are essentially PAX; the Postgres heap is not.",
-      "sourceAnchor": "619-distinctions-hybrids-and-vectorized-execution",
+      "sourceAnchor": "614-rows-columns-memory-and-authority--core",
       "difficulty": "recall"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Wide-column refers to the data model: a row key maps to column families, each a possibly per-row-variable set of columns. The physical engine is typically LSM-tree, not the compressed columnar layout of ClickHouse or Vertica.",
-      "sourceAnchor": "6110-wide-column-stores-are-not-column-stores",
+      "sourceAnchor": "614-rows-columns-memory-and-authority--core",
       "difficulty": "trap"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Data files hold records; index files map keys to record locations so lookups are sublinear. Without indexes, every point query would be a full sequential scan of the table.",
-      "sourceAnchor": "6111-data-files-and-index-files",
+      "sourceAnchor": "615-pages-data-files-and-index-indirection--core",
       "difficulty": "recall"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because rows live in the clustered PK B-tree and can move on page splits, secondary indexes store the PK rather than a physical pointer. So a secondary lookup does two descents, and a large PK bloats every secondary index.",
-      "sourceAnchor": "6112-data-files-heap-organized-vs-index-organized",
+      "sourceAnchor": "615-pages-data-files-and-index-indirection--core",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Postgres is heap-organized; the primary key is an ordinary unique B-tree index pointing at TIDs. CLUSTER reorders the heap once and the order then decays; Postgres maintains no clustered index.",
-      "sourceAnchor": "6112-data-files-heap-organized-vs-index-organized",
+      "sourceAnchor": "615-pages-data-files-and-index-indirection--core",
       "difficulty": "recall"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Clustered means index order equals data order, and data can only be laid out one way, so there is at most one clustered index. All other indexes are non-clustered and independent of the data's physical order.",
-      "sourceAnchor": "6113-index-files-primary-secondary-clustered-non-clustered",
+      "sourceAnchor": "615-pages-data-files-and-index-indirection--core",
       "difficulty": "recall"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A covering index can answer from its leaves, but because tuple visibility (xmin/xmax) is in the heap, Postgres checks the visibility map; if the page is not marked all-visible, it must fetch the heap tuple to judge visibility.",
-      "sourceAnchor": "6113-index-files-primary-secondary-clustered-non-clustered",
+      "sourceAnchor": "615-pages-data-files-and-index-indirection--core",
       "difficulty": "trap"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "When the new version fits on the same page and no indexed column changed, Postgres links it off the old tuple via t_ctid and updates no index, relying entirely on the line-pointer indirection. HOT greatly reduces index write amplification.",
-      "sourceAnchor": "6114-the-primary-index-as-indirection",
+      "sourceAnchor": "615-pages-data-files-and-index-indirection--core",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Every update/delete writes a new version and leaves the old as a dead tuple. VACUUM (and autovacuum) reclaim dead tuples and their index entries; neglect causes table bloat and eventually transaction-ID wraparound that forces the database read-only.",
-      "sourceAnchor": "6114-the-primary-index-as-indirection",
+      "sourceAnchor": "615-pages-data-files-and-index-indirection--core",
       "difficulty": "recall"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Nearly every engine is defined by these three choices. B-trees are unbuffered/in-place/ordered; LSM trees are buffered/immutable/ordered. The axes predict the performance profile, which is why they organize all of Part I.",
-      "sourceAnchor": "6115-buffering-immutability-and-ordering-the-three-axes",
+      "sourceAnchor": "the-storage-engine-comparison-framework",
       "difficulty": "recall"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "B-trees mutate pages in place and keep keys ordered, giving excellent point/range reads but random write I/O. LSM trees buffer writes in a memtable and flush immutable sorted SSTables, giving high write throughput at the cost of read/space amplification and compaction (the RUM-conjecture trade).",
-      "sourceAnchor": "6115-buffering-immutability-and-ordering-the-three-axes",
+      "sourceAnchor": "the-storage-engine-comparison-framework",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The backend parses and resolves the query, the optimizer chooses an Index Scan on the pkey, the B-tree is descended (pages via the buffer pool) to a TID, the heap page is fetched and the line pointer followed, MVCC visibility is checked (following the t_ctid chain if needed), and the visible tuple is returned.",
-      "sourceAnchor": "6116-the-life-of-a-query-an-end-to-end-walkthrough",
+      "sourceAnchor": "612-dbms-layers-and-query-flow--core",
       "difficulty": "application"
     }
   ]

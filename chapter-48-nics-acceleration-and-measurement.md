@@ -1,633 +1,892 @@
-# Chapter 48 — NICs, Acceleration and Measurement
+# Chapter 48 — NICs, Acceleration, and Measurement
 
-*Interview-focused revision notes. The theme: every layer below the socket API is a latency budget you can either spend or reclaim — and none of it means anything until you can measure it with a clock you trust and a tap that doesn't lie.*
+A network latency claim is meaningless until its endpoints are named.
 
----
+“The NIC adds almost nothing,” “the FPGA responds immediately,” and “wire-to-user is only a few microseconds” sound precise enough to repeat. Yet each can hide serialization, PHY processing, buffering, DMA, notification, queueing, clock conversion, capture loss, or work performed outside the timed interval. A product number may be correct for its test and irrelevant to yours.
 
-## 48.1 FPGA-Based NICs
+This chapter connects three questions:
 
-A **field-programmable gate array** is a chip of reconfigurable logic: a fabric of lookup tables (LUTs), flip-flops, block RAM, and DSP slices, wired together by a synthesized netlist. Unlike a CPU it does not fetch and execute instructions; the "program" *is* the circuit. That distinction is the entire latency argument. A CPU processing a packet must at minimum have the bytes DMA'd to memory, notice them (interrupt or poll), fetch them into L1 (Ch. 29 §29.22), decode them with branchy code, and issue a response through the transmit path. An FPGA sitting between the SFP+ cage and the PCIe bus can start reacting to a packet **while the packet is still arriving on the wire**.
+1. How do bytes travel through NIC queues, offload engines, PCIe, and host software?
+2. Which work can a SmartNIC or FPGA actually remove from the critical path?
+3. Where must timestamps and counters be placed to measure latency, loss, jitter, and saturation honestly?
 
-**Cut-through parsing** is the key mechanism (compare cut-through switching, Ch. 39 §39.2). A 10 GbE link delivers 64 bits per 6.4 ns cycle at 156.25 MHz. The Ethernet header is 14 bytes, IPv4 20, UDP 8 — 42 bytes, or ~34 ns of wire time. An FPGA pipeline can have the message type decoded and a comparator loaded before the payload's last byte has arrived. A CPU cannot begin until the *entire* frame is received, checked, and DMA'd, because the NIC only signals completion at end-of-frame.
+Chapters 36 and 39 own Ethernet and switching details. Chapters 45 and 46 own socket and Linux packet-path APIs. Chapter 47 owns kernel-bypass and RDMA programming. Chapter 43 owns general statistical methodology. Here, packet-rate arithmetic and timestamp placement are first-class tools.
 
+## The 90-second version
+
+Draw the path before measuring:
+
+```text
+remote wire
+    │
+    ▼
+[medium]─[PHY]─[MAC/parser/offloads]─[RX queue/ring]─DMA/PCIe─[host buffer]
+                                                              │
+                                  interrupt/poll─[driver/stack]─[socket/bypass]
+                                                              │
+                                                          [application]
+
+[application]─[socket/bypass]─[host buffer]─descriptor/doorbell─PCIe/DMA
+                                                              │
+remote wire ◀─[medium]─[PHY]─[MAC/scheduler/offloads]─[TX queue/ring]◀────┘
 ```
-Wire arrival:  [preamble][eth][ip][udp][----- payload -----][FCS]
-                          ^          ^                        ^
-FPGA:                     |parse     |compare/decide          |emit TX (start)
-CPU path:                                                     |----DMA----|IRQ/poll|L1 miss|parse|...
+
+Then record:
+
+- exact start and end events;
+- the clock domain of every timestamp;
+- frame sizes **on the MAC link**, including framing overhead used in the calculation;
+- offered packets, offered bits, completions, useful messages, and loss at each layer;
+- queue, ring, interrupt/coalescing, RSS, offload, affinity, and NUMA settings;
+- NIC, firmware, driver, kernel, capture-tool, and FPGA-image versions.
+
+Use five rules:
+
+- An RX descriptor is not a packet; it is a negotiated unit of buffer ownership. Ring capacity and packet capacity may differ.
+- An offload is beneficial only if it removes more critical-path work than it adds in batching, queueing, observability loss, or semantic constraints.
+- A hardware timestamp marks a device-specific point. It is not automatically “the wire.”
+- One-way latency across two clocks inherits their relative clock error. RTT avoids that offset but does not reveal either direction without assumptions.
+- Find capacity with open-loop offered-load sweeps. Report goodput, loss, and latency together; delivered throughput alone can hide overload.
+
+At the end, a reader should be able to look at a vendor benchmark and ask: Were preamble and interpacket gap counted? Which timestamp point? Which clock? Which direction? Which frame distribution? Which offloads? Did the generator sustain the stated offered load? What was dropped before the measurement endpoint?
+
+### Label every claim
+
+Networking crosses several authorities. Prefix working notes with the claim’s source:
+
+- **Protocol:** Ethernet, IP, UDP, TCP, or PTP wire semantics under a named revision/profile.
+- **PCIe:** transaction and ordering semantics for a named PCIe generation, topology, and device configuration.
+- **NIC:** behavior documented for an exact adapter, port mode, firmware, and driver.
+- **Vendor:** a product or tool claim whose test method and version must accompany it.
+- **Version:** the exact protocol revision, hardware stepping, firmware, driver, kernel, tool, or FPGA image to which another claim applies.
+- **OS/tool:** Linux, `ethtool`, libpcap, tcpdump, Wireshark, or another versioned interface.
+- **Measured:** an observation tied to a build, host, topology, workload, sample definition, and statistic.
+
+A **calculated** value is another category. The 10 Gb/s minimum-frame rate derived later follows from declared MAC-layer assumptions; it is not a measured capacity claim about a NIC or host.
+
+## Core path: from wire to application and back
+
+The Core follows ownership and time through the live path. Read §§48.1–48.10 in order the first time; the reference material that follows is designed for lookup.
+
+## 48.1 Ports, queues, rings, and ownership
+
+A physical port contains or connects several stages: medium-dependent circuitry, a PHY, a MAC, packet classification and offload logic, queue state, DMA engines, and a host interface. Implementations may combine or reorder internal stages. Product block diagrams are evidence for that product, not an Ethernet guarantee.
+
+### Receive
+
+A simplified RX lifecycle is:
+
+1. The driver or user-space bypass process allocates buffers.
+2. It places buffer addresses and metadata in receive descriptors.
+3. It publishes descriptors to the NIC according to the device’s ownership protocol.
+4. The NIC receives and validates a frame, classifies it, and selects an RX queue.
+5. DMA writes packet bytes and status into host-visible memory.
+6. The NIC makes completion state visible and may signal an interrupt.
+7. The driver or polling process consumes the completion and packet.
+8. The buffer is returned, recycled, or replaced.
+
+```text
+software owns free buffer
+        │ post descriptor
+        ▼
+NIC owns descriptor/buffer
+        │ receive + DMA + completion
+        ▼
+software owns filled buffer
+        │ consume + recycle
+        └──────────────────────────► post again
 ```
 
-**Latency scale.** Wire-to-wire on a tuned FPGA trading path is roughly 20–100 ns for a simple decision; a kernel-bypass CPU path (Ch. 47) is roughly 1–5 µs tick-to-trade, and a kernel socket path 10–50 µs. Two orders of magnitude separate the top and bottom.
+The exact ownership bits, descriptor size, memory barriers, head/tail registers, completion format, and DMA ordering are NIC- and driver-specific. Portable code cannot infer them from “ring buffer.”
 
-**What you give up:**
+If no usable receive buffer is available, a device may drop the frame, place it elsewhere, or apply a product-specific fallback. The counter naming and counting point vary. Never translate a counter named `rx_missed_errors` into a universal cause without the driver/NIC documentation and a controlled test.
 
-| Property | FPGA | CPU (bypass) |
+### Transmit
+
+A simplified TX lifecycle is:
+
+1. Software prepares packet bytes and metadata.
+2. It posts one or more TX descriptors.
+3. It orders the writes required by the device contract and notifies the NIC, often through a memory-mapped doorbell.
+4. The NIC DMA-reads bytes or metadata, applies requested offloads, queues the frame, and transmits it.
+5. A completion eventually permits software to reuse the buffer and descriptor.
+
+A successful `send()` normally means that the software layer accepted data, not that the last bit crossed the medium. A TX descriptor consumed by the NIC is also not necessarily a wire event. The selected TX timestamp or completion definition must name the boundary.
+
+Doorbell writes, descriptor fetches, data reads, completions, and interrupts consume PCIe transactions. Devices can prefetch or batch them. IOMMUs, address-translation caches, relaxed ordering, switch topology, NUMA placement, and host cache/I/O-coherence policy can affect the path. Those are platform properties; Chapter 29 owns their deeper mechanics.
+
+A negotiated PCIe generation and lane count is not an application DMA-bandwidth guarantee. Encoding, TLP/DLLP overhead, read completions, payload size, topology sharing, and transfer direction matter. Declare those assumptions before calculating a bound, then measure the actual path.
+
+### Multiple queues
+
+Modern NICs commonly expose multiple RX and TX queues. On receive, RSS can hash selected header fields and use an indirection table to choose a queue. Explicit filters may steer selected traffic. On transmit, the driver, queue discipline, or application chooses a queue.
+
+Multiple queues can:
+
+- distribute independent flows across CPUs;
+- isolate traffic classes;
+- preserve per-flow processing locality;
+- reduce contention on a single descriptor ring.
+
+They can also:
+
+- reorder packets when a flow moves between queues;
+- spread one application’s working set across caches;
+- create uneven “elephant-flow” load;
+- multiply total buffered packets;
+- make counters and timestamp streams queue-specific.
+
+The Linux RSS/RPS/RFS/XPS interfaces are OS mechanisms, not NIC guarantees. Verify the active indirection table, queue count, IRQ mapping, and application CPU placement. A configuration with more queues is not universally faster; the useful number is the smallest arrangement that meets the measured parallelism, isolation, ordering, and loss requirements.
+
+### Rings are capacity with a time dimension
+
+An RX ring absorbs arrivals while the consumer is not returning buffers. For an offered packet rate \(R\) packets/s and a service gap \(g\) seconds, a first lower-bound estimate is:
+
+\[
+B_{\text{gap}} = \lceil Rg \rceil
+\]
+
+This is arithmetic, not a sizing prescription. Add existing occupancy, burstiness, descriptor-to-packet mapping, safety margin, and any hardware buffering outside the ring. Multi-buffer receives can consume several descriptors per packet; header splitting can do the same. Conversely, aggregation may make one host object represent multiple wire packets.
+
+At a declared 1.5 Mpacket/s arrival rate and a declared 200 µs gap, the calculation gives:
+
+\[
+\lceil 1.5\times10^6 \times 200\times10^{-6}\rceil = 300
+\]
+
+At the calculated 10 Gb/s minimum-frame MAC rate derived in §48.8, the same declared gap covers approximately 2,977 packet arrival opportunities after rounding upward. Neither result says that a 300- or 2,977-entry ring is supported, sufficient, or desirable on a particular adapter.
+
+A deeper ring trades drops for residence time and memory footprint. If \(N\) packets are already ahead in a FIFO and departure rate is \(C\), the added queue time is approximately \(N/C\) while the rate remains stable. For stale market data, delayed delivery may be worse than explicit loss. For bulk transfer, buffering a burst may improve goodput. Choose from the application’s loss and freshness contract.
+
+## 48.2 Offload engines: conditional decisions
+
+An offload moves or combines work; it does not make the work disappear. Evaluate it against the outcome you care about.
+
+| Facility | Potential benefit | What can change | Reasons to disable or constrain it |
+|---|---|---|---|
+| RX/TX checksum offload | Avoid host checksum work | Capture may see partial or not-yet-final checksums on local TX | Unsupported encapsulation, diagnostic fidelity, device errata |
+| TSO/GSO/USO | Submit a large software object for later segmentation | Host capture can show “superpackets” not present on wire | Per-packet timing, unsupported headers, latency from batching |
+| GRO/LRO | Coalesce received packets | Packet boundaries, timestamps, and observed counts can change | Wire-faithful capture, per-datagram latency, ordering diagnosis |
+| RSS/flow steering | Parallelism and locality | Queue assignment, CPU ownership, possible flow migration | Single-flow ordering, skewed load, cache footprint |
+| Interrupt moderation | Amortize interrupt cost | Notification delay and burst delivery | Tight latency tail, timestamp-to-app decomposition |
+| VLAN/tunnel/crypto offload | Remove encapsulation or cryptographic CPU work | Supported headers, state, and failure paths differ | Feature mismatch, fallback cost, visibility, key/state handling |
+| Flow filtering/replication | Avoid unwanted DMA or host fan-out | Capacity and rule priority are finite | Rule overflow/fallback, correctness, operational complexity |
+| Hardware timestamping | Timestamp near a device boundary | Only selected packets/queues may be supported | Missing support, timestamp resource limits, clock uncertainty |
+
+Do not ask “Should GRO be on?” without naming the workload and measurement endpoint. For a throughput test of TCP byte delivery, aggregation may be appropriate. For a packet-by-packet feed latency test, it may erase the boundaries being measured.
+
+Inspect, do not assume:
+
+```sh
+ethtool -i eth0
+ethtool -k eth0
+ethtool -l eth0
+ethtool -x eth0
+ethtool -g eth0
+ethtool -c eth0
+ethtool -T eth0
+```
+
+These Linux commands are read-only examples. Options, fields, privilege requirements, and support depend on the installed `ethtool`, kernel, driver, and NIC. Save their full output with the experiment. A feature displayed as enabled is not proof that every packet used it; protocol, encapsulation, size, or resource limits can cause fallback.
+
+### Capture lies when offload boundaries are ignored
+
+A capture on the transmitting host may occur before segmentation and checksum completion. A receiving host capture may occur after aggregation. Therefore:
+
+- a large captured TCP object may correspond to several wire frames;
+- a locally captured checksum may look invalid although the NIC later completes it;
+- one captured aggregate may contain several original packets;
+- traffic consumed by a bypass path may never reach an ordinary kernel capture hook.
+
+This is not a tcpdump or Wireshark defect. The capture accurately reports its observation point. For wire claims, use an external tap/capture device or a documented NIC capture point and calibrate it.
+
+## 48.3 Timestamp placement and clock domains
+
+Timestamp placement determines which latency components are included.
+
+```text
+RX:
+wire ─ PHY ─ MAC ─ classify ─ queue ─ DMA ─ completion ─ driver ─ socket ─ app
+       h0?    h1?                         s0?       s1?                a0
+
+TX:
+app ─ send ─ scheduler ─ driver ─ DMA/descriptor ─ NIC queue ─ MAC ─ PHY ─ wire
+a1              s2?       s3?              c?          h2?     h3?
+```
+
+The labels are possibilities, not guaranteed locations:
+
+- `h*`: a hardware timestamp at a device-documented provider;
+- `s*`: a kernel/software timestamp;
+- `a*`: an application clock read;
+- `c`: a completion whose semantics may be DMA consumption, transmission completion, or a batched report.
+
+The phrase “NIC hardware timestamp” does not tell you whether the provider is in the PHY, MAC, or another block. Recent Linux interfaces can represent different hardware timestamp providers, but actual support is device and driver dependent. Determine the provider and qualify whether the stamp refers to start-of-frame, end-of-frame, or another event.
+
+### Linux timestamp delivery
+
+Linux `SO_TIMESTAMPING` separates timestamp **generation** from timestamp **reporting**. Relevant requests include RX/TX software and hardware generation. Receive timestamps arrive as ancillary data with the normal `recvmsg()` result. Transmit timestamps are normally reported asynchronously through the socket error queue; applications correlate them with transmitted data or an ID.
+
+New Linux interfaces and flags evolve. The current kernel documentation recommends the newer time structures for year-2038-safe applications and describes options such as timestamp IDs and timestamp-only error-queue payloads. Chapter 45 owns complete socket code. The robust event loop here is:
+
+```text
+configure device timestamp provider/filter
+configure socket generation + reporting flags
+
+on receive-ready:
+    recvmsg(normal queue)
+    parse all ancillary messages
+    record packet identity, timestamp type, value, clock domain
+
+on error-queue-ready:
+    repeat recvmsg(MSG_ERRQUEUE) until empty
+    parse extended error + timestamp ancillary data
+    correlate timestamp ID with the original transmission
+
+continuously:
+    count requests, delivered stamps, missing stamps, queue overflows
+```
+
+Do not assume one TX request produces one immediate timestamp. Segmentation, fragmentation, retransmission, device filtering, and completion aggregation affect semantics. Undrained TX timestamp data consumes socket receive-buffer budget on Linux, so error-queue handling is part of correctness.
+
+### Which timestamp should you choose?
+
+| Goal | Prefer | Includes | Excludes or risks |
+|---|---|---|---|
+| Arrival near a port boundary | Documented RX hardware timestamp | Device processing up to stamp point | DMA, host queueing, app wakeup; provider placement |
+| Host-stack receive delay | RX hardware plus application timestamp in a related clock | Difference spans downstream path | Cross-clock conversion and correlation |
+| Time accepted by kernel TX path | Application + TX scheduler/software stamps | Selected protocol/scheduler stages | NIC queue and physical transmission |
+| Actual device egress event | Documented TX hardware timestamp | Path up to hardware stamp | Later PHY/medium stages; device filtering |
+| Application-observed response | Application monotonic timestamps | All delays between calls | Remote direction and remote processing combined |
+| Wire-to-wire response | One external capture clock on both directions | Between calibrated tap points | Tap/channel skew, capture loss, trigger correlation |
+
+Hardware timestamps usually reduce host scheduling uncertainty, but their **resolution**, **precision**, **accuracy**, and **placement** are separate. A counter with fine nominal units can be poorly synchronized. A repeatable stamp at the MAC can omit variable PHY or queue latency on the other side of that point.
+
+### PTP and PHCs
+
+A PTP hardware clock (PHC) is associated with a timestamp-capable hardware provider and exposed by supported Linux drivers. `ptp4l` can discipline a PHC using IEEE 1588 messaging; `phc2sys` can synchronize the system clock and a PHC in a selected direction; `ts2phc` can synchronize PHCs from external timestamp signals. Exact topology and configuration matter.
+
+A **grandmaster** is the root time source for a PTP domain. It can be selected by the profile’s best-master-clock procedure or constrained by configuration. A GNSS-disciplined oscillator is one possible source; holdover quality, antenna state, UTC/PTP time-scale data, and the selected profile remain part of the accuracy chain. An ordinary clock has one PTP port, a boundary clock participates in separate timing segments, and a transparent clock forwards timing messages while correcting for measured residence time where supported. These roles describe protocol behavior, not a universal error bound.
+
+PTP may use one-step timestamp insertion or a two-step follow-up carrying the precise origin timestamp. The choice changes message handling, not the need to account for path asymmetry and timestamp placement.
+
+In an end-to-end delay exchange, use:
+
+```text
+server/master sends Sync at t1
+client/slave receives it at t2
+client/slave sends Delay_Req at t3
+server/master receives it at t4
+```
+
+Let the client clock offset from the server be \(\theta\), forward path delay be \(d_f\), and reverse delay be \(d_r\). Then:
+
+\[
+t_2-t_1=d_f+\theta
+\]
+
+\[
+t_4-t_3=d_r-\theta
+\]
+
+The familiar estimate is:
+
+\[
+\hat{\theta} =
+\frac{(t_2-t_1)-(t_4-t_3)}{2}
+= \theta + \frac{d_f-d_r}{2}
+\]
+
+The last term is the asymmetry error. More samples reduce random variation but do not remove a stable path asymmetry. Transparent clocks can report residence-time corrections and boundary clocks create new timing domains, but neither name guarantees a particular end-to-end accuracy. Profile, topology, hardware support, servo state, holdover behavior, and asymmetry must be recorded.
+
+Grandmaster selection and GNSS discipline are operational subjects, not magic accuracy sources. Monitor identity, port state, offset/path-delay estimates, servo state, frequency adjustment, time-scale configuration, leap-second state, and holdover alarms. For relative latency on one host, a common monotonic clock may be better than translating through UTC. For UTC traceability across devices, record the synchronization chain and uncertainty.
+
+## 48.4 Acceleration boundaries: fixed function, SmartNIC, and FPGA
+
+Acceleration is valuable when it removes a dominant path stage without breaking correctness or observability.
+
+### Three broad device styles
+
+- A **fixed-function NIC** has vendor-defined parsers, queues, filters, and offloads.
+- A **programmable NIC or SmartNIC** adds a programmable pipeline, embedded processor complex, FPGA fabric, or a combination.
+- An **FPGA-based NIC** exposes reconfigurable logic close to the packet path and host interface.
+
+Product names do not define architecture consistently. “DPU,” “IPU,” and “SmartNIC” are marketing categories. Record the actual execution resource, memory hierarchy, pipeline constraints, queue crossings, and software/bitstream version.
+
+An embedded general-purpose core is not inherently faster or slower than a host core. Its value may be isolation, host-CPU reclamation, direct access to NIC state, or deterministic placement. Measure the complete path; moving work to a device can add a hop for packets that still need the host.
+
+### When offload helps
+
+Good candidates are work with:
+
+- a bounded protocol and state space;
+- high per-packet repetition;
+- a clear hardware-friendly pipeline;
+- limited shared mutable state;
+- a benefit from acting before host DMA or scheduling;
+- a reliable fallback and observable failure mode.
+
+Examples include classification, filtering, replication, timestamping, simple feed arbitration, checksums, encryption under a supported state model, and narrowly defined trigger logic.
+
+Poor candidates include rapidly changing algorithms, large irregular models, unbounded parsing, complex recovery, or logic whose correctness depends on host state that cannot be synchronized cheaply.
+
+### FPGA cut-through processing
+
+An FPGA pipeline can sometimes parse earlier fields while later frame bytes are still arriving. This can reduce the decision’s dependency on full-frame reception and host notification. It does not abolish:
+
+- serialization until each required field arrives;
+- PHY/MAC and clock-domain crossing;
+- parsing and pipeline stages;
+- output arbitration and egress serialization;
+- protocol checks that require later fields;
+- queueing behind an already transmitting frame;
+- error handling when the frame later fails validation.
+
+Therefore a “wire-to-wire FPGA latency” must define:
+
+- ingress reference: first bit, start-of-frame delimiter, end of required field, or end of frame;
+- egress reference: enqueue, first transmitted bit, or end of frame;
+- frame size and link rate;
+- whether frames were already queued;
+- decision path and enabled checks;
+- FPGA image, synthesis constraints, place-and-route result, board, transceiver, and clock;
+- sample count, statistic, loss, and measurement apparatus.
+
+Do not transfer a latency number between bitstreams or board configurations.
+
+### FPGA order entry
+
+A common boundary is **pre-staged transmission**:
+
+1. Host software constructs and validates an order template.
+2. It publishes the payload and metadata into device-visible storage.
+3. It atomically arms a generation/version.
+4. FPGA logic recognizes an inbound trigger.
+5. It validates the armed state and hardware-resident risk limits.
+6. It patches permitted fields, updates length/checksum/sequence state as required, and schedules TX.
+7. It reports the decision and completion to the host.
+
+The safety problem is harder than the comparator:
+
+- partially published templates must never fire;
+- a late disarm must not re-enable an old generation;
+- duplicate or reordered feed messages must not double-trigger;
+- sequence numbers and sessions must remain correct;
+- all mandatory pre-trade controls must be on the actual path;
+- kill, cancel, recovery, and reconciliation paths must work when PCIe or host software fails;
+- retransmission/recovery cannot silently send a different semantic order.
+
+Use a versioned slot state such as `EMPTY → PREPARED(version) → ARMED(version) → FIRED(version)` with one owner for each transition. The precise atomicity mechanism is a device contract. A host memory barrier alone does not define visibility through PCIe and FPGA logic.
+
+### FPGA and bypass hybrids
+
+Hybrid designs keep a narrow trigger/transmit path in hardware and send the complete feed and device events to a bypass application for strategy, monitoring, recovery, and slow-path orders.
+
+This creates two timelines:
+
+```text
+fast: ingress → FPGA parse/state/risk → egress
+slow: ingress → DMA → CPU strategy/state/reconcile → control update → FPGA
+```
+
+The critical invariant is agreement between hardware and software state. Include monotonically identified input events, configuration generations, fired-order IDs, acknowledgments, and replayable logs. Measure fast-path latency separately from host visibility and reconciliation lag.
+
+Choose acceleration only after locating the budget. If external switch queueing dominates, an FPGA host path may not improve end-to-end outcome. If CPU parsing dominates and the parser is bounded, it may.
+
+## Core measurement: wire to application
+
+The next sections turn the path into an explicit experiment: define endpoints, calibrate clocks, account for loss, derive the packet budget, and sweep through saturation.
+
+## 48.5 Define endpoints and the error model
+
+Write the measurement as an equation. For RX:
+
+\[
+L_{\text{wire→app}} =
+L_{\text{tap/PHY}} +
+L_{\text{MAC/NIC}} +
+L_{\text{queue}} +
+L_{\text{DMA/PCIe}} +
+L_{\text{notify/driver}} +
+L_{\text{stack}} +
+L_{\text{schedule}} +
+L_{\text{app boundary}}
+\]
+
+Not every component is separately observable. The equation prevents an omitted component from silently becoming zero.
+
+For two timestamp readings:
+
+\[
+\hat L = (T_B + e_B) - (T_A + e_A)
+\]
+
+where \(e_A\) and \(e_B\) include clock offset, rate error, timestamp placement error, quantization, and capture/association error. If clocks differ, relative offset appears directly. If maximum relative frequency error is bounded by \(|\epsilon|\), additional time uncertainty after \(\Delta t\) without a new calibration can be bounded by \(|\epsilon|\Delta t\). Add worst-case bounds for a conservative bound; combine variances only with a justified stochastic independence model.
+
+Every result should state:
+
+- event A and event B;
+- direction;
+- clocks and their synchronization/translation;
+- calibration time and uncertainty;
+- timestamp provider/placement;
+- trigger/response correlation rule;
+- workload and frame distribution;
+- independent sample unit/count and statistic.
+
+### One-way versus round-trip
+
+One-way delay measures a direction but usually needs synchronized endpoints or a common external clock. Its observed value includes relative clock offset.
+
+Round-trip time can use one clock:
+
+\[
+RTT = t_{\text{return}} - t_{\text{send}}
+\]
+
+but contains forward delay, remote turnaround, and reverse delay:
+
+\[
+RTT = d_f + p_{\text{remote}} + d_r
+\]
+
+Dividing by two assumes a known or negligible turnaround and symmetric directions. That is a model, not a measurement. Report RTT as RTT unless those assumptions are tested.
+
+For tick-to-action measurement, a high-quality design taps inbound and outbound links into two channels of one capture clock. Calibrate channel skew and tap/fibre asymmetry, verify no capture loss, and correlate the response with an explicit triggering sequence ID. “Nearest preceding packet” fails during bursts and can bias latency downward.
+
+### Error inventory
+
+| Source | Symptom | Detection/control |
 |---|---|---|
-| Latency | 20–100 ns wire-to-wire | 1–5 µs |
-| Jitter | Deterministic, cycle-accurate | Interrupts, cache misses, C-states |
-| Logic complexity | Severely limited by LUT/BRAM budget | Effectively unlimited |
-| Iteration time | Hours (synthesis + place-and-route) | Seconds (compile) |
-| Debuggability | Simulation, ILA/ChipScope probes | gdb, perf, printf |
-| Floating point | Expensive; use fixed-point (Ch. 23 §23.10) | Native |
-| Cost | High (hardware + FPGA engineers) | Commodity |
+| Different clock offset | Constant or slowly changing shift; possible negative delays | Common clock or repeated cross-timestamp calibration |
+| Clock rate error | Delay estimate drifts with elapsed time | Frequency/servo telemetry; shorten calibration interval |
+| Path asymmetry | Biased one-way time despite stable PTP | Calibrated links, topology reversal, common capture clock |
+| Timestamp placement | Missing fixed or variable stages | Device documentation and loopback/tap experiment |
+| Capture channel skew | Direction-dependent constant | Swap channels; calibrated simultaneous stimulus |
+| Offload/aggregation | Impossible sizes or altered packet counts | External capture; record offloads |
+| Capture loss | Gaps concentrated during bursts | Capture and interface drop counters; second observer |
+| Wrong association | Implausibly small/negative response delays | Protocol identifiers; ambiguity count |
+| Probe effect | Outcome changes when capture enabled | A/B collection-control runs |
 
-**Determinism is the underrated half.** An FPGA's latency distribution is nearly a spike: same path, same cycle count, every time. A CPU's is a long right tail driven by cache misses, TLB misses, IRQs, and frequency transitions (Ch. 35 §35.11–§35.13). For strategies where the *99.9th percentile* decides fills, removing the tail is often worth more than removing the mean.
+Precision is not accuracy. A timestamp displayed to nanoseconds may have much larger uncertainty. Averaging can reduce some zero-mean random error, not systematic placement, offset, or asymmetry.
 
-**Vendors and forms.** AMD/Xilinx (Alveo, UltraScale+, Versal) and Intel/Altera (Agilex, Stratix) dominate; trading-specific boards come from Exablaze/Cisco Nexus SmartNIC, Solarflare/AMD X2/X3 with "Application Onload Engine" (AOE) FPGA variants, Enyx, NovaSparks, and Metamako/Arista layer-1 devices. Development is via VHDL/Verilog, or High-Level Synthesis (HLS) which compiles a restricted C++ subset to RTL — useful for datapath prototyping, rarely competitive with hand-written RTL on the critical path.
+## 48.6 Capture: tcpdump, Wireshark, and libpcap
 
-**Interview framing:** "Why is an FPGA faster than a well-tuned C++ program?" The strong answer is not "hardware is fast" — it is *cut-through processing plus no instruction fetch/decode plus deterministic pipelining*, and the cost is a logic budget measured in LUTs and a build measured in hours.
+Host capture answers “what crossed this capture hook?” An external optical/electrical tap answers a different question. A switch mirror may drop, reorder, or apply its own timestamp behavior under load. Document the observation point.
 
----
+### tcpdump and Wireshark
 
-## 48.2 FPGA Order Entry
+A bounded Linux capture might begin with:
 
-**Order entry** is the path from a trading decision to an order message on the wire toward the exchange's matching engine (Ch. 50 §50.18). Putting it in an FPGA is the most common production FPGA application in trading, and it comes in three architectures.
-
-**1. Full-FPGA (autonomous) path.** The FPGA parses market data, evaluates a decision, and emits the order — the CPU never touches the critical path. Wire-to-wire ~30–100 ns. The strategy must fit in the fabric: comparators against thresholds, simple book state, fixed-point arithmetic. Anything requiring a model evaluation, a large lookup, or a floating-point computation does not fit.
-
-**2. Pre-staged trigger ("firing solution", "canned order").** The dominant production design and the one interviewers probe. The CPU computes the *content* of an order in advance and writes it into the FPGA's buffer; the FPGA holds it armed and, on detecting a trigger condition in the inbound feed, transmits it immediately.
-
-```
-CPU (slow path, microseconds):
-    build order template  →  DMA into FPGA "order slot" N
-    write arm/trigger predicate (price threshold, symbol, side)
-FPGA (fast path, nanoseconds):
-    on each inbound feed message:
-        if (symbol == armed.symbol && price crosses armed.threshold && armed.enabled)
-            emit slot N onto TX  (already-serialized bytes, checksum precomputed)
+```sh
+tcpdump --version
+tcpdump -D
+tcpdump -i eth0 -nn -s 0 -w trial.pcap
 ```
 
-The genius of this split is that all complexity — strategy, risk, message construction, sequence numbers, checksums — is done ahead of time on the CPU, and the FPGA does only a comparison and a DMA-to-wire. The FPGA's task reduces to *"stream these N bytes when this predicate fires."*
+Record the exact filter, snap length, capture buffer setting, timestamp type/precision, interface, offloads, and tool versions. Check tcpdump’s final received/dropped counts. A zero displayed drop count is not proof that upstream NIC or switch loss was zero.
 
-**3. Hybrid / "TCP offload with FPGA punt".** The FPGA maintains the exchange TCP session (or at least the transmit side) so a pre-staged order can be sent with correct sequence numbers without CPU involvement. See §48.6.
+Wireshark is valuable for protocol decoding, sequence analysis, I/O graphs, and expert warnings. Its displayed “time” can be absolute, relative, delta, or adjusted; choose explicitly. A checksum warning on locally transmitted traffic can reflect checksum offload rather than a corrupt wire frame. Verify externally before diagnosing the network.
 
-**Non-obvious engineering details:**
+### libpcap
 
-- **Checksums and sequence numbers must be precomputed.** A TCP order carries a sequence number and checksum that depend on the exact bytes. Because the pre-staged payload is fixed, the checksum is computed once by the CPU. If the FPGA mutates any field (e.g. patches a quantity at fire time), it must incrementally adjust the checksum — RFC 1624 one's-complement update — in a single cycle.
-- **Arming is a race.** Between "CPU decides to arm" and "market moves," the market can move. The disarm path must be as fast as the fire path, or you send stale orders. Production designs use a monotonically increasing generation counter so a late disarm cannot resurrect an old arm.
-- **Pre-trade risk must live in the FPGA.** If the CPU is not in the path, the CPU's risk checks are not in the path either (Ch. 56 §56.13–§56.17). Regulatory regimes (SEC Rule 15c3-5, "the market access rule") require pre-trade controls on every order, so quantity, notional, and price-collar checks are synthesized into the fabric as fixed-point comparators. A candidate who mentions this unprompted is signalling real exposure to the domain.
-- **Kill switch in hardware.** A single register write (or a physical signal) must be able to disable all slots in one cycle (Ch. 56 §56.18).
+libpcap lets an application select a device, snap length, promiscuous mode, buffer size, timeout/immediate behavior, timestamp type and precision where supported, and a compiled BPF filter before activation. Requested settings may be adjusted or unsupported; query the activated handle and record results.
 
-**Failure mode with signature:** an FPGA that fires on a *duplicate* market data packet from the redundant B feed (Ch. 37 §37.14) will double-fire. Diagnostic signature: two identical orders separated by the A/B feed skew (typically 5–200 µs), on exactly the trigger event. Fix: sequence-number-based duplicate suppression in the fabric (Ch. 53 §53.5), not timestamp windows.
+Minimal control flow:
 
----
+```text
+h = pcap_create(device)
+set snaplen, buffer, timeout/immediate mode
+enumerate/select timestamp type and precision if supported
+compile + install filter
+activate; record warnings and effective settings
 
-## 48.3 SmartNICs
+while experiment_active:
+    dispatch packets
+    for each packet:
+        retain capture timestamp, captured length, original length,
+        interface/direction metadata, sequence identity
 
-A **SmartNIC** is a NIC with a general-purpose programmable processing complex on it — as opposed to a fixed-function NIC (offloads only, §48.4-adjacent) or a pure FPGA NIC (§48.1). Three families:
-
-| Type | Programming model | Example | Latency character |
-|---|---|---|---|
-| **FPGA-based** | RTL / HLS | AMD Alveo, Napatech | Lowest, deterministic |
-| **ASIC + fixed pipeline** | P4, flow rules | Mellanox/NVIDIA ConnectX ASAP², Intel FXP | Low, but only expressible operations |
-| **SoC-based (DPU)** | Linux + C on embedded cores | NVIDIA BlueField (Arm A72/A78), Marvell OCTEON, Intel IPU | *Higher* than host CPU per-packet |
-
-The critical and frequently-missed point: **a SoC-based SmartNIC is usually slower per packet than your host CPU.** BlueField Arm cores run at ~2–2.75 GHz with far smaller caches than a Xeon or EPYC core. Moving packet processing onto them raises per-packet latency. Their value is *offload of work you want removed from the host* — infrastructure functions, not trading hot paths:
-
-- Virtual switching (OVS), overlay encap/decap (VXLAN/Geneve)
-- Storage initiator emulation (NVMe-oF), encryption (IPsec, TLS handshake offload)
-- Isolation: the DPU runs the infrastructure so the host is untrusted tenant space
-- Telemetry and capture without host CPU cost (relevant to §48.7–§48.8)
-
-**When SmartNICs pay in low latency:**
-
-1. **Timestamping and capture** at line rate with no host involvement (§48.4, §48.7).
-2. **Fan-out / replication in hardware** — e.g. arbitrating redundant A/B multicast feeds on the NIC and delivering one deduplicated stream to the host, removing an entire host-side stage (Ch. 53 §53.6).
-3. **Filtering** — dropping the 95% of a multicast feed your strategy doesn't care about before it consumes host PCIe bandwidth and cache. This is a genuine win: PCIe bandwidth and DDIO cache footprint (Ch. 29 §29.24) are real constraints at high message rates.
-4. **Pre-staged order transmit** as in §48.2, if the platform supports it.
-
-**P4** deserves a mention: a domain-specific language for describing packet-processing pipelines (parse graph, match-action tables, deparse). It targets programmable switch ASICs (Tofino) and some SmartNICs. It cannot express arbitrary computation — no loops, bounded state — which is exactly why it can compile to a fixed-latency pipeline.
-
-**The evaluation question you should be able to answer:** "Should we offload X to a SmartNIC?" Ask (a) is X on the critical path or beside it? (b) does the offload *remove* a host-side stage, or merely relocate it? (c) what is the added latency for anything that still must reach the host — because a DPU in front of the host adds a store-and-forward hop, typically 1–3 µs. Offloading beside-the-path work is nearly always good; offloading on-path work to a slower core is nearly always bad.
-
----
-
-## 48.4 NIC Hardware Timestamping
-
-A **timestamp** here means a recorded time associated with a packet's arrival at or departure from a point in the system. Where that timestamp is taken determines what it can tell you.
-
-**The three timestamp points:**
-
-```
-   wire ──► [PHY/MAC] ──► [NIC SRAM] ──► DMA ──► [host RAM] ──► driver ──► socket ──► app
-              ^hardware TS               ^                       ^softirq TS   ^app read
-              (PHC domain)                                       (SW TS, CLOCK_REALTIME)
+read pcap_stats
+store ps_recv, ps_drop, ps_ifdrop with platform semantics
+close handle
 ```
 
-| Timestamp | Taken by | Typical precision | Includes |
-|---|---|---|---|
-| **Hardware (HW)** | NIC MAC/PHY, PHC clock | 1–10 ns resolution, few-ns error | Nothing downstream |
-| **Software receive (SW)** | Kernel, in NAPI/softirq context | ~100 ns resolution, µs-scale error | DMA + interrupt/poll + scheduling delay |
-| **Application** | `clock_gettime` after `recvmsg` | ~20 ns resolution, µs-scale error | Everything, incl. app scheduling |
+`pcap_stats` fields are not fully portable. `ps_drop` and `ps_ifdrop` availability and counting semantics differ by platform. The capture file alone cannot prove completeness; preserve source sequence numbers and independent device counters.
 
-The **PHC (PTP hardware clock)** is a free-running counter on the NIC, exposed on Linux as `/dev/ptp0` (Ch. 35 §35.9). Hardware timestamps are in the *PHC time domain*, not `CLOCK_REALTIME`. Comparing an HW timestamp with a `clock_gettime(CLOCK_REALTIME)` value without translating domains is one of the most common measurement errors in the field (see §48.11).
+Capture work itself can cause drops or perturb the host. Filter early when that preserves the target population, write to adequate storage, avoid expensive live decoding during the run, and compare application behavior with and without capture.
 
-**Enabling it.** Hardware timestamping is requested per-socket via `SO_TIMESTAMPING` and enabled per-device via `SIOCSHWTSTAMP` (Ch. 45 §45.9):
+## 48.7 Loss and jitter are layered
+
+Packet loss must be localized:
+
+```text
+source generated
+  ├─ lost before tap/switch
+tap observed
+  ├─ lost in network
+NIC port observed
+  ├─ rejected/classified/dropped in NIC
+DMA/completion observed
+  ├─ lost in driver/kernel queue
+socket/bypass observed
+  ├─ overwritten/dropped by application queue
+application processed
+```
+
+Use monotonically increasing protocol sequence numbers where available. At each layer retain counts with definitions and reset/wrap behavior:
+
+- source offered and transmitted;
+- external tap/capture observed and dropped;
+- switch ingress/egress and discard counters;
+- NIC MAC/PHY error and discard counters;
+- per-queue no-buffer/missed counters;
+- kernel and socket drop indicators;
+- bypass-ring and application-queue overruns;
+- application accepted, duplicate, stale, invalid, and processed counts.
+
+Counter names are not standardized across drivers. Use `ethtool -S eth0` plus exact driver documentation and a controlled fault. `ip -s link show dev eth0` and protocol statistics provide other views, but counters can overlap. Do not sum overlapping layers as if they were disjoint.
+
+Define loss rate from a named population:
+
+\[
+\text{loss fraction} =
+\frac{N_{\text{expected}}-N_{\text{accepted exactly once}}}
+     {N_{\text{expected}}}
+\]
+
+Separate missing, duplicate, corrupt, late, and reordered packets. For an application with a freshness deadline, “arrived after deadline” may be an operational loss even though the NIC delivered it.
+
+**Jitter** is variation in a defined delay or interarrival process. Avoid one undocumented scalar. Report:
+
+- the underlying latency or interarrival distribution;
+- units and timestamp point;
+- central and tail summaries;
+- consecutive differences if that is the chosen packet-delay-variation definition;
+- burst/gap sequence and loss;
+- clock-error bound.
+
+Host software timestamps can show batching caused by interrupt moderation or scheduling rather than wire jitter. Hardware or external timestamps help distinguish them.
+
+## 48.8 Packet-rate arithmetic
+
+At the Ethernet MAC service boundary, a conventional minimum frame occupies:
+
+- 64 bytes from destination address through frame check sequence;
+- 8 bytes of preamble and start-frame delimiter;
+- 12 byte-times of interpacket gap.
+
+Under those declared assumptions, one minimum frame consumes 84 byte-times, or 672 bit-times. Thus:
+
+\[
+PPS = \frac{\text{MAC bit rate}}
+            {8(\text{frame bytes} + 8 + 12)}
+\]
+
+Calculated examples:
+
+| Declared MAC rate and frame | Calculated packets/s | Calculated serialization opportunity |
+|---|---:|---:|
+| 10 Gb/s, 64-byte frame | 14.880952 Mpacket/s | 67.2 ns/packet |
+| 25 Gb/s, 64-byte frame | 37.202381 Mpacket/s | 26.88 ns/packet |
+| 100 Gb/s, 64-byte frame | 148.809524 Mpacket/s | 6.72 ns/packet |
+| 10 Gb/s, 1,518-byte frame | 0.812744 Mpacket/s | 1.2304 µs/packet |
+
+These are arithmetic upper bounds on continuously occupied MAC time, not guaranteed NIC, PCIe, host, switch, or application rates. Pause frames, link-layer control traffic, FEC/PCS behavior, VLAN/tunnel headers, bursts, flow-control gaps, device packet-rate limits, and the actual frame-size distribution change the usable result.
+
+The following C++23 program validates the arithmetic and two ring-coverage examples:
 
 ```cpp
-int flags = SOF_TIMESTAMPING_RX_HARDWARE   // NIC stamps on receive
-          | SOF_TIMESTAMPING_TX_HARDWARE   // NIC stamps on transmit
-          | SOF_TIMESTAMPING_RAW_HARDWARE  // deliver in PHC domain, untranslated
-          | SOF_TIMESTAMPING_SOFTWARE;     // also give me the kernel SW stamp
-setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof flags);
-// ethtool -T eth0  →  shows which of these the device actually supports
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+
+constexpr long double packets_per_second(std::uint64_t bits_per_second,
+                                         std::uint64_t frame_bytes) {
+    constexpr std::uint64_t preamble_sfd = 8;
+    constexpr std::uint64_t interpacket_gap = 12;
+    const auto byte_times = frame_bytes + preamble_sfd + interpacket_gap;
+    return static_cast<long double>(bits_per_second) /
+           (8.0L * static_cast<long double>(byte_times));
+}
+
+constexpr std::uint64_t packets_during_gap(long double pps,
+                                           long double gap_seconds) {
+    // Precondition: inputs are finite and nonnegative, and their product is
+    // representable as std::uint64_t.
+    const long double exact = pps * gap_seconds;
+    const auto whole = static_cast<std::uint64_t>(exact);
+    return whole + (static_cast<long double>(whole) < exact ? 1U : 0U);
+}
+
+int main() {
+    constexpr auto pps_10g_min =
+        packets_per_second(10'000'000'000ULL, 64);
+    constexpr auto pps_10g_1518 =
+        packets_per_second(10'000'000'000ULL, 1'518);
+
+    static_assert(packets_during_gap(1'500'000.0L, 200e-6L) == 300);
+    static_assert(packets_during_gap(pps_10g_min, 200e-6L) == 2'977);
+
+    std::cout << std::fixed << std::setprecision(6)
+              << "10G minimum-frame Mpps: " << pps_10g_min / 1e6L << '\n'
+              << "10G 1518-byte Mpps: " << pps_10g_1518 / 1e6L << '\n';
+}
 ```
 
-Received timestamps arrive as ancillary data in `recvmsg` (`SCM_TIMESTAMPING`, a `struct scm_timestamping` with three `timespec`s: software, deprecated, raw hardware). **Transmit** timestamps do not come back with `send`; they arrive later on the **socket error queue**, read with `recvmsg(fd, &msg, MSG_ERRQUEUE)` (Ch. 45 §45.15). Forgetting to drain the error queue leaks buffers and eventually stalls TX timestamping — diagnostic signature: TX timestamps stop appearing after N packets, `ethtool -S` shows no drops, and `SO_TIMESTAMPING` TX counters flatline.
+For goodput, count useful application bytes once:
 
-**Where the stamp is really taken matters.** Some NICs stamp at the MAC after the PHY has already deserialized; the PHY itself contributes latency (100–300 ns for 10GBASE-SR, more for 10GBASE-T which is ~2 µs and disqualifying for latency work). Crucially, **PHY latency is not always constant** — some PHYs have variable pipeline depth on link retrain. For absolute accuracy you must know and calibrate the *ingress/egress asymmetry* of your PHY.
+\[
+\text{goodput} =
+\frac{\text{useful bytes accepted}}
+     {\text{measurement duration}}
+\]
 
-**Non-obvious details:**
+For a calculated UDP/IPv4 example with no options or VLAN tag, one 40-byte application message occupies:
 
-- Many NICs support HW timestamping only for **PTP packets** by default; you must set the filter to `HWTSTAMP_FILTER_ALL` to stamp everything, and some devices refuse.
-- HW timestamp precision is not accuracy. A 1 ns *resolution* counter disciplined to a grandmaster with 200 ns of error gives you 200 ns of accuracy (§48.11).
-- Timestamping typically costs nothing in the datapath — the counter is captured by the MAC regardless — but delivering it consumes an ancillary-data path, so `recvmsg` becomes mandatory (no `recv`), which is a measurable syscall cost difference on kernel paths.
-- Kernel-bypass stacks (Ch. 47) have their own APIs: `ef_vi` returns per-packet hardware timestamps directly in the event queue, which is the cleanest source available.
+\[
+14_{\text{Ethernet}}+20_{\text{IPv4}}+8_{\text{UDP}}+
+40_{\text{data}}+4_{\text{FCS}}+8_{\text{preamble}}+12_{\text{gap}}
+=106\text{ byte-times}
+\]
 
----
+Its calculated link efficiency is \(40/106 \approx 37.74\%\). Packing ten such messages in one datagram under the same assumptions gives \(400/466 \approx 85.84\%\). These calculations do not include application-level envelope headers, timestamps, VLANs, tunnels, loss, or retransmission.
 
-## 48.5 PTP Grandmaster Clocks
+## 48.9 Capacity and saturation
 
-**PTP** (Precision Time Protocol, IEEE 1588) distributes time over Ethernet with sub-microsecond accuracy, versus NTP's typical millisecond-to-100-µs range (Ch. 35 §35.6–§35.8). A **grandmaster** is the root clock of a PTP domain — the device that all others synchronize to, normally disciplined by GNSS (GPS/Galileo) with a holdover oscillator (OCXO or rubidium) for when satellites are lost.
+Define:
 
-**The mechanism.** PTP measures offset and path delay using four timestamps:
+- **offered load:** packets, bits, or messages presented per second;
+- **accepted load:** work admitted at a named boundary;
+- **throughput:** work completed at a named boundary per second;
+- **goodput:** useful nonduplicate application data completed per second;
+- **capacity:** the greatest load meeting a declared correctness, loss, and latency criterion for a declared duration.
 
-```
-Master                          Slave
-  |----- Sync (t1) ------------->| t2
-  |----- Follow_Up (carries t1)->|          (two-step clocks only)
-  |<---- Delay_Req (t3) ---------| t3
-  | t4                           |
-  |----- Delay_Resp (carries t4)>|
+Capacity is not “the highest number printed before the test ended.” Use an open-loop generator whose schedule does not wait for responses. Verify offered load with an independent counter or capture. If the generator cannot sustain a step, report the achieved offered rate rather than the requested rate.
 
-offset      = ((t2 - t1) - (t4 - t3)) / 2
-path_delay  = ((t2 - t1) + (t4 - t3)) / 2
-```
+A useful sweep:
 
-**The load-bearing assumption is path symmetry.** The offset formula divides total round-trip by two; if forward and reverse delays differ by Δ, your clock is wrong by Δ/2. Asymmetry sources: different physical fibre lengths per direction, asymmetric switch queueing, and — the big one — a switch that is not PTP-aware.
+1. Fix topology, frame/message distribution, flow count, offloads, and queue placement.
+2. Start well below expected saturation.
+3. Increase offered load in randomized or otherwise drift-controlled steps.
+4. At every step record offered, accepted, goodput, every loss layer, queue depth/residence evidence, CPU/device utilization, and latency distribution.
+5. Hold each step long enough to cover relevant bursts and state transitions.
+6. Repeat independent runs near the transition.
+7. Define capacity as the highest range satisfying the predeclared service criteria with uncertainty.
 
-**One-step vs two-step.** A one-step clock writes t1 into the Sync message as it transmits (requires on-the-fly checksum correction in hardware); a two-step sends t1 afterwards in Follow_Up. Both are accurate; one-step halves message count.
+The “knee” is measured, not assumed to occur at a universal utilization. Saturation may appear as:
 
-**Transparent clocks vs boundary clocks** — a guaranteed interview discriminator:
+- increasing queue residence and latency tails;
+- NIC or driver no-buffer drops;
+- application queue overflow;
+- flat goodput with growing offered load;
+- throughput collapse from livelock or retry work;
+- unfairness between flows;
+- timestamp/capture loss before workload loss.
 
-| | Boundary clock (BC) | Transparent clock (TC) |
-|---|---|---|
-| Behavior | Terminates PTP; acts as a slave upstream and a master downstream | Forwards PTP, adding its measured residence time to the `correctionField` |
-| Error accumulation | Each hop adds its own servo error; errors compound over hops | Residence time measured in hardware; error does not compound the same way |
-| Effect of switch queueing | Hidden (BC re-times) | Explicitly measured and corrected |
-| Typical use | Hierarchical networks | Trading networks (preferred) |
+Small frames may hit packet/descriptor/transaction limits before bit rate. Large frames may hit byte bandwidth. One flow may hit one queue/core before total device capacity. Report a surface over frame sizes, flow counts, and rates when those dimensions matter.
 
-A switch that is *neither* — a plain store-and-forward switch — injects its variable queueing delay directly into t2−t1 as noise, and that noise is asymmetric under load. This is why "we have PTP" is not the same as "we have accurate time": PTP over non-PTP-aware switches under load can be worse than a well-tuned NTP setup.
+## 48.10 Worked packet-budget and timestamp diagnosis
 
-**Profiles.** The default IEEE 1588 profile, the **telecom profile (G.8275.1/.2)**, and importantly for finance, PTP over multicast UDP vs Layer-2. MiFID II RTS 25 mandates clock accuracy for reportable events: 100 µs of UTC for most HFT participants, 1 ms for others, with divergence documented. Note the regulatory bar (100 µs) is *thousands of times looser* than what latency measurement requires (sub-µs) — compliance time and measurement time are different problems.
+The following values form one **illustrative calculated-and-measured record**. They are not vendor specifications.
 
-**Practical stack on Linux:** `ptp4l` disciplines `/dev/ptpN` (the PHC) from the network; `phc2sys` copies PHC time into the system clock (or vice versa); `ts2phc` disciplines the PHC from a PPS input. Health signals to monitor: `ptp4l` reported *master offset* (should be tens of ns, stable), path delay stability, and grandmaster GNSS lock/holdover state. Diagnostic signature of a failing GNSS antenna: offset stays small but slowly ramps as the grandmaster free-runs on holdover, and every host drifts *together* — so intra-site comparisons look fine while inter-site comparisons diverge.
+### Declared setup
 
----
+- two hosts connected through one named switch and two named 10 GbE NIC ports;
+- NIC model, firmware, driver, PCIe link state, kernel, and `ethtool` outputs archived;
+- fixed CPU/NUMA placement and offload state archived;
+- UDP frames of 64 bytes from destination address through FCS for the packet-rate test;
+- open-loop hardware generator;
+- 30 independent 60 s runs per offered-load point in randomized order;
+- RX hardware timestamp at the documented MAC provider, application timestamp immediately after bypass completion dequeue;
+- PHC-to-host cross-timestamp calibration before and after each run;
+- external two-channel capture with one clock, calibrated channel-skew bound;
+- sequence number in every payload;
+- statistics computed over runs; packet distributions retained separately.
 
-## 48.6 FPGA and Kernel-Bypass Hybrids
+Every measured number below belongs only to that setup.
 
-Pure FPGA logic is fast but small; pure CPU logic is flexible but slow. Production systems overwhelmingly use a **hybrid**: the FPGA owns a narrow, latency-critical slice; a kernel-bypass CPU path (Ch. 47) owns everything else; and both see the same packets.
+### Budget
 
-**The canonical split:**
+At the declared 10 Gb/s MAC rate and 64-byte frame, the §48.8 calculation gives 14.880952 Mpacket/s and 67.2 ns between frame starts under continuous occupancy. A measured worst host refill gap of 80 µs—the maximum across the 30 runs at one declared load point—corresponds arithmetically to:
 
-```
-          ┌──────────────────── FPGA ────────────────────┐
-  wire ───┤ parse → filter → [trigger match] → TX order  ├──► wire  (~40 ns)
-          │            │                                  │
-          │            └── copy every packet ──► PCIe DMA ┤
-          └───────────────────────────────────────────────┘
-                                     │
-                          ef_vi / DPDK RX ring (Ch. 47 §47.5)
-                                     ▼
-                        CPU: full book build, strategy,
-                        risk state, arming/disarming FPGA slots
-```
+\[
+\lceil 14.880952\times10^6 \times 80\times10^{-6}\rceil
+=1{,}191\text{ packet opportunities}
+\]
 
-The FPGA is the **fast path**; the CPU is the **slow path** that keeps the fast path's state current (Ch. 52 §52.7). The CPU sees the same market data with a few microseconds of additional delay and reconciles.
+The configured 1,024-descriptor ring therefore cannot by itself cover that calculated worst case even if every descriptor holds one packet and the ring begins empty. The conclusion is not “set the ring to 2,048.” The intervention should target the 80 µs stall and separately evaluate whether added buffering meets the freshness budget.
 
-**Design invariants that matter:**
+### Timestamp symptom
 
-1. **The FPGA must never depend on a CPU response to complete an action.** Any round trip to the host costs 1–2 µs of PCIe plus host processing — more than the entire FPGA budget. The FPGA either decides alone or does not decide.
-2. **State must be idempotent and versioned.** The CPU writes "slot 7 = order X, generation 42, armed." The FPGA fires only if generation matches its expectation. Otherwise a CPU update that races a fire produces a hybrid order (new price, old quantity) — a real and terrifying failure mode. Slot updates must be atomic from the FPGA's perspective: write payload, then write the arm word last (a release-style publication, Ch. 25 §25.17), and the FPGA reads the arm word first.
-3. **Both paths must share risk state, and the FPGA's copy is authoritative on the fast path.** If the CPU decrements remaining quantity but the FPGA has already fired, the CPU must reconcile from the FPGA's fill notifications, not from its own intent.
+At a measured offered load of 12.0 Mpacket/s:
 
-**Onload/ef_vi + AOE-style designs.** Solarflare/AMD X2/X3 cards with an on-board FPGA (the "Application Onload Engine" lineage) let you run standard kernel-bypass sockets *and* have FPGA logic in the datapath on the same card, avoiding an extra device hop. Exablaze/Cisco cards similarly expose an FPGA plus a normal NIC personality.
+- the median over 30 runs of each run’s median hardware-to-application delta was 3.1 µs;
+- the median over 30 runs of each run’s p99 delta was 7.4 µs;
+- 8 of 30 runs contained intervals where the application delta exceeded 60 µs;
+- source-to-external-capture sequence accounting found zero missing frames in those runs;
+- NIC-to-application accounting found 18,420 missing sequence IDs across the affected 8 runs, out of the exact per-run offered counts stored in the artifact;
+- the driver’s documented no-buffer counter increased by the same count in this illustrative record;
+- external capture’s calibrated inter-channel uncertainty bound was ±12 ns for the run configuration;
+- PHC-to-host conversion uncertainty was bounded at ±90 ns across each run by the stated calibration method.
 
-**Layer-1 devices** are the adjacent trick worth knowing: a Metamako/Arista 7130-class device can replicate a feed to N ports in ~4–5 ns (essentially a physical-layer fanout, no packet parsing at all), and can do "media-with-tap" replication for capture. Sub-5 ns fanout beats any switch by two orders of magnitude, and it is the standard way to feed both the FPGA and the capture appliance from one wire without adding measurable delay.
+The long delta is much larger than the declared clock-conversion bound, so clock uncertainty alone cannot explain it. The matching sequence and documented no-buffer counts place loss between NIC reception and a usable host buffer. Scheduler tracing finds the 80 µs refill gap on the queue’s polling CPU.
 
-**What breaks.** Hybrids fail at the seams: PCIe backpressure stalling the DMA copy while the FPGA path continues fine (host sees a gap, FPGA does not — diagnostic: CPU book has sequence gaps but FPGA fill reports reference prices the CPU never saw), and arm/disarm races (§48.2). Instrument both paths with the *same* hardware clock domain so the seam is measurable.
+### Intervention
 
----
+The suspected cause is a periodic statistics callback in the polling thread. Move it to a control thread while preserving queue, ring, and offered load. Repeat the 30-run randomized design.
 
-## 48.7 tcpdump and Wireshark
+In this illustrative result:
 
-**tcpdump** is a CLI packet capture tool built on libpcap (§48.8); **Wireshark** is a GUI/TUI analyzer (`tshark` for CLI) with thousands of protocol dissectors. Both read/write **pcap** and **pcapng** files.
+- the maximum observed refill gap across the 30 candidate runs becomes 11 µs;
+- the candidate has zero application sequence gaps at 12.0 Mpacket/s across the exact offered counts;
+- the median over 30 candidate runs of per-run p99 hardware-to-application delta is 6.9 µs;
+- an additional larger-ring control removes loss in the baseline but leaves a measured long tail above the application freshness limit.
 
-**What you must know about the capture point.** `tcpdump` on a host captures via `AF_PACKET` — a tap *inside the kernel*, after the driver has processed the packet. Consequences:
+This supports a bounded causal conclusion:
 
-- It sees packets **after** NIC offloads have already acted. With GRO/LRO enabled (Ch. 46 §46.9) you will see a single 8 KB "TCP segment" that never existed on the wire. With TSO/GSO (Ch. 46 §46.10) you see one giant outbound segment that the NIC will actually split. Anyone reasoning about wire behavior from a host capture without disabling offloads is reading fiction:
-  ```
-  ethtool -K eth0 gro off lro off tso off gso off ufo off
-  ```
-- **It cannot see kernel-bypass traffic at all.** Onload, DPDK, ef_vi, and VMA take the packet before the kernel stack; `tcpdump` shows nothing. This surprises people constantly. Mitigations: Onload's `onload_tcpdump`, DPDK's `pdump`, or — correctly — an external tap (§48.9).
-- Its timestamps are **software** by default. `tcpdump --time-stamp-precision=nano` gives nanosecond *units*, not nanosecond *accuracy*; use `-j adapter_unsynced` / `-j adapter` to request NIC hardware timestamps where supported (`tcpdump -J eth0` lists available sources).
+> In the recorded configuration at the declared 12.0 Mpacket/s workload, moving the periodic callback off the poll thread removed the observed refill stall and associated RX no-buffer loss. Increasing ring depth masked loss but did not meet the declared freshness criterion.
 
-**Essential invocations:**
+It does not establish capacity at 14.880952 Mpacket/s, another frame distribution, another NIC, or another queue count. A complete capacity sweep is still required.
 
-```bash
-tcpdump -i eth0 -n -s 0 -w cap.pcap 'udp port 12345'   # -n: no DNS; -s 0: full frame
-tcpdump -i eth0 -B 65536 --time-stamp-precision=nano -j adapter_unsynced -w cap.pcap
-tcpdump -r cap.pcap -c 10 -tttt -vv                     # read back, absolute timestamps
-tshark -r cap.pcap -T fields -e frame.time_epoch -e udp.length -E separator=,
-```
+## Skippable reference
 
-**The drop counters are the first thing to check.** On exit tcpdump prints `N packets captured, M packets received by filter, K packets dropped by kernel`. Nonzero `dropped by kernel` means your capture is incomplete and any latency conclusion drawn from it is suspect — the drops are load-correlated, so you lose exactly the interesting bursts. Fixes: larger `-B` buffer, write to a fast local device or `-w -` into a compressor on another core, use `PACKET_MMAP` (libpcap does by default) and pin the capture process off your trading cores (Ch. 31 §31.17).
+### 48.11 Choosing the observation point
 
-**Wireshark essentials for this domain:** custom dissectors (Lua for prototyping, C for volume), `Statistics → I/O Graph` for microburst visualization at 1 ms granularity, `tcp.analysis.retransmission` / `tcp.analysis.lost_segment` filters (Ch. 38), and *time reference* / delta-time columns to compute per-packet deltas. Be aware Wireshark's own "expert" TCP analysis is heuristic and reports spurious retransmissions when the capture itself dropped packets — a capture artifact misread as a network problem is a classic diagnostic dead end.
-
----
-
-## 48.8 Packet Capture with libpcap
-
-**libpcap** is the portable capture library beneath tcpdump. Understanding it matters because at trading message rates the naive path drops packets.
-
-**The mechanism on Linux.** libpcap opens an `AF_PACKET` socket, attaches a compiled **BPF filter** (Ch. 45 §45.12) in the kernel so unwanted packets are discarded before being copied, and maps a ring buffer with `PACKET_MMAP` (`TPACKET_V3`) so packets are read from a shared memory ring with no per-packet syscall.
-
-```c
-pcap_t* p = pcap_create("eth0", errbuf);
-pcap_set_snaplen(p, 65535);          // 0/65535 = full frame; small snaplen = headers only
-pcap_set_promisc(p, 1);
-pcap_set_timeout(p, 1);              // ms; buffering delay before delivery
-pcap_set_buffer_size(p, 256<<20);    // kernel ring; the single most important knob
-pcap_set_tstamp_type(p, PCAP_TSTAMP_ADAPTER_UNSYNCED);   // NIC hardware clock
-pcap_set_tstamp_precision(p, PCAP_TSTAMP_PRECISION_NANO);
-pcap_activate(p);
-struct bpf_program fp; pcap_compile(p, &fp, "udp port 12345", 1, PCAP_NETMASK_UNKNOWN);
-pcap_setfilter(p, &fp);
-pcap_loop(p, -1, handler, nullptr);
-```
-
-**Timestamp source selection is the load-bearing call.** `pcap_list_tstamp_types` enumerates what the device offers:
-
-| Type | Meaning |
+| Claim | Minimum defensible observation |
 |---|---|
-| `PCAP_TSTAMP_HOST` | Host clock, taken by kernel — includes driver/IRQ delay |
-| `PCAP_TSTAMP_HOST_LOWPREC` | Jiffy-granularity; useless for latency |
-| `PCAP_TSTAMP_HOST_HIPREC` | Best host clock |
-| `PCAP_TSTAMP_ADAPTER` | NIC hardware clock, synchronized to host time |
-| `PCAP_TSTAMP_ADAPTER_UNSYNCED` | NIC hardware clock, free-running (best precision, own domain) |
-
-`ADAPTER_UNSYNCED` gives you the tightest *relative* measurements (deltas between packets on the same NIC) at the cost of needing your own translation to wall clock. For measuring latency between two points on one card, that is exactly what you want.
-
-**File formats.** Classic **pcap** has a 16-byte per-packet header with microsecond or nanosecond timestamps (indicated by magic number `0xa1b2c3d4` vs `0xa1b23c4d`) and one link type for the whole file. **pcapng** is the modern block-based format: multiple interfaces, per-interface timestamp resolution, comments, name resolution blocks. Trading capture appliances often write pcapng with nanosecond resolution and per-packet metadata.
-
-**Snaplen is a real tuning decision.** Capturing 64 bytes per packet instead of 1500 cuts capture bandwidth by an order of magnitude and is sufficient for latency and sequence-number analysis — but destroys your ability to reconstruct the book from the capture. Full-payload capture at 10 Gbps sustained is 1.25 GB/s to disk; plan storage accordingly or use a purpose-built capture appliance (Corvil/Pico, Napatech, cPacket) with hardware timestamping and dedicated recording.
-
-**Failure modes and their signatures:**
-
-- **Kernel ring overflow** — `pcap_stats().ps_drop` climbs; drops cluster during microbursts (Ch. 39 §39.5), so your capture is systematically blind to the events you care about.
-- **NIC-level drop** — `pcap_stats().ps_ifdrop` and `ethtool -S | grep -i drop`; the packet never reached the ring. Ring sizing (§48.13) is the fix, not buffer sizing.
-- **BPF filter too permissive** — capture CPU saturates; a filter that must touch payload (`udp[8:4] == ...`) is far more expensive than a header-field match.
-- **Writing to a shared/spinning disk** — write stalls backpressure into the ring. Always benchmark the writer independently.
-
----
-
-## 48.9 Software and Hardware Timestamp Selection
-
-The single most important measurement decision: *which clock stamps the event, and where*. Getting this wrong invalidates everything downstream, and interviewers test it because it separates people who have measured from people who have read.
-
-**The hierarchy, worst to best:**
-
-| Method | Resolution | Accuracy vs wire | Includes |
-|---|---|---|---|
-| Application `clock_gettime` after read | ~20–30 ns | ±10s of µs | Everything: DMA, IRQ, softirq, scheduler, app loop |
-| Kernel software timestamp (`SOF_TIMESTAMPING_SOFTWARE`) | ~100 ns | ±1–20 µs | DMA + IRQ/NAPI + softirq scheduling |
-| NIC hardware timestamp (`RAW_HARDWARE` / PHC) | 1–10 ns | ±50–500 ns (PHC sync) | PHY/MAC ingress only |
-| External tap + capture appliance | ~1 ns | ±5–20 ns | Nothing (true wire time) |
-| FPGA inline stamp at the SFP | sub-ns | ±few ns | Nothing |
-
-**Key principle: a timestamp measures the instant the *stamping stage* saw the packet, so the difference between two timestamps only measures the stages between them.** An application timestamp minus a hardware timestamp is a legitimate and extremely useful measurement — it is exactly your *host stack latency*. But an application timestamp minus another application timestamp on a different host measures host stack on both ends plus the network plus the clock offset, and blames it all on "the network."
-
-```
-wire_arrival ──► HW TS ──► [DMA+IRQ+softirq] ──► SW TS ──► [sched+loop] ──► APP TS
-                 |◄──────────── stack latency ─────────────►|
-                                 |◄─ delivery jitter ─►|
-```
-
-**Decision rules:**
-
-- Measuring *your own* stack: HW RX timestamp vs application timestamp on the same host. Requires translating PHC→host clock, or (better) reading the TSC and PHC together once to establish an offset and slope (Ch. 43 §43.13).
-- Measuring *wire-to-wire* (tick-to-trade): tap both the inbound feed and your outbound order on a single capture device with one clock (§48.10). This removes clock sync error entirely — the strongest measurement you can make.
-- Measuring *exchange-to-you*: needs synchronized clocks at both ends, which you rarely have; you almost always measure round trips instead.
-- Never mix domains without explicit conversion. Symptom of mixing: negative latencies, or a latency distribution with a constant offset that changes after a `phc2sys` restart.
-
-**The `SOF_TIMESTAMPING_SOFTWARE` subtlety.** The kernel software timestamp is taken in `netif_receive_skb` — i.e. in NAPI softirq context, *after* the interrupt has been serviced. Under interrupt coalescing (Ch. 46 §46.6) with `rx-usecs=50`, that stamp can be up to 50 µs late and, worse, the *lateness is inversely correlated with load* (busy = coalescing fires early on packet-count threshold; idle = full timer expiry). The result is the notorious inverted latency profile where the system appears faster under load. If your software-timestamped latency drops when traffic increases, coalescing is your answer.
-
-**TX timestamping is a different beast.** `SOF_TIMESTAMPING_TX_HARDWARE` stamps when the frame leaves the MAC, delivered later via `MSG_ERRQUEUE`. Comparing your application's pre-`send` timestamp to the TX HW stamp gives you *transmit stack latency* — the number that Nagle, qdisc, and TSO all live in (Ch. 38 §38.13, Ch. 46 §46.10). Many teams instrument RX exhaustively and never instrument TX, then wonder where microseconds go.
-
----
-
-## 48.10 One-Way Versus Round-Trip Latency
-
-**Round-trip time (RTT)** is measured with one clock: send at t0, receive the response at t1, RTT = t1 − t0. **One-way delay (OWD)** is measured with two clocks: sent at t0 by clock A, received at t1 by clock B, OWD = t1 − t0 — and is therefore contaminated by the offset between A and B.
-
-| | Round-trip | One-way |
-|---|---|---|
-| Clocks needed | One | Two, synchronized |
-| Error source | Only measurement overhead | Clock offset (§48.11) adds directly |
-| Path asymmetry | Hidden (averaged) | Exposed (this is the point) |
-| Includes remote processing | Yes, inseparably | No |
-| Easy to get right | Yes | No |
-
-**RTT/2 is not one-way delay.** It is one-way delay only if the path is symmetric *and* remote turnaround time is zero. In practice neither holds: exchange gateways have asymmetric internal paths, market data egresses via a different path than order entry ingresses, and remote processing is exactly what you often want to isolate. Stating "RTT/2 assumes symmetry, and in a trading network the market-data path and the order path are physically different, so it's meaningless" is a strong answer.
-
-**The measurement that actually matters: wire-to-wire tick-to-trade.** Tap the inbound market-data fibre and the outbound order fibre into the *same* capture device:
-
-```
-exchange feed ──► [L1 tap] ──┬──► your host/FPGA
-                             └──► capture appliance  (clock C, timestamp T_in)
-your order    ◄── [L1 tap] ──┬──◄ your host/FPGA
-                             └──► capture appliance  (clock C, timestamp T_out)
-
-tick_to_trade = T_out − T_in     ← single clock domain, no sync error
-```
-
-This is the industry-standard measurement and it is exact to the appliance's timestamp precision (~a few ns) because **both stamps come from one clock**. Everything else — including any measurement that involves your application's view of time — is inferior.
-
-**Matching the tick to the trade** is the hard part, not the timestamping. You must correlate the specific inbound message that *caused* the outbound order. Techniques: embed a sequence identifier of the triggering message in the order's client order ID (Ch. 54 §54.6) so correlation is exact; or, when you cannot, correlate by nearest-preceding-event and accept ambiguity under bursts. Under a microburst, nearest-preceding correlation systematically *under*-reports latency, because a later tick sits closer to your (actually slow) response. This bias is invisible unless you look for it.
-
-**One-way delay when you must have it.** Use PTP (§48.5) with hardware timestamping on both ends and report the clock error alongside the measurement: "OWD 4.2 µs ± 0.3 µs (clock)". A latency figure without an error bar from someone who used two clocks is not a measurement, it's a number.
-
-**Practical guidance:** measure RTT for anything involving a remote peer you don't control; measure single-clock wire-to-wire for anything inside your rack; measure one-way with PTP only when you own both ends and have characterized the clock error.
-
----
-
-## 48.11 Clock Synchronization Error
-
-**Clock error** decomposes into three components you should be able to name separately:
-
-- **Offset** — the instantaneous difference between two clocks. Directly adds to any one-way measurement.
-- **Skew (frequency error / drift rate)** — the rate at which offset grows, in parts per million. A free-running crystal is typically ±20–100 ppm: 50 ppm is 50 µs per second, 180 ms per hour. An OCXO is ~0.01 ppm; a rubidium standard ~0.001 ppm.
-- **Jitter / wander** — short-term random variation in the offset, which sets the noise floor of your measurement.
-
-**Why this dominates one-way measurements.** If your PTP servo holds ±200 ns and you are measuring a 500 ns link, your error bar is 40% of the measurement. Worse, offset is not random noise — it is *slowly varying and correlated*, so averaging many samples does not reduce it. Averaging reduces jitter; it does nothing for a systematic offset. Candidates frequently claim "we take a million samples so the error averages out" — this is wrong for exactly this reason, and saying so is a strong signal.
-
-**Sources of PTP error, ranked:**
-
-1. **Path asymmetry** (§48.5) — the un-measurable one. Contributes exactly Δ/2 and no amount of statistics detects it. Different fibre lengths in each direction of a "pair" is a real and common cause; 1 metre of fibre is ~5 ns.
-2. **Non-PTP-aware switches** — queueing delay enters as asymmetric noise under load.
-3. **Servo transients** — after a step correction or a link flap, the PLL takes seconds to reconverge.
-4. **PHC↔system-clock translation** — `phc2sys` adds its own error; if you compare a PHC timestamp with a `CLOCK_REALTIME` timestamp you inherit it.
-5. **Timestamping point** — MAC vs PHY, and PHY latency asymmetry.
-
-**Validating your time infrastructure** (the answer to "how do you know your clocks are right?"):
-
-- Two independent grandmasters from different GNSS receivers; compare their disciplined outputs. Divergence is the honest error estimate.
-- A **loopback sanity test**: send a packet out one port and directly back into another on the *same* card, capturing both with the same PHC. The measured "network" delay should equal the cable's propagation delay (~5 ns/m) plus PHY latency. Anything else is your measurement error, exposed with no clock sync involved.
-- Monitor `ptp4l` master offset and path delay time series continuously. Path delay should be constant to within a few ns; a step change means a topology or fibre change, and every one-way number recorded before it is now differently biased.
-
-**Leap seconds and time bases** (Ch. 35 §35.10): PTP runs on **TAI**; UTC differs by the current leap-second count, carried in the PTP announce message's `currentUtcOffset`. A host that takes the offset from a misconfigured grandmaster is off by exactly 37 seconds — a beautifully unmistakable signature. Never use `CLOCK_REALTIME` for latency deltas; it can step backwards. Use `CLOCK_MONOTONIC`, `CLOCK_MONOTONIC_RAW`, or the TSC (Ch. 35 §35.2–§35.3, Ch. 43 §43.12).
-
----
-
-## 48.12 Packet-Loss and Jitter Measurement
-
-**Loss** is a packet that was sent and not received. **Jitter** is variation in delay. Both are meaningless without a defined observation point and a defined interval.
-
-**Measuring loss correctly.** Never infer loss from application-level symptoms alone. Layer your accounting:
-
-```
-Exchange sequence numbers   → gaps = loss anywhere upstream of your app (Ch. 37 §37.4)
-NIC counters (ethtool -S)   → rx_missed_errors, rx_no_buffer_count = NIC ring overflow (§48.13)
-Kernel counters             → /proc/net/snmp UdpInErrors, netstat -su "receive buffer errors"
-Socket counters             → SO_RXQ_OVFL gives per-socket drop count in ancillary data
-Capture counters            → pcap_stats ps_drop / ps_ifdrop (§48.8)
-```
-
-Each layer localizes the loss. Sequence gaps with clean NIC and kernel counters means the loss happened before your NIC — the network or the source. Sequence gaps *with* `rx_no_buffer` means you dropped it yourself. Presenting this as a decision tree is the expected answer to "how do you debug a market-data gap?"
-
-**`SO_RXQ_OVFL`** deserves a specific mention: enable it and every `recvmsg` carries a cumulative drop counter as ancillary data, letting you attribute drops to a specific socket and, by differencing, to a specific point in the message stream:
-
-```cpp
-int on = 1;
-setsockopt(fd, SOL_SOCKET, SO_RXQ_OVFL, &on, sizeof on);
-// then read cmsg SOL_SOCKET / SO_RXQ_OVFL as a uint32 counter
-```
-
-**Jitter definitions — do not conflate them:**
-
-| Metric | Definition | Use |
-|---|---|---|
-| **RFC 3550 interarrival jitter** | Smoothed mean deviation of the transit-time difference between consecutive packets | RTP/streaming; heavily smoothed, hides tails |
-| **IPDV** (RFC 3393) | Delay difference between *consecutive* packets: D(i) − D(i−1) | Detects bursts and gaps |
-| **PDV** | Delay minus the minimum observed delay | The one that matters for queueing analysis |
-| **Percentile spread** | p99.9 − p50, or the full histogram | What you actually report (Ch. 43 §43.2) |
-
-For low-latency work, **report a histogram, not a jitter scalar.** The minimum observed delay is your structural floor (propagation + serialization + fixed processing); everything above it is queueing and contention. `p99.9 − min` is a far more actionable number than "jitter = 3 µs".
-
-**Coordinated omission** (Ch. 43 §43.3) applies here too: if your measurement loop stalls, it doesn't sample during the stall, so the worst latencies are never recorded. In network measurement the equivalent is a capture that drops packets during microbursts — you lose exactly the samples that would show the problem. Always cross-check capture drop counters before believing a clean tail.
-
-**Microburst detection** (Ch. 39 §39.5) needs sub-millisecond bins. A link averaging 2 Gbps over 1 second can be at 10 Gbps for 20 ms; a 1-second average shows 20% utilization and a full output buffer. Bin your capture at 10–100 µs and compute per-bin bit rate — a 1 ms bin already hides most of the problem.
-
----
-
-## 48.13 NIC Ring Sizing
-
-A **descriptor ring** is a circular array in host memory of descriptors, each pointing to a buffer (Ch. 46 §46.3). On receive, the NIC DMAs an arriving frame into the buffer named by the next descriptor the driver has posted, then advances a producer index; the driver consumes and re-posts descriptors. If the NIC finds no free descriptor, the packet is dropped **in the NIC** and counted as `rx_missed_errors` / `rx_no_buffer_count`.
-
-```
- driver posts here                       NIC fills here
-        ↓                                     ↓
- [ D ][ D ][ D ][ F ][ F ][ F ][ D ][ D ][ D ][ D ]   D=driver-owned(free), F=filled
-        ^tail (driver)                 ^head (NIC)
- free descriptors = ring_size - in_flight ;  zero free ⇒ drop
-```
-
-**Sizing arithmetic.** The ring must absorb the largest burst that can arrive during the longest time the host fails to replenish it:
-
-```
-required_entries ≈ peak_pps × max_service_gap
-e.g. 1.5 Mpps × 200 µs (a scheduling hiccup) = 300 entries
-     14.88 Mpps (10G, 64B) × 200 µs          = 2976 entries
-```
-
-Common ring sizes are 512–4096 (`ethtool -g eth0` shows current and maximum; `ethtool -G eth0 rx 4096` sets it).
-
-**The tradeoff — and why "bigger is better" is wrong:**
-
-| Larger ring | Smaller ring |
-|---|---|
-| Absorbs longer bursts and scheduling stalls | Less absorption; drops sooner |
-| More descriptors and buffers resident → larger cache/TLB footprint, worse DDIO hit rate (Ch. 29 §29.24) | Working set fits in LLC; better cache behavior |
-| **Bufferbloat**: a packet at the back of a full ring waits behind everything ahead of it | Bounded queueing delay |
-| Hides the symptom of a too-slow consumer | Exposes it |
-
-That third row is the mature point. For a market-data feed, a packet that has been sitting in the ring for 500 µs is *stale* — acting on it may be worse than dropping it. A large ring converts loss into latency, and for trading, latency of stale data is not a win. Deep rings make sense for bulk throughput; shallow rings plus a consumer that never stalls make sense for latency. The right answer to "how big should the ring be?" is: *big enough to cover your worst consumer stall, and no bigger — then eliminate the stalls.*
-
-**Related knobs and their interactions:**
-
-- **Interrupt coalescing** (`ethtool -c`, Ch. 46 §46.6): coalescing lengthens the service gap, so it forces a larger ring. Low-latency configurations set `rx-usecs 0 rx-frames 1` (or busy-poll, Ch. 45 §45.8) and can then afford a smaller ring.
-- **RSS queue count** (Ch. 46 §46.12): rings are per-queue, so total buffering is `queues × ring_size`. A single-queue latency-pinned setup has far less absorption than the default multi-queue configuration — a common regression when someone "simplifies" the NIC config.
-- **Kernel-bypass rings** (Ch. 47 §47.13): with ef_vi/DPDK you own the refill loop directly, and the ring is the *only* buffer — there is no socket receive queue behind it. A single blocking operation in your poll loop drops packets immediately. This is why bypass loops must be strictly allocation-free and syscall-free (Ch. 55 §55.6–§55.7).
-
-**Diagnostic signature.** `rx_missed_errors` rising with `rx_errors` at zero means the NIC received the frames fine and had nowhere to put them — a host-side problem (ring too small, consumer too slow, or IRQ affinity landing on a busy core, Ch. 35 §35.16). `rx_crc_errors` or `rx_length_errors` rising means a physical-layer problem — check optics, fibre, and the switch port's counters.
-
----
-
-## 48.14 Packets-Per-Second Limits
-
-Throughput limits in packet processing are almost always **packet-rate** bound, not bit-rate bound, and knowing the arithmetic cold is a standard interview probe.
-
-**Wire arithmetic** (Ch. 36 §36.4). Every Ethernet frame carries 8 bytes preamble/SFD, 12 bytes interframe gap, and 4 bytes FCS beyond the payload:
-
-```
-on-wire bytes = payload_and_headers + 4 (FCS) + 8 (preamble) + 12 (IFG)
-minimum frame = 64 bytes (incl. FCS) + 20 = 84 bytes = 672 bits
-
-10 GbE max pps = 10e9 / 672  = 14,880,952 pps   → 67.2 ns per packet
-25 GbE                        = 37.2 Mpps        → 26.9 ns
-100 GbE                       = 148.8 Mpps       → 6.7 ns
-1500B frame @10G              = 812,743 pps      → 1.23 µs
-```
-
-**67 nanoseconds per packet.** At 3 GHz that is roughly 200 cycles for *everything*: DMA, descriptor handling, parse, dispatch. A single LLC miss is ~80 ns — you cannot afford one per packet at line rate with small frames. This single number explains DPDK's entire design (batching, prefetching, huge pages, no syscalls) and is the answer to "why can't the Linux stack do line rate with 64-byte packets on one core?"
-
-**Where the limits actually bind:**
-
-| Limit | Typical ceiling | Signature when hit |
-|---|---|---|
-| NIC ASIC pps | Often < line rate for small frames (e.g. 20–60 Mpps on a 100G card) | Drops at the NIC with no host load |
-| PCIe transactions | Each packet costs descriptor read + data write + completion; PCIe Gen3 x8 ≈ 63 Gbps usable, and small packets waste TLP overhead | `rx_missed` under small-frame load only |
-| Per-core packet rate | Kernel stack ~1–2 Mpps/core; DPDK 10–30 Mpps/core | 100% softirq CPU, `ksoftirqd` runnable |
-| Interrupt rate | ~200k–1M IRQ/s before the CPU is consumed by entry/exit | High `%irq`, latency rising with load |
-| Multicast group / flow-steering table size | Hundreds to thousands of entries | Groups silently fall back to host filtering (Ch. 37 §37.8) |
-
-**Frame size dominates everything.** A NIC that does 100 Gbps with 1500-byte frames may manage only 30 Gbps with 128-byte frames, because the bottleneck is transactions, not bytes. Market data is *small-packet* traffic — ITCH messages are tens of bytes — so trading networks live in the worst region of the curve. Anyone benchmarking with `iperf`'s default large TCP segments is measuring the wrong thing entirely.
-
-**Batching** is the standard mitigation and the standard tradeoff (Ch. 52 §52.13): processing 32 packets per poll amortizes the per-batch cost across 32 packets, raising throughput dramatically while adding up to a batch-time of latency to the first packet in the batch. Under low load, batching should collapse to batch-size-1 naturally — which is exactly what a busy-poll loop does, and why busy polling is both the lowest-latency and (at low rates) not the highest-throughput design.
-
----
-
-## 48.15 Offered Load and Goodput
-
-Four terms that get muddled, defined precisely:
-
-- **Offered load** — the rate at which traffic is *presented* to the system, whether or not it can be handled.
-- **Throughput / carried load** — the rate actually delivered, in bits or packets per second.
-- **Goodput** — the rate of *useful application payload* delivered, excluding headers, retransmissions, duplicates, and padding.
-- **Capacity** — the maximum sustainable throughput.
-
-```
-offered load
-     │
-     ├──► accepted ──► delivered ──► useful payload = GOODPUT
-     ├──► dropped (ring, queue, switch buffer)
-     └──► duplicated / retransmitted (counted in throughput, not goodput)
-```
-
-**Goodput arithmetic** (Ch. 36 §36.4). A 40-byte ITCH-style message inside UDP/IPv4/Ethernet:
-
-```
-payload 40 + UDP 8 + IP 20 + Eth 14 + FCS 4 = 86  (below 64-byte minimum? no, 86 > 64)
-on-wire = 86 + 8 preamble + 12 IFG = 106 bytes
-goodput efficiency = 40 / 106 = 37.7%
-```
-
-So a 10 Gbps link carrying single-message datagrams delivers under 4 Gbps of application data. **Message aggregation** — packing many messages into one datagram, which every real exchange feed does — moves this dramatically: ten 40-byte messages in one datagram gives 400/466 = 86%. This is why "our feed is 2 Gbps" tells you nothing about message rate without knowing the packing.
-
-**The throughput–latency curve** (Ch. 52 §52.14) is the concept behind the whole section:
-
-```
-latency
-  │                                        ╱  ← knee: queues start filling
-  │                                      ╱
-  │                                    ╱
-  │─────────────────────────────────╱          ← flat region: latency ≈ structural floor
-  └──────────────────────────────────────────► offered load
-                                   ~70-80% of capacity
-```
-
-Latency is flat and near the structural minimum until utilization approaches capacity, then rises hyperbolically (the M/M/1 intuition: mean queue delay ∝ ρ/(1−ρ)). Two operational conclusions: (1) **run well below the knee** — a link at 80% average utilization has a terrible tail; (2) **the average is the wrong statistic**, because microbursts (Ch. 39 §39.5) put you past the knee for milliseconds at a time even when the one-second average is 20%.
-
-**Measuring correctly:**
-
-- **Report offered load and goodput together.** "We handle 5 Mpps" is incomplete without the loss rate at that offered load. A system that "handles" 5 Mpps while dropping 3% is handling 4.85.
-- **Test past the knee deliberately** to find where the system degrades and *how* — gracefully (queueing, then drops) or catastrophically (livelock, where the machine spends 100% of its time in interrupt handling and delivers nothing; Ch. 24 §24.18). Receive livelock's signature is throughput that *decreases* as offered load increases.
-- **Load generators must not be the bottleneck.** `pktgen`, DPDK `pktgen`, TRex, or a hardware generator (Ixia/Spirent). A software generator that can't sustain the target rate silently under-offers, and you conclude your receiver is fine.
-- **Coordinated omission again** (Ch. 43 §43.3): an open-loop generator (fixed rate regardless of responses) exposes queueing; a closed-loop generator (send next after response) throttles itself and hides it. For latency-under-load testing, open-loop is mandatory.
-
-**Overload policy is a design decision, not an accident** (Ch. 52 §52.16). When offered load exceeds capacity you will drop something; choosing *what* — oldest-first, newest-first, by priority, by symbol — is far better than letting a ring overflow arbitrarily. For market data, dropping the *oldest* queued message is often correct because stale prices have no value; for order entry, dropping newest and rejecting explicitly is correct because silent loss of an order is unacceptable.
-
----
-
-## Key Interview Questions
-
-1. **Why is an FPGA fundamentally faster than optimized C++ on a bypass stack?** — Cut-through processing begins before the frame fully arrives, there is no instruction fetch/decode or cache hierarchy, and the pipeline is cycle-deterministic; cost is a tiny logic budget and hours-long builds.
-2. **What is a pre-staged (canned) order and why is it the dominant FPGA order-entry design?** — The CPU builds the full message, checksum and all, and arms an FPGA slot; the FPGA only evaluates a comparator and streams fixed bytes, so all complexity stays off the critical path.
-3. **Are SmartNIC cores faster than host cores?** — Almost never for SoC/DPU designs; their value is offloading non-critical infrastructure, filtering, replication, and timestamping, not accelerating hot-path logic.
-4. **Where exactly is a NIC hardware timestamp taken, and what does it exclude?** — At the MAC/PHY into the PHC domain; it excludes DMA, interrupt, softirq, and application scheduling — which is precisely why HW-minus-app is your stack latency.
-5. **Why can't you compare a hardware timestamp to `clock_gettime(CLOCK_REALTIME)` directly?** — They are different clock domains (PHC vs system clock); you must translate, and the translation carries `phc2sys` error.
-6. **Boundary clock vs transparent clock?** — BC terminates PTP and re-masters (servo error compounds per hop); TC forwards while adding measured residence time to `correctionField`, which is why trading networks use TCs.
-7. **What single assumption does PTP's offset formula depend on?** — Path symmetry; asymmetry Δ produces exactly Δ/2 of unremovable error, invisible to any amount of averaging.
-8. **Why doesn't averaging a million samples fix clock error?** — Averaging reduces jitter, not offset; offset is systematic and slowly varying.
-9. **Why does `tcpdump` show an 8 KB TCP segment that can't exist on the wire?** — GRO/LRO coalesced it before the `AF_PACKET` tap; disable offloads or capture externally.
-10. **Why does `tcpdump` show nothing for a kernel-bypass application?** — Onload/DPDK/ef_vi take the packet before the kernel stack; use the stack's own capture tool or an external tap.
-11. **RTT/2 as one-way delay — what's wrong?** — Assumes path symmetry and zero remote turnaround; in trading, market data and order entry traverse physically different paths.
-12. **What is the gold-standard tick-to-trade measurement?** — Tap inbound feed and outbound order into one capture device so both timestamps share a clock, eliminating sync error entirely.
-13. **How do you correlate the triggering tick with the resulting order?** — Embed the triggering message's sequence identifier in the client order ID; nearest-preceding correlation under-reports latency during bursts.
-14. **How would you localize a market-data gap?** — Layered counters: exchange sequence numbers, `ethtool -S rx_missed/rx_no_buffer`, `/proc/net/snmp` UDP errors, `SO_RXQ_OVFL`, and capture `ps_drop`/`ps_ifdrop`.
-15. **Why is a bigger RX ring not always better?** — It converts loss into latency; a packet delayed 500 µs behind a full ring is stale data, and a deep ring hides a slow consumer while worsening cache/DDIO footprint.
-16. **How many packets per second is 10 GbE, and why does the number matter?** — 14.88 Mpps at 64 bytes, i.e. 67 ns or ~200 cycles per packet — less than one LLC miss, which dictates batching, prefetching, and no syscalls.
-17. **Why can a 100 G NIC deliver only 30 Gbps of small frames?** — The bottleneck is packet/PCIe transaction rate, not bits; small frames waste PCIe TLP overhead and exhaust the ASIC's pps budget.
-18. **Difference between throughput and goodput, with numbers?** — Goodput excludes headers, IFG, retransmits and duplicates; a 40-byte message per datagram is only ~38% efficient on the wire, versus ~86% when ten are packed together.
-19. **Why report a latency histogram instead of a jitter number?** — Minimum delay is the structural floor and everything above it is queueing; a smoothed jitter scalar hides exactly the tail that matters.
-
----
-
-## Common Traps
-
-- **Believing a host `tcpdump` shows the wire** — GRO/LRO/TSO fabricate segments; kernel bypass is invisible entirely.
-- **Ignoring `packets dropped by kernel`** in capture output — drops correlate with microbursts, so the capture is blind precisely where it matters.
-- **Mixing PHC and system-clock timestamps** — symptom is negative latencies or a constant offset that changes on `phc2sys` restart.
-- **Reporting one-way delay without a clock error bar** — the number is unverifiable and often smaller than the error.
-- **Treating RTT/2 as one-way delay** on an asymmetric path.
-- **Assuming more samples cancel clock offset** — they cancel jitter only.
-- **Using `CLOCK_REALTIME` for latency deltas** — it steps; use `CLOCK_MONOTONIC`/TSC.
-- **Forgetting to drain `MSG_ERRQUEUE`** for TX timestamps — TX stamps silently stop.
-- **Software timestamps under interrupt coalescing** — produces the inverted profile where the system looks faster under load.
-- **Sizing the RX ring for the burst instead of fixing the consumer stall** — trades drops for stale data.
-- **Forgetting rings are per-queue** — reducing RSS queues silently reduces total absorption.
-- **Benchmarking with large frames** — hides the pps limit that actually binds on market data.
-- **Closed-loop load generators** for latency-under-load — they self-throttle and hide queueing (coordinated omission).
-- **A load generator that is itself the bottleneck** — you measure the generator, not the system.
-- **Assuming line rate means line rate at any frame size** — NIC ASIC and PCIe transaction limits bind first.
-- **FPGA firing on duplicate A/B feed packets** — double orders separated by the feed skew; dedupe by sequence number, not time window.
-- **Non-atomic FPGA slot updates** — a fire racing an update sends a hybrid order; publish the arm word last with a generation counter.
-- **Assuming pre-trade risk is covered because the CPU checks it** — if the CPU isn't on the path, neither are its checks.
-- **10GBASE-T copper on a latency path** — ~2 µs of PHY latency, versus ~300 ns for SR fibre.
-- **Quoting mean utilization** — microbursts put you past the knee while the one-second average looks idle.
-
----
-
-## Compact Recall Summary
-
-**FPGA.** Reconfigurable logic, no instruction fetch, cut-through parsing that starts before the frame ends: 20–100 ns wire-to-wire versus 1–5 µs for bypass CPU and 10–50 µs for kernel sockets — and a near-spike latency distribution, which is often worth more than the mean. Costs: tiny logic budget, hours-long place-and-route, fixed-point only, hard debugging.
-
-**FPGA order entry.** The production pattern is the **pre-staged trigger**: the CPU builds the full message with precomputed checksum and sequence number and arms a slot; the FPGA evaluates one comparator and streams bytes. Publish payload before the arm word, use a generation counter so a late disarm can't resurrect an old arm, put pre-trade risk and the kill switch in the fabric, and dedupe A/B feeds by sequence number or you double-fire.
-
-**SmartNICs.** FPGA / ASIC-pipeline (P4) / SoC-DPU. DPU cores are *slower* than host cores — offload infrastructure, filtering, replication and capture beside the path, never hot-path logic. An in-line DPU adds a 1–3 µs store-and-forward hop.
-
-**Timestamping.** HW (PHC domain, ns resolution, excludes everything downstream) > kernel SW (NAPI/softirq, µs error, inverted under coalescing) > application. TX stamps return via `MSG_ERRQUEUE` — drain it. HW-minus-app is your stack latency; that decomposition is the whole point of having multiple stamp points.
-
-**PTP.** Four-timestamp exchange; offset = ((t2−t1)−(t4−t3))/2 assuming **path symmetry**. Transparent clocks (add residence time) beat boundary clocks (compound servo error). Grandmaster on GNSS with OCXO/rubidium holdover; `ptp4l`/`phc2sys`/`ts2phc`. Error = offset (systematic, unaveraged away) + skew (ppm) + jitter. MiFID II's 100 µs is compliance time, not measurement time. PTP runs on TAI; a bad `currentUtcOffset` shows as exactly 37 s.
-
-**Capture.** libpcap over `AF_PACKET` + BPF + `PACKET_MMAP`; select `ADAPTER_UNSYNCED` for the tightest relative deltas. Check `ps_drop` (ring) and `ps_ifdrop` (NIC) before believing anything. Host captures see post-offload traffic and never see kernel bypass — use an L1 tap (~5 ns fanout) into a capture appliance.
-
-**One-way vs round-trip.** RTT needs one clock and hides asymmetry; OWD needs two and inherits their offset. The gold standard is single-clock wire-to-wire tick-to-trade via taps on both fibres, with the trigger's sequence ID embedded in the client order ID for exact correlation.
-
-**Loss and jitter.** Localize loss with layered counters (exchange sequence → NIC → kernel → socket `SO_RXQ_OVFL` → capture). Report histograms: min is the structural floor, p99.9−min is the queueing. Bin at 10–100 µs to see microbursts.
-
-**Rings and rates.** `required ≈ peak_pps × max_service_gap`; bigger rings convert loss into *stale data* and hide slow consumers. 10 GbE at 64 B = 14.88 Mpps = 67 ns = ~200 cycles per packet, less than one LLC miss — hence batching, prefetch, no syscalls. Small frames bind on pps and PCIe transactions, not bits.
-
-**Load.** Offered ≠ carried ≠ goodput; a lone 40-byte message on the wire is ~38% efficient, ten packed are ~86%. Latency is flat until ~70–80% of capacity then hyperbolic, so run below the knee, measure with open-loop generators, and choose your overload policy deliberately — drop oldest for market data, reject explicitly for orders.
+| Frame crossed physical link | Calibrated external tap/capture or documented port timestamp |
+| NIC received frame | Documented NIC/MAC counter or RX hardware timestamp |
+| Host buffer became available | Device completion with documented semantics |
+| Kernel accepted datagram | Named kernel/socket point and counter |
+| Bypass application saw packet | Completion dequeue plus sequence ID |
+| Frame began transmission | Documented TX hardware timestamp near egress |
+| TX buffer may be reused | Completion under the device ownership contract |
+| End-to-end application latency | Application-defined start/end plus correlation and clocks |
+| Wire-to-wire reaction | Two directions captured in one calibrated clock domain |
+
+### 48.12 Decision checklist for acceleration
+
+1. What measured component dominates the target percentile or deadline miss?
+2. Which stage will the accelerator remove rather than relocate?
+3. Can required state, parsing, risk, and error handling fit?
+4. What queue or bridge does acceleration add?
+5. What is the fallback when device logic, host control, link, or clock fails?
+6. How are configuration generations and events reconciled?
+7. Can the accelerated path be captured, timestamped, and replayed?
+8. Which product/firmware/bitstream claims require revalidation after upgrade?
+9. Does the improvement persist end to end under representative offered load?
+
+### 48.13 Primary references
+
+- Linux kernel, [Timestamping](https://docs.kernel.org/networking/timestamping.html): `SO_TIMESTAMPING`, TX error-queue delivery, hardware providers, and device configuration.
+- Linux kernel, [Scaling in the Linux Networking Stack](https://docs.kernel.org/networking/scaling.html): RSS, RPS, RFS, and XPS.
+- Linux kernel, [Segmentation Offloads](https://docs.kernel.org/networking/segmentation-offloads.html): TSO, GSO, GRO, and related offloads.
+- Linux kernel, [ethtool netlink interface](https://docs.kernel.org/networking/ethtool-netlink.html): versioned device-query and timestamp-provider interfaces.
+- linuxptp, [`ptp4l`](https://www.linuxptp.org/documentation/ptp4l/) and [`phc2sys`](https://www.linuxptp.org/documentation/phc2sys/): PHC synchronization and time-scale behavior.
+- libpcap, [`pcap_stats`](https://man7.org/linux/man-pages/man3/pcap_stats.3pcap.html): capture-statistic definitions and portability warnings.
+- Wireshark, [User’s Guide](https://www.wireshark.org/docs/wsug_html_chunked/): capture, timestamp display, checksum, and protocol-analysis behavior.
+
+Use the documentation matching the installed kernel, tool, driver, NIC, and firmware. “Latest” documentation is not evidence for an older deployed system.
+
+## Recall card
+
+- A descriptor represents buffer ownership; it is not necessarily one packet.
+- RX: post → NIC owns → receive/DMA → completion → software owns → recycle.
+- TX acceptance, descriptor completion, hardware timestamp, and wire departure are different events.
+- Multiple queues trade parallelism against ordering, locality, imbalance, and buffering.
+- Ring lower bound for a service gap is \(\lceil Rg\rceil\), then add occupancy and burst assumptions.
+- Offloads move work and alter capture semantics; choose them per goal.
+- A hardware timestamp is near a documented provider, not automatically at the wire.
+- TX timestamps on Linux are asynchronous; drain and correlate the error queue.
+- One-way time across clocks includes relative offset; RTT includes two paths and turnaround.
+- PTP symmetry error is \((d_f-d_r)/2\); averaging does not remove it.
+- External single-clock capture avoids endpoint offset but needs channel calibration and loss checks.
+- Minimum-frame MAC PPS uses 64 + 8 + 12 byte-times under the declared Ethernet assumptions.
+- Offered load, accepted load, throughput, goodput, and capacity are different.
+- Find saturation with an open-loop sweep and report latency, goodput, and loss together.
+- FPGA benefit comes from a bounded pipeline and earlier action, not a universal latency number.
+
+## Review questions
+
+1. Why can an RX ring with 1,024 descriptors hold fewer than 1,024 packets?
+2. Distinguish TX socket acceptance, descriptor completion, and hardware egress timestamp.
+3. Why can GRO make a host capture unsuitable for a wire packet-count claim?
+4. Derive the packet rate for a declared link rate and frame size. Which overheads must be named?
+5. What clock and path assumptions are hidden by reporting one-way latency?
+6. Why is RTT/2 generally not a measured one-way delay?
+7. How does a stable forward/reverse path asymmetry bias a PTP offset estimate?
+8. Give two ways a larger RX ring can improve one outcome while harming another.
+9. What must an FPGA order-entry path do besides recognize a trigger?
+10. How would you distinguish source loss, NIC no-buffer loss, capture loss, and application-queue loss?
+
+## Exercise
+
+Measure one receive path at three offered-load levels.
+
+Before running:
+
+1. draw the wire-to-application stages;
+2. name the timestamp provider and clock domain;
+3. record NIC, firmware, driver, kernel, queue, ring, coalescing, offload, CPU, and NUMA state;
+4. derive expected packet rate from the actual frame-size distribution;
+5. choose source, capture, NIC, kernel/bypass, and application sequence/drop counters;
+6. define a freshness deadline, loss limit, and independent run count.
+
+At each load, retain raw timestamp deltas and all counts. Repeat once with a single controlled change—coalescing, queue placement, offload, or ring depth. Explain the result as a path change, not just a percentage.
+
+Then audit your own report: could a reader tell whether the timestamp begins at first bit, end of frame, hardware provider, driver entry, or application dequeue? If not, the central number is not yet publishable.
+
+## Puzzle
+
+After enabling RX hardware timestamps, a team reports that “wire-to-application latency” improved by several microseconds, even though no packet-processing configuration changed. External capture shows identical application response times. What happened?
+
+The likely error is a changed start point, not a faster path. The previous software timestamp may have been generated later in the host receive path than the hardware timestamp—or the two values may have been translated incorrectly between PHC and system clock domains. Subtracting each from the same application timestamp changes the reported interval. A hardware stamp can reveal more of the path, but enabling it cannot retroactively accelerate the packet. Define both old and new placement and validate clock conversion against the external common-clock measurement.
+
+## Common traps
+
+- Calling a MAC or completion timestamp “the wire” without provider documentation.
+- Comparing PHC and system-clock values without conversion and uncertainty.
+- Displaying nanoseconds and implying nanosecond accuracy.
+- Treating more PTP samples as a cure for stable path asymmetry.
+- Reporting RTT/2 as one-way delay without symmetry and turnaround evidence.
+- Correlating a response with the nearest earlier packet during a burst.
+- Believing host capture preserves wire packet boundaries with offloads enabled.
+- Diagnosing locally captured partial checksums as wire corruption.
+- Assuming tcpdump can see a bypass path.
+- Ignoring capture drops because application counters look complete—or vice versa.
+- Treating driver counter names as portable semantics.
+- Summing overlapping drop counters.
+- Forgetting duplicates and late packets in “loss” accounting.
+- Equating a descriptor with a packet.
+- Sizing a ring from average PPS instead of burst/service-gap behavior.
+- Increasing a ring without checking added residence time and freshness.
+- Assuming a documented maximum ring depth is the right operating depth.
+- Treating more queues as universally better.
+- Moving a flow between queues without checking ordering.
+- Quoting line-rate PPS as measured host capacity.
+- Omitting preamble and interpacket gap from small-frame arithmetic.
+- Reporting requested generator rate instead of observed offered rate.
+- Using a closed-loop generator to find saturation.
+- Defining capacity without latency and loss criteria.
+- Benchmarking only one frame size or flow distribution.
+- Enabling/disabling all offloads as a ritual instead of matching the endpoint.
+- Assuming SmartNIC or DPU product naming identifies its datapath.
+- Quoting FPGA, PHY, PCIe, or NIC latency without board/image/version and endpoints.
+- Accelerating the comparator while leaving risk or recovery outside the actual path.
+- Publishing a staged order before its payload and version are coherently visible.
+- Measuring the fast FPGA path but excluding host reconciliation and failure behavior.
+
+## Prerequisite check
+
+You are ready to use this chapter when you can:
+
+- distinguish an Ethernet frame, IP packet, transport datagram/segment, and application message;
+- explain DMA descriptor ownership and why memory ordering is device-specific;
+- distinguish bit rate, packet rate, throughput, and goodput;
+- explain the difference between a clock’s resolution and its accuracy;
+- identify at least three possible receive timestamp points;
+- use sequence numbers to localize a gap;
+- state why a profile, counter, or timestamp difference needs a controlled intervention.
+
+If any item is unfamiliar, begin with one RX queue and two observation points. Draw ownership, capture one fixed workload, reconcile every sequence number, and attach a clock domain to every timestamp before optimizing anything.

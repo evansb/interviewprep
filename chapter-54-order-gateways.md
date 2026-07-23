@@ -1,580 +1,769 @@
 # Chapter 54 — Order Gateways
 
-*Interview-focused revision notes. The theme: a market-data feed can drop a message and you lose an opportunity; an order gateway can drop a message and you lose money you did not know you had spent. This chapter is about the session, sequencing, and identity machinery that makes an unreliable duplex link carry legally binding instructions exactly once.*
+## Why this matters
+
+An order gateway is the last component under the firm’s control before an instruction can create venue exposure. It owns more than serialization and a socket. It must decide whether the session may send, assign durable identities, correlate every response, survive duplicates and gaps, preserve uncertainty after a disconnect, and reconcile its model with external evidence.
+
+The central difficulty is an information boundary. After bytes may have left the process but before an authoritative venue response arrives, the gateway cannot infer whether an order was accepted, rejected, filled, or never received. A timeout does not resolve that ambiguity. Correct gateways represent it, fence new exposure when necessary, and recover through protocol-defined replay, queries, drop copy, and reconciliation.
+
+Chapter 50 owns order types, matching, and venue lifecycle semantics. Chapter 51 owns framing, parsing, encoding, and schema evolution. This chapter assumes both and owns **gateway session and order correctness**: state machines, identifiers, idempotence, races, reconnect, throttling, and reconciliation.
+
+All protocol names in this chapter are examples, not portable contracts. “FIX” means the FIX Session Layer plus the counterparties’ rules of engagement. “OUCH 5.0” means the named Nasdaq specification revision. Native binary and FIXP-based venues define different sequence, recovery, identifier, and cancel behavior. Pin the venue, market, session type, schema/version, and effective date in every implementation decision.
 
 ---
 
-**Terminology used throughout.** An **order gateway** (or *order entry gateway*, OE) is the component that owns the outbound connection to an exchange or broker and translates internal trading intents into protocol messages, and exchange responses back into internal events. A **session** is one authenticated, sequenced logical connection over that link — usually one TCP connection, but the session concept outlives the connection. An **order** is an instruction to buy or sell a quantity of an instrument at a price; once **acknowledged** by the exchange it is **live** (also *working*, *resting*) and can trade. An **execution** or **fill** is a report that some quantity traded. **Cancel** removes a live order; **cancel/replace** (also *modify*, *amend*) changes price or quantity. An **exchange session** typically runs one trading day; sequence numbers usually reset at a defined boundary.
+## 90-second screen — Core
+
+- Session state answers **whether and how messages may flow**. Order state answers **what the venue may have done**. Reconnecting a session does not make orders known.
+- A successful socket write is not venue acceptance. An acknowledgement is not proof that an order is still live: it may already have partially or fully filled.
+- Assign a stable internal order handle and protocol idempotency key before any send attempt. Never recycle either until the venue’s replay, late-message, correction, and reconciliation windows are closed.
+- Model the venue lifecycle separately from outstanding commands. An order can be working while a cancel is pending, fill while that cancel is pending, and finish before a cancel reject arrives.
+- Process delivery as at least once: classify session duplicates, deduplicate business events by their specified identity, and make every state mutation and downstream side effect idempotent.
+- After disconnect, preserve each order’s last confirmed facts and mark unresolved effects unknown. Resume/replay where the protocol supports it; query and reconcile where it does not.
+- Rate limits and cancel-on-disconnect are venue/session/version contracts. A local cancel reserve cannot bypass an exchange quota, and cancel-on-disconnect does not prove that no fill occurred.
+
+Be ready to defend:
+
+1. At which exact event does the gateway promise the strategy “accepted locally,” “sent,” “accepted by venue,” and “no longer live”?
+2. What safe action follows a disconnect at each point from “definitely not sent” through “execution may already have occurred”?
 
 ---
 
-## 54.1 Trading-Session Logon and Logout
+## 54.1 Gateway responsibilities, trust boundaries, and invariants — Core
 
-A session begins with a **logon**: an authentication and negotiation handshake carried inside the protocol, above TCP. In FIX (Ch. 51 §51.1) this is `MsgType=A` carrying `SenderCompID`, `TargetCompID`, optional `Username`/`Password` or a signed credential, `HeartBtInt` (heartbeat interval in seconds), `EncryptMethod`, and critically `MsgSeqNum` — the logon is itself a sequenced message. In binary protocols like OUCH or SBE-framed native gateways, logon is a fixed-layout `LoginRequest` with account, password, and a *requested sequence number* field. The exchange replies with a logon accept (echoing the negotiated heartbeat interval, which may be *lower* than requested) or a reject with a reason code.
+The gateway sits between internal intent and an external authority:
 
-Two negotiation outcomes matter and they are the source of most first-day-on-the-desk incidents:
+```text
+strategy
+   |
+   | order intent + risk authorization
+   v
+order gateway
+   |  admission -> identity -> encode -> sequence -> send
+   |  receive -> validate -> correlate -> reduce -> publish
+   v
+venue order-entry session
+   |
+   +---- independent evidence: drop copy / status / trade files
+```
 
-| Field | Meaning | Hazard |
+The strategy owns desired behavior. The risk service owns the firm’s authorization policy. The venue owns whether an order exists and what traded. The gateway owns an auditable translation between them; it must not turn transport success into venue truth or local timeout into rejection.
+
+### Non-negotiable invariants
+
+1. **One owner mutates a session’s protocol state.** This gives a total order for outbound sequence assignment, inbound processing, throttling, and order transitions.
+2. **Every send attempt is correlatable before bytes may leave.** The internal handle and client request identifier already exist and are recorded.
+3. **Confirmed facts never become guesses.** A known fill remains a fill across disconnect; an unacknowledged new remains unknown until authoritative evidence resolves it.
+4. **Quantities reconcile.** For ordinary execution flow, `0 <= cumulative <= accepted quantity`; remaining quantity and terminal status must agree with the venue’s protocol semantics.
+5. **Duplicate input cannot duplicate a business effect.** Position, risk reservation, strategy notification, and journal publication are covered—not only the in-memory order object.
+6. **No new exposure while recovery is incomplete unless a documented degraded mode authorizes it.** The decision belongs to risk policy, not a reconnect callback.
+7. **External evidence is never discarded because it contradicts memory.** An unknown-order fill is a critical reconciliation event, not a log line to ignore.
+
+### Commit points, not vague “success”
+
+Use distinct acknowledgements internally:
+
+| Gateway event | Defensible statement | Statement not yet defensible |
 |---|---|---|
-| `HeartBtInt` | Idle interval before a heartbeat is required | Exchange may impose its own; honor the *response*, not your request |
-| `ResetSeqNumFlag` (141=Y) | "Start both directions at 1" | Discards the exchange's memory of what it sent you — including fills you never processed |
-| `NextExpectedMsgSeqNum` (789) | "I expect your next outbound to be N" | Makes recovery declarative; if supported, always use it |
+| Intent rejected before admission | Gateway will not send this intent | Nothing about prior related orders |
+| Intent admitted and ID allocated | Gateway owns a request record | Venue received it |
+| Bytes queued/written to transport | A send attempt occurred | Venue parsed or accepted it |
+| Venue new-order acceptance | Venue accepted according to that report | Order is still unfilled/live now |
+| Venue execution report | Reported quantity traded | Every independent feed has observed it |
+| Venue cancel confirmation | Venue reports cancellation effective under its rules | No earlier execution can arrive late |
+| Reconciliation closes the window | Named authorities agree for named scope/time | Future corrections are impossible |
 
-The logon is the last point at which the two sides agree cheaply about state. After it, every disagreement costs a resend or a manual reconciliation.
-
-**Logout** (`MsgType=5`, or `LogoutRequest`) is a *graceful* termination: the initiator sends logout, the responder echoes it, then either side closes TCP. The half-close ordering matters (Ch. 38 §38.20): if you close the socket immediately after writing the logout, data the exchange already sent may be discarded by your kernel and RST'd back, and the exchange records an abnormal disconnect — which, depending on venue configuration, may trigger cancel-on-disconnect (§54.13) when you intended an orderly end-of-day. The correct sequence is: send logout, `shutdown(fd, SHUT_WR)`, keep reading until EOF or a short timer expires, then `close`.
-
-A logout is *not* a cancel. Live orders survive logout unless the venue's session configuration says otherwise (many venues persist GTC orders across sessions and cancel day orders at close). Candidates who assume "disconnect means flat" are wrong at most venues and dangerously wrong at the rest, because the assumption is silently correct in staging environments where they had no resting orders.
-
-**Engineering shape.** Logon is a *cold-path* operation (Ch. 52 §52.7) — it runs once, it can allocate, it can log verbosely, it can take milliseconds. Keep it entirely out of the hot-path code so that its parsing generality and error handling never appear in the steady-state instruction stream. The session state machine, however, must be visible to the hot path as a single atomically-read enum, because every outbound order must check "am I logged on?" in a few nanoseconds.
-
-```cpp
-enum class SessionState : uint8_t {
-    Disconnected, Connecting, LogonSent, Established, LogoutSent, Failed
-};
-// hot path reads one relaxed atomic; no lock, no branch to the session module
-std::atomic<SessionState> state_{SessionState::Disconnected};
-```
-
-Legal transitions form a small graph; encode it as a table and reject illegal transitions loudly rather than tolerating them, because a gateway that silently accepts `Established → LogonSent` is a gateway that will one day send orders on a socket the exchange has already forgotten.
+The precise local durability point is architectural. A gateway may synchronously journal before send, replicate an admitted command to another process, or rely on venue recovery plus an asynchronous journal. Each choice creates a different crash window. Document the guarantee instead of calling all three “persisted.”
 
 ---
 
-## 54.2 Session Heartbeats
+## 54.2 Two state machines, one owner — Core
 
-A **heartbeat** is a periodic no-op message whose sole purpose is to prove the session is alive in both directions. TCP alone cannot do this: a peer that has crashed, or a path that has silently blackholed, produces no error on an idle socket. `SO_KEEPALIVE` defaults are measured in hours (Ch. 38 §38.16) and are useless here. The protocol-level heartbeat gives you a liveness detector with a bound you control.
+Session state and order state interact, but neither should be encoded inside the other.
 
-The standard mechanism (FIX, and structurally identical in binary protocols):
+### Session state machine
 
-- If you have sent nothing for `HeartBtInt` seconds, send a heartbeat.
-- If you have *received* nothing for `HeartBtInt` seconds, send a **test request** (`MsgType=1`) carrying a `TestReqID`.
-- If no response (a heartbeat echoing that `TestReqID`) arrives within roughly another interval, declare the session dead and disconnect.
+```text
+Disconnected
+    |
+    v
+Connecting -> Authenticating -> Recovering -> Active
+    |              |               |           |
+    +--------------+---------------+-----------+
+                       failure
+                         |
+                         v
+                       Fenced
 
-Two subtleties separate strong candidates. First, **any** outbound message resets the outbound timer — a heartbeat is only needed on idle, so a busy session sends none, and the absence of heartbeats is not evidence of trouble. Second, the receive-side detector must be armed against a *slow reader*, not just a dead peer: if your own event loop is stalled (a page fault, a GC-equivalent stall from an allocation, a `write()` blocking on a full socket buffer), you will fail to send your heartbeat and the exchange will drop *you*. Heartbeat failures are therefore a leading indicator of local latency pathology, not only of network trouble, and this is the diagnostic signature worth memorizing: **exchange-initiated disconnects clustered on the same host with no packet loss on the wire means your process stalled.**
-
-Implementation discipline for a busy-spin gateway (Ch. 55 §55.3):
-
-```cpp
-// Called from the spin loop; no syscall unless a heartbeat is actually due.
-inline void poll_timers(uint64_t now_tsc) noexcept {
-    if (now_tsc - last_tx_tsc_ >= hb_interval_tsc_) send_heartbeat();
-    if (now_tsc - last_rx_tsc_ >= hb_interval_tsc_ && !test_req_outstanding_)
-        send_test_request();
-    if (test_req_outstanding_ && now_tsc - test_req_tsc_ >= hb_interval_tsc_)
-        fail_session(Reason::HeartbeatTimeout);
-}
+Active -> LogoutPending -> Disconnected
 ```
 
-Use TSC deltas (Ch. 43 §43.12), not `clock_gettime`, so the timer check costs a compare rather than a vDSO call. The comparison against a precomputed `hb_interval_tsc_` avoids a division. Note the check is *unconditional* per loop iteration — a predictable, always-not-taken branch costs essentially nothing, whereas a timerfd (Ch. 33 §33.10) costs an epoll wakeup you do not want on an isolated core.
+- **Disconnected:** no usable transport.
+- **Connecting:** transport establishment is in progress.
+- **Authenticating:** logon/establishment negotiation is incomplete.
+- **Recovering:** authenticated, but sequence gaps and order uncertainty are unresolved.
+- **Active:** application sends are permitted subject to risk and throttle.
+- **LogoutPending:** graceful session closure is in progress; new application flow is stopped.
+- **Fenced:** the gateway deliberately refuses new exposure because identity, sequence, authority, or recovery is unsafe.
 
-A final operational point: heartbeat intervals of 30 seconds are common by convention but are far too coarse for a low-latency system's own health monitoring. Run an internal watchdog (Ch. 56 §56.7) at millisecond granularity on the gateway thread independently of the protocol heartbeat; the protocol heartbeat exists to satisfy the exchange, the watchdog exists to satisfy you.
+Whether cancel messages are permitted during `Recovering` is a venue and risk-policy decision. Some venues accept them only after session synchronization; an alternate cancel facility may be required. “Not Active” therefore cannot be one Boolean used for every message class.
+
+The session owner publishes a coarse state to producers, but only the owner decides admission after rechecking it. A producer can read `Active`, enqueue an intent, and race a disconnect. The consumer must validate the state and authorization again at the actual admission point.
+
+### Trading-session logon and logout
+
+**FIX Session Layer label:** a FIX session may span multiple transport connections. It maintains `NextNumIn` and `NextNumOut`; logon authenticates a new connection into that logical session. Sequence persistence and reset policy come from the FIX session profile and bilateral rules of engagement.
+
+**FIXP/native label:** CME iLink 3 uses FIXP and SBE, while Nasdaq OUCH uses its own order-entry messages over a separately specified session transport. Do not copy FIX tag behavior into these protocols.
+
+Logon must validate:
+
+- expected peer/session identity and credentials;
+- negotiated protocol/schema version;
+- expected inbound/outbound sequence or recovery cursor;
+- heartbeat/keepalive terms;
+- trading date and environment;
+- duplicate primary/secondary connection rules;
+- whether the venue reports recovery complete.
+
+The gateway remains `Recovering` until these checks and the order reconciliation gate pass. “TCP connected” and even “logon accepted” are too early for strategy order entry.
+
+Graceful logout is a protocol exchange. For the FIX Session Layer, the initiator waits for the peer’s Logout response while resolving any required gaps before terminating the connection. Socket half-close details are transport implementation choices, not a universal FIX recipe. Logout also does **not** imply cancellation unless the venue’s rules explicitly make it do so.
+
+### Heartbeats and liveness
+
+Protocol keepalives detect a quiet or unresponsive peer; TCP alone may not detect a blackholed path promptly. Under FIX, outbound idleness leads to Heartbeat and inbound silence can lead to TestRequest followed by timeout, according to the configured session rules. Native protocols differ.
+
+Use monotonic elapsed time, not wall-clock time, and track separately:
+
+- last byte/message received;
+- last valid application/session message processed;
+- last message transmitted;
+- outstanding test/keepalive challenge and deadline;
+- local event-loop progress observed by an independent watchdog.
+
+A heartbeat timeout identifies loss of timely communication, not its cause. The peer, network, NIC, kernel, or local thread may be responsible. Fence first; diagnose with timestamps and health evidence later.
 
 ---
 
-## 54.3 Session Sequence Reset
+## 54.3 Sequencing, sequence reset, resend, and replay — Core
 
-Every sequenced session protocol assigns each message an integer **sequence number** that increments by exactly one per direction. The invariant "the next message I receive has sequence `expected`" is the entire basis for detecting loss, duplication, and reordering above a byte stream that cannot itself lose data — because the *stream* is reliable, a sequence gap means something worse than packet loss: a message was generated and not delivered, i.e. the session was interrupted, or the peer's state does not match yours.
+Transport sequence and business identity solve different problems. A session sequence detects missing or repeated positions in one logical stream. A client order ID or execution ID determines whether a business effect is new.
 
-**Sequence reset** is the operation that moves the expected number without delivering the intervening messages. Two forms exist and confusing them is a classic interview discriminator:
+### FIX Session Layer example
 
-| Form | FIX encoding | Meaning | When legitimate |
-|---|---|---|---|
-| **Gap fill** | `MsgType=4`, `GapFillFlag=Y`, `NewSeqNo=N` | "Messages up to N−1 were administrative; skip them" | During a resend, replacing heartbeats/logons that must not be replayed |
-| **Hard reset** | `MsgType=4`, `GapFillFlag=N`, `NewSeqNo=N` | "Set your expected inbound to N unconditionally" | Recovery from an unrecoverable mismatch; operationally supervised |
+For FIX, each direction has an independent sequence space. The receiver compares `MsgSeqNum(34)` with `NextNumIn`:
 
-A gap fill is itself sequenced and must arrive at the sequence number it claims to start from; a hard reset is *not* required to, which is precisely why it is dangerous. A hard reset discards the loss detector. If the exchange sends `SequenceReset` with `NewSeqNo` past a fill report you never saw, that fill is gone from the session and can only be recovered from a drop copy (§54.14) or the end-of-day file (§54.15).
-
-The other reset is **logon-time reset** via `ResetSeqNumFlag=Y`, which sets both directions to 1. Firms use it at start-of-day because it removes any dependency on yesterday's persisted state. The hazard is using it *after an intraday disconnect*: you are telling the exchange to forget everything it was going to resend, and any execution report generated during the disconnect window is discarded. The rule to state in an interview: **`ResetSeqNumFlag=Y` is a start-of-day operation with no live orders and no unreconciled fills; intraday reconnects must resume, not reset.**
-
-Persistence is what makes resumption possible. Both the last-sent and last-received sequence numbers must survive a process crash, which means they must be written durably *before* the corresponding message is acted upon. This is the write-ahead journal problem (Ch. 56 §56.1) in miniature:
-
-```cpp
-// Outbound: assign, journal, then send. Never send-then-journal.
-uint64_t seq = ++next_out_;
-journal_.append_and_sync(seq, msg);   // durable
-transport_.send(msg);                 // if we crash after this, we replay a duplicate — safe
-// Inbound: process, then advance. Never advance-then-process.
-```
-
-Ordering matters in opposite directions on the two sides: on send you must persist before transmitting (so a crash cannot lose the fact that a message *may* have gone out); on receive you must process before advancing (so a crash cannot lose an unprocessed message). Getting this backwards produces the two canonical failures — sending an order twice, or losing a fill — and being able to state the asymmetry crisply is a strong signal.
-
----
-
-## 54.4 Resend and Replay
-
-**Resend** is the recovery mechanism: when the receiving side detects that the incoming sequence number exceeds `expected`, it asks the peer to retransmit the range. In FIX this is `ResendRequest` (`MsgType=2`) with `BeginSeqNo` and `EndSeqNo` (0 or 999999 meaning "through the end"). The responder walks its outbound store and re-sends each message with `PossDupFlag=Y` (43=Y) and the *original* `MsgSeqNum` and `SendingTime`, plus `OrigSendingTime` (122) recording when it was first sent.
-
-The mechanics that matter:
-
-- **Administrative messages are not replayed.** Heartbeats, test requests, logons, and resend requests from the original stream are meaningless out of time. They are collapsed into a `SequenceReset`–`GapFill` covering their range (§54.3). A resend response is therefore a *mixture* of real application messages and gap fills.
-- **The requester must not process the range twice.** Messages below `expected` arriving with `PossDupFlag=Y` are duplicates and must be suppressed (§54.9) — but they must be suppressed *at the application level*, because the session layer will happily hand you both copies during a range that overlaps what you already have.
-- **A resend request received while you are already resending** is a recursion hazard; implementations queue or reject it.
-- **The gap detector must not fire on the resend itself.** While resending, the responder's own outbound sequence continues from the high-water mark; the receiver must distinguish "replayed message with an old sequence number" from "new message" purely by `PossDupFlag` and the numeric comparison, not by arrival order.
-
-The **outbound message store** is the data structure behind all of this: an append-only log of every message sent, indexed by sequence number, retained for the session's life. For a gateway sending 100k messages a day at ~200 bytes, that is 20 MB — trivially memory-resident. Preallocate it (Ch. 55 §55.1) as a fixed-capacity ring of offsets into a slab, and size it for the day's worst case plus margin; a store that wraps has silently lost the ability to answer a resend request.
-
-```cpp
-struct OutStore {
-    std::byte* slab;                    // preallocated, huge-page backed (Ch. 32 §32.9)
-    struct Rec { uint32_t off, len; };
-    Rec index[kMaxSeqPerDay];           // seq -> slab slice; seq is dense from 1
-    uint32_t used = 0;
-};
-```
-
-**Replay** is the broader term: replaying the *inbound* stream into the application to rebuild state after a restart. This is distinct from a session resend — it reads your own journal, not the exchange's store — and it is the recovery path in Ch. 56 §56.3. The two must produce the same end state, which is exactly the property that makes a deterministic, side-effect-free application core (Ch. 52 §52.6, Ch. 57 §57.12) worth the design cost: replay is only trustworthy if replaying N messages yields bit-identical state to having processed them live.
-
-Cost note: resend handling belongs on the cold path. It runs after a disruption, it may touch megabytes, and it must be correct rather than fast. Structuring the gateway so the resend responder shares no code with the steady-state send path — only the store — keeps the hot path free of the branches resend logic would otherwise introduce.
-
----
-
-## 54.5 Reconnect Behavior
-
-A **reconnect** is re-establishing the transport and resuming the session after an unplanned disconnect. The engineering questions are: how fast, how many times, and in what state does the application sit while it is down.
-
-**Detection.** A TCP disconnect surfaces as `EPIPE`/`ECONNRESET` on write, `read()` returning 0 (orderly FIN), or nothing at all in the blackhole case — which is why the heartbeat detector (§54.2) is the real disconnect detector and the socket error is merely the fast path. Detection latency is bounded by `min(TCP error, heartbeat timeout)`, and for a system where cancel latency during an outage is a risk exposure, that bound is a design parameter, not an accident.
-
-**Backoff.** Immediate unbounded retry is wrong for two reasons: exchanges rate-limit logon attempts and will lock out a session that hammers (typically 3–5 failures), and a reconnect storm across a fleet after a venue-side event turns a recoverable blip into a lockout. Standard shape: immediate first attempt (the common case is a transient socket error where reconnection succeeds instantly), then exponential backoff with jitter, capped, with a distinct much-longer backoff for *authentication* failures — because a bad password never fixes itself and retrying it locks the account.
-
-```
-attempt 1: 0 ms      (transient errors dominate)
-attempt 2: 100 ms ± 50
-attempt 3: 400 ms ± 200
-attempt n: min(100 * 2^(n-1), 30000) ± 50%
-auth reject: stop; require operator intervention
-```
-
-**Sequence continuity.** On reconnect, send logon with `ResetSeqNumFlag=N` and, if the venue supports it, `NextExpectedMsgSeqNum` set to your expected inbound. This turns recovery into a single declarative statement: the exchange immediately begins its resend from that number without a round-trip `ResendRequest`. Without tag 789 the flow is logon → detect gap → `ResendRequest` → replay, which is three round trips of exposure.
-
-**Application state during the gap.** This is the part candidates underestimate. While disconnected you have *in-flight uncertainty*: orders you sent whose acks you never received, and orders that may have filled. The correct posture is:
-
-| Order state at disconnect | Posture while down | On reconnect |
+| Comparison | Session interpretation | Safe action |
 |---|---|---|
-| Acked, live | Assume live and exposed | Reconcile; it may have filled |
-| Sent, unacked | **Unknown** — may be live | Must be resolved before reuse of its ID |
-| Cancel sent, unacked | Assume still live | Re-query or re-cancel |
-| Filled | Position is real | Verify against drop copy |
+| equal | next expected message | Validate, process, then advance |
+| greater | gap | Hold newer application effects; request recovery |
+| lower with valid `PossDupFlag(43)=Y` | retransmission candidate | Determine whether already processed |
+| lower without permitted duplicate/reset semantics | protocol error | Follow rules of engagement; usually logout/fence |
 
-The unknown states are why the gateway must not simply "resend everything" — a resend of a new-order message the exchange already accepted creates a second order if the venue keys on nothing, or is rejected as a duplicate if it keys on client order ID (§54.6). Idempotency is what makes reconnect safe, and it is designed in at the identifier layer, not bolted on at reconnect time.
+FIX retransmission uses the original sequence number and `PossDupFlag=Y`; fields such as current `SendingTime` are updated and `OrigSendingTime` identifies the original send time. `SequenceReset` with `GapFillFlag=Y` advances over a declared range. The FIX standard permits session messages—and, by counterparty agreement, application messages that will not be retransmitted—to be gap-filled. A hard reset (`GapFillFlag=N`) is exceptional because it can abandon recoverability.
 
-**Multiple sessions.** Firms usually hold several concurrent sessions to a venue for throughput and failover. Two hazards: an order must be cancelled on the *same* session that created it at many venues (session-scoped order IDs), and a failover that moves order flow to a second session leaves the first session's live orders unmanageable if it cannot be restored. Design for "session down ⇒ its orders are frozen but visible", not "session down ⇒ its orders vanish from my model."
+`PossResend(97)` is application-layer, not session-layer, duplicate information. An application resend consumes a new session sequence and must be resolved by business identity according to the rules of engagement. Treating it as interchangeable with `PossDupFlag` is incorrect.
+
+`NextExpectedMsgSeqNum(789)` on Logon can accelerate FIX resynchronization only when the negotiated session profile supports it. It is not a portable reconnect flag.
+
+### Gap policy is a correctness policy
+
+When message `N+2` arrives before missing `N+1`, do not mutate order state with `N+2` merely because parsing succeeded. Buffer within a fixed bound or stop processing and recover the range. If the bound is exceeded, fence and reconnect rather than silently drop.
+
+When responding to a resend request:
+
+1. retrieve the exact requested range from the outbound session store;
+2. retransmit permitted application messages with protocol-correct duplicate fields;
+3. gap-fill messages that the agreed profile does not retransmit;
+4. keep ordinary new outbound sequencing independent from the old sequence values being replayed;
+5. avoid recursive/unbounded resend work through an explicit recovery state and bounded queues.
+
+The store’s retention, capacity, durability, and corruption policy are part of session correctness. A wrapped or missing range means the gateway cannot claim ordinary recovery; it must use the protocol’s supervised reset/reconciliation path.
+
+### Journal, resend store, and application replay
+
+Do not collapse three artifacts:
+
+- **session resend store:** exact outbound wire messages indexed by session sequence;
+- **gateway event journal:** admitted intents, sends, reports, and decisions used for audit/restart;
+- **application replay log:** normalized events used to rebuild deterministic internal state.
+
+They can share storage, but their contracts differ. Raw wire bytes answer “what did we send/receive?” Normalized events answer “what state transition did we apply?” A recovery procedure needs both when a parser or schema bug is possible.
+
+For inbound messages, record enough information before acknowledging irreversible internal consumption. Applying the business effect and advancing a durable cursor need either one transaction or idempotent replay across the crash window. For outbound messages, allocate identity and record the attempted effect before the first operation that may expose bytes externally. A synchronous disk flush per order is not universally required, but the chosen persistence/replication boundary must make the remaining ambiguity recoverable.
 
 ---
 
-## 54.6 Client and Exchange Order Identifiers
+## 54.4 Identity, correlation, and effective-once processing — Core
 
-Every order carries two identities and confusing them causes an entire class of bugs.
+Every order needs identities for three different scopes:
 
-- **Client order ID** (`ClOrdID`, tag 11; `Token` in OUCH) — assigned by *you*, before the order leaves the building. It is the only identifier that exists at the moment of send, and it is therefore the only key you can use to correlate a response with a request that may never have been acknowledged.
-- **Exchange order ID** (`OrderID`, tag 37) — assigned by the *exchange* on acceptance. It is stable for the order's life and is the identifier used in market-by-order feeds and in the exchange's own records.
-
-Uniqueness requirements are protocol-specific but the safe common denominator is: **`ClOrdID` must be unique per session per day, and must never be reused, including for orders that were rejected.** Many venues require global uniqueness across the firm; some require monotonicity. Reusing a `ClOrdID` after a reject is a common bug because the reject "feels like" the order never existed — but if the reject was generated by your own gateway due to a throttle (§54.12) while the message was already on the wire, it did exist.
-
-The cancel/replace chain adds a third identifier: `OrigClOrdID` (tag 41), naming the order being replaced. A replace generates a *new* `ClOrdID`, so an order's identity is a chain:
-
-```
-ClOrdID=A  (new)          → exchange OrderID=X
-ClOrdID=B, OrigClOrdID=A  (replace)  → still OrderID=X
-ClOrdID=C, OrigClOrdID=B  (replace)  → still OrderID=X
+```text
+stable internal order handle
+    |
+    +-- client new-order/request IDs created by the gateway
+    |
+    +-- venue order ID(s) learned from responses
+    |
+    +-- execution/correction IDs learned from reports
 ```
 
-The exchange `OrderID` is invariant across the chain at most venues (not all — some issue a new one per replace, which must be read from the ack). Your internal representation should therefore have a **stable internal order handle** — a dense `uint32_t` index into a preallocated array — that is *neither* of the protocol identifiers, with both mapped onto it. This is the single most important structural decision in the gateway:
+The internal handle identifies the firm’s logical order across replacements and reconnects. A client request ID identifies one new/cancel/replace attempt. The venue order ID identifies the venue object under that protocol; it may be absent before acceptance and may or may not survive replace. Execution identity identifies one trade event or revision.
+
+### Protocol labels
+
+- **FIX application layer:** `ClOrdID(11)`, `OrigClOrdID(41)`, `OrderID(37)`, and `ExecID(17)` are common fields, but uniqueness scope, reuse, correction semantics, and query support come from the application version and venue rules of engagement.
+- **Nasdaq OUCH 5.0 example:** `UserRefNum` is used for uniqueness/duplicate detection in that version; older OUCH versions used an Order Token. This is exactly why field names must be versioned.
+- **Other native protocols:** some use a monotonic client sequence, an exchange-assigned order identifier, or a composite partition/session key. Implement the published scope exactly.
+
+“Never reuse an ID” is a safe internal default only after defining the domain: venue, account/firm, session, trading day, protocol version, and message type. Generate enough namespace to survive failover without collision. Persist or partition ID allocation so two active gateways cannot issue the same key.
+
+### Correlation table
+
+The hot lookup is normally:
+
+```text
+(venue, session generation, client ID) -> internal handle
+(venue, partition, exchange order ID)  -> internal handle
+(venue, execution-ID scope)            -> applied execution
+```
+
+A counter-derived direct index can be excellent when the protocol permits it: mask/index, then compare the complete stored ID and generation to reject wraparound and stale traffic. Otherwise use a preallocated flat table with a measured maximum probe bound. `std::unordered_map` is not forbidden by correctness, but its node allocation, rehashing, and pointer locality are usually poor fits for a bounded single-writer hot path.
+
+Do not recycle a terminal order immediately. Keep its identities resolvable through:
+
+- the venue’s maximum retransmission/status window;
+- the firm’s late-report and correction policy;
+- drop-copy reorder delay;
+- post-trade reconciliation closure;
+- any outstanding cancel/replace request.
+
+The duration is not a guessed number of seconds. It is a capacity calculation from the venue contract and observed tail, with an overflow policy that fences rather than aliases a new order onto an old identifier.
+
+### At least once, not magical exactly once
+
+After a send attempt and lost response, retransmitting may duplicate an accepted effect while not retransmitting may lose an unaccepted one. Transport acknowledgement alone cannot decide which occurred. Gateway correctness therefore uses:
+
+1. stable idempotency keys recognized according to venue rules;
+2. session recovery or application query;
+3. exact duplicate detection where the protocol provides event identity;
+4. idempotent state reduction and downstream publication;
+5. external reconciliation.
+
+Some transactional systems advertise exactly-once effects within a defined boundary. That does not make an exchange order-entry socket and the firm’s local database one atomic transaction. State the boundary rather than arguing from a slogan.
+
+---
+
+## 54.5 Outbound lifecycle and failure windows — Core
+
+The outbound path is a series of commitments:
+
+```text
+intent
+  -> validate/risk-authorize
+  -> admit and reserve local exposure
+  -> allocate stable IDs
+  -> encode and journal/send-store
+  -> attempt transport write
+  -> receive venue response(s)
+  -> reconcile reservation with accepted/fill/cancel facts
+```
+
+The gateway must publish which stage was reached. A single `bool send_order()` forces callers to guess.
+
+| Failure window | What is known | Required posture |
+|---|---|---|
+| Before admission | This intent was not accepted by gateway | No venue action from this intent |
+| After admission, before any possible send | Local request exists; venue cannot have this attempt if boundary is proven | Retry locally with same intent policy or reject |
+| During/after send attempt, before venue response | Venue effect unknown | Keep ID reserved; do not create replacement exposure by assumption |
+| New accepted, no later report | Venue accepted; current live/fill state may have advanced | Treat exposure as live/unknown until recovered |
+| Cancel sent, no cancel response | Original may still be live, partly filled, canceled, or already terminal | Continue counting possible leaves; query/recover |
+| Replace sent, no response | Old or new terms may govern according to venue semantics | Preserve both requested and last-confirmed terms |
+| Execution reported | Quantity traded is a confirmed venue fact | Update position/risk exactly once; later bust/correct may revise it |
+
+The hardest distinction is **definitely not sent** versus **send outcome unknown**. Proving the former requires the single session owner to record that no API capable of exposing bytes was reached. Queue residence alone is not enough if another thread can concurrently drain it.
+
+### Risk handoff
+
+Risk approval can go stale between check and send. The gateway should receive a bounded authorization containing enough context—account, instrument, side, quantity/notional, strategy, policy generation, and expiry—or perform the last-mile check in the same single-writer admission step.
+
+Exposure reservation needs one owner and explicit release events:
+
+- reserve when the gateway commits to possible new exposure;
+- convert reservation into live/filled exposure on venue facts;
+- release on an authoritative new-order reject;
+- reduce on fills/cancels according to the risk model;
+- retain conservative exposure while outcome is unknown.
+
+A session-level reject, malformed response, or timeout is not automatically an authoritative order reject. The protocol/venue specification must identify which response proves that the business instruction was not accepted.
+
+---
+
+## 54.6 A race-aware order model — Core
+
+Chapter 50 explains venue order semantics. The gateway representation must preserve them under duplicated and reordered delivery.
+
+### Separate confirmed lifecycle from outstanding command
+
+```text
+confirmed venue lifecycle:
+  PendingNew -> Working/PartFilled -> Terminal
+       |              |
+       +-> Rejected   +-> Terminal by fill or cancel
+
+outstanding command:
+  None <-> CancelPending
+  None <-> ReplacePending
+```
+
+These axes are orthogonal. `CancelPending` does not replace `Working`; it means “last confirmed working state plus an unresolved cancel attempt.” A partial fill can update cumulative quantity while the cancel remains pending. A cancel reject resolves the command but does not by itself prove the order is working: it may say “too late,” “unknown order,” or another venue-specific reason requiring a status report.
+
+Likewise, `ReplacePending` must preserve last-confirmed price/quantity and requested price/quantity. Venues differ on whether replace is atomic, whether it gets a new client or exchange ID, whether priority changes, and which state applies during a race. Never overwrite the confirmed terms at send time.
+
+### Response/race table
+
+| Observed event | Common but unsafe shortcut | Correct reduction |
+|---|---|---|
+| Fill before new ack | “Unknown order; drop” | Correlate by available client/venue key; a fill proves acceptance/effect |
+| Duplicate fill report | Add `LastQty` again | Deduplicate by specified execution identity; use cumulative checks as defense |
+| Fill while cancel pending | Cancel won, ignore fill | Apply fill; cancel effectiveness occurs only at its venue-defined commit |
+| Cancel confirmation after partial fill | Restore original leaves or assume zero fills | Preserve cumulative fills; set remaining according to report semantics |
+| Cancel reject | Return unconditionally to Working | Resolve reason/status; order may be filled, canceled, unknown, or working |
+| Replace ack after fill | Apply requested quantity blindly | Validate cumulative/remaining quantities and venue replace rules |
+| Late old ack after terminal event | Move state backward | Keep terminal/current facts; record response as duplicate/late evidence |
+| Trade bust/correction | Reject because cumulative decreased | Apply the venue’s referenced revision as a first-class event |
+
+Ordinary fills often expose `LastQty`, cumulative quantity, and leaves quantity. Cumulative values provide a strong invariant and make exact duplicates harmless, but `max(cumulative)` is not a complete execution ledger: busts and corrections can legitimately revise prior effects. Keep execution identity and reference relationships long enough to reverse or correct the exact business event.
+
+### Compact C++23 reducer
+
+This complete model covers new, ordinary fills, cancel, and their duplicates. Exact execution-ID deduplication happens before this reducer. Replace and trade-correction handlers are deliberately separate because their contracts are venue-specific.
 
 ```cpp
-using OrderIdx = uint32_t;                 // dense, preallocated, cache-friendly
+#include <cstdint>
+
+enum class Life : std::uint8_t {
+    PendingNew, Working, Filled, Canceled, Rejected, Unknown
+};
+enum class Pending : std::uint8_t { None, Cancel };
+enum class Kind : std::uint8_t { Accepted, Fill, Canceled, NewRejected, CancelRejected };
+enum class Result : std::uint8_t { Applied, Duplicate, Invalid };
+
 struct Order {
-    OrderIdx     idx;
-    uint64_t     cl_ord_id;                // current
-    uint64_t     orig_cl_ord_id;           // previous link in the chain
-    uint64_t     exch_ord_id;              // 0 until acked
-    int64_t      price_ticks;              // fixed point (Ch. 23 §23.10)
-    uint32_t     leaves_qty, cum_qty;
-    OrderState   state;
-    uint16_t     instrument_id;
-    uint8_t      side, session_id;
+    std::uint32_t quantity{};
+    std::uint32_t cumulative{};
+    std::uint32_t leaves{};
+    Life life{Life::PendingNew};
+    Pending pending{Pending::None};
 };
-static_assert(sizeof(Order) <= 64);        // one cache line
-```
 
-**Generating `ClOrdID` cheaply.** The hot path must not format strings or take a lock. The standard construction is a 64-bit integer partitioned into fields — session/gateway id, a per-day epoch marker, and a monotonically increasing counter incremented with a plain non-atomic `++` if the gateway is single-writer (Ch. 52 §52.6), or `fetch_add(1, relaxed)` if not. If the protocol requires an ASCII `ClOrdID` (FIX does), encode with a fixed-width base-36 or hex conversion into a preallocated field — never `std::to_string`, never `std::format` on the hot path (Ch. 16 §16.3). The encoding must be *reversible* so that an inbound response's `ClOrdID` maps back to the internal index by arithmetic rather than by a hash lookup:
+struct Report {
+    Kind kind{};
+    std::uint32_t cumulative{};
+    std::uint32_t leaves{};
+};
 
-```cpp
-// 64-bit ClOrdID layout: [ gateway:8 | day:16 | counter:40 ]
-inline uint64_t make_clordid(uint8_t gw, uint16_t day, uint64_t ctr) noexcept {
-    return (uint64_t(gw) << 56) | (uint64_t(day) << 40) | (ctr & ((1ull<<40)-1));
-}
-```
+constexpr Result apply(Order& o, Report r) noexcept {
+    if (r.cumulative < o.cumulative || r.cumulative > o.quantity ||
+        r.leaves > o.quantity - r.cumulative)
+        return Result::Invalid;
 
-If the counter *is* the array index (mod capacity), correlation becomes a mask and a load instead of a hash probe — the difference between ~2 ns and ~30 ns on the ack path, which is on the critical path for any strategy that reacts to its own fills.
-
----
-
-## 54.7 Order-Correlation Tables
-
-The **correlation table** maps inbound protocol identifiers to internal order state. Every response — ack, reject, fill, cancel ack, replace reject — arrives keyed by `ClOrdID` and/or `OrderID`, and must find its order in bounded, small time.
-
-Three lookups exist and they have different requirements:
-
-| Lookup | Frequency | Structure |
-|---|---|---|
-| `ClOrdID` → order | Every inbound message | Direct index if IDs are counter-derived; else open-addressed flat map |
-| `OrderID` → order | Fills at some venues, market-by-order correlation | Open-addressed flat map (Ch. 12 §12.7) |
-| internal index → order | Everything internal | Array index |
-
-**Do not use `std::unordered_map`.** It is node-based: every lookup is a pointer chase into a separately allocated node, insertion allocates, and erasure frees — three properties that are individually disqualifying on the hot path (Ch. 12 §12.2, Ch. 8 §8.8). The measured difference against a flat open-addressed map with linear probing is typically 3–10× on lookup and unbounded on insert (the allocator's tail). If you must have a hash map, use a preallocated open-addressed table with power-of-two capacity, a cheap mixing function, and tombstone-free deletion by backward-shift.
-
-The strictly better answer when you control identifier generation is **no hash at all**:
-
-```cpp
-// Counter-derived ClOrdID: the low bits ARE the slot.
-inline Order* lookup(uint64_t clordid) noexcept {
-    uint32_t slot = uint32_t(clordid) & (kCapacity - 1);
-    Order* o = &orders_[slot];
-    return (o->cl_ord_id == clordid) ? o : nullptr;   // verify to catch wrap/stale
-}
-```
-
-The verification compare is essential: it turns a wrapped counter or a stale response from a previous session into a `nullptr` rather than a corrupted order. Size `kCapacity` above the day's peak *live plus recently-terminated* order count — terminated orders must remain resolvable for a grace period, because late acknowledgements (§54.10 territory; see Ch. 50 §50.10) arrive for orders you consider finished, and a lookup miss on a fill is a position error, the worst outcome in this chapter.
-
-**Retention policy.** Orders cannot be recycled the instant they reach a terminal state. The safe rule is a **two-phase retirement**: on terminal state, move the order to a *retired* status but keep the slot occupied and resolvable; reclaim the slot only after a time bound exceeding the venue's maximum message latency (seconds, not milliseconds) *and* after any outstanding request on that order has been resolved. A free-list of slots with a timestamp-ordered reclaim queue implements this in O(1) with no allocation.
-
-**Failure signature.** "Fill for unknown order" in the log is nearly always one of: slot recycled too early, `ClOrdID` reused after a reject, a response from a *previous* session (didn't include session id in the key), or a replace chain where you keyed on the original `ClOrdID` and the exchange responded with the new one. Each has a distinct fix; the shared prevention is that the correlation key must include everything that scopes the identifier — session and trading day — not just the counter.
-
----
-
-## 54.8 Idempotent Order State Transitions
-
-**Idempotent** here means: applying the same state transition twice produces the same result as applying it once, with no additional side effect. Because the link is at-least-once (§54.16) and because reconnects replay, the order state machine must be written so that duplicate application is harmless *by construction*, not by an upstream promise of exactly-once delivery that no real system provides.
-
-The order lifecycle (introduced in Ch. 50 §50.9) as the gateway sees it:
-
-```
-                 ┌──────────────┐
-                 │   PendingNew │──reject──▶ Rejected (terminal)
-   send new ────▶│  (in flight) │
-                 └──────┬───────┘
-                        │ ack
-                        ▼
-   ┌──────────────▶ ┌────────┐ ──partial fill──▶ (stays Live, leaves↓)
-   │  replace ack   │  Live  │ ──full fill─────▶ Filled (terminal)
-   │                └───┬────┘
-   │                    │ cancel sent          cancel reject
-   │              ┌─────▼────────┐ ───────────────────┐
-   │              │PendingCancel │                    ▼
-   │              └─────┬────────┘             (back to Live)
-   │                    │ cancel ack
-   │                    ▼
-   │              Cancelled (terminal)
-   │
-   └── PendingReplace ◀── replace sent (from Live)
-```
-
-Idempotency is achieved by making transitions **monotone in a well-order** and keyed on the message's own identity:
-
-1. **Assign each state a rank.** `PendingNew(0) < Live(1) < PendingCancel/Replace(2) < Terminal(3)`. A transition that would move backwards in rank, or that targets a terminal state already reached, is *ignored*, not treated as an error. This single rule absorbs duplicate acks, duplicate cancel confirmations, and out-of-order replace responses.
-2. **Make quantity updates absolute, not incremental.** Execution reports carry `CumQty` (cumulative filled) and `LeavesQty` (remaining), not just `LastQty`. Track `cum_qty` and apply `cum_qty = max(cum_qty, msg.cum_qty)`. A duplicated fill then contributes nothing, because the cumulative value is unchanged. If you accumulate `cum_qty += msg.last_qty` instead, a single duplicated execution report doubles a position — this is *the* canonical order-gateway bug, and stating the absolute-vs-incremental fix is the expected answer.
-3. **Key the transition on `ExecID`.** Venues assign each execution report a unique `ExecID` (tag 17). Maintaining a small recently-seen `ExecID` set per order (or a global ring) gives exact duplicate detection where the cumulative-quantity trick is insufficient — notably for **trade busts/corrections**, which legitimately revise a prior fill and therefore *must not* be idempotently ignored.
-
-```cpp
-inline void apply_exec(Order& o, const ExecReport& e) noexcept {
-    if (rank(e.state) < rank(o.state) && !is_correction(e)) return;   // stale/dup
-    if (e.cum_qty <= o.cum_qty && !is_correction(e))      return;     // dup fill
-    o.cum_qty    = e.cum_qty;
-    o.leaves_qty = e.leaves_qty;
-    o.state      = e.state;
-}
-```
-
-The subtlety worth raising unprompted: **idempotence of state is not idempotence of side effects.** Ignoring a duplicate fill for position purposes is right; suppressing the *risk system's* observation of it may be wrong if the risk system counts messages rather than quantity. Every consumer of the fill stream must independently be idempotent, which is why the deduplication belongs at the gateway boundary (§54.9) and the internal event stream should carry a monotone sequence number that downstream stages can use to discard replays.
-
----
-
-## 54.9 Duplicate Suppression
-
-Duplicates arrive from four distinct sources, and a gateway needs a defence for each because they have different keys:
-
-| Source | Marker | Detection |
-|---|---|---|
-| Session resend (§54.4) | `PossDupFlag=Y`, seq ≤ expected | Sequence number comparison |
-| Exchange re-send after its own failover | `PossResend=Y` (tag 97) | Application-level: `ExecID` / `ClOrdID` + state |
-| Your own retransmission after reconnect | none | `ClOrdID` uniqueness; exchange rejects the duplicate |
-| Redundant drop-copy feed (§54.14) | none | `ExecID` set |
-
-`PossDupFlag` (43) and `PossResend` (97) mean different things and interviewers ask. **`PossDupFlag=Y`** means "this is a session-layer retransmission of a message already sent with this sequence number" — same message, same content, safe to discard on sequence grounds alone. **`PossResend=Y`** means "this message may duplicate one sent earlier *under a different sequence number*" — it originates from the application layer (typically after an exchange-side failover), the sequence number is new, and the session layer cannot detect it. Only application-level identity (`ExecID`, or `ClOrdID` + state) resolves it. A gateway that treats `PossResend` as `PossDup` will discard legitimate messages; one that ignores it will double-count fills.
-
-**The dedup structure.** A bounded, allocation-free, false-negative-free set of recently seen identifiers:
-
-```cpp
-// Open-addressed ring of ExecIDs; capacity >> max in-flight, power of two.
-class DupFilter {
-    static constexpr uint32_t kCap = 1u << 16;
-    uint64_t seen_[kCap]{};                       // 0 = empty; preallocated, 512 KB
-public:
-    bool insert_is_new(uint64_t id) noexcept {
-        uint32_t h = uint32_t(id * 0x9E3779B97F4A7C15ull >> 48) & (kCap - 1);
-        for (uint32_t i = 0; i < 8; ++i, h = (h + 1) & (kCap - 1)) {
-            if (seen_[h] == id) return false;     // duplicate
-            if (seen_[h] == 0)  { seen_[h] = id; return true; }
-        }
-        return true;   // probe budget exhausted: fail OPEN (process it)
+    switch (r.kind) {
+    case Kind::Accepted:
+        if (o.life != Life::PendingNew && o.life != Life::Unknown)
+            return Result::Duplicate;
+        o.life = Life::Working; o.leaves = r.leaves; return Result::Applied;
+    case Kind::Fill:
+        if (r.cumulative == o.cumulative) return Result::Duplicate;
+        o.cumulative = r.cumulative; o.leaves = r.leaves;
+        o.life = r.leaves == 0 ? Life::Filled : Life::Working;
+        if (o.life == Life::Filled) o.pending = Pending::None;
+        return Result::Applied;
+    case Kind::Canceled:
+        if (o.life == Life::Canceled && r.cumulative == o.cumulative)
+            return Result::Duplicate;
+        if (o.life == Life::Filled) return Result::Invalid;
+        o.cumulative = r.cumulative; o.leaves = 0;
+        o.life = Life::Canceled; o.pending = Pending::None;
+        return Result::Applied;
+    case Kind::NewRejected:
+        if (o.life == Life::Rejected) return Result::Duplicate;
+        if (o.life != Life::PendingNew || o.cumulative != 0) return Result::Invalid;
+        o.life = Life::Rejected; o.leaves = 0; return Result::Applied;
+    case Kind::CancelRejected:
+        if (o.pending != Pending::Cancel) return Result::Duplicate;
+        o.pending = Pending::None; return Result::Applied;
     }
-};
+    return Result::Invalid;
+}
+
+constexpr bool cancel_race() {
+    Order o{100, 0, 100};
+    if (apply(o, {Kind::Accepted, 0, 100}) != Result::Applied) return false;
+    o.pending = Pending::Cancel;
+    if (apply(o, {Kind::Fill, 40, 60}) != Result::Applied) return false;
+    if (apply(o, {Kind::Fill, 40, 60}) != Result::Duplicate) return false;
+    return apply(o, {Kind::Canceled, 40, 0}) == Result::Applied &&
+           o.life == Life::Canceled && o.cumulative == 40;
+}
+static_assert(cancel_race());
 ```
 
-The design decision embedded in that last line is worth calling out. When the filter is uncertain, it must **fail open and process the message**, because a false duplicate (dropping a real fill) corrupts your position silently, while a false new (processing a duplicate) is caught downstream by the idempotent state machine (§54.8). Layered defences with different failure directions is the correct architecture: cheap probabilistic dedup at the edge that never drops a real message, plus exact idempotence in the state machine.
+The reducer does not infer whether a cancel reject means Working; it only clears the outstanding request. A status/recovery event must establish any missing venue fact. In production, invalid transitions fence the affected order or session and preserve raw evidence; they do not disappear behind an assertion compiled out.
 
-Never use a Bloom filter here (Ch. 21 §21.19) — its error direction is false *positives*, i.e. it will claim a new message is a duplicate, which is exactly the unacceptable direction.
+### Publication is part of the transition
 
-**Clearing.** The filter must be cleared per session/day, and its capacity must exceed the day's message count or it saturates and every lookup degrades to a linear probe. Sizing it to 4× peak daily executions and resetting at session start is simplest; the memory is negligible.
+Updating `Order` is only half the commit. A newly applied execution normally changes position, consumes or releases risk reservation, notifies the strategy, and enters audit/reconciliation streams. If a crash can occur between those effects, each downstream consumer needs a stable gateway event ID and its own idempotent cursor, or the effects need one transactional boundary.
 
----
+A useful owner sequence is:
 
-## 54.10 Disconnect Recovery
+```text
+classify session position and business identity
+  -> validate transition against current order
+  -> append/publish one stable internal event
+  -> apply event to owner state and risk accounting
+  -> advance the recoverable inbound cursor
+```
 
-Recovery is the process of restoring a consistent picture of "what orders exist and what have they done" after any interruption. Its inputs are, in decreasing authority: the exchange's own state (via an order status request or mass status request), the drop copy (§54.14), your journal (Ch. 56 §56.1), and your in-memory model — which after a crash does not exist and after a disconnect is *stale by an unknown amount*.
-
-The recovery sequence:
-
-1. **Reconnect and resume sequence** (§54.5). Do not reset.
-2. **Consume the resend.** Every execution report generated during the outage arrives here. Apply through the idempotent state machine (§54.8) with dedup (§54.9). This alone resolves most disconnects.
-3. **Reconcile in-flight orders.** For each order in `PendingNew`, `PendingCancel`, or `PendingReplace` at disconnect time, its true state is unknown. Resolve by *querying*, not by guessing: `OrderStatusRequest` (`MsgType=H`) per order, or `OrderMassStatusRequest` (`MsgType=AF`) for the whole session, which returns an execution report per live order. Venues that support mass status make recovery a single round trip; venues that do not force per-order queries, which must be throttled (§54.12) or they trip the rate limit at exactly the worst moment.
-4. **Reconcile positions** against the drop copy and, at end of day, the clearing file (§54.15).
-5. **Only then** re-enable order entry. A gateway that starts sending before reconciliation completes can duplicate an order it already placed or, worse, believe it is flat and take a position on top of an existing one.
-
-**The hard case: `PendingNew` at disconnect.** You sent a new order; you have no ack. Three possibilities: the message never reached the exchange; it reached and was accepted; it reached and was rejected. Guessing wrong in either direction is expensive — assume-not-sent and re-send, and you may have two orders; assume-sent and wait, and you may have no order when you believe you have one, so a subsequent cancel does nothing and a hedge is unhedged.
-
-The resolution is structural: **because `ClOrdID` is unique and never reused, the query is always answerable.** `OrderStatusRequest` with the original `ClOrdID` returns either the order's state or "unknown order" — a definitive answer. This is the payoff for the identifier discipline in §54.6, and it is why "never reuse a `ClOrdID`, even for rejects" is not pedantry.
-
-**Timeouts as a state, not an error.** Every in-flight request needs a deadline. When it expires, the order does not become `Rejected` — it becomes `Unknown`, a distinct state that permits *only* status queries and cancels, never new exposure. Systems that collapse `Unknown` into `Rejected` are the ones that end the day with a phantom position.
-
-**Diagnostic signature.** If reconciliation regularly finds orders the exchange knows about that you do not, suspect journal-after-send ordering (§54.3). If it finds orders you know about that the exchange does not, suspect `ClOrdID` reuse or a throttle rejection that your model recorded as sent. The direction of the discrepancy names the bug.
+The exact order depends on the journal/queue design; the invariant is that every crash point replays to the same result without losing a confirmed fill or publishing it twice. Do not emit a strategy callback before knowing how restart will detect that callback’s event. Sequence numbers on the internal event stream also let risk, strategy, and reconciliation consumers report precisely which prefix they have applied.
 
 ---
 
-## 54.11 Exchange Rate Limits
+## 54.7 Worked trace: fill, disconnect, duplicate, cancel — Core
 
-Venues limit the rate at which a session may send messages, for their own protection. The limits are contractual and enforced, and exceeding them results in rejects, session disconnection, or — at some venues — fines and a compliance conversation. There are several distinct limit shapes and a gateway must model whichever ones its venues impose:
+Assume protocol `V1` defines:
 
-| Limit shape | Typical form | Enforcement |
+- unique client request IDs within `(firm, session generation, trading day)`;
+- replayable sequenced execution reports;
+- cumulative and remaining quantity on fills;
+- cancel-on-disconnect enabled for day orders, with no guarantee of immediate cancellation;
+- a separate drop-copy execution stream.
+
+The order is a day limit for 100 units.
+
+```text
+t0 gateway admits New C101, reserves exposure 100
+t1 gateway records send attempt and writes New C101
+t2 venue accepts C101 as exchange order X77
+t3 venue executes 40; order leaves 60
+t4 connection fails before ack/fill reaches gateway
+t5 gateway marks session Fenced; C101 outcome Unknown
+t6 drop copy reports execution E9, cumulative 40, leaves 60
+t7 venue detects disconnect and cancels remaining 60
+t8 gateway reconnects, authenticates, enters Recovering
+t9 replay delivers new ack, E9 fill, and cancel report
+t10 gateway reconciles live-order/status evidence and returns Active
+```
+
+Reason through each transition:
+
+1. At `t1`, transport success cannot promote `C101` to Working. It remains `PendingNew` with an external-effect uncertainty window.
+2. At `t4`, the gateway retains the maximum plausible exposure of 100 until external evidence arrives. It must not release the risk reservation or reuse `C101`.
+3. At `t6`, the independently received fill is valid even though the order-entry ack was absent. Correlation maps `C101` or `X77` to the stable handle; exact key `(venue, execution scope, E9)` makes the position change once.
+4. Cancel-on-disconnect at `t7` removes the remaining quantity only when the venue processes it. It does not invalidate the earlier 40-unit fill.
+5. Replay at `t9` may deliver the ack after the drop-copy fill. The ack cannot move cumulative quantity backward. Replayed `E9` is detected as the same business execution and does not publish another position change.
+6. The cancel report makes remaining quantity zero while preserving cumulative 40. Only after the session gap is complete, outstanding IDs resolve, and independent evidence agrees does the gateway reopen.
+
+Now change one fact: drop copy is also disconnected between `t4` and `t9`. The correct model is still safe because it retains unknown exposure. Recovery latency grows, but correctness does not rely on one feed being continuously available.
+
+This trace also distinguishes **message order** from **business order**. Ack, fill, and cancel reports can be observed in a different order across the primary and drop-copy paths. The reducer uses identities, cumulative facts, and venue semantics rather than arrival order alone.
+
+---
+
+## 54.8 Disconnect, reconnect, and reconciliation — Core
+
+Disconnect recovery begins by fencing, not by reconnecting as quickly as possible.
+
+### Recovery sequence
+
+1. Stop admission of new exposure; preserve risk-reducing paths that the policy and venue still make usable.
+2. Snapshot session cursors, send-attempt records, outstanding commands, and last-confirmed order facts.
+3. Establish transport with bounded retry/backoff appropriate to the venue’s login limits and operational runbook.
+4. Authenticate and resume the existing logical session where supported. Do not reset sequences merely to make logon succeed.
+5. Complete session replay/gap recovery before applying newer messages out of order.
+6. Resolve every ambiguous new/cancel/replace through the venue’s supported status, mass-status, replay, or operator facility.
+7. Reconcile executions and live orders against drop copy and other named authorities.
+8. Have the risk owner approve the resulting exposure and release the fence.
+
+Authentication failure, duplicate-primary rejection, missing resend-store range, sequence state behind the venue, and contradictory order evidence are different failures. Give each a bounded retry policy and an escalation action. Unbounded immediate login retries can worsen a venue incident or trigger controls.
+
+### Safe action by disconnect point
+
+| Last proven point | Gateway classification | Safe default |
 |---|---|---|
-| **Fixed-window** | N messages per second, reset on the wall-clock second | Simple; permits a 2N burst across a boundary |
-| **Sliding-window** | N messages in any trailing 1 s | Stricter; requires a timestamp ring |
-| **Token bucket** | rate R, burst B | Most common in modern venues |
-| **Order-to-trade ratio (OTR)** | messages ÷ executions over a period | Measured over minutes; a *quality* limit |
-| **Message-type weighted** | new = 1, cancel = 0.5, mass cancel = 10 | Encourages cancels over news |
-| **Per-instrument / per-port** | Independent budgets | Must be tracked separately |
+| Intent not admitted | Not sent | Caller may create a new request |
+| Admitted but provably before send boundary | Local-only | Re-drive under same ID/policy or reject locally |
+| Send may have begun, no venue response | Unknown new | Query/recover; do not submit replacement exposure |
+| New accepted | Possibly live/filled | Count leaves as exposed until newer evidence |
+| Cancel may have been sent | Cancel unknown | Assume remaining quantity can trade |
+| Replace may have been sent | Terms unknown | Preserve old confirmed and new requested terms |
+| Partial fill confirmed | Filled amount known; leaves uncertain | Position includes fill; remaining maximum stays exposed |
+| Full fill confirmed | Execution known | Do not cancel/recreate; await corrections/reconcile |
+| Cancel confirmed | No remaining order under report semantics | Still accept earlier/late-delivered fills and corrections |
 
-Two structural facts drive the design. First, **the exchange's counter is authoritative and you cannot read it** — you are shadowing it. Clock skew, in-flight messages, and the venue's exact window boundary mean your estimate is approximate, so you must run your own limit strictly *below* the contractual one; a headroom of 5–15% is the usual engineering choice, and the reserve exists specifically so that cancels are never throttled.
+Not every venue offers an order-status query by client ID, and “unknown order” may mean wrong scope, expired retention, pending processing, or genuinely absent depending on its specification. A status response is definitive only to the extent the venue contract says it is. If no online mechanism resolves the ambiguity, keep the gateway fenced and use drop copy, alternate risk/cancel tools, venue operations, and post-trade files.
 
-Second, **cancels must be privileged.** If a single budget covers new orders and cancels and you exhaust it sending quotes, you cannot cancel — a risk exposure created by your own throttle. The standard fix is a reserved sub-budget: order entry may consume at most X% of the bucket, leaving the remainder permanently available for cancels and mass cancels. This is a risk control implemented in the gateway, and mentioning it unprompted is a strong signal.
+### Cancel on disconnect
 
-**Order-to-trade ratio** deserves separate treatment because it cannot be enforced instantaneously. It is a ratio measured over a long window, so the control is a slow feedback loop: monitor the running ratio, and when it approaches the threshold, reduce quoting rather than block messages. Blocking messages to satisfy an OTR limit tends to block the wrong ones (cancels raise the numerator too at some venues — check whether the venue counts cancels).
+Cancel on disconnect (COD) is an external risk control, not a local state transition. Record:
 
-**What happens when you exceed.** Responses vary: a business reject per message (cheap, recoverable), a session-level reject, forced logout (expensive — now you are in §54.10 recovery), or silent queuing at the venue's edge (worst, because your latency inflates without any error and your orders arrive late enough to be adversely selected). The last case has a distinctive signature: *ack latency rises smoothly with send rate and returns to normal when rate falls*, with no rejects. That is queuing, not congestion, and the fix is your throttle, not your network.
+- whether it is enabled and how configuration is verified;
+- trigger: involuntary disconnect, logout, heartbeat expiry, port close, or another condition;
+- scope: session, user, port, firm, product, and order types;
+- excluded time-in-force/order types;
+- venue detection and cancellation timing;
+- reports produced and recovery behavior;
+- interaction with primary/backup connections.
+
+**Venue example, not a universal rule:** current CME documentation describes COD for an involuntary lost iLink connection and excludes GTC/GTD orders. Another venue may define different scope and exclusions. Therefore the gateway moves orders to “COD expected, outcome unknown,” not Cancelled, until reports/status confirm them.
+
+Test abrupt process death, network blackhole, transport reset, primary/secondary failover, and graceful logout separately. They can invoke different venue behavior.
 
 ---
 
-## 54.12 Message Throttling
+## 54.9 Rate limits, throttling, and the risk path — Core
 
-Throttling is the local enforcement mechanism that keeps you inside §54.11's limits. It sits on the outbound path, which means it is **on the critical path** and must cost a handful of nanoseconds.
+Exchange limits are protocol facts, not generic token-bucket facts. A venue may enforce:
 
-**Token bucket, branchlessly.** The canonical implementation refills continuously rather than on a timer, so there is no timer thread and no syscall:
+- messages per second over a fixed or rolling window;
+- per-session, per-firm, per-user, or per-partition budgets;
+- separate administrative and application limits;
+- weighted costs by message type;
+- outstanding-order or in-flight-request caps;
+- order-to-trade or cancel ratios over longer periods;
+- reject, delay, disconnect, or administrative action on breach.
+
+Pin the current rule and test boundary behavior in certification. Do not invent “safe headroom” as a universal percentage.
+
+### Local throttle model
+
+A token bucket is appropriate only when it matches the venue’s semantics closely enough. A rolling-window venue may require a timestamp ring; a fixed-window rule needs boundary-aware accounting. The local counter shadows an external counter that may include messages the gateway classified differently, so rejects and venue-provided utilization must feed monitoring.
+
+Use one owner per budget. Precompute fixed-point refill parameters, handle timer discontinuities and integer overflow, and test burst boundaries. Chapter 55 owns the micro-optimization; this chapter owns which messages may proceed when capacity is scarce.
+
+| Message class | Typical local policy | Required qualification |
+|---|---|---|
+| New exposure | Reject or boundedly defer | Delayed intent may be stale; risk authorization may expire |
+| Replace increasing exposure | Treat like new exposure | Venue may count/cost it differently |
+| Replace reducing exposure | Prefer over new flow | Still consumes whatever venue quota applies |
+| Single cancel | Highest usable priority | Cannot bypass exchange enforcement |
+| Mass cancel/disable | Dedicated emergency path if offered | Must be authenticated, tested, and rate-limit aware |
+| Recovery/status | Reserved recovery budget or paced queue | Flooding queries can prevent recovery |
+
+A “cancel reserve” means local new orders stop before consuming capacity expected to be needed for cancels. It does **not** authorize transmission above the venue limit. If cancels share an exhausted venue bucket, use any documented mass-cancel, cancel-on-behalf, kill, or operator facility and keep exposure conservative.
+
+### Queueing policy
+
+Never turn throttling into an unbounded FIFO:
+
+- new/quote intents expire or are rejected when their market context is stale;
+- multiple unsent replaces for one order can often be coalesced to the latest desired state, but only before any earlier request crosses the send boundary;
+- cancels are deduplicated by order/request state, not dropped blindly;
+- recovery queries are paced and bounded;
+- overflow fences affected flow and alerts rather than overwriting a live request.
+
+Record admission-to-send delay separately from network/venue acknowledgement latency. Otherwise local throttle queueing looks like venue latency.
+
+---
+
+## 54.10 Drop copy and post-trade reconciliation — Core
+
+A drop copy is an independently delivered view of order/execution activity for an agreed account/session scope. It is valuable because it can reveal a fill missing from the order-entry path. It is not automatically complete, instantaneous, or infallible: it has its own session, sequence gaps, schema, duplicate behavior, account coverage, and operational outages.
+
+Keep its consumer isolated from the latency-critical order-entry process where practical, but route urgent discrepancies to risk. Correlate using the full execution identity scope—not a bare `ExecID` unless the venue guarantees global uniqueness.
+
+```text
+order-entry executions        drop-copy executions
+          \                         /
+           \---- normalized IDs ---/
+                       |
+                 reconciler
+                       |
+         match / late / missing / conflicting
+```
+
+Classify differences:
+
+| Difference | Possible explanation | Safe response |
+|---|---|---|
+| Drop copy only | missed primary report, coverage/manual activity, reorder | Update risk through controlled authority path; investigate |
+| Order entry only | drop-copy lag/gap/scope, duplicate leak | Hold until reorder deadline; recover drop-copy gap |
+| Same ID, different economics | parse/version bug, correction, identifier-scope collision | Fence affected scope and preserve raw bytes |
+| Quantity matches, event count differs | duplicate/correction aggregation | Compare exact execution lineage |
+| Live-order sets differ | missed cancel/new, COD, session ownership mismatch | Query authoritative live state; restrict new flow |
+
+Continuous reconciliation uses a bounded lateness window derived from measured and contractual behavior. Post-trade reconciliation then compares the gateway journal, venue trade/order files, clearing or broker records, and internal positions. “Authoritative” is field-specific: the venue may own execution facts while clearing records own settlement state.
+
+The gateway must retain:
+
+- raw inbound/outbound bytes and protocol/schema version;
+- session generation and sequence/cursor;
+- internal handle and all client/venue identifiers;
+- event/receive/send timestamps with clock domain;
+- decision results, throttle/risk authorization generation, and reason codes;
+- original execution plus correction/bust lineage.
+
+Chapter 56 owns durable journaling and risk-control architecture. Here the invariant is that reconciliation can reconstruct every gateway decision and map it to external evidence.
+
+---
+
+## 54.11 Protocol and venue checklist — Role-specific
+
+Complete this matrix per deployed session. “Unknown” is a release blocker, not a default:
+
+| Contract area | Questions to answer |
+|---|---|
+| Identity | What scopes client IDs, venue IDs, and execution IDs? Can any change on replace or failover? |
+| New duplicate | Is the repeated ID rejected, ignored, replayed, or treated as a new order? For how long? |
+| Session sequence | Per direction or one stream? Persistent across connections? Reset boundary? |
+| Recovery | Resend, snapshot, status query, failover cursor, or no online recovery? |
+| Gap behavior | Buffer limit, request form, gap-fill meaning, unrecoverable action? |
+| Heartbeat | Negotiation, idle definition, test/challenge, timeout, clock source? |
+| Logout | Handshake and effect on working orders? |
+| Ack/reject | Which response proves business acceptance or non-acceptance? |
+| Fill | Can it precede ack? Cumulative fields? execution-ID scope? bust/correct model? |
+| Cancel | Effectiveness point, too-late reason, cancel/fill ordering, mass cancel? |
+| Replace | Atomicity, priority, quantity rules, identifiers, old/new terms during race? |
+| Disconnect | Working-order persistence, COD trigger/scope/exclusions/timing? |
+| Throttle | Exact window, scope, weights, emergency/recovery traffic, breach action? |
+| Drop copy | Coverage, latency/reorder contract, sequence/recovery, correction messages? |
+| Versioning | Schema/profile revision, effective date, certification cases, rollback? |
+
+Three concrete labels illustrate why this work cannot be generalized:
+
+- The FIX Session Layer defines persistent directional sequence numbers, resend requests, possible-duplicate handling, gap fill, and optional next-expected synchronization; bilateral rules select application replay behavior.
+- Nasdaq OUCH 5.0’s current specification uses `UserRefNum` for uniqueness/duplicate checking and defines explicit accepted, executed, canceled, replaced, broken-trade, reject, and cancel-reject messages.
+- CME iLink 3 uses FIXP session mechanics with SBE order messages; current CME COD documentation describes a configured session-level facility with stated order-type exclusions.
+
+These examples are not interchangeable designs. A gateway adapter converts each one into the stable internal facts defined earlier while preserving venue-specific reason and lineage data for recovery.
+
+Primary deployment references should be pinned in the adapter’s certification record: the FIX Trading Community’s **FIX Session Layer** specification, Nasdaq’s dated **OUCH 5.0 Order Entry Specification**, and the venue’s current session/COD/rate-limit rules. A web page remembered from the previous release is not a protocol contract; archive the approved revision and diff it before certification.
+
+---
+
+## 54.12 Observability and fault injection — Reference
+
+### Minimum per-session telemetry
+
+- connection/session state transitions with reason and duration;
+- `NextNumIn`/`NextNumOut` or native cursor, gaps, replay ranges, duplicates;
+- heartbeat/test timeouts and event-loop watchdog stalls;
+- orders admitted, attempted, accepted, rejected, and unknown;
+- outstanding new/cancel/replace counts and oldest age;
+- acknowledgement latency split into local queue, write, network/venue, and recovery;
+- throttle utilization/rejects/queue age by message class;
+- COD configuration observed and COD-related recovery results;
+- primary/drop-copy unmatched executions by age;
+- correlation misses, invalid transitions, and identifier-capacity headroom.
+
+Metrics must not mutate protocol state from another thread. Snapshot owner-written counters or publish bounded events. Raw logging must preserve evidence without blocking the session owner; Chapter 55 covers the hot-path mechanism.
+
+### Fault matrix
+
+| Injection | Invariant to verify |
+|---|---|
+| Disconnect before any write-capable call | Intent remains definitely unsent |
+| Disconnect after partial/complete transport write | Request becomes unknown, ID retained |
+| Drop new ack but deliver fill | Fill correlates and updates once |
+| Duplicate every execution report | Position and downstream events remain single-effect |
+| Reorder ack/fill/cancel across primary/drop copy | Confirmed quantities never regress |
+| Reject cancel after full fill | Order stays terminal; command resolution is separate |
+| Lose resend-store range | Session fences and takes supervised recovery path |
+| Exhaust correlation capacity | No ID alias; admission stops safely |
+| Exhaust new-order throttle budget | Cancel/recovery policy follows documented venue limits |
+| Kill process with COD enabled/disabled | Observed venue outcomes match configured scope |
+| Schema/version mismatch | Session rejects/fences before state mutation |
+| Drop-copy gap | Reconciler alarms and recovers rather than declaring agreement |
+
+Certification tests supplied by a venue are necessary but insufficient. Add deterministic model tests, duplicate/reorder property tests, crash-point tests around every local commit, and production-like capacity tests. Store the protocol revision and expected outcome beside each scenario so a venue upgrade produces an explicit review.
+
+---
+
+## Recall card — Core
+
+- The venue owns order/execution truth; the gateway owns a recoverable, auditable model of it.
+- Session `Active` permits flow; it does not prove any order state.
+- Transport write is a send attempt, not acceptance. Timeout creates uncertainty, not rejection.
+- Stable internal handle, client request ID, venue order ID, and execution ID have different scopes.
+- Keep confirmed lifecycle separate from `CancelPending`/`ReplacePending`.
+- A fill can precede ack and race cancel. Apply execution facts once; never let a late ack regress them.
+- Session sequence detects gaps; business identity detects duplicate effects.
+- Preserve unknown exposure across disconnect; resume, replay, query, and reconcile before reopening.
+- COD and throttles are venue/session/version contracts. Local priority cannot override external enforcement.
+- Drop copy is independent evidence with its own gaps; post-trade records close a wider reconciliation window.
+
+---
+
+## Common traps — Core
+
+- Collapsing session state and order state into one enum.
+- Returning “sent” as if it meant “accepted.”
+- Converting an acknowledgement timeout into `Rejected`.
+- Reusing a client ID after a local/ambiguous failure.
+- Treating FIX `PossDupFlag` and `PossResend` as the same mechanism.
+- Assuming gap fill skips only administrative messages under every agreement.
+- Resetting sequence numbers on an intraday reconnect to avoid recovery.
+- Modeling `PendingCancel` as a venue lifecycle state and losing working exposure.
+- Ignoring a fill because the new-order acknowledgement has not arrived.
+- Adding `LastQty` again on duplicate delivery.
+- Using only `max(CumQty)` and losing trade-bust/correction lineage.
+- Returning to Working on every cancel reject, regardless of reason.
+- Replacing confirmed terms at replace-send time.
+- Recycling terminal correlation entries before late/replay/correction closure.
+- Assuming a status query exists or that “unknown order” always proves absence.
+- Treating COD as immediate, universal, or equivalent to flat.
+- Letting a local cancel reserve exceed the exchange rate limit.
+- Queueing stale new orders without expiry or renewed risk authorization.
+- Calling drop copy infallible or using an unscoped execution ID.
+- Reopening after logon before sequence, order, and risk reconciliation complete.
+
+---
+
+## Reasoning questions
+
+1. Why can a gateway be logged on successfully while every order remains unsafe to act on?
+2. Define the exact boundary between definitely unsent and send-outcome unknown in a single-writer gateway.
+3. How do FIX session retransmission and application resend differ, and which identity resolves each duplicate?
+4. Why is `CancelPending` better represented beside Working than instead of Working?
+5. A fill arrives before the new acknowledgement. Which facts does it establish, and which remain unknown?
+6. A cancel reject says “too late.” Why is returning unconditionally to Working unsafe?
+7. What must be retained before an internal order slot and its identifiers can be reused?
+8. How should local throttling behave when new orders have exhausted the budget needed for cancels, but the venue’s shared quota is already full?
+9. Which evidence is required before reopening order entry after an unrecoverable resend gap?
+10. What can drop copy reveal that an internally consistent gateway journal cannot?
+
+---
+
+## Code-reading puzzle
 
 ```cpp
-class TokenBucket {
-    int64_t  tokens_;          // scaled fixed point: tokens * 2^16
-    uint64_t last_tsc_;
-    int64_t  per_tsc_;         // refill rate, same scale
-    int64_t  cap_;
-public:
-    // Returns true if the message may be sent; consumes one token.
-    inline bool try_consume(uint64_t now_tsc, int64_t cost = 1<<16) noexcept {
-        tokens_ += (int64_t)(now_tsc - last_tsc_) * per_tsc_ >> 16;
-        last_tsc_ = now_tsc;
-        if (tokens_ > cap_) tokens_ = cap_;
-        if (tokens_ < cost) return false;
-        tokens_ -= cost;
-        return true;
-    }
-};
+void on_cancel_timeout(Order& o) {
+    o.life = Life::Working;
+    o.pending = Pending::None;
+    risk.release_cancel_reservation(o.leaves);
+}
 ```
 
-Points that matter: `now_tsc` comes from `rdtsc` (Ch. 43 §43.12), ~20 cycles, not `clock_gettime`; the refill is a multiply-shift, not a division; the state is a single cache line owned by the sending thread, so there is no atomic and no contention (Ch. 52 §52.6's single-writer discipline pays off here); the `cost` parameter carries message-type weighting for free.
-
-**Sliding window** when the venue enforces one exactly: keep a ring of the last N send timestamps; a send is permitted iff `now - ring[head] >= window`. This is exact, O(1), and uses `N * 8` bytes — for N=1000 that is 8 KB, two pages, worth locking (Ch. 32 §32.15).
-
-**What to do when throttled** is the real design question, and the answer is *never block*. Blocking on a hot path is a syscall and a scheduling event; worse, it means the strategy thread stalls while the market moves. Three policies, chosen per message class:
-
-| Policy | Applies to | Rationale |
-|---|---|---|
-| **Reject to caller** | New orders, quote updates | The intent is time-sensitive; a delayed order is often worse than none. Caller decides. |
-| **Queue (bounded)** | Cancels, cancel/replace to reduce size | Risk-reducing actions must eventually go out |
-| **Bypass reserve** | Mass cancel, kill-switch cancels (Ch. 56 §56.18) | Must never be throttled |
-
-A bounded queue with a drop-oldest policy is wrong for cancels (the oldest cancel is the most urgent); drop-newest is wrong too. The right answer for the cancel queue is *never drop* — size it to the maximum possible number of live orders, which is itself bounded by the order count limit, so the bound is known at startup and can be preallocated.
-
-**Observability.** Export, per session: tokens remaining, throttle-rejections by message class, time spent at zero tokens, and the ratio of your throttle rate to the venue limit. A throttle that never fires may be misconfigured (too loose) and a throttle firing constantly means the strategy is over-sending. Both are invisible without counters (Ch. 59 §59.1). Increment them with plain non-atomic adds on the owning thread and publish periodically.
+List at least four possible venue realities when this timer fires. Explain which assignment invents a fact, why releasing exposure can be dangerous, and what event should actually resolve the pending command. Then state what the gateway may do while the protocol provides no definitive query.
 
 ---
 
-## 54.13 Cancel on Disconnect
+## Implementation exercise
 
-**Cancel on disconnect** (COD) is a venue-side facility: if the session drops, the exchange automatically cancels the session's live orders. It exists because a disconnected participant cannot manage risk, and orders resting in a market you cannot see or cancel are unbounded exposure.
+Build a deterministic gateway simulator with:
 
-The mechanics and their non-obvious edges:
+1. one session state machine and one single-writer event queue;
+2. stable internal handles plus scoped client, venue, and execution identifiers;
+3. new, accept, reject, partial/full fill, cancel, cancel reject, replace, correction, and bust events;
+4. a bounded session resend store and a separately replayable gateway journal;
+5. primary and delayed drop-copy streams;
+6. venue-configurable duplicate-ID, recovery, throttle, and COD policies.
 
-- **Scope.** Usually per session, sometimes per port or per firm. Orders entered on session A are not necessarily cancelled when session B drops. If you spread orders across sessions for throughput, you have spread your COD protection too.
-- **Order types excluded.** GTC (good-till-cancelled) and other multi-day orders are frequently *exempt* from COD, on the reasoning that their intent spans sessions. So COD does not imply "flat after disconnect."
-- **Trigger definition.** COD typically fires on abnormal disconnect, and often *not* on a graceful logout — the venue treats logout as "I am done for now, keep my orders." Some venues invert this. Read the specification; do not assume.
-- **Latency.** COD is not instantaneous. The venue must detect the disconnect (TCP error, or its own heartbeat timeout — which may be 30 s) and then cancel. Between the disconnect and the cancels, your orders are live and can trade. A fill during the COD window is legitimate and you must accept it on reconnect. Candidates who say "COD means I have no risk when disconnected" are wrong by exactly the detection interval, which is the interval during which markets often move (a venue-side event that disconnects you may be correlated with a price move).
-- **Reconnect races.** If you reconnect quickly, the cancels may arrive *after* your new orders. The cancel messages are for the old orders by exchange `OrderID`, so they should not touch the new ones — but a gateway that keys internal state by slot and recycles aggressively (§54.7) can mis-attribute them.
-
-**Client-side complement.** COD is a backstop, not a strategy. The gateway should also implement local cancel-on-disconnect: on detecting loss of the market-data feed, of a downstream risk service, or of its own heartbeat to the strategy, it should proactively cancel. Because that requires a working order session, it must run *before* the session dies — which is why stale-market detection (Ch. 53 §53.8) and internal watchdogs (Ch. 56 §56.7) are wired to the cancel path with the highest priority and a reserved throttle budget (§54.12).
-
-**Testing.** COD behaviour is exactly the kind of thing that is never exercised until it matters. The test is a fault-injection exercise (Ch. 57 §57.14): place orders in the venue's test environment, `SIGKILL` the gateway (not a graceful shutdown — that path is different), reconnect, and assert the order states you observe match the specification. Do this for each venue and each order type, and re-run it after every venue software release, because COD semantics change quietly.
+Generate every crash point around admission, journal append, send attempt, acknowledgement, and publication. Duplicate and reorder inbound events within the protocol’s allowed rules. Assert that no send-outcome-unknown ID is reused, cumulative ordinary fills do not regress, every execution effect is applied once, possible exposure is conservative, and `Active` is reached only after reconciliation. Finish with capacity calculations for order retention, resend storage, gap buffering, throttle queues, and the drop-copy lateness window.
 
 ---
 
-## 54.14 Drop Copy
+## Prerequisite for Chapter 55
 
-A **drop copy** is a separate, read-only session from the venue that delivers a copy of all execution reports and order state changes for a firm's account(s), independent of the order-entry sessions that generated them. It exists so that risk, compliance, and back-office systems can observe trading activity without sitting on the latency-critical path, and so that a firm retains visibility when an order session is down.
-
-Why it matters to a gateway engineer:
-
-- **It is the authoritative cross-check.** The drop copy is generated by the exchange from its own books, on a different path, so agreement between your gateway's fill stream and the drop copy is genuine independent confirmation. Disagreement is a real problem and always investigated.
-- **It survives your session failure.** During a disconnect (§54.10), the drop copy continues to deliver fills, so a risk system fed from drop copy sees exposure your gateway cannot.
-- **It covers all sessions and often manual activity** — trades entered by a human via the venue's GUI, or corrections applied by the exchange, appear in drop copy and never in your order session.
-- **It is slower.** Drop copy is deliberately not latency-optimized; delays of milliseconds to seconds are normal. Never use it on the trading path.
-
-Architecturally, the drop copy consumer is a separate process on the warm path (Ch. 52 §52.7) with its own session state machine (all of §54.1–§54.5 applies — it is a full FIX session with logon, heartbeats, sequencing, and resend). It writes into the reconciliation engine, not into the trading model. Keeping it out-of-process matters: a bug in drop-copy parsing must not be able to stall or crash the order gateway.
-
-**Reconciliation logic** is a three-way set comparison over `ExecID`:
-
-```
-gateway_execs  Δ  dropcopy_execs
-  ├─ in both, matching qty/price      → OK
-  ├─ in drop copy only                → gateway missed a fill  (SERIOUS: position wrong)
-  ├─ in gateway only                  → gateway invented a fill (SERIOUS: dedup bug or replay leak)
-  └─ in both, differing qty/price     → parsing bug or a correction/bust
-```
-
-The "drop copy only" case is the one that justifies the whole facility: it catches a lost fill, which no amount of internal consistency checking can find, because internally you are consistent — just wrong. Run the comparison continuously (a streaming match with a bounded reorder window, typically 30–60 s to absorb drop-copy delay) rather than only at end of day, and alarm on any unmatched execution older than the window.
-
-**Sequence discipline.** Drop copy has its own sequence numbers and its own gap recovery; a gap in the drop copy is not a gap in trading, but it *blinds the reconciler*, so it must alarm rather than silently gap-fill past it.
-
----
-
-## 54.15 Post-Trade Reconciliation
-
-Post-trade reconciliation is the end-of-cycle verification that your recorded state matches every external authority. It is a batch, cold-path activity, but its design constrains the hot path: you can only reconcile what you recorded, and you can only record cheaply what you designed to be recordable cheaply.
-
-The comparison set:
-
-| Source | Authority | Timing |
-|---|---|---|
-| Gateway journal (Ch. 56 §56.1) | Yours | Real time |
-| Drop copy (§54.14) | Exchange, real-time | Seconds |
-| Exchange end-of-day trade file | Exchange, definitive for the session | After close |
-| Clearing house / prime broker file | Definitive for settlement | T+0 evening to T+1 |
-| Internal position/PnL system | Yours | Continuous |
-
-Each pair must match on: execution count, per-instrument signed quantity, and notional. Mismatches are classified by their signature:
-
-- **Quantity matches, execution count differs** → a duplicate was collapsed on one side. Usually a dedup (§54.9) or replay leak.
-- **Count matches, quantity differs on one instrument** → fixed-point scale or lot-multiplier bug (Ch. 23 §23.10, Ch. 49 §49.8). Deterministic and reproducible.
-- **One extra execution near a disconnect** → an order was duplicated across reconnect; identifier discipline failure (§54.6).
-- **Everything matches except late corrections** → trade busts applied by the exchange after your snapshot. Expected; the reconciler must accept corrections as first-class, not as errors.
-- **Off by exactly one fill, consistently at session start** → sequence reset (§54.3) discarded a message.
-
-**What the gateway must record for this to be possible.** For every message, in and out: the sequence number, the full raw bytes, the hardware receive timestamp or TSC at send/receive (Ch. 48 §48.4), and the internal order handle. Raw bytes matter — a normalized record cannot answer "did we mis-parse this?", which is the question you will actually need. Writing raw bytes is cheap if it is done as an append into a preallocated mapped ring with the flush handled by a separate thread (Ch. 55 §55.7); it is ruinous if it is `fprintf`.
-
-**Determinism is the multiplier.** If the gateway's processing is deterministic given its input byte stream (no wall-clock reads embedded in logic, no map iteration order dependence, no unordered thread interleaving in the core), then a reconciliation break can be reproduced offline by replaying the journal (Ch. 57 §57.12), and the investigation takes minutes instead of days. Non-deterministic gateways produce breaks that cannot be explained, which are then written off — and a written-off break is an unmonitored bug.
-
----
-
-## 54.16 At-Least-Once Processing
-
-The delivery-semantics taxonomy, stated precisely because interviewers probe it:
-
-- **At-most-once** — a message is delivered zero or one times. Achieved by never retrying. Loses data on failure.
-- **At-least-once** — a message is delivered one or more times. Achieved by retrying until acknowledged. Duplicates are possible.
-- **Exactly-once** — delivered precisely once. **Not achievable** at the transport layer between two independently-failing parties; the two-generals result forbids it. What is achievable is *effectively-once processing*: at-least-once delivery plus idempotent, deduplicating consumers.
-
-Order gateways are irreducibly at-least-once, and the reason is worth being able to derive on the spot. To be exactly-once, the sender must know whether the receiver processed a message before deciding to retransmit. That knowledge requires an acknowledgement, which can itself be lost; if the ack is lost, the sender must choose between retransmitting (risking a duplicate) and not (risking a loss). No protocol removes that choice — it can only move it. Every "exactly-once" system in practice is at-least-once delivery with an idempotency key, which is exactly what `ClOrdID` and `ExecID` are.
-
-The design rules that follow:
-
-1. **Every message carries an idempotency key that is stable across retransmission.** `ClOrdID` outbound, `ExecID` inbound. Never derive the key from anything that changes on retry (timestamps, sequence numbers, connection identity).
-2. **Every consumer is idempotent** (§54.8), all the way down. The gateway dedups, the order state machine is monotone, the position keeper uses absolute cumulative quantities, the risk system dedups by `ExecID`. A single non-idempotent consumer anywhere in the chain defeats the whole design.
-3. **Persist before acting, on the send side; act before advancing, on the receive side** (§54.3). This is the write-ahead rule and it is what makes crash-restart equivalent to a duplicate rather than to a loss.
-4. **Prefer duplicates to losses at every ambiguous decision.** A duplicate is detectable and cancellable; a loss is invisible. This is why the dup filter fails open (§54.9), why unacked orders become `Unknown` rather than `Rejected` (§54.10), and why the journal is written before the send.
-
-The one place this rule inverts is *order submission itself*: a duplicated new order is a real, tradeable second order, and cancelling it costs money if it fills first. That is why the idempotency key must be enforced by the **exchange** — venues reject a repeated `ClOrdID` — and why you must never resend a new order after a reconnect without a status query (§54.10). The general principle "prefer duplicates" applies to *processing*; for *transmission of new exposure*, prefer querying.
-
----
-
-## Key Interview Questions
-
-1. **Why do sequenced session protocols exist on top of TCP, which already guarantees delivery?** — TCP guarantees delivery *within a connection*; sessions span connections. Sequence numbers detect messages lost to a disconnect, a peer restart, or a state mismatch, none of which TCP sees.
-2. **What is the difference between `PossDupFlag` and `PossResend`?** — `PossDup` is a session-layer retransmission at the same sequence number (detectable by sequence comparison); `PossResend` is an application-layer re-issue at a *new* sequence number, detectable only by application identity such as `ExecID`.
-3. **When is `ResetSeqNumFlag=Y` safe?** — Start of day, no live orders, no unreconciled fills. Intraday it discards the exchange's pending resend, which can include execution reports you never saw.
-4. **Why must `ClOrdID` never be reused, even after a reject?** — Because a reject may be locally generated while the message was already on the wire, and because `OrderStatusRequest` by `ClOrdID` is the only definitive way to resolve an unacknowledged order.
-5. **How do you correlate an inbound execution report to internal state in a few nanoseconds?** — Derive `ClOrdID` from a counter whose low bits are the slot index in a preallocated array; mask, load, verify the full ID. No hashing, no allocation.
-6. **Why not `std::unordered_map` for the order table?** — Node-based: pointer chase per lookup, allocation per insert, free per erase. Use a preallocated open-addressed flat map, or direct indexing.
-7. **A duplicated execution report arrives. Why does `cum_qty += last_qty` break and `cum_qty = max(cum_qty, e.cum_qty)` not?** — Cumulative quantity is absolute and idempotent under repetition; incremental accumulation double-counts.
-8. **Which direction should a duplicate filter fail?** — Open: process the message. Dropping a real fill corrupts position silently; processing a duplicate is caught by the idempotent state machine. Never use a Bloom filter — its errors are false positives.
-9. **You disconnect with an order in `PendingNew`. What is its state?** — Unknown. Resolve by `OrderStatusRequest` on the original `ClOrdID`, never by resending or by assuming. Model `Unknown` as a distinct state that permits cancels but no new exposure.
-10. **Why must the journal be written before sending, but the inbound message processed before advancing the sequence number?** — Send-side: a crash after journaling and before sending yields a duplicate (recoverable); the reverse yields an untracked live order. Receive-side: a crash after processing and before advancing yields a duplicate (recoverable); the reverse loses a fill.
-11. **Does cancel-on-disconnect mean you are flat after a disconnect?** — No. It fires only after venue-side detection (up to the venue's heartbeat timeout), is often per-session, and typically excludes GTC orders. Fills during the detection window are real.
-12. **Why reserve throttle budget for cancels?** — Otherwise exhausting the rate limit with new orders makes you unable to cancel, converting a throughput limit into an unbounded risk exposure.
-13. **Ack latency rises smoothly with your send rate, with no rejects. Diagnosis?** — Venue-side queuing against a rate limit, not network congestion. Fix the throttle, not the network.
-14. **What is a drop copy and why can't you use it for trading?** — An independent read-only feed of the firm's executions from the venue; authoritative for reconciliation, but deliberately not latency-optimized (ms to s of delay) and often covering multiple sessions.
-15. **Is exactly-once delivery achievable?** — No, between independently-failing parties. Achievable is at-least-once delivery plus idempotent, deduplicating consumers keyed on a retransmission-stable identifier.
-16. **What does a reconciliation break where quantities match but execution counts differ tell you?** — A duplicate was collapsed on one side: a dedup or replay-leak bug, not an arithmetic one.
-17. **Why must an order's correlation slot not be recycled immediately on reaching a terminal state?** — Late acknowledgements and late fills arrive for orders you consider finished; a lookup miss on a fill is a position error. Retire, then reclaim after a bound exceeding maximum venue latency.
-18. **Where does throttle state live in a multi-threaded gateway?** — On the single writer that owns the session, as plain non-atomic fields in one cache line. Sharing it across threads reintroduces contention on the critical path.
-
----
-
-## Common Traps
-
-- **`ResetSeqNumFlag=Y` on an intraday reconnect** — silently discards the exchange's queued execution reports.
-- **Reusing a `ClOrdID` after a reject** — makes the unacked case unresolvable and can be rejected as a duplicate at the venue.
-- **`cum_qty += last_qty`** — a single duplicated execution report doubles the position.
-- **Treating `PossResend` like `PossDup`** — discards legitimate messages; ignoring it double-counts fills.
-- **Bloom filter for duplicate suppression** — false positives drop real fills.
-- **Recycling an order slot at terminal state** — late fills land on a reused or empty slot.
-- **Keying correlation on `ClOrdID` alone across sessions/days** — a stale response from a previous session resolves to a live order.
-- **Keying a replace on `OrigClOrdID` when the venue responds with the new `ClOrdID`** — every replace ack becomes an unknown-order error.
-- **Assuming logout cancels orders** — most venues persist them; day orders die at close, not at logout.
-- **Assuming cancel-on-disconnect is immediate** — you are exposed for the venue's detection interval.
-- **Closing the socket immediately after sending logout** — RST, abnormal-disconnect classification, possible unintended COD.
-- **Sending before reconciliation completes on reconnect** — duplicate orders or trading on top of an unknown position.
-- **A single throttle budget shared by new orders and cancels** — throttling yourself out of risk reduction.
-- **Blocking when throttled** — a syscall and a scheduling event on the hot path, while the market moves.
-- **Sizing the outbound message store below the day's message count** — a wrapped store cannot answer a resend request.
-- **Formatting `ClOrdID` with `std::to_string`/`std::format` on the send path** — allocation and hundreds of nanoseconds.
-- **Feeding the risk system from the order session only** — it goes blind exactly when the session drops; drop copy exists for this.
-- **Non-deterministic gateway processing** — reconciliation breaks that cannot be reproduced get written off.
-- **Assuming the exchange `OrderID` is stable across a replace** — true at most venues, not all; read it from the ack.
-- **Per-order status queries during recovery without throttling** — trips the rate limit at the worst possible moment.
-
----
-
-## Compact Recall Summary
-
-**Session.** Logon negotiates heartbeat interval and sequence policy; honor the *response*. Logout is graceful and does not cancel orders — send logout, `SHUT_WR`, drain, close. Heartbeats detect blackholed peers that TCP cannot; check them with TSC deltas in the spin loop, and treat exchange-initiated heartbeat disconnects as evidence of a *local* stall.
-
-**Sequencing.** One integer per direction, increment by one, gap ⇒ something was generated and not delivered. Gap-fill replaces administrative messages during a resend; hard reset discards the loss detector and is supervised. `ResetSeqNumFlag=Y` is start-of-day only. Persist outbound *before* sending; process inbound *before* advancing — the asymmetry is what makes crash-restart a duplicate rather than a loss.
-
-**Recovery.** Reconnect with backoff and jitter, long backoff on auth failures, resume rather than reset, use `NextExpectedMsgSeqNum` where available. Consume the resend, then resolve every `PendingNew`/`PendingCancel`/`PendingReplace` by *querying* (`OrderStatusRequest`, `OrderMassStatusRequest`), then reconcile, then enable sending. Unresolved in-flight orders go to a distinct `Unknown` state permitting cancels only.
-
-**Identity.** `ClOrdID` is yours and exists before the send — the only key usable for an unacked order; `OrderID` is the exchange's and appears on the ack; replaces form a `ClOrdID` chain via `OrigClOrdID`. Never reuse a `ClOrdID`. Carry a dense internal `OrderIdx` distinct from both. Build `ClOrdID` from bit-packed fields with the counter's low bits as the array slot, so correlation is a mask, a load, and a verify — not a hash probe.
-
-**Idempotence.** Rank states and ignore backwards transitions; apply `cum_qty` absolutely, never incrementally; dedup exactly by `ExecID`, and treat corrections/busts as legitimate revisions that must *not* be ignored. Dedup filters fail open; the state machine is the exact defence behind them.
-
-**Rate control.** Venue limits are fixed-window, sliding-window, token-bucket, weighted, or order-to-trade ratios; you shadow an unreadable counter, so run 5–15% below the contractual limit. Token bucket refilled from `rdtsc`, single-writer, no atomics. Reserve budget for cancels. Never block on throttle: reject new orders to the caller, queue cancels in a bound sized to the maximum live-order count, and bypass entirely for mass cancel and kill switches.
-
-**Cross-checks.** Cancel-on-disconnect is a venue backstop with a detection delay, per-session scope, and GTC exemptions — complement it with local proactive cancellation driven by watchdogs and stale-market detection. Drop copy is the independent authority: three-way `ExecID` set comparison catches the fill you missed, which internal consistency checking never can. Post-trade reconciliation against drop copy, exchange EOD, and clearing files classifies breaks by signature — count-vs-quantity mismatch names the bug class.
-
-**Semantics.** Exactly-once delivery is impossible between independently failing parties; the achievable target is at-least-once delivery with idempotency keys and idempotent consumers end-to-end. Prefer duplicates to losses everywhere in *processing*; invert only for transmission of new exposure, where a duplicate is a real second order — there, query rather than resend.
+Chapter 55 optimizes the gateway’s hot path. Before continuing, be able to identify its correctness boundaries: the single session owner, admission commit, send uncertainty window, correlation lookup, idempotent reducer, throttle decision, and publication point. An optimization that moves or weakens one of those boundaries must first reproduce this chapter’s state-machine and fault-injection results.

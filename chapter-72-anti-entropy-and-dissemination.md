@@ -1,719 +1,1147 @@
 # Chapter 72 — Anti-Entropy and Dissemination
 
-*Interview-focused revision notes. The theme: leaderless, eventually-consistent replication buys availability by letting replicas diverge — and then spends the rest of its life paying that debt back. Anti-entropy is the collection of background and foreground processes that drag divergent replicas back together, and dissemination is how a fact reaches every node when there is no leader to broadcast it. PostgreSQL's classic single-leader replication needs almost none of this, and that absence is the whole point: anti-entropy is the price of giving up a single ordering authority. Cassandra, Dynamo, and Riak are the reference systems throughout; the math is the math of epidemics.*
+## 72.0 Why This Changes the Decision — Core
+
+Leaderless replication accepts that replicas can temporarily disagree. That
+choice is useful only if the system can later:
+
+1. tell equal from divergent state;
+2. determine which states dominate, conflict, or represent deletion;
+3. transfer only what is missing;
+4. spread membership and repair knowledge without one indispensable sender;
+5. prevent old values from returning after deletion.
+
+The chapter follows that chain:
+
+```
+missed write → version/digest comparison → hot-key repair
+             → range/Merkle repair       → cold-key repair
+             → gossip dissemination      → decentralized reach
+             → tombstone-safe cleanup    → no resurrection
+```
+
+Chapter 71 owns quorum intersection, consistency models, conflict-resolution
+families, and CRDT theory. Here versions and merge functions are inputs to the
+repair layer. Anti-entropy can make replicas agree on a wrong or lossy resolver;
+it does not upgrade the consistency model.
+
+### Claim labels
+
+- **[Protocol/model]** follows only under the stated network, failure, peer
+  selection, version, merge, and stopping assumptions.
+- **[Probability/model]** is a probability or expectation in a named stochastic
+  model, not a per-run deadline.
+- **[Implementation]** is one possible design rather than a protocol theorem.
+- **[Cassandra 5.0/configuration]** describes the cited Apache Cassandra 5.0
+  behavior; exact repair, read-repair, hint, tombstone, and gossip behavior is
+  product/version/configuration dependent.
+- **[Measured]** bandwidth, convergence time, tree cost, and operational
+  thresholds require a named dataset, workload, topology, and failure pattern.
 
 ---
 
-## 72.1 The Problem: Replicas Diverge
+## 72.1 90-Second Screen — Core
 
-Replication (Ch. 71 §71.1) keeps *N* copies of every key so the system survives node loss and serves reads locally. The moment you have more than one copy that can be written independently, the copies drift. In a leaderless / Dynamo-style system (Ch. 71 §71.14) there is no single authority that serializes writes, so divergence is not an exceptional event — it is the *normal steady state* between repairs.
+Seven facts:
 
-Three distinct forces push replicas apart, and an interviewer will want you to name all three:
+1. A missed replica write is not automatically repaired by waiting. Convergence
+   needs repeated delivery or explicit comparison plus a deterministic,
+   inflationary merge/winner rule.
+2. Hinted handoff covers many short outages but is best effort. A hint may
+   expire, be lost with its holder, become obsolete, or fail replay.
+3. Read repair discovers divergence only for keys and replicas actually read.
+   It is valuable for hot data and cannot guarantee cold-data convergence.
+4. Merkle trees summarize canonical key ranges. Comparing already-built equal
+   roots is O(1); building, updating, snapshotting, and validating the trees is
+   not. A mismatching leaf identifies a range to compare/stream, not necessarily
+   one bad record.
+5. Gossip is redundant randomized dissemination. Its round/message behavior
+   depends on peer sampling, fanout, topology, loss, churn, push/pull mode, and
+   stopping rule. “O(log n) rounds” is a model result, not an operational SLA.
+6. Deletion must replicate as a versioned tombstone. Garbage-collect it only
+   after the system can exclude every older live copy, or that copy can
+   resurrect the value.
+7. A repair job is a distributed operation: pin ownership/schema/version
+   context, handle concurrent writes, throttle streams, checkpoint progress,
+   retry idempotently, and verify the result.
 
-1. **Dropped or lost messages.** A write is sent to *N* replicas; the network drops one, or a replica's socket buffer overflows, or a GC pause makes it miss the request window. The coordinator got a quorum (Ch. 71 §71.9) of acks and told the client "success," but one replica never applied the write. That replica is now stale and *nothing in the write path will ever notice*.
-2. **Downed nodes.** A replica is partitioned away or crashed while writes continued elsewhere. When it returns it has a gap — every write that landed during its absence is missing.
-3. **Concurrent writes.** Two clients write the same key through different coordinators at the same logical time. With no leader to order them, different replicas may apply them in different orders, or hold genuinely concurrent (causally unordered) values that must be reconciled by version vectors / conflict resolution (Ch. 71 §71.12, §71.13).
+One layered answer:
 
-```
-Write w=5 to key K, N=3, W=2 (quorum). Replica C is GC-paused.
-
-client ──▶ coordinator ──┬──▶ A  applies K=5   ack
-                         ├──▶ B  applies K=5   ack   ◀── W=2 reached, client told OK
-                         └──▶ C  (paused)  ...no ack, request times out, dropped
-
-state after:   A: K=5    B: K=5    C: K=4   ← C is silently stale forever
-```
-
-The third force, **concurrent writes**, produces a subtler divergence that no amount of waiting fixes, because the values are genuinely unordered:
-
-```
-Two clients write key K at the same logical time through different coordinators.
-
-client1 ─put K=a─▶ coord1 ─┬─▶ A: K=a
-                           └─▶ B: K=a
-client2 ─put K=b─▶ coord2 ─┬─▶ B: K=b   (B applies a then b, or b then a?)
-                           └─▶ C: K=b
-
-  A: K=a     B: K=? (order-dependent)     C: K=b
-  → a and b are CONCURRENT (causally unordered); there is no "stale" one.
-  → resolution needs version vectors / LWW / sibling values (Ch. 71 §71.12–§71.13),
-    not just "pick the newer" — because neither happened-before the other.
-```
-
-This is why anti-entropy alone (propagating the "newest" value) is insufficient for concurrent writes: convergence requires a *deterministic conflict-resolution rule* (last-write-wins by timestamp, version-vector dominance, or CRDT merge) so every replica picks the same winner. Dropped messages and downed nodes create a *stale vs fresh* asymmetry that repair resolves by copying the fresh value; concurrent writes create a genuine *tie* that only a resolution policy can break.
-
-Because the write path deliberately does **not** wait for all *N* replicas (that would sacrifice availability and latency, Ch. 71 §71.9), staleness is baked in by design. The system's correctness argument is not "replicas never diverge" but "replicas *converge* — every value eventually reaches every replica, and conflicts are resolved deterministically." Delivering on that promise is the job of this chapter. This is the operational meaning of **eventual consistency**: convergence guaranteed only in the absence of new writes, with the convergence *mechanism* left to anti-entropy.
-
----
-
-## 72.2 Anti-Entropy, Convergence, and Repair
-
-**Entropy**, borrowing the thermodynamic metaphor, is the disorder that accumulates as replicas drift. **Anti-entropy** is any background process that detects and reduces that disorder by comparing replicas and propagating missing or newer data until they agree. Petrov frames the whole space as answering one question: *how does an update, or the knowledge of an update, reach every node that needs it, cheaply and reliably, when there is no central coordinator you can trust to still be alive?*
-
-Two orthogonal timing choices organize every technique:
-
-| Axis | Foreground | Background |
+| Gap | First response | Backstop |
 |---|---|---|
-| **When** | On the critical path of a client read/write | Off the critical path, on a timer or trigger |
-| **Coverage** | Only keys clients actually touch | *All* keys, including cold ones never read |
-| **Latency cost** | Adds to client-visible latency | Zero client latency, spends CPU/disk/net |
-| **Examples** | Read repair, hinted-handoff replay | Merkle-tree repair, gossip anti-entropy rounds |
-
-The critical insight: **foreground repair cannot fix what nobody reads.** Read repair only touches keys on the read path, so a key written once and never read again can stay divergent indefinitely — until a background process sweeps it. Conversely, background full repair is expensive (it must consider every key) and runs infrequently. Production systems therefore layer *both*: read repair and hinted handoff for the hot, recently-touched set with low latency, and periodic Merkle-tree repair as the backstop that guarantees even cold keys converge. Getting a candidate to say "you need all three because each covers a gap the others leave" is the marker of a strong answer.
+| replica briefly unavailable | hint replay/direct retry | range repair |
+| hot key differs | digest/full read and read repair | range repair |
+| cold key differs | scheduled Merkle/range repair | rebuild/restore |
+| hint lost or expired | none on hint path | range repair |
+| membership fact missed | repeated gossip/pull | seed/control-plane reconciliation |
+| stale live value after delete | retained tombstone + repair | restore/rebuild if tombstone was purged too early |
 
 ---
 
-## 72.3 Dissemination Approaches: The Overview
+## 72.2 Failure Walkthrough: How Replicas Diverge — Core
 
-Petrov groups the ways a piece of information spreads through a cluster into three families. They differ in reliability, message overhead, and how gracefully they tolerate the very failures they exist to survive.
+Assume a key range is owned by replicas A, B, and C. Version comparison and
+conflict resolution are already defined as required by Chapter 71. The client
+writes `K = blue` with version `v7`:
 
 ```
-(1) NOTIFICATION BROADCAST         (2) ANTI-ENTROPY / BACKGROUND SYNC   (3) GOSSIP / EPIDEMIC
-    one source → everyone              periodic pairwise comparison         random peer exchange
-    ┌──▶ B                             A ⇄ B  "what do you have               A→B→D
-  A ┼──▶ C                             A ⇄ C   that I don't?"                  ↘C→E
-    └──▶ D                             (reconcile diffs)                      each round
-  O(n) msgs, single point,           thorough, self-healing,               2× reach per round,
-  fragile to source failure          higher latency, periodic              O(log n) rounds
+time     A                 B                 C              hint holder H
+t0       K=red,v6          K=red,v6          K=red,v6       —
+t1       apply blue,v7     apply blue,v7     unreachable    store hint(C,K,v7)
+t2       client receives success under the chosen write policy
+t3       H loses disk before replay
+t4       C returns: red,v6
 ```
 
-- **(1) Notification / broadcast.** A coordinator with a fact directly tells everyone. Cheap in messages (*O(n)*) and immediate, but **fragile**: if the source dies mid-broadcast, or a target is briefly unreachable, that target simply never learns the fact. There is no redundancy and no retry built into the topology. Direct write fan-out from a coordinator is broadcast; so is a leader pushing to followers (Ch. 71 §71.4).
-- **(2) Anti-entropy / background sync.** Nodes *periodically* pick a peer and compare their full data (or a compact summary of it), then exchange whatever differs. It is thorough and self-healing — a message missed this round is caught next round — but it has higher latency (you wait for the next cycle) and costs a full or summarized comparison each time. Merkle-tree repair (§72.10) is the canonical instance.
-- **(3) Gossip / epidemic.** Each node periodically forwards what it knows to a small random set of peers, who forward it onward, like an infection. Highly reliable through **redundancy** (many paths to each node), scales to huge clusters, but delivers the same fact multiple times to the same node (wasted bandwidth) and converges *probabilistically* rather than deterministically.
+The accepted write and its exact acknowledgment policy belong to Chapter 71.
+For anti-entropy, the important facts are:
 
-The families are not mutually exclusive; real systems combine them. Cassandra uses direct write fan-out (1), read repair and Merkle repair (2), and gossip (3) for membership and failure detection (Ch. 69 §69.x) simultaneously. The rest of the chapter develops each.
+- A and B have a state that dominates C under the chosen version rule.
+- C does not know it missed anything.
+- no message is still guaranteed to deliver `v7` because the hint was lost;
+- a read contacting A and C can discover and repair this hot key;
+- if `K` remains cold, scheduled range repair must find it.
 
-The mechanisms map onto Petrov's SI/anti-entropy taxonomy as follows — worth internalizing as one table because it is the map for the whole chapter:
+Divergence also arises from timeouts whose writes actually applied, process
+crashes between local persistence and reply, network partitions, restored old
+snapshots, node replacement, ownership movement, operator error, disk loss, and
+concurrent writes. Repair must distinguish:
 
-| Mechanism | Family | Timing | Detects or prevents | System example |
+| Relationship | Meaning | Safe action |
+|---|---|---|
+| equal version and equal canonical content | replicas agree | none |
+| one version dominates | one state supersedes the other | propagate dominant state |
+| versions concurrent | neither supersedes the other | retain siblings or apply the declared deterministic merge |
+| same version, different content | invariant/protocol corruption | quarantine and investigate; do not choose arbitrarily |
+| state absent on one side | could mean never written, missed write, or purged tombstone | compare version/retention/ownership evidence |
+
+An unversioned digest can say bytes differ but not which state is valid. A
+timestamp can totally order values but may discard causally concurrent writes
+and depends on its clock policy. Anti-entropy therefore transports the product's
+version and deletion semantics; it does not invent them.
+
+### Divergence has several clocks
+
+Track separate durations:
+
+- **write gap:** time from one replica accepting an update until every intended
+  replica has it;
+- **detection latency:** time until any mechanism notices the mismatch;
+- **repair latency:** time from detection until all selected targets durably
+  apply it;
+- **verification latency:** time until a later comparison confirms agreement;
+- **exposure:** number and policy of reads that could observe an older or
+  conflicting state during the gap.
+
+A low average repair latency can hide a cold-key tail. Read repair makes popular
+keys converge quickly while keys never read depend entirely on background range
+coverage. Report the oldest unrepaired range/version horizon, not only repair
+throughput.
+
+Classify root causes because remediation differs:
+
+| Cause | Evidence | Response |
+|---|---|---|
+| transient delivery miss | timeout plus later healthy target | retry/hint, then verify |
+| target outage/partition | failure interval and hint backlog | controlled replay + range repair |
+| coordinator ambiguity | client timeout, some replica versions advanced | idempotent retry/read resolution |
+| disk/page corruption | checksum/I/O error or same version with bad bytes | isolate, reconstruct from verified sources |
+| stale snapshot rejoin | replica incarnation/data horizon behind cluster | fence and rebuild, not ordinary trickle repair |
+| topology race | data on old/new owner sets differ by epoch | ownership-aware bootstrap/cleanup |
+| resolver/schema mismatch | peers interpret equal input differently | stop repair and fix compatibility |
+
+Repair is unsafe when nodes disagree on the meaning of a version or value. More
+bandwidth merely spreads the disagreement faster.
+
+### Explicit convergence assumptions
+
+One useful convergence statement is:
+
+> After updates stop, all live replicas for a range eventually reach the same
+> state if every relevant state is retained, the merge is deterministic and
+> convergent, every divergent range is compared fairly often, messages
+> eventually get through often enough, and repair keeps retrying.
+
+Spell out the assumptions:
+
+- ownership/schema/partitioning epoch is stable, or repair uses a protocol that
+  accounts for transitions;
+- replicas that are permanently lost are rebuilt from an authoritative live
+  set rather than returning indefinitely with stale storage;
+- version comparison and merge are deterministic; for state-based convergence,
+  merge is typically associative, commutative, and idempotent;
+- deletes remain represented until every older copy is repaired or excluded;
+- digest collisions are acceptably unlikely or confirmed by finer comparison;
+- peer/range scheduling is fair—no replica or cold range is starved forever;
+- there is an eventual period in which useful communication and storage
+  capacity are available;
+- repair messages are idempotent or deduplicated and failed jobs resume.
+
+Continuous partitions, unbounded churn, unbounded new writes, Byzantine peers,
+premature tombstone collection, inconsistent resolvers, or a scheduler that
+never selects a range invalidate that statement. Eventual consistency has no
+universal deadline.
+
+---
+
+## 72.3 The Layered Repair Stack — Core
+
+No single mechanism covers all failure windows:
+
+```
+write path:  direct fanout ──miss──> durable hint ──loss/expiry──┐
+                                                                │
+read path:   digest/full read ──mismatch──> read repair          │
+                 (only keys/replicas touched)                    │
+                                                                ▼
+background:  snapshot range → summaries/Merkle → stream/merge → verify
+                              (cold-data backstop)
+```
+
+| Mechanism | Trigger | Coverage | Main cost | Gap left |
 |---|---|---|---|---|
-| Direct write fan-out | broadcast (1) | foreground write | prevents (spreads immediately) | any coordinator write |
-| Read repair | anti-entropy (2) | foreground read | detects on read | Cassandra, Riak, Dynamo |
-| Digest read | anti-entropy (2) | foreground read | detects cheaply | Cassandra |
-| Hinted handoff | broadcast (1) + repair | foreground write, deferred | prevents gap | Dynamo, Cassandra, Riak |
-| Merkle-tree repair | anti-entropy (2) | background, periodic | detects over all keys | Cassandra `nodetool repair` |
-| Rumor-mongering gossip | gossip (3) SIR | background, bursty | spreads hot updates | Serf, Consul events |
-| Anti-entropy gossip | gossip (3) SI | background, continuous | reconciles full state | Cassandra/Scylla membership |
+| direct retry | write timeout | one mutation/target | write latency/load | retries can end |
+| hinted handoff | missed write, target later returns | recorded recent misses | hint disk and replay traffic | lost/expired/unrecorded hints |
+| read repair | read observes differing versions/digests | read key + contacted replicas | read latency and repair writes | cold keys/uncontacted replicas |
+| range/Merkle repair | scheduled/manual discrepancy check | selected range/replica set | scans, hashing, streaming, compaction | ranges not scheduled/completed |
+| rebuild/bootstrap | lost or replaced replica | assigned ranges from sources | large transfer and validation | bad source/transition race |
+| gossip | periodic peer exchange | membership/summaries/rumors selected for gossip | duplicate messages/state | finite rumor may die out |
 
-The columns that matter: *foreground vs background* decides latency; *detects vs prevents* decides whether the mechanism stops divergence from happening or only repairs it after the fact; *coverage* (touched keys vs all keys) decides whether a cold key is ever fixed.
-
----
-
-## 72.4 Read Repair
-
-**Read repair** is foreground anti-entropy driven by client reads. When a coordinator performs a quorum read (Ch. 71 §71.9), it contacts multiple replicas, and their responses let it *detect* divergence at exactly the moment a client cares about that key — and fix it.
-
-The mechanism, using the Dynamo/Cassandra model with replication factor *N* and read quorum *R*:
-
-1. Coordinator sends the read to *R* (or more) replicas.
-2. Each replica returns its value plus a **version** — a timestamp (Cassandra's last-write-wins cell timestamp) or a version vector (Riak, Ch. 71 §71.12).
-3. The coordinator picks the **winning** (most recent / causally dominant) version and returns it to the client.
-4. If any responding replica returned a stale version, the coordinator **writes the winning value back** to those stale replicas — the "repair."
-
-```
-Read K, N=3, R=3 (read all).  A,B fresh (K=5,t=20);  C stale (K=4,t=15)
-
-coordinator ──get K──▶ A  →  (5, t=20)
-             ──get K──▶ B  →  (5, t=20)
-             ──get K──▶ C  →  (4, t=15)   ◀── stale detected (t=15 < t=20)
-                                  │
-             ◀────── return (5,t=20) to client
-                                  │
-             ──put K=(5,t=20)──▶ C   ◀── REPAIR: overwrite C's stale copy
-```
-
-Read repair's coverage is exactly the read-hot set: keys that are read get repaired; keys that are never read never do. That is precisely why it cannot stand alone. Its great virtue is that it costs almost nothing on top of a quorum read you were already doing — you already have the responses; comparing versions and issuing a corrective write is cheap and amortized over real traffic.
+Layering is not redundant waste. Each mechanism shortens a different
+inconsistency window, while scheduled full coverage prevents best-effort paths
+from becoming correctness assumptions.
 
 ---
 
-## 72.5 Blocking vs Asynchronous Read Repair
+## 72.4 Versions, Digests, and Compact Summaries — Core
 
-There are two policies for *when* the coordinator issues the repair write relative to answering the client, and the distinction is a favorite interview probe because it maps directly onto a consistency guarantee.
+### Compare versions before payloads
 
-- **Blocking (synchronous) read repair.** The coordinator repairs the stale replicas and **waits for their acks before returning to the client.** This is more than hygiene: it makes the read **monotonic / read-your-writes stronger** in a specific sense. If the read touched a quorum and repaired the laggards synchronously, a subsequent quorum read is guaranteed to intersect at least one up-to-date replica *even if* the first read's quorum and the second's barely overlap. Cassandra's older behavior and its consistency-level machinery lean on blocking repair to make `QUORUM` reads behave. The cost is added tail latency — the client waits for the slowest repair.
-- **Asynchronous read repair.** The coordinator returns the winning value to the client *immediately*, then repairs stale replicas in the background. Lower latency, but the repair is best-effort and provides no ordering guarantee to the returning read. Cassandra's `read_repair` table option (`BLOCKING` vs `NONE` in modern versions; historically the `read_repair_chance` / `dclocal_read_repair_chance` probabilistic knobs) controls this.
+A record comparison normally considers:
 
-A subtle but important point: **blocking read repair is what lets a strict quorum (R + W > N) actually deliver its promised freshness in the presence of failed writes.** R + W > N guarantees the read set and last write set *intersect by node* (Ch. 71 §71.10), but if the write only reached W−k of the intended replicas due to drops, the intersecting node might itself have been one that missed it. Synchronous repair on the read path closes that residual gap by pushing the freshest value into the laggards before the read is considered done. Interviewers love the trap: "R + W > N alone guarantees you *see* a fresh value, but not that replicas *stay* fresh — that is what repair adds."
+```
+key + version/causal metadata + tombstone/expiry + canonical value
+```
+
+If one version dominates, repair can transfer the winner. Concurrent versions
+must be retained or merged by the Chapter 71 policy. A tombstone participates
+as a value with a version; “missing” is not equivalent to “deleted.”
+
+A digest is a compact fingerprint. It is useful at three scales:
+
+- value digest on a read path;
+- bucket/range digest for repair;
+- tree root/interior digest for hierarchical localization.
+
+Both peers must hash the same canonical representation, range boundary,
+snapshot point, schema, comparator, tombstone treatment, and hash algorithm.
+Otherwise equal logical state can hash differently, or unequal state can be
+omitted from coverage.
+
+Hash equality is evidence with collision probability determined by the
+algorithm and adversary model. Non-cryptographic hashes may be fine for
+accidental mismatch localization with full comparison before destructive
+action; hostile peers or corruption threats may need cryptographic hashes/MACs.
+
+### Digest reads and read repair
+
+An **[Implementation]** coordinator may request one full value and digests from
+other read replicas:
+
+```
+A → full(K,v,payload)
+B → digest(canonical K,v,payload)
+C → digest(canonical K,v,payload)
+```
+
+If digests match the full response, payload transfer is saved. On mismatch, the
+coordinator fetches enough full versioned states to resolve correctly, returns
+according to the read policy, and may repair stale respondents.
+
+Do not universalize this sequence. Which replicas return data or digests, when
+repair blocks the client, how ranges/partitions are reconciled, and what
+consistency property follows are product/version/configuration details. A read
+that contacts two of three replicas cannot repair the third. An asynchronous
+repair can fail after the client response. A digest of a filtered query must
+cover exactly the data whose agreement is claimed.
+
+### Bitmap version summaries
+
+A per-origin scalar “largest sequence seen” is compact only when receipt is
+contiguous. Out-of-order delivery creates holes. A bitmap summary can encode:
+
+```
+origin X:
+  contiguous base = 103
+  bitmap for 104..111 = 0 1 0 1 0 0 0 0
+                              ^   ^
+                         have 105,107
+```
+
+The peer can request 104 and 106 without retransmitting 105 and 107. When 104
+arrives, the contiguous base can advance through any now-complete prefix.
+Window size bounds metadata; events older than retained history require a
+snapshot/range repair. This is not the same as a causal version vector:
+
+- a version vector summarizes causal progress by origin;
+- a bitmap/window records holes in a bounded sequence space;
+- neither contains missing payloads;
+- counter reuse, origin reincarnation, wraparound, and membership changes need
+  epochs/identities;
+- a summary claiming receipt is safe only after the corresponding state is
+  durably incorporated under the protocol.
+
+### Summary validity is protocol state
+
+Cacheable summaries need invalidation rules. Tag a range digest with:
+
+```
+(range, ownership_epoch, schema_epoch, snapshot_horizon,
+ canonical_encoder, hash_algorithm, generation)
+```
+
+It is comparable only to a summary with compatible tags. A crash between
+applying a record and updating a persisted digest can create false equality or
+a false mismatch unless both changes share an atomic log/rebuild protocol.
+Common choices are:
+
+- build summaries from an immutable snapshot for each repair;
+- maintain a tree transactionally with data mutations;
+- mark affected leaves dirty and recompute before comparison;
+- treat cached summaries as hints, then verify records before completion.
+
+Incremental summaries also require retained history. If A says “all events
+through 50,000” but discarded the event log, B cannot fetch event 49,000 from
+A even if the summary exposes the gap. It needs a snapshot or another source.
+Metadata reduces discovery bandwidth; it does not create missing history.
+
+Compression, encryption, and nondeterministic serialization can make physical
+bytes differ for equal logical values. Decide whether a digest protects stored
+representation or canonical logical state. The former detects storage
+differences; the latter supports logical reconciliation. Some designs keep both.
 
 ---
 
-## 72.6 Digest Reads: Saving Bandwidth
+## 72.5 Merkle Trees: Localize Before Streaming — Core
 
-Comparing replicas requires knowing whether their values match — but shipping the full value from every replica just to discover they *agree* is wasteful, especially for large values. **Digest reads** are the optimization.
-
-The coordinator asks **one** replica for the full data and asks the **other** replicas for only a **digest** — a hash (e.g., MD5 in Cassandra) of the value(s) they hold.
+A Merkle tree partitions a canonical ordered key space into leaves. Each leaf
+hashes records in its range; each parent hashes its ordered child hashes:
 
 ```
-Read K, N=3, R=3, with digest optimization
-
-coordinator ──full read──▶ A   →  value + hash(A) = 0x9f3c...
-            ──DIGEST────▶ B   →  hash(B) = 0x9f3c...     (cheap, just the hash)
-            ──DIGEST────▶ C   →  hash(C) = 0x9f3c...
-
-  all digests equal hash(A)  ⇒  agreement, return A's value, NO repair, minimal bytes
+                    H(0..15)
+                 /             \
+            H(0..7)             H(8..15)
+           /      \             /       \
+       H(0..3) H(4..7)     H(8..11) H(12..15)
 ```
 
-- **Digests match:** all replicas agree; return the full value from the one replica; **no data transfer beyond one full copy plus small hashes.** This is the common case, and it makes quorum reads cheap even at *R = N*.
-- **Digests mismatch:** at least one replica disagrees. The coordinator escalates — issues a **full data read** to the replicas whose digests differed (or to all), reconciles the real values, returns the winner, and repairs the laggards.
+Two replicas compare roots:
 
-The saving is dramatic for large or numerous cells: instead of *R* full payloads, you move one payload plus *(R−1)* tiny hashes on the overwhelmingly common no-conflict path, and only pay the full cost when there is actually something to fix. The cost is one extra round trip on a mismatch. This is the read-path analogue of the Merkle-tree idea (§72.10): **compare hashes first, transfer data only where hashes disagree.** Both are instances of the general principle *summarize to detect, transfer to repair*.
+- equal roots: the covered snapshots are probably equal under the hash model;
+- unequal roots: compare children and descend only into mismatching branches;
+- mismatching leaves: exchange finer summaries or versioned records for those
+  key/token ranges, merge, then verify.
+
+### Cost without slogans
+
+Comparing two already-built root hashes is O(1). Constructing a tree from `M`
+records is at least proportional to reading/canonicalizing the covered state in
+a simple implementation. Incremental maintenance shifts work onto writes and
+must remain consistent with compaction, tombstones, snapshots, and crashes.
+
+For a balanced binary tree with fixed leaf boundaries, locating `d` sparse
+mismatching leaves often compares far fewer than all leaves, but “O(d log M)”
+is only a useful model under assumptions about balance, resolution, and
+non-overlapping paths. Shared paths reduce comparisons; coarse leaves cause
+overstreaming; widespread divergence approaches full comparison/transfer.
+
+Tree memory sets resolution. If one leaf represents a million records, one
+different record makes the whole leaf suspect. A second record-level exchange
+can avoid streaming the entire bucket, at extra reads/rounds.
+
+### Snapshot and ownership requirements
+
+Peers must compare like with like:
+
+- identical token/key boundaries and ownership epoch;
+- compatible schema, partitioner, comparator, and canonical encoder;
+- a stable snapshot or logical cut, or a protocol that tolerates concurrent
+  mutation;
+- all relevant live values, versions, tombstones, and expirations;
+- agreed tree shape/hash algorithm.
+
+If A hashes before `v9` and B hashes after `v9`, a mismatch may be legitimate
+concurrency rather than lost data. Repairs should stream versioned states and
+merge, not blindly overwrite a range image. After topology change, an old tree
+for different ownership cannot prove current replicas agree.
+
+### Worked Merkle comparison
+
+Replicas cover 16 keys with one key per leaf. A and B differ at keys 2 and 13.
+Using interval notation, comparison visits:
+
+```
+[0,16) mismatch                                      1
+  [0,8) mismatch, [8,16) mismatch                    2
+  [0,4) mismatch, [4,8) equal                        2
+  [8,12) equal, [12,16) mismatch                     2
+  [0,2) equal, [2,4) mismatch                        2
+  [12,14) mismatch, [14,16) equal                    2
+  [2,3) mismatch, [3,4) equal                        2
+  [12,13) equal, [13,14) mismatch                    2
+                                                     —
+                                          15 hash comparisons
+```
+
+A flat leaf comparison would compare 16 leaf hashes; full data comparison would
+inspect all 16 records. This tiny example saves little. With many leaves and
+few differences, high-level equal branches prune large ranges. The calculation
+is not a universal complexity bound: a different arity, batch protocol, cached
+nodes, or mismatch distribution changes it.
+
+The actual transfer is two versioned records only if leaves are single-key and
+the merge finds one winner each. With four-key leaves and no finer exchange,
+up to eight records/range contents may be inspected or streamed—overrepair
+caused by summary granularity.
+
+### Tree arity and lifecycle
+
+Binary trees make the worked descent easy to see. Higher arity shortens height
+but sends more child hashes at a mismatching node. If hashes are `h` bytes and a
+node has arity `b`, expanding it transfers roughly `b × h` digest bytes plus
+framing. The optimum depends on mismatch clustering, round-trip latency, tree
+memory, and batch size; it is **[Measured]**.
+
+Fixed range boundaries let independently built trees align, but skew can put
+most data in one leaf. Equal-count boundaries improve balance but require peers
+to agree on split points despite missing keys. Token subranges, histograms, or a
+negotiated partition plan are alternatives. Never compare child position 3 on
+A with position 3 on B unless both cover the same interval.
+
+A tree can be:
+
+- built on demand by scanning an immutable storage snapshot;
+- cached per immutable storage component and composed;
+- incrementally updated with each mutation;
+- periodically rebuilt under a snapshot sequence.
+
+On-demand builds spend read I/O and CPU during repair. Incremental trees make
+comparison fast but add write amplification, persistence/recovery complexity,
+and dirty-state handling. Trees age after compaction, tombstone purge, schema
+change, ownership movement, or a hash upgrade.
+
+Use the hierarchy for localization. Before streaming or deleting, compare
+versioned records in the mismatching range. After repair, rebuild/invalidate
+affected summaries and compare again at a clearly identified horizon.
 
 ---
 
-## 72.7 Hinted Handoff
+## 72.6 Compact Validated C++23 Model — Core
 
-Read repair fixes staleness lazily, only when someone reads. **Hinted handoff** attacks the *write*-side source of divergence directly: it keeps writes from being lost when a replica is temporarily down, so there is less to repair later.
+The model below uses a toy totally ordered version `(counter, writer)` and
+versioned tombstones. It builds deterministic range hashes, descends to
+mismatching keys, repairs both sides, and verifies convergence. It deliberately
+does not model concurrent siblings or production cryptographic hashing.
 
-When a coordinator sends a write to the *N* replicas and one is unreachable, instead of just dropping that write for the down node, the coordinator (or a healthy replica) stores a **hint** — a small record saying "replica X owes this write; replay it to X when X comes back." When failure detection (Ch. 69 §69.x) reports X alive again, the holder **replays** the buffered hints to X, healing the gap without waiting for a read or a full repair.
+```cpp
+#include <algorithm>
+#include <cassert>
+#include <compare>
+#include <cstdint>
+#include <map>
+#include <set>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 
+struct Version {
+    std::uint64_t counter{};
+    std::uint32_t writer{};
+    auto operator<=>(const Version&) const = default;
+};
+
+struct Record {
+    Version version;
+    bool tombstone{};
+    std::string value;
+    bool operator==(const Record&) const = default;
+};
+
+using State = std::map<std::string, Record>;
+
+void hash_byte(std::uint64_t& h, std::uint8_t b) {
+    h ^= b;
+    h *= 1'099'511'628'211ull; // FNV-1a step: illustrative, not adversarial
+}
+
+template<class T>
+void hash_uint(std::uint64_t& h, T value) {
+    for (std::size_t i = 0; i < sizeof(T); ++i) {
+        hash_byte(h, static_cast<std::uint8_t>(value >> (8 * i)));
+    }
+}
+
+void hash_text(std::uint64_t& h, std::string_view text) {
+    hash_uint(h, std::uint64_t{text.size()});
+    for (unsigned char c : text) hash_byte(h, c);
+}
+
+void hash_record(std::uint64_t& h, std::string_view key,
+                 const Record* record) {
+    hash_text(h, key);
+    hash_byte(h, record ? 1 : 0); // distinguish absent from tombstone
+    if (!record) return;
+    hash_uint(h, record->version.counter);
+    hash_uint(h, record->version.writer);
+    hash_byte(h, record->tombstone ? 1 : 0);
+    hash_text(h, record->value);
+}
+
+std::uint64_t range_hash(const State& state,
+                         std::span<const std::string> keys,
+                         std::size_t first, std::size_t last) {
+    std::uint64_t h = 14'695'981'039'346'656'037ull;
+    hash_uint(h, std::uint64_t{last - first});
+    for (std::size_t i = first; i < last; ++i) {
+        const auto it = state.find(keys[i]);
+        hash_record(h, keys[i], it == state.end() ? nullptr : &it->second);
+    }
+    return h;
+}
+
+void find_differences(const State& a, const State& b,
+                      std::span<const std::string> keys,
+                      std::size_t first, std::size_t last,
+                      std::vector<std::string>& out) {
+    if (range_hash(a, keys, first, last) ==
+        range_hash(b, keys, first, last)) return;
+    if (last - first == 1) {
+        out.push_back(keys[first]);
+        return;
+    }
+    const std::size_t mid = first + (last - first) / 2;
+    find_differences(a, b, keys, first, mid, out);
+    find_differences(a, b, keys, mid, last, out);
+}
+
+const Record* lookup(const State& s, const std::string& key) {
+    const auto it = s.find(key);
+    return it == s.end() ? nullptr : &it->second;
+}
+
+bool reconcile_key(State& a, State& b, const std::string& key) {
+    const Record* left = lookup(a, key);
+    const Record* right = lookup(b, key);
+    if (!left && !right) return true;
+    if (!left) { a[key] = *right; return true; }
+    if (!right) { b[key] = *left; return true; }
+
+    if (left->version == right->version) {
+        return *left == *right; // same version/different content is corruption
+    }
+    const Record winner =
+        left->version > right->version ? *left : *right;
+    a[key] = winner;
+    b[key] = winner;
+    return true;
+}
+
+std::vector<std::string> key_union(const State& a, const State& b) {
+    std::set<std::string> keys;
+    for (const auto& [key, _] : a) keys.insert(key);
+    for (const auto& [key, _] : b) keys.insert(key);
+    return {keys.begin(), keys.end()};
+}
+
+int main() {
+    State a{
+        {"alpha", {{1, 1}, false, "red"}},
+        {"beta",  {{4, 1}, true,  ""}},     // deletion
+        {"gamma", {{3, 2}, false, "green"}}
+    };
+    State b{
+        {"alpha", {{1, 1}, false, "red"}},
+        {"beta",  {{2, 2}, false, "obsolete"}}
+        // gamma was missed
+    };
+
+    const auto keys = key_union(a, b);
+    std::vector<std::string> differing;
+    find_differences(a, b, keys, 0, keys.size(), differing);
+    assert((differing == std::vector<std::string>{"beta", "gamma"}));
+
+    for (const auto& key : differing) {
+        assert(reconcile_key(a, b, key));
+    }
+    assert(a == b);
+    assert(a.at("beta").tombstone); // old beta did not resurrect
+    assert(range_hash(a, keys, 0, keys.size()) ==
+           range_hash(b, keys, 0, keys.size()));
+}
 ```
-Write K=5, N=3, target replicas A,B,C.  C is DOWN.
 
-coordinator ──▶ A  K=5 ✔
-            ──▶ B  K=5 ✔
-            ──▶ C  ✗ down
-            └── store HINT{ for=C, key=K, val=5, ts } locally (or on a live replica)
+Compile and run:
 
-... time passes, gossip/failure-detector reports C is back ...
-
-hint holder ──replay HINT{K=5}──▶ C   ✔    then delete the hint
+```bash
+clang++ -std=c++23 -O2 -Wall -Wextra -Wpedantic repair_model.cpp
+./a.out
 ```
 
-Key properties and system specifics:
-
-- **Dynamo, Cassandra, and Riak** all implement hinted handoff. In Cassandra hints are written to a local hints store (historically a system table, later flat files under `hints/`) and replayed with backpressure. Hints have a **TTL** (`max_hint_window_in_ms`, default 3 hours): if the node is down longer than the window, the coordinator *stops* collecting hints for it, on the theory that a node down that long should be fully repaired via Merkle trees, not dribbled hints.
-- Hinted handoff reduces the *amount* of anti-entropy work later — it is a proactive patch, not a detector. It does **not** guarantee delivery: if the hint holder itself dies before replaying, the hint is lost (unless the hint was itself replicated).
-- It interacts directly with quorum semantics via **sloppy quorums** (§72.8).
+This teaching implementation recomputes range hashes repeatedly, so its local
+CPU work is worse than a maintained tree. That is intentional: it validates the
+canonicalization and descent logic without pretending cached-tree construction
+is free. A production implementation needs snapshot integration, bounded
+memory/work, strong hash selection, typed corruption errors, streaming,
+checkpointing, and a resolver for concurrent versions.
 
 ---
 
-## 72.8 Sloppy Quorums and Hinted Handoff
+## 72.7 Hinted Handoff and Read Repair — Core
 
-A **strict quorum** (Ch. 71 §71.9) requires *W* of the *specific N* replicas that own a key to ack a write. If enough of those specific owners are down, a strict quorum write **fails** — availability drops. Dynamo introduced the **sloppy quorum** to preserve write availability under failure, and hinted handoff is its enabling mechanism.
+### Hints shorten transient gaps
 
-Under a sloppy quorum, when some of the *N* home replicas are unreachable, the coordinator writes to the **next healthy nodes in the ring** (nodes that do *not* normally own the key), each holding the write as a **hint** destined for a down home replica. The write achieves *W* acks — from a mix of true owners and stand-in hint holders — so it **succeeds and stays available**. When the home replicas recover, hints are handed off to them.
+When target C is unavailable, a coordinator can durably record:
 
 ```
-Key K's home replicas (preference list): A, B, C.  B and C down.
-Ring also contains D, E (not owners of K).
-
-Sloppy quorum W=3:
-  A  ✔ (true owner)
-  D  ✔ holds hint for B     ← stand-in
-  E  ✔ holds hint for C     ← stand-in
-  → 3 acks, write SUCCEEDS despite 2 of 3 owners down
-  later: D→B, E→C hand off the hints
+Hint {
+  destination replica/epoch,
+  key or mutation,
+  original version,
+  creation/expiry metadata,
+  schema/serialization version,
+  integrity check
+}
 ```
 
-Strict vs sloppy quorum, side by side:
+After C returns, the holder streams hints with throttling. Applying the original
+version makes replay idempotent under the record resolver; inventing a new
+version at replay time could overwrite a later write.
 
-| Property | Strict quorum | Sloppy quorum |
-|---|---|---|
-| Who may ack a write | only the *N* home replicas (preference list) | home replicas *plus* next healthy ring nodes as hint holders |
-| Behavior when > N−W owners down | write **fails** (unavailable) | write **succeeds** (stand-ins ack) |
-| R+W>N read/write overlap | guaranteed on the owners | **not** guaranteed during the failure window |
-| Recovery | none needed | hints handed off to owners on recovery |
-| Prioritizes | consistency/ordering | write availability |
+Failure windows:
 
-The trade-off is a genuine consistency relaxation, and it is a classic gotcha:
+| Window | Consequence |
+|---|---|
+| target applies write but reply is lost | hint/retry duplicates; idempotent version handles it |
+| client acknowledged before hint is locally durable | accepted gap may have no hint |
+| hint durable, holder fails permanently | hint is lost unless replicated/recoverable |
+| target stays down beyond retention | new hints may no longer be recorded; full repair required |
+| topology/schema changes before replay | destination and mutation need epoch/version validation |
+| replay floods recovering target | recovery can fail again; throttle/backpressure/jitter |
+| newer target value exists | old hinted version must lose under the resolver |
 
-- **Availability up:** writes succeed as long as *any* *W* healthy nodes exist, not just the specific owners.
-- **Consistency guarantee weakened:** during the failure window the *W* acking nodes are **not** the *N* owners, so **R + W > N no longer guarantees read/write overlap on the home replicas.** A subsequent strict quorum read of A, B, C might miss the value entirely (it sat on D and E as hints, invisible to a normal read of the preference list) until handoff completes. Dynamo explicitly accepts this: sloppy quorum trades the intersection guarantee for availability. Riak makes it configurable; Cassandra's hinted handoff is *not* a sloppy quorum in the acking sense (hints do not count toward the write's consistency level by default) — a distinction worth stating precisely, because conflating "hinted handoff" with "sloppy quorum" is a common error.
+Hints consume disk and can form a replay storm after a long outage. They are an
+optimization for the common transient case, not proof that scheduled repair is
+unnecessary.
+
+### Read repair covers observed replicas
+
+On a read, a coordinator compares versioned responses or digests, fetches
+needed full states, resolves them, and may send the result to stale respondents.
+Blocking until some repair writes finish increases latency and may support a
+product's particular read guarantee; asynchronous repair reduces client delay
+but can fail later.
+
+Do not infer universal semantics from the name “read repair.” State:
+
+- consistency/read policy and contacted replicas;
+- data/digest request pattern;
+- resolver for domination/concurrency/tombstones;
+- whether the response waits for repairs and which acknowledgments;
+- behavior on timeout or digest collision/mismatch;
+- whether uncontacted replicas are repaired.
+
+**[Cassandra 5.0/configuration]** Apache Cassandra documents hints and read
+repair as best-effort mechanisms and full/incremental anti-entropy repair as the
+backstop. Exact options and defaults change; consult the documentation and live
+configuration rather than memorizing a historical chance or mode.
 
 ---
 
-## 72.9 Hint Storms and Handoff Failure Modes
+## 72.8 Tombstones: Repairing Absence Safely — Core
 
-Hinted handoff has operational hazards that separate a textbook answer from an operational one.
+A physical absence carries no version. If A deletes `K` by erasing it while C
+is offline, later repair sees:
 
-- **Hint accumulation / storms.** If a replica is down for a long time under heavy write traffic, hint holders accumulate enormous hint backlogs. When the node returns, all holders try to replay simultaneously, hammering the just-recovered (and often still cold-cache, under-provisioned) node with a **hint storm** that can knock it back over — a thundering-herd (Ch. 24 §24.x) against a fragile target. Mitigations: replay throttling/backpressure, the hint window TTL that caps how much is ever buffered, and randomized/jittered replay start times.
-- **Disk pressure on holders.** Hints consume disk on healthy nodes. A prolonged outage of one node imposes storage cost on its neighbors; if the window is large and traffic high, holders can fill disks.
-- **Lost hints.** A hint is durable only on its holder. If the holder dies (or its disk fails) before handoff, the hint — and thus that write's chance of reaching the down replica *proactively* — is gone. This is why hinted handoff is a *reducer* of anti-entropy work, **never a substitute** for periodic Merkle repair; the repair backstop must assume hints can vanish.
-- **The window boundary.** Once `max_hint_window` elapses, hint collection stops and the operator must run full repair. Setting the window too long risks storms and disk fill; too short forces expensive repairs for brief outages. The typical default (a few hours) is a deliberate compromise.
+```
+A: absent          C: K=red,v6
+```
+
+It cannot distinguish “A never had K” from “A deleted K after v6.” The live
+copy can spread back. Instead write a tombstone:
+
+```
+A: TOMBSTONE(K,v7)     C: K=red,v6
+```
+
+`v7` dominates `v6`, so repair propagates deletion. Reads hide the tombstone
+from application results while storage and repair retain it.
+
+### The resurrection window
+
+```
+t0  C goes offline with K=v6
+t1  A/B accept tombstone v7
+t2  hint expires or is lost
+t3  A/B garbage-collect tombstone v7
+t4  C returns with v6
+t5  repair sees live v6 versus absence → v6 may resurrect
+```
+
+Safe garbage collection requires evidence stronger than elapsed wall time:
+
+- every replica that could hold an older version was repaired after the delete;
+- permanently missing replicas are fenced/rebuilt rather than rejoining with
+  old storage;
+- snapshots, backups, hints, queues, and new ownership transfers cannot
+  reintroduce the old version without the tombstone;
+- repair completion is trustworthy for the relevant range/epoch;
+- clock/TTL assumptions are satisfied if time participates.
+
+Some products approximate this with a grace/retention interval longer than the
+maximum expected outage and repair interval. That is an operational assumption,
+not a theorem. Longer retention increases read/compaction/storage cost; shorter
+retention increases resurrection risk.
+
+**[Cassandra 5.0/configuration]** Tombstone purging depends on table
+`gc_grace_seconds`, compaction state/strategy, repaired status and related
+options. Official repair guidance ties repair scheduling to the tombstone
+retention policy. Do not claim “tombstones disappear exactly after N days” or
+copy a default across versions/tables.
+
+Range tombstones, TTL expiry, and partition deletion make coverage more complex:
+the anti-entropy digest must include deletion state that suppresses older cells.
+Repairing only visible live rows is incorrect.
 
 ---
 
-## 72.10 Merkle Trees for Anti-Entropy
+## 72.9 Gossip and Epidemic Dissemination — Core
 
-Read repair and hinted handoff are patches on the read and write paths. The **background backstop** — the process that guarantees even never-read, never-hinted keys converge — needs to compare two replicas' *entire* datasets and find exactly where they differ, without shipping all the data across the network. Naively, comparing two replicas holding *M* keys costs *O(M)* transfer. **Merkle trees** (hash trees) reduce the *detection* cost to *O(log M)* comparisons for a small number of divergent ranges.
+Gossip disseminates a fact without requiring its originator to contact every
+node. Periodically, each node samples one or more peers and exchanges rumors,
+version summaries, or state digests. Multiple paths tolerate individual loss
+and temporary failure.
 
-A **Merkle tree** is a tree of hashes over a sorted key range:
+Separate two uses:
 
-- **Leaves** each cover a contiguous **sub-range** of the key space and hold the hash of all data (keys+values, or their versions) in that sub-range.
-- **Internal nodes** hold the hash of the concatenation of their children's hashes.
-- The **root** is a single hash summarizing the *entire* dataset.
+- **membership/control gossip:** liveness suspicions, endpoint state, schema or
+  topology metadata;
+- **data anti-entropy:** summaries or actual replicated data.
 
-The magic is the comparison. Two replicas exchange **roots first**. If the roots are equal, the datasets are identical — *one hash comparison* proves whole-range agreement, and no data moves at all. If the roots differ, they descend: compare children, recurse only into subtrees whose hashes differ, and stop at the differing **leaves**, which pinpoint the divergent key ranges. Only the data in those leaf ranges is then exchanged and reconciled.
+A product may use gossip for membership while Merkle streaming repairs user
+data. Hearing that C is alive can trigger hint replay; gossip did not itself
+deliver every missed row.
 
-```
-Merkle-tree diff between replica A and replica B (4 leaves over key ranges r0..r3)
+### Push, pull, and push-pull
 
-            A root  Hab != Hcd  ← roots differ, descend
-             / \                        B root differs
-          Hab   Hcd                     (only shows where A≠B)
-          / \    / \
-       h0  h1  h2  h3        A:  h0  h1  h2  h3
-       =   =   =   ≠         B:  h0  h1  h2  h3'
-                                            ↑
-   compare level by level:
-     root:  differ → descend both children
-     Hab (covers r0,r1): EQUAL on both → PRUNE, skip r0 and r1 entirely
-     Hcd (covers r2,r3): differ → descend
-        h2 (r2): equal → skip
-        h3 (r3): differ → r3 is the divergent range; exchange only r3's data
-   Result: found the one bad range in O(log M) hash comparisons, transferred only r3.
-```
-
-The cost accounting interviewers want:
-
-- **Detection:** *O(log M)* comparisons (tree height) when few ranges differ; equal roots settle it in *O(1)*. For *d* divergent leaves the descent touches *O(d · log(M/d))* nodes.
-- **Transfer:** proportional only to the data in divergent leaf ranges, not the whole dataset — the entire point.
-- **Build:** *O(M)* — you must hash every key/value once to construct the tree. This is the dominant cost and the reason repair is expensive and infrequent (§72.12).
-
----
-
-## 72.11 Merkle-Tree Repair in Cassandra: nodetool repair
-
-Cassandra's `nodetool repair` is the reference implementation and a frequent interview target. The flow for a token range:
-
-1. **Trigger.** An operator (or a scheduler like Cassandra Reaper) runs `nodetool repair`, or incremental repair runs on a schedule. Repair operates per **token range** per **table**.
-2. **Validation compaction / tree build.** Each replica that owns the range performs a **validation compaction**: it reads every partition in the range and builds a Merkle tree, hashing partition data into leaves. This is a full read of the range — CPU- and I/O-heavy — which is why repair competes with live traffic and is typically throttled and scheduled off-peak.
-3. **Tree exchange.** Replicas send their Merkle trees to the repair coordinator (or exchange pairwise), which **compares** them to find mismatching leaf ranges.
-4. **Streaming.** For each mismatching range, the replicas **stream** the actual differing data to one another so each ends up with the union (reconciled by cell timestamp / version). Only divergent ranges are streamed.
-
-```
-nodetool repair for one token range, N=3 (replicas A,B,C):
-
-  operator/scheduler
-        │ trigger
-        ▼
-  ┌───────────────────────────────────────────────────────────┐
-  │ 1. each replica runs VALIDATION COMPACTION over the range  │
-  │    A: read range → build Merkle tree Ta   (O(M), heavy)    │
-  │    B: read range → build Merkle tree Tb                    │
-  │    C: read range → build Merkle tree Tc                    │
-  └───────────────────────────────────────────────────────────┘
-        │ send trees to repair coordinator
-        ▼
-  ┌───────────────────────────────────────────────────────────┐
-  │ 2. COMPARE roots/leaves pairwise → find mismatching ranges │
-  │    Ta vs Tb: differ in leaf r7                             │
-  │    Ta vs Tc: differ in leaves r7, r12                      │
-  └───────────────────────────────────────────────────────────┘
-        │
-        ▼
-  ┌───────────────────────────────────────────────────────────┐
-  │ 3. STREAM only r7, r12 data between the disagreeing pairs; │
-  │    reconcile by cell timestamp → all three converge        │
-  └───────────────────────────────────────────────────────────┘
-```
-
-Cassandra repair flavors, worth naming:
-
-- **Full repair:** builds trees over all data; comprehensive but expensive.
-- **Incremental repair:** tracks which SSTables have already been repaired (marked with a `repairedAt` flag) and only builds/compares trees over the **unrepaired** set, so already-converged data is not re-examined every cycle — dramatically cheaper steady-state, at the cost of extra bookkeeping and some notorious historical bugs.
-- **Sub-range / primary-range repair:** repair only the token ranges a node is the primary for, avoiding redundant repair of the same range from every replica.
-
-The operational rule Cassandra ships with: **you must run repair within `gc_grace_seconds` (default 10 days)**, because deletes are represented as **tombstones** that are purged after that window; if a replica missed a delete and repair does not run before the tombstone is collected everywhere, the deleted data can **resurrect** (a zombie). This ties anti-entropy directly to correctness of deletion, and it is a beloved trap.
-
----
-
-## 72.12 Merkle-Tree Granularity Trade-offs
-
-The **leaf granularity** — how much key range each leaf covers — is the central tuning knob, and it is a pure precision/cost trade-off.
-
-- **Fine granularity (many leaves, deep tree).** Each leaf covers a tiny range, so a mismatching leaf pinpoints a **small** divergent range and you stream very little unnecessary data. But the tree is **large** — more memory to hold, more hashes to compute and compare. In the limit, one leaf per key gives perfect precision at the cost of *O(M)* tree size — no better than shipping everything.
-- **Coarse granularity (few leaves, shallow tree).** The tree is small and cheap to build and compare, but a single differing key marks its **whole** leaf range as divergent, forcing you to stream the entire range even though only one key changed — **over-transfer / false-positive amplification.**
-
-```
-One changed key, coarse vs fine leaves:
-
-Coarse (leaf covers 1,000,000 keys):   1 key differs → stream 1,000,000 keys
-Fine   (leaf covers 100 keys):         1 key differs → stream 100 keys
-                                       but tree has 10,000× more leaves to build/hold
-```
-
-Cassandra bounds tree **depth** (historically ~15 levels → up to 32,768 leaves per range) so the tree fits in memory regardless of partition count; consequently, on a range with many more partitions than leaves, each leaf covers many partitions and a single mismatch over-streams. This is why **more, smaller token ranges** (or vnodes) and incremental repair help: they keep the ratio of partitions-to-leaves low so leaves stay precise. The general principle: **tree size trades off against streaming precision, and you size the tree to fit memory while keeping over-transfer acceptable for your data distribution.**
-
----
-
-## 72.13 Bitmap Version Vectors and Compact Causal Metadata
-
-Version vectors (Ch. 71 §71.12) track causal history per key so replicas can decide which value is newer or whether two values are concurrent. But a naive version vector grows with the number of writers, and tracking *which specific updates a replica has already seen* — the exact question anti-entropy asks — can be verbose. **Bitmap version vectors** are a compact encoding of "which updates has this replica seen," used to make reconciliation cheap.
-
-The idea: each node numbers its own updates with a monotonically increasing counter (a **dot**: `(node_id, counter)`). A replica's knowledge of another node's updates is usually a **contiguous prefix** — "I have seen everything node N produced up through counter 42" — which compresses to a single integer. Occasionally, due to out-of-order delivery, there are **gaps** (I have 1–42 and 44, missing 43). A bitmap version vector stores, per source node, a **base counter** (the contiguous prefix) plus a **bitmap** of the sparse dots received beyond the base.
-
-```
-Node A's view of node N's updates:  seen 1..42 contiguously, plus 44, 47 (missing 43,45,46)
-
-  base = 42                       (everything ≤ 42 is known)
-  bitmap over 43,44,45,46,47 = 0 1 0 0 1
-                                    └ 44   └ 47
-
-Compact: one integer + a short bitmap, instead of listing every update id.
-```
-
-Why it matters for anti-entropy: when two replicas reconcile, comparing base+bitmap summaries lets each compute **exactly which dots the other is missing** and send only those — the causal analogue of the Merkle diff. As gaps fill (43 arrives), the base advances and the bitmap shrinks back toward empty. Riak's DVV (dotted version vectors) and the "bitmapped version vector" literature (used in systems like the Dotted DB research and influences on Riak) formalize this: **track a dense prefix as a number and only the sparse tail as bits**, keeping causal metadata *O(nodes)* in the common case rather than *O(updates)*.
-
----
-
-## 72.14 Gossip Dissemination: Epidemic Protocols
-
-Broadcast (§72.3) is fragile and pairwise anti-entropy is slow to reach everyone. **Gossip** (a.k.a. **epidemic**) protocols get the reliability of redundancy and the speed of exponential spread by having each node behave like an infected host: periodically pick a few random peers and pass along what it knows, who then pass it along further. The vocabulary is lifted directly from epidemiology (SIR/SI models, §72.16).
-
-The core loop, run by every node once per **round** (a fixed interval, e.g., every 1 second in Cassandra; Serf/Consul on similar orders):
-
-1. Wake up on the gossip timer.
-2. Select **fan-out** *b* peers uniformly at random from the known membership.
-3. Exchange state with them (push, pull, or push-pull — §72.15).
-4. Merge received state into local state (newer versions win; version vectors / heartbeat counters reconcile).
-
-```
-Epidemic spread, fan-out b=1 (each infected node infects one new node per round):
-
-round 0:  •                       1 node knows  (2^0)
-round 1:  • •                     2             (2^1)
-round 2:  • • • •                 4             (2^2)
-round 3:  • • • • • • • •         8             (2^3)
-   ...
-round k:  2^k nodes know      ⇒  reach n nodes in ~log2(n) rounds
-
-Infected fraction over time (S-curve):
-  1.0 ┤                         ______________
-      │                    __---
-      │               __--
-  0.5 ┤            _--
-      │        __--
-      │   __---
-  0.0 ┤--                        rounds →
-      slow start → explosive middle → saturation tail
-```
-
-The defining properties: **exponential (geometric) growth** in the number of informed nodes, hence *O(log n)* rounds to reach the whole cluster; **redundancy** (each node hears the fact via multiple paths, so losing any node or message barely dents delivery); and **decentralization** (no coordinator, no single point of failure — every node runs the identical loop). Cassandra, ScyllaDB, Riak, Serf, and Consul all use gossip for membership and failure detection (Ch. 69 §69.x); Dynamo uses it to propagate the ring/membership.
-
----
-
-## 72.15 Push, Pull, and Push-Pull
-
-There are three ways two gossiping nodes can exchange state, and the difference determines convergence speed. Petrov emphasizes push-pull because of its superior tail behavior.
-
-- **Push.** The initiator *sends* its updates to the selected peers ("here is what I know"). Efficient while few nodes are infected (an infected node actively spreads), but **slow in the tail**: once almost everyone already knows, a push from a random node usually lands on an already-informed peer and is wasted. The number of *still-ignorant* nodes shrinks slowly under pure push because ignorant nodes are passive — they must be *found* by an infected pusher.
-- **Pull.** The initiator *asks* peers "what do you know that I don't?" and receives updates. **Fast in the tail**: an ignorant node actively pulls, and once a large fraction is infected, a random pull very likely hits an infected peer and succeeds. But **slow at the start** — when almost nobody knows, most pulls hit ignorant peers and return nothing.
-- **Push-pull.** Do both in one exchange: initiator sends its updates *and* requests the peer's. Combines push's fast start with pull's fast finish, so it converges fastest and is the standard choice.
-
-```
-Ignorant-fraction decay per round (intuition):
-
-  Push :   fast early, LONG tail  — ignorant set shrinks ~linearly late
-  Pull :   slow early, fast late  — ignorant fraction squares each round once >50% infected
-  Push-Pull: fast throughout      — ignorant fraction roughly SQUARES each round
-             p_{k+1} ≈ p_k^2   ⇒  double-exponential shrink of the uninformed set
-```
-
-The quantitative punchline: under **push-pull**, the fraction of still-uninformed nodes roughly **squares each round** in the late phase (`p → p²`), giving *doubly*-exponential convergence and the tightest *O(log n)* round count with small constants. Pure push needs *O(log n)* rounds to reach the majority but a longer tail to mop up the last stragglers; push-pull collapses that tail. This is why membership/anti-entropy gossip almost always uses push-pull reconciliation.
-
-A concrete worked comparison of the uninformed fraction over rounds (n large, fan-out 1, orders of magnitude) makes the tail behavior vivid:
-
-```
-round │ push (uninformed)  │ pull (uninformed)   │ push-pull (uninformed)
-──────┼────────────────────┼─────────────────────┼───────────────────────
-  0   │ ~1.0               │ ~1.0                │ ~1.0
-  1   │ 0.5                │ 0.90                │ 0.5
-  2   │ 0.25               │ 0.72                │ 0.25
-  3   │ 0.12               │ 0.40                │ 0.06     ← squares
-  4   │ 0.06               │ 0.12                │ 0.004    ← squares again
-  5   │ 0.03  (long tail)  │ 0.02  (fast finish) │ ~1e-5    ← essentially done
-      │  ↑ linear-ish tail │  ↑ slow start       │  fast at BOTH ends
-```
-
-The variants summarized as a quick-reference table:
-
-| Variant | Early phase | Late phase (tail) | Best used for |
+| Mode | Exchange | Strength | Weakness |
 |---|---|---|---|
-| Push | fast (infected spread actively) | slow — pushes hit informed peers | initial burst of a fresh rumor |
-| Pull | slow — pulls hit ignorant peers | fast — ignorant nodes find infected ones | mopping up after majority infected |
-| Push-pull | fast | fast (uninformed fraction squares) | general anti-entropy, the default |
+| push | informed node sends newer facts | rapid early spread | uninformed tail may be missed; duplicates |
+| pull | node asks peer for what it lacks | good at finding late/missed nodes | early spread waits for uninformed nodes to sample informed ones |
+| push-pull | both exchange summaries/deltas | strong early and tail behavior | more bytes/work per contact |
+
+Messages should carry identities/versions and be idempotent. Bound rumor state
+with acknowledgments, age, counters, or summaries, but every finite stopping
+rule admits some probability that a live node never received a rumor. Periodic
+pull or full reconciliation supplies the backstop.
+
+### Why convergence is probabilistic
+
+Random peer selection can repeatedly choose already-informed peers. Loss and
+churn add more misses. A stochastic analysis describes a distribution over
+runs; it cannot say a particular run completes by a fixed round unless the
+protocol adds deterministic coverage or an external deadline/fallback.
+
+Under a simplified push model:
+
+- `N` nodes are all mutually reachable;
+- `I` informed nodes each choose `f` targets independently and uniformly from
+  the other `N-1` nodes;
+- messages in the round are delivered;
+- targets become informed after the round.
+
+For one uninformed node, the probability of no contact in that round is:
+
+```
+P(not contacted) = (1 - 1/(N-1))^(fI)
+```
+
+With `N=8`, `I=4`, `f=1`:
+
+```
+P(contacted) = 1 - (6/7)^4 ≈ 0.4602
+expected newly informed = (8-4) × 0.4602 ≈ 1.84
+```
+
+This is an expectation under independent uniform choices, not a guarantee that
+two nodes join in the next round. Targets chosen by the same sender may be
+without replacement; real partial views are nonuniform; messages are lost;
+nodes have capacity limits. Recompute for the actual model.
+
+An ideal duplicate-free doubling trace can inform 8 nodes from one in three
+rounds:
+
+```
+round 0: A
+round 1: A→B                                  2 informed
+round 2: A→C, B→D                             4 informed
+round 3: A→E, B→F, C→G, D→H                   8 informed
+```
+
+Random gossip usually includes duplicate contacts, so this is a lower-bound
+illustration for that ideal schedule, not a universal `ceil(log2 N)` deadline.
+
+### Conditions for durable dissemination
+
+Convergence needs peer sampling whose time-varying communication graph connects
+the live membership, continued rounds or a safe stopping rule, eventual message
+delivery opportunities, bounded overload, retained facts/summaries, and
+compatible merge rules. A partitioned subgroup cannot learn facts while cut
+off; after healing, pull/anti-entropy must bridge it.
+
+Failure detectors provide suspicions, not perfect membership truth. Excluding a
+slow live peer forever can violate fairness. Including dead peers forever wastes
+contacts. Chapter 69 owns detector thresholds and actions.
+
+### Rumor lifetime, duplicates, and overload
+
+A gossip item needs an identity such as `(origin_incarnation, sequence)` and a
+merge rule. Receivers remember enough IDs or version summaries to suppress
+duplicate work. If deduplication state expires before old messages, the
+operation must remain idempotent.
+
+Three stopping patterns have different semantics:
+
+- **fixed rounds/forward count:** bounds traffic, but leaves a nonzero miss
+  probability under the model;
+- **acknowledgment-based:** stronger evidence for named members, but membership
+  changes and acknowledgments can be lost;
+- **continuous anti-entropy:** no per-rumor completion point; periodic summaries
+  rediscover omissions while consuming steady traffic.
+
+Many systems combine a finite eager rumor with continuous pull. A newly joined
+or long-partitioned node cannot rely on rumors whose lifetime ended before it
+appeared; it must bootstrap a snapshot and reconcile a version horizon.
+
+Gossip is not free during an incident. A topology change can generate large
+state while packet loss causes retries and partial views retain dead peers.
+Bound message size, prioritize freshness, coalesce superseded versions,
+rate-limit rounds, and add backpressure. Dropping an old rumor is safe only if
+a pull/snapshot path can recover it. Observe duplicate ratio, bytes per useful
+update, peer-sampling bias, convergence quantiles, stale-view age, and the
+nonconverged fraction under the chosen stopping rule.
+
+Security also matters. A forged membership rumor can redirect traffic or evict
+healthy peers. Authenticate peers/messages when required, bind versions to node
+incarnations, prevent replay across clusters, and rate-limit announcements.
+Epidemic redundancy amplifies malicious input as efficiently as legitimate
+input.
 
 ---
 
-## 72.16 The Epidemic Model: SI, SIR, and the Math
+## 72.10 Repair as an Operational Protocol — Core
 
-Gossip's guarantees come straight from mathematical epidemiology, and interviewers who go deep will ask you to reason with the model.
-
-- **Susceptible (S):** a node that has not yet received the update (ignorant).
-- **Infected (I):** a node that has the update and is actively spreading it.
-- **Removed (R):** a node that has the update but has **stopped** spreading it (in gossip terms, it decided the update is "old news" and no longer forwards it).
-
-Two models map onto two gossip design choices:
-
-- **SI model (susceptible-infected):** once infected, a node spreads forever. Everyone eventually gets it (full convergence guaranteed) but nodes keep gossiping known facts indefinitely — wasteful. Corresponds to *never stop spreading*.
-- **SIR model (susceptible-infected-removed):** infected nodes eventually **stop** spreading (become removed), typically after they have seen the same update redundantly enough times to conclude it is saturated. This bounds the wasted messages but introduces a small probability that a few susceptible nodes are never reached before all their potential infectors go quiet.
-
-The **removal/stop rule** is the key design lever. A common rule (from Demers et al.'s classic Xerox epidemic-algorithms paper): a node stops forwarding an update after it has encountered it *k* times already (it keeps gossiping it with probability that decays). Larger *k* → higher reliability (fewer missed nodes) but more redundant messages; smaller *k* → cheaper but higher chance a corner of the cluster is missed.
-
-Quantitatively, with fan-out *b* and *n* nodes, the number of rounds to infect essentially the whole cluster is:
+A scheduled repair is not just “run Merkle trees.” A robust range session has:
 
 ```
-rounds ≈ log_{b+1}(n) + O(1)          (push-pull, high probability)
-       ≈ (ln n) / (ln(b+1))
-
-Examples (push-pull, order-of-magnitude):
-  n = 1,000     b = 3   →  ~log_4(1000)   ≈ 5 rounds
-  n = 1,000,000 b = 3   →  ~log_4(10^6)   ≈ 10 rounds
-  n = 1,000,000 b = 10  →  ~log_11(10^6)  ≈ 6 rounds
-
-Total messages to disseminate one update: O(n log n)
-  (each of n nodes participates in ~log n rounds, sending b messages/round)
+plan → snapshot/validation summaries → compare → stream versioned differences
+     → apply idempotently → verify → checkpoint completion
 ```
 
-The headline numbers to memorize: **gossip converges in *O(log n)* rounds** and costs **_O(n log n)_ messages** per update — logarithmic latency, near-linear (times a log) total traffic. The *log n* redundancy factor over the theoretical *n* minimum is exactly the price of reliability without a coordinator.
+### Plan and fence context
+
+Record:
+
+- keyspace/table/range and replica set;
+- topology/ownership and schema epochs;
+- partitioner/comparator/canonicalization/hash versions;
+- full versus incremental scope and prior repair metadata;
+- tombstone/TTL horizon;
+- source selection and failure policy;
+- resource budgets and job identity.
+
+If ownership changes mid-session, either coordinate/fence the transition or
+restart/replan affected ranges. Marking an obsolete replica set “repaired” can
+leave the new owner stale.
+
+### Stream and apply
+
+Range streaming competes with foreground disk, network, CPU, memory, cache, and
+compaction. Limit concurrent sessions and bytes, use backpressure, and expose:
+
+- ranges planned/compared/verified;
+- bytes scanned/hashed/streamed;
+- mismatching leaves/partitions;
+- retries, failures, and checkpoint age;
+- per-peer backlog and throughput;
+- oldest unrepaired range relative to tombstone retention;
+- overstreaming ratio and foreground latency impact.
+
+Repair messages must carry original versions and tombstones. Concurrent writes
+may occur after the snapshot; applying streamed records via the normal resolver
+prevents an old snapshot value from overwriting a newer local one. Bulk file
+replacement needs stronger snapshot/fencing rules.
+
+### Full, incremental, and verification
+
+- **full repair** reconsiders all selected data and can detect old divergence or
+  some corruption, at high scan/stream cost;
+- **incremental repair** uses metadata to limit work since earlier successful
+  sessions, but depends on that metadata and implementation invariants;
+- **preview/validation** builds/compares summaries without streaming, useful for
+  estimating or checking, but does not heal data.
+
+Definitions and exact behavior are product-specific. A failed incremental
+session must not advance completion metadata for unfinished ranges. Periodic
+full verification can catch gaps outside incremental assumptions.
+
+### Restartable repair state machine
+
+Persist progress at a retryable unit:
+
+```
+PLANNED
+  → SNAPSHOTTED(summary IDs/horizons)
+  → COMPARED(mismatching subranges)
+  → STREAMING(per-peer checkpoints)
+  → APPLIED(original versions)
+  → VERIFIED(new compatible summaries)
+  → COMPLETE
+```
+
+Failure windows:
+
+| Crash/failure | Safe restart |
+|---|---|
+| after plan, before snapshot | revalidate epochs and resnapshot |
+| after one peer snapshots | expire the partial session or obtain compatible horizons |
+| after compare, before stream | reuse only while source snapshots/history remain pinned |
+| midway through stream | resume by chunk ID/version; duplicates must be harmless |
+| after apply, before checkpoint | resend; resolver/idempotency prevents regression |
+| after stream, before verification | verify; bytes-sent is not completion |
+| after verification, before completion record | repeat or atomically publish verification evidence |
+
+A completion record should name job ID, ranges, every replica incarnation,
+ownership/schema epochs, snapshot/version horizons, hash/canonicalization
+versions, stream results, verification roots, and completion time. “Last repair
+Tuesday” is too weak to decide whether a tombstone for one range may be purged.
+
+### Source selection and disagreement
+
+With three replicas, repair is not always “copy from A.” If A dominates B and C,
+A is an obvious source. If A and B are concurrent, preserve/merge both. If two
+replicas report the same version with different content, majority voting may
+mask deterministic corruption or a software bug; quarantine the range and
+preserve evidence.
+
+For bulk rebuild, select sources by range ownership, durable version/log
+horizon, integrity, failure domain, and load. Verify chunks end to end and the
+completed range structurally. A checksum-valid source can still be stale.
+Cross-datacenter policies may intentionally limit traffic, but then the
+convergence claim must name the replica set covered.
+
+### Cancellation and admission control
+
+Repair should yield to survival. Before admitting work, estimate snapshot
+space, tree memory, read I/O, outgoing/incoming streams, compaction debt, and
+the target's ability to ingest. Reserve capacity for foreground requests and
+failure recovery. A node that is already rebuilding should not become the
+source for every other repair merely because it responds.
+
+Cancellation also needs semantics. Stopping comparison is harmless if no
+completion state advances. Stopping a stream leaves a prefix applied; original
+versions make a later restart safe, but pinned snapshots and temporary files
+must be released or retained by an explicit lease. Never roll back by writing
+the source snapshot over newer target values.
+
+Schedule for correlated failures: running all replica-pair repairs for the same
+range simultaneously may concentrate reads on one disk or remove all failure
+headroom. Stagger ranges/failure domains, randomize starts, and bound retries.
+Exponential backoff without a maximum repair-age alert can quietly violate the
+tombstone horizon, so pair backoff with a deadline/escalation derived from the
+retention contract.
+
+Operational success has three layers:
+
+1. the command/process finished;
+2. every planned range reached a durable verified state for the named epoch;
+3. the fleet completed all required coverage before its safety horizon.
+
+Only the latter two justify convergence or tombstone-GC claims.
+
+### Repair scheduling calculation
+
+Suppose tombstones are eligible for collection after a configured retention
+`G`, the worst planned node outage is `D`, one full repair cycle takes `R`, and
+alert/operator recovery margin is `M`. A necessary planning inequality in this
+simplified policy is:
+
+```
+D + R + M < G
+```
+
+It is not sufficient: jobs can fail, clocks/compaction interact, coverage can
+be incomplete, and restored snapshots may be older. If `D=24 h`, `R=30 h`, and
+`M=12 h`, then the plan needs `G > 66 h`; choosing 72 h leaves only 6 h of
+unmodeled margin. Measure actual high-percentile repair completion and alert
+before the margin is consumed. Do not import these numbers as defaults.
 
 ---
 
-## 72.17 Fan-out, Rounds, and the Cost Trade-offs
+## 72.11 Overlay and Product Reference — Skippable
 
-The **fan-out** *b* (peers contacted per round) is the primary tuning knob, and it trades latency against bandwidth and redundancy.
+### Partial views and hybrid overlays
 
-| Fan-out *b* | Rounds to converge | Messages/round/node | Redundancy / reliability |
-|---|---|---|---|
-| 1 | ~log₂ n (largest) | 1 (cheapest) | low — a missed link can strand nodes |
-| 3–4 | ~log₄ n | moderate | good; common production default |
-| log n | ~constant-ish, few | high (bandwidth heavy) | very high, approaches broadcast |
+All-to-all membership costs grow with cluster size. A **partial view** keeps a
+bounded set of peers and refreshes it through sampling/shuffling. The overlay
+must remain connected under churn and avoid correlated neighborhoods. Metrics
+include component count, path length, peer diversity, stale/dead entries, and
+sampling bias.
 
-- **Higher *b* → fewer rounds** (lower dissemination latency) but **more messages per round** and more redundant deliveries (wasted bandwidth). Doubling *b* barely changes the *O(log n)* round count (it changes the log base) but linearly increases per-round traffic.
-- There is a **percolation threshold**: below a critical fan-out relative to *n*, the "infection" can die out and fail to reach everyone (the graph of contacts is not connected enough). Practical systems keep *b* comfortably above this threshold (a small constant like 3–4 suffices for reliability at scale because the *number of rounds* absorbs the growth in *n*).
-- **Rounds vs interval:** wall-clock convergence time = rounds × gossip interval. Cassandra's 1-second interval and small fan-out give whole-cluster convergence in a handful of seconds for thousands of nodes — fast enough for membership, deliberately *not* instant (gossip is for eventually-consistent metadata, not for data on the critical path).
+A broadcast tree has low duplicate traffic but a failed interior node cuts a
+subtree until repair. Unstructured gossip is redundant but wasteful. Hybrid
+protocols can use an eager tree for first delivery and lazy gossip/digests to
+detect and repair omissions. Research systems such as Plumtree and HyParView
+illustrate these designs; their guarantees depend on their precise algorithms,
+failure model, and parameters. They are role-specific, not requirements for
+operating ordinary database repair.
 
-Concrete wall-clock numbers, push-pull, 1-second gossip interval:
+### Cassandra 5.0 orientation
 
-```
-   n nodes │ fan-out b │ ~rounds       │ ~convergence time
-  ─────────┼───────────┼───────────────┼──────────────────
-      100  │    3      │ log_4(100)≈4  │ ~4 s
-    1,000  │    3      │ ≈5            │ ~5 s
-   10,000  │    3      │ ≈7            │ ~7 s
-  100,000  │    3      │ ≈8            │ ~8 s
-1,000,000  │    3      │ ≈10          │ ~10 s
-1,000,000  │   10      │ log_11≈6      │ ~6 s   (higher b, fewer rounds, more traffic)
-```
+**[Cassandra 5.0/configuration]** The official Apache documentation describes a
+layered scheme:
 
-The striking property: convergence time grows only **logarithmically** with cluster size — a 10,000× larger cluster costs barely 2–3× more rounds. This log-scaling is exactly why gossip is the tool of choice for membership and failure detection at fleet scale, where a deterministic broadcast tree would be a maintenance liability.
+- coordinators store best-effort hints for unavailable replicas and later
+  replay them;
+- reads can perform replica read repair according to current table/system
+  behavior;
+- full/incremental anti-entropy repair compares common token ranges with Merkle
+  trees and streams differences;
+- repair is operationally scheduled/managed and can consume substantial disk
+  and network I/O;
+- tombstone safety depends on completing appropriate repair before purge
+  assumptions are exceeded.
 
-Compared to **deterministic broadcast** (a spanning tree, §72.20): broadcast delivers each fact exactly once (*O(n)* messages, optimal) and in *O(log n)* or fewer hops if the tree is balanced, but it is **brittle** — a single failed internal node severs an entire subtree, and you must repair the tree. Gossip pays *O(n log n)* messages (a log factor of redundant traffic) to buy failure-obliviousness: no node is critical, so nothing needs repairing when a node dies. **That log-factor of wasted bandwidth is the insurance premium for coordinator-free reliability**, and it is the core gossip-vs-broadcast trade-off.
-
----
-
-## 72.18 Gossip Mechanics: Peer Selection and State Reconciliation
-
-Beyond the push/pull choice, several mechanics determine whether a gossip protocol actually converges and scales.
-
-- **Peer selection.** Uniform random selection from the full membership gives the cleanest theory and best mixing. But it requires each node to *know* the full membership (a *O(n)* view), which is itself disseminated by gossip and does not scale to very large clusters — motivating partial views (§72.21). Refinements: avoid re-selecting the immediately-previous peer, and bias slightly toward less-recently-contacted peers to reduce redundant coverage.
-- **State reconciliation.** When two nodes gossip, they must merge state so that **newer wins** and the merge is **commutative/idempotent** (order of gossip must not matter — receiving the same update twice, or in different orders, must converge to the same result). This is why gossiped state is typically versioned with **heartbeat counters** (monotonic per-node generation + version, as in Cassandra's `HeartbeatState`/`ApplicationState`) or CRDT-like merge functions. Failure detection (Ch. 69 §69.x) piggybacks here: each node gossips a heartbeat counter for every other node, and a counter that stops advancing signals suspected failure (phi-accrual detector).
-- **Anti-entropy vs rumor-mongering.** Petrov and the literature distinguish two gossip *purposes*: **anti-entropy** gossip continuously reconciles full state (or Merkle summaries) to guarantee eventual convergence (SI-style, never stops); **rumor-mongering** spreads a *specific hot* update aggressively then stops (SIR-style). Real systems run anti-entropy as the reliable backstop and rumor-mongering for fast propagation of fresh updates — the same two-layer pattern as §72.2.
-
-```
-Two gossip purposes, side by side:
-
-  RUMOR-MONGERING (SIR)              ANTI-ENTROPY (SI)
-  ─────────────────────             ─────────────────
-  goal: spread ONE hot update fast  goal: reconcile ALL state, guarantee convergence
-  stop rule: after seen k times     stop rule: never (runs every round forever)
-  payload: the specific update      payload: full state digest / Merkle summary
-  cost: bursty, cheap, self-limits  cost: steady, continuous, background
-  risk: may miss a few nodes        risk: none (eventually reaches everyone)
-  → fast propagation layer          → reliable backstop layer
-```
-
-The pairing is deliberate: rumor-mongering gets a fresh fact almost everywhere in a few rounds, and the ever-running anti-entropy layer guarantees the stragglers rumor-mongering's stop rule left behind are eventually caught — exactly the foreground/background layering of §72.2, one level down at the gossip layer.
+Current commands/options, automatic-repair capabilities, defaults, incremental
+repair metadata, and read-repair behavior are version-specific. Inspect the
+running version and configuration. Do not equate Cassandra hints with every
+Dynamo-style sloppy-quorum design, and do not treat gossip membership as the
+mechanism that repairs all table data.
 
 ---
 
-## 72.19 Overlay Networks: Structured vs Unstructured
+## 72.12 Common Traps — Core
 
-Which peers a node *may* gossip with is defined by an **overlay network** — a logical graph laid over the physical network. Its structure governs the reliability/efficiency trade-off.
-
-- **Unstructured overlay.** Peers are chosen essentially at random; the contact graph has no imposed shape. This is classic gossip: maximally **robust** (no node is special, random redundancy heals around failures) but **inefficient** (the same message reaches a node many times; *O(n log n)* traffic). Easy to build and self-heals, which is why membership/failure-detection gossip is unstructured.
-- **Structured overlay.** Nodes are arranged in a deliberate topology — a **spanning tree**, a **ring** (consistent-hashing ring, Ch. 71 §71.16), a hypercube, or a DHT geometry (Chord/Pastry). Dissemination follows the structure, so each message travels a near-optimal path and reaches each node about **once** (*O(n)* traffic, low redundancy). Efficient, but **fragile**: a failed structural node breaks paths, and the structure must be *maintained* (repaired) as membership changes — exactly the cost gossip avoids.
-
-The tension is fundamental: **structure buys efficiency (fewer, non-redundant messages) at the cost of fragility and maintenance; lack of structure buys robustness and self-healing at the cost of redundant traffic.** This sets up hybrid designs (§72.20) that try to get both.
-
----
-
-## 72.20 Hybrid Gossip: Plumtree and Spanning-Tree Backbones
-
-The state of the art combines a deterministic backbone for efficiency with random gossip for reliability. **Plumtree** (Push-Lazy-Push Multicast Tree) is the canonical hybrid and a strong thing to name.
-
-Plumtree maintains **two kinds of links** between peers:
-
-- **Eager-push links** form a **spanning tree**. Along tree links, a node **eagerly pushes the full payload** as soon as it receives it — this delivers the message to everyone in *O(n)* messages along the tree, fast and non-redundant, exactly like structured broadcast.
-- **Lazy-push links** are all the *other* peer links. Along these, a node only pushes a **lazy header** — a cheap "I have message *m*" announcement (an ID/digest, not the payload).
-
-The trick is **self-healing via the lazy layer.** If a tree link fails, a node stops receiving eager payloads for some messages but still hears **lazy headers** advertising them from non-tree peers. When it notices it is missing a message it was advertised (after a timeout), it **pulls** the payload over the lazy link and **grafts** that link into the tree (promotes it to eager), simultaneously **pruning** the now-redundant broken branch. The tree thus **repairs itself** using gossip's redundancy, without any central rebuild.
-
-```
-Plumtree: eager tree (payload) + lazy mesh (just IDs)
-
-        A ═══► B ═══► D        ═══  eager: full payload, spanning tree, O(n) msgs
-        ║      ║               ───  lazy : "I have m" headers only (cheap)
-        ╚═► C  ╚┈┈┈► E
-            ┊       ▲
-            └┈┈lazy┈┘   if B→D breaks, D missing payload but sees lazy "have m"
-                        from E → D PULLS from E, GRAFTS E→D eager, PRUNES B→D
-```
-
-The result: **broadcast-tree efficiency in steady state (payload travels the tree once, *O(n)*), with gossip-grade fault tolerance** (the lazy mesh detects and routes around failures). You pay only cheap header traffic for the redundancy, not full-payload redundancy. This is the "combine a spanning tree with a deterministic backbone" hybrid the outline calls out, and it directly resolves the §72.19 tension.
+- Saying replicas converge “eventually” without naming fair scheduling,
+  eventual communication, retained state, and merge assumptions.
+- Repeating `R + W > N` as if it specifies repair; Chapter 71 explains why
+  quorum arithmetic alone is not a complete freshness/linearizability proof.
+- Treating physical absence as a deletion.
+- Purging tombstones because a timer elapsed even though a replica/backup can
+  still return an older live value.
+- Letting a restored or replaced node rejoin from stale storage without fencing
+  its incarnation and rebuilding/repairing it.
+- Comparing values by digest without comparing versions or handling collisions.
+- Hashing different snapshots, schemas, ownership ranges, tombstone rules, or
+  canonical encodings and calling the mismatch corruption.
+- Saying Merkle comparison is O(1) while ignoring tree construction and update.
+- Assuming a mismatching Merkle leaf identifies one record or means the entire
+  leaf must be streamed.
+- Counting a stored hint as guaranteed delivery.
+- Replaying hints with a new timestamp/version so an old mutation defeats a
+  later write.
+- Repairing only read respondents and claiming the whole replica set is healed.
+- Treating gossip's expected/model round count as a deterministic deadline.
+- Stopping a rumor after a fixed number of forwards with no pull/full-sync
+  backstop.
+- Using all-to-all peer lists or correlated partial views without measuring
+  connectivity and control traffic.
+- Running unthrottled repair on every node simultaneously and turning recovery
+  into an outage.
+- Marking a failed/obsolete incremental range complete.
+- Copying historical Cassandra hint, read-repair, gossip, or `gc_grace`
+  defaults into an architecture guarantee.
 
 ---
 
-## 72.21 Partial Views: HyParView and Scalable Membership
+## Recall Card — Core
 
-Uniform-random gossip (§72.18) assumes each node knows the whole membership — an *O(n)* view per node. For clusters of tens of thousands of nodes that is expensive to store and, worse, expensive to keep converged. **Partial-view** protocols give each node only a **small, fixed-size subset** of peers to gossip with, and prove that if those partial views are maintained well, global connectivity and *O(log n)* dissemination still hold. **HyParView** (Hybrid Partial View) is the reference design and pairs naturally with Plumtree.
+- Direct retries/hints shorten write misses; read repair heals hot observed
+  keys; Merkle/range repair heals cold and lost-hint gaps.
+- Compare canonical `(key, version, tombstone, value)` state. A digest detects a
+  difference; the version/merge policy decides repair.
+- Equal cached Merkle roots compare in O(1); building and maintaining them costs
+  scans or write-path work.
+- Leaf resolution trades tree memory against comparison rounds and overstreaming.
+- A bitmap version summary records bounded holes; it is not missing data and is
+  not automatically a causal version vector.
+- Gossip is probabilistic under its peer-selection/loss model. Push spreads
+  early, pull repairs the tail, push-pull does both at more per-contact cost.
+- Tombstones are versioned deletions. Retain them until every older source is
+  repaired, retired, or fenced.
+- Repair pins range/topology/schema context, streams original versions
+  idempotently, throttles, checkpoints, and verifies.
 
-HyParView maintains **two views** of different sizes and reliabilities:
+## Questions — Core
 
-- **Active view** — small (≈ `log(n) + c`, e.g., ~5 nodes). These are the peers a node actually gossips with, and the connections are kept alive (TCP, monitored). The union of active views across the cluster *is* the overlay's spanning-tree-like backbone (what Plumtree runs its eager layer over). Because it is small, maintaining it is cheap.
-- **Passive view** — larger (e.g., ~30 nodes). A **reserve** pool, *not* actively used, refreshed periodically via a random-walk/shuffle with peers. When an active-view peer fails, the node promotes a passive-view node to replace it, so the active view is quickly repaired from the reserve.
+1. Walk the A/B/C lost-hint scenario and identify which mechanism repairs a hot
+   key, a cold key, and a hint lost with its holder.
+2. State sufficient convergence assumptions for a state-based anti-entropy
+   system. Which assumption does a permanent partition violate?
+3. Why does a digest mismatch not say which replica is correct? What metadata
+   must the full comparison include?
+4. Compare the build, root-comparison, descent, and transfer costs of a Merkle
+   repair; explain how leaf granularity causes overstreaming.
+5. A bitmap says origin X has base 103 and bits for 105/107. What can the peer
+   infer, and what can it not infer about causal conflicts or payloads?
+6. Derive the `N=8, I=4, f=1` expected-newly-informed calculation. Which real
+   gossip behaviors invalidate its independence/uniform-delivery model?
+7. Draw the tombstone resurrection timeline and list the evidence required
+   before garbage collection.
+8. Why must a repair session pin or validate ownership and schema epochs? What
+   can fail during token movement?
+9. Contrast hints, read repair, incremental repair, full repair, and rebuild by
+   coverage, latency path, resource cost, and failure window.
+10. Given outage, repair-duration, and operator-margin distributions, design an
+    alert and retention policy without treating one configured grace value as a
+    universal guarantee.
 
-```
-Each node keeps only:
-  active view (~log n, e.g. 5):   ●━●━●━●━●   ← gossip here; TCP-monitored backbone
-  passive view (~30):             ○ ○ ○ ○ ...  ← reserve; shuffle-refreshed, promote on failure
+## Applied Exercise and Puzzle — Core
 
-  active-peer dies → promote a passive peer → connectivity restored, O(1) local work
-  Total per-node state: O(log n), independent of cluster size n → scales to 10^4–10^5 nodes
-```
+Extend §72.6 into a three-replica simulator:
 
-The active-view repair loop under a peer failure, step by step:
+1. add concurrent-version siblings or a semilattice merge rather than the toy
+   total order;
+2. model a durable hint queue with holder crash, expiry, replay, and idempotence;
+3. retain versioned tombstones and demonstrate resurrection when they are
+   deliberately purged too early;
+4. build cached binary Merkle trees over fixed ranges and count construction,
+   comparison, and streamed-record work separately;
+5. implement push, pull, and push-pull gossip with seeded randomness, loss, and
+   partial views;
+6. run many trials and report a convergence-time distribution and nonconverged
+   fraction under an explicit stopping rule—not only the mean;
+7. inject ownership changes and require repair jobs to restart or translate
+   their range epoch;
+8. verify all replicas converge after writes stop under the stated fairness and
+   connectivity assumptions.
 
-```
-node X active view: [P, Q, R, S, T]   passive view: [u,v,w,...] (reserve)
+**Puzzle:** A, B, and C store a key. A/B hold tombstone `v20`; C was offline
+with live `v19`. A scheduled repair reports success, then A/B compact away
+`v20`. C returns and `v19` reappears everywhere.
 
-  1. TCP to peer R drops → failure detected
-  2. X removes R from active view          active: [P, Q, _, S, T]
-  3. X promotes a passive peer, say u:
-       - send NEIGHBOR request to u
-       - u accepts, opens TCP              active: [P, Q, u, S, T]
-  4. periodic SHUFFLE refreshes passive view with random walk exchanges
-     so the reserve never runs dry under churn
-  → O(1) local work per failure; per-node state stays O(log n)
-```
+Give at least four explanations consistent with “repair succeeded”: C was not
+in the repaired ownership set; the key range/session failed but aggregate status
+was misread; repair used a snapshot before `v20`; incremental metadata excluded
+the relevant data; the tombstone was omitted from hashing/streaming; or C was
+later restored from an unfenced snapshot. Redesign the completion record and
+tombstone-GC gate so “success” proves coverage of the correct range, replica
+incarnations, ownership/schema epoch, snapshot/version horizon, and deletion
+state.
 
-Why it works: the active views collectively form a **connected, low-diameter random graph** with high probability, so a message still reaches everyone in *O(log n)* rounds even though no node knows more than a handful of peers. The passive view provides **resilience** — a fresh supply of replacements so the active graph stays connected under churn. The payoff: **membership and dissemination that scale to enormous clusters with *O(log n)* per-node state instead of *O(n)*.** HyParView (unstructured, robust, partial-view) as the membership substrate + Plumtree (structured eager tree + lazy repair) as the broadcast layer is a widely-cited modern stack.
+## Prerequisites for Chapter 73 — Core
 
----
-
-## 72.22 Choosing: Gossip vs Broadcast Tree vs Anti-Entropy
-
-Pulling the mechanisms together into a decision framework — the synthesis interviewers reward.
-
-| Mechanism | Latency | Msg overhead | Reliability | Coverage | Best for |
-|---|---|---|---|---|---|
-| **Direct broadcast** | 1 hop, immediate | *O(n)*, minimal | low (source/target failure loses it) | only current targets | small clusters, coordinator-driven writes |
-| **Broadcast tree** (structured) | *O(log n)* hops | *O(n)*, optimal | low–med (tree node failure severs subtree; needs repair) | one message, all nodes | efficient one-to-many when topology is stable |
-| **Gossip** (unstructured) | *O(log n)* rounds | *O(n log n)*, redundant | **high** (redundant paths, no critical node) | one message/state, all nodes | membership, failure detection, metadata at scale |
-| **Hybrid** (Plumtree/HyParView) | *O(log n)* | ~*O(n)* payload + cheap headers | high (self-healing tree) | one message, all nodes | large-scale reliable broadcast |
-| **Anti-entropy / Merkle** | periodic (minutes–hours) | *O(log M)* detect + diff transfer | high (thorough, self-healing) | **all keys**, even cold | data convergence backstop |
-| **Read repair** | on read, foreground | tiny (piggybacked) | med (only read keys) | read-hot keys only | low-latency freshness for hot data |
-| **Hinted handoff** | on write, foreground | small (buffered hints) | med (hints can be lost) | recently-written keys during outages | proactive gap-filling under transient failure |
-
-Decision heuristics:
-
-- **Small, stable cluster, source reliable?** Direct broadcast is fine — don't pay gossip's overhead.
-- **One-to-many, topology stable, efficiency critical?** Broadcast tree; accept the repair burden.
-- **Large or churny cluster, must tolerate arbitrary node failure?** Gossip (or Plumtree/HyParView hybrid). The *O(log n)* redundant-message premium is worth it.
-- **Guaranteeing data (not just metadata) converges, including cold keys?** Anti-entropy with Merkle trees — nothing else covers never-read data.
-- **In practice:** layer them. Foreground (read repair + hinted handoff) for hot-path freshness, background Merkle repair as the correctness backstop, gossip for membership/failure detection underneath. This is exactly the Cassandra/Dynamo stack.
-
----
-
-## 72.23 The PostgreSQL Contrast: Why Single-Leader Needs Almost None of This
-
-The sharpest way to understand anti-entropy is to notice which systems *don't need it*. Classic **PostgreSQL streaming replication** is **single-leader** (Ch. 71 §71.4): all writes go to one primary, which ships its **WAL** (Ch. 65) to standbys in strict log order. The standbys replay the identical, totally-ordered stream. There is exactly one authority for write ordering, and replicas are byte-for-byte reconstructions of the primary's history.
-
-Consequently, in vanilla Postgres:
-
-- **No divergence to repair.** A standby cannot hold a different value for a key than the primary's log dictates; it can only be *behind* (replication lag), never *divergent*. "Catching up" is replaying the log suffix — deterministic, ordered — not reconciling conflicting versions. There is nothing for a Merkle tree to find.
-- **No read repair, no hinted handoff, no version vectors.** These exist to reconcile *independently accepted* writes. Postgres never independently accepts a write on two replicas, so there are no conflicts and no per-key causal metadata to track.
-- **No sloppy quorums.** If the primary is down, writes *stop* (until failover promotes a standby) rather than being accepted by stand-in nodes. Postgres chooses consistency/ordering over write availability during the failure — the opposite of Dynamo's choice.
-
-The contrast *is* the lesson: **anti-entropy is the price of giving up a single ordering leader.** Leaderless/eventually-consistent replication (Dynamo, Cassandra, Riak) buys always-on write availability and coordinator-free scaling, and pays for it with the entire machinery of this chapter — read repair, hinted handoff, Merkle repair, version vectors, gossip. Single-leader replication buys simple, conflict-free convergence and pays with a write-availability gap at failover and a throughput ceiling at the leader.
-
-The line blurs at the edges: Postgres **logical replication** and multi-master extensions (BDR, pglogical, Citus) *do* accept independent writes and therefore *do* reintroduce conflict detection and resolution (last-write-wins, custom conflict handlers) — and with it, some of anti-entropy's flavor. The moment you allow two nodes to accept a write for the same key without a shared ordering authority, you have bought into this chapter, whatever the database is called.
-
----
-
-## 72.24 Putting It Together: The Anti-Entropy Stack in a Dynamo-Style System
-
-A concrete walkthrough tying the mechanisms to one write's lifecycle in a Cassandra-like store (*N*=3, *R*=*W*=QUORUM):
-
-1. **Write arrives.** Coordinator sends `K=v` to the 3 owner replicas. Two ack (quorum met), one is down → coordinator stores a **hint** (§72.7). Client sees success. *Foreground write-side anti-entropy engaged.*
-2. **Divergence exists.** The down replica is stale. If the outage is brief and the node returns within `max_hint_window`, **hinted handoff replays** the write (§72.7) — gap closed proactively, no read needed.
-3. **A client reads K.** Coordinator does a quorum **digest read** (§72.6): one full copy + digests. If a responding replica is stale, **read repair** (§72.4–72.5) pushes the fresh value to it — the hot key is healed on access.
-4. **A cold key stays divergent.** A key written once, never read, whose hint was lost when its holder crashed (§72.9), is invisible to steps 2–3. Only **scheduled Merkle-tree repair** (§72.10–72.12) — run within `gc_grace_seconds` to prevent zombie deletes (§72.11) — will detect and reconcile it. *Background backstop.*
-5. **Meanwhile, membership and liveness** (which node is up, who owns which token range) propagate continuously via **gossip** (§72.14–72.18), converging in *O(log n)* rounds so coordinators route to live replicas and failure detection triggers hint TTLs and repair scheduling.
-
-Every layer covers a gap the others leave: hinted handoff for transient outages, read repair for hot keys, Merkle repair for cold keys, gossip for the membership substrate that makes the other three know where to send things. That defense-in-depth is what "eventual consistency" actually costs to deliver.
-
----
-
-## Summary
-
-- **Replicas in a leaderless system diverge by design** — dropped messages, downed nodes, and concurrent writes — because the write path deliberately does not wait for all *N* replicas. Anti-entropy is the set of processes that make them *converge*.
-- **Repair is foreground or background.** Foreground (read repair, hinted handoff) is low-latency but only covers keys clients touch; background (Merkle-tree repair) is expensive but covers *all* keys including cold ones. Production layers both because each leaves a gap the other fills.
-- **Read repair** compares replica responses on a quorum read and writes the winning version back to stale replicas. **Blocking** repair adds an ordering guarantee at latency cost; **async** repair is best-effort. **Digest reads** ship one full copy plus hashes, transferring data only on a hash mismatch.
-- **Hinted handoff** buffers writes for down replicas and replays them on recovery, reducing later repair work; it enables **sloppy quorums** (write to stand-in nodes for availability), which *weakens* the R+W>N intersection guarantee. Hints can be lost and cause **hint storms** — so they never replace Merkle repair.
-- **Merkle trees** hash key ranges into a tree so two replicas find divergent ranges in *O(log M)* comparisons (equal roots settle it in *O(1)*) and transfer only differing leaves. Build cost is *O(M)*; leaf **granularity** trades tree size against over-streaming. Cassandra's `nodetool repair` must run within `gc_grace_seconds` to prevent zombie deletes.
-- **Bitmap version vectors** compress "which updates a replica has seen" into a contiguous base counter plus a sparse bitmap of the tail, keeping causal metadata *O(nodes)*.
-- **Gossip/epidemic** protocols spread information like an infection: fan-out *b* random peers per round, converging in ***O(log n)* rounds** with ***O(n log n)* messages**. **Push-pull** converges fastest (uninformed fraction squares each round). The SIR "stop spreading" rule trades reliability against wasted traffic.
-- **Structured overlays** (trees, rings) are efficient (*O(n)*) but fragile; **unstructured** gossip is robust but redundant (*O(n log n)*). **Hybrids** — **Plumtree** (eager spanning tree + lazy repair mesh) over **HyParView** (partial views, *O(log n)* state) — get tree efficiency with gossip resilience at scale.
-- **Single-leader PostgreSQL needs almost none of this**: one ordering authority means standbys can only *lag*, never *diverge*. Anti-entropy is precisely the price of leaderless, eventually-consistent replication — and Postgres multi-master/logical replication reintroduces it the moment two nodes accept independent writes.
-
----
-
-## Key Interview Questions
-
-1. **Why do replicas in a leaderless system diverge, and is it avoidable?** — Three causes: dropped/lost messages, downed nodes catching writes they miss, and concurrent writes with no leader to order them. It is not avoidable because the write path intentionally waits for only *W* < *N* replicas for availability and latency; divergence is the normal steady state, and correctness rests on eventual *convergence*, not on never diverging.
-2. **What is anti-entropy?** — Background (and foreground) processes that detect divergence between replicas and propagate missing/newer data until they agree. It is how eventually-consistent systems make good on convergence when there is no central coordinator.
-3. **Foreground vs background repair — why do you need both?** — Foreground (read repair, hinted handoff) is on the client path, low-latency, but only covers keys clients actually touch. Background (Merkle repair) is expensive and periodic but covers *all* keys, including cold ones never read. A never-read key can only be fixed by the background backstop, so you layer them.
-4. **How does read repair work?** — On a quorum read the coordinator gathers versions from multiple replicas, picks the winning (newest/causally dominant) version, returns it, and writes it back to any replica that returned a stale version. It heals exactly the read-hot key set at near-zero extra cost since the responses were already gathered.
-5. **Blocking vs asynchronous read repair?** — Blocking waits for repair acks before answering the client, adding tail latency but strengthening ordering (a following quorum read is guaranteed to see the repaired value even with minimally overlapping quorums). Async returns immediately and repairs in the background — lower latency, best-effort, no ordering guarantee.
-6. **What is a digest read and why use it?** — The coordinator requests the full value from one replica and only a hash (digest) from the others. If digests match, all agree and no data beyond one copy plus small hashes moves; if they mismatch, it escalates to a full read of the disagreeing replicas. It slashes bandwidth on the common no-conflict path.
-7. **What is hinted handoff?** — When a replica is down during a write, the coordinator stores a hint ("replica X owes this write") and replays it when X recovers, proactively filling the gap instead of waiting for a read or full repair. Hints have a TTL (`max_hint_window`, ~3h default); past it, collection stops and full repair is expected.
-8. **What is a sloppy quorum and how does hinted handoff enable it?** — Under failure, the coordinator writes to the next healthy nodes in the ring (non-owners) that hold the write as hints for the down owners, so *W* acks are met and the write stays available. Hints are handed off when owners recover. It trades away the R+W>N intersection guarantee for write availability.
-9. **Why does a sloppy quorum weaken consistency?** — During the failure window the *W* acking nodes are not the *N* owners, so a subsequent strict quorum read of the owners may miss the value (it sits as hints on stand-in nodes, invisible to a normal read of the preference list) until handoff completes. R+W>N no longer guarantees overlap on the home replicas.
-10. **What is a hint storm?** — When a long-down, heavily-written node returns, all hint holders replay simultaneously and can overwhelm the just-recovered node — a thundering herd. Mitigated by replay throttling/backpressure, the hint-window TTL capping backlog, and jittered replay start times.
-11. **Why is hinted handoff not a substitute for Merkle repair?** — A hint is durable only on its holder; if the holder dies before handoff, the hint is lost and that gap persists. Hints reduce repair work but can vanish, so periodic Merkle repair remains the guaranteed backstop.
-12. **What is a Merkle tree and how does it make anti-entropy cheap?** — A tree of hashes over sorted key ranges: leaves hash sub-ranges, internal nodes hash their children, the root summarizes everything. Two replicas compare roots (equal → identical in *O(1)*), then descend only into differing subtrees, pinpointing divergent leaf ranges in *O(log M)* comparisons and transferring only those ranges instead of the whole dataset.
-13. **What is the build cost of a Merkle tree and why does it dominate?** — *O(M)*: every key/value in the range must be hashed to build the tree (Cassandra's "validation compaction" reads the whole range). This full read competes with live traffic, which is why repair is throttled, scheduled off-peak, and run infrequently rather than continuously.
-14. **How does Cassandra's `nodetool repair` use Merkle trees?** — Per token range and table: each replica builds a Merkle tree via validation compaction, trees are exchanged and compared to find mismatching leaf ranges, then replicas stream only the differing data and reconcile by cell timestamp. Full, incremental (only unrepaired SSTables), and sub-range variants trade thoroughness against cost.
-15. **What is the Merkle-tree granularity trade-off?** — Fine leaves (small ranges) pinpoint divergence precisely so you stream little, but the tree is large (memory, build/compare cost). Coarse leaves make a tiny tree but one changed key marks its whole range divergent, forcing over-transfer of the entire range. You size the tree to fit memory while keeping over-streaming tolerable.
-16. **Why must Cassandra repair run within `gc_grace_seconds`?** — Deletes are tombstones purged after that window (default 10 days). If a replica missed a delete and repair does not reconcile it before the tombstone is collected everywhere, the deleted data resurrects as a zombie. Repair frequency is thus a correctness requirement for deletion, not just hygiene.
-17. **What are bitmap version vectors for?** — Compactly tracking which updates a replica has seen. Each source node's updates form a mostly-contiguous prefix stored as a single base counter, plus a small bitmap for out-of-order gaps in the tail. This keeps causal metadata *O(nodes)* and lets reconciling replicas compute exactly which dots the other is missing.
-18. **What is a gossip/epidemic protocol?** — Each node periodically picks a small random set of peers (fan-out *b*) and exchanges state, which propagates like an infection. It gives exponential spread (*O(log n)* rounds), high reliability through redundant paths, and full decentralization (no coordinator, every node runs the identical loop).
-19. **Push vs pull vs push-pull gossip?** — Push (send what I know) spreads fast early but has a long tail once most nodes know (pushes hit informed peers). Pull (ask what I lack) is slow early but fast late (ignorant nodes actively find infected ones). Push-pull does both, combining fast start and fast finish; the uninformed fraction roughly squares each round, giving the tightest convergence.
-20. **How many rounds and messages does gossip need to reach the whole cluster?** — Roughly log₍b+1₎(n) rounds (e.g., ~10 rounds for a million nodes at fan-out 3) and *O(n log n)* total messages per update. Latency is logarithmic; total traffic is near-linear times a log — the log factor is redundant delivery, the premium for coordinator-free reliability.
-21. **What is the SIR model and the "stop spreading" rule?** — Susceptible (ignorant), Infected (spreading), Removed (stopped spreading). SI spreads forever (guaranteed reach, wasteful); SIR stops infected nodes after they've seen an update redundantly *k* times, bounding wasted messages but risking a few unreached nodes. Larger *k* → more reliable and more costly.
-22. **How does fan-out affect gossip?** — Higher fan-out means fewer rounds (lower latency) but more messages per round and more redundancy. It only changes the log base, so doubling *b* barely reduces round count while linearly raising traffic. There is a percolation threshold below which the infection can die out; production uses a small constant (3–4) safely above it.
-23. **Gossip vs a broadcast tree — the trade-off?** — A tree delivers each fact once (*O(n)*, optimal) but is fragile: a failed internal node severs a subtree and the tree must be repaired. Gossip pays *O(n log n)* redundant messages to be failure-oblivious — no node is critical, so nothing needs repairing on failure. The extra log-factor of bandwidth is the insurance premium for reliability.
-24. **What is Plumtree and what problem does it solve?** — A hybrid: eager-push links form a spanning tree carrying full payloads (*O(n)*, efficient), while lazy-push links carry only "I have message *m*" headers. If a tree link fails, a node still hears lazy headers, pulls the missing payload, grafts that link into the tree and prunes the broken branch — self-healing broadcast with tree efficiency and gossip resilience.
-25. **What are partial views and why HyParView?** — Uniform gossip needs each node to know all *n* peers (*O(n)* state). Partial-view protocols give each node a small active view (~log n, the gossip backbone) plus a larger passive reserve view; on failure a passive peer is promoted. Global connectivity and *O(log n)* dissemination still hold, but per-node state is *O(log n)*, so it scales to huge clusters.
-26. **Why does classic single-leader PostgreSQL need almost no anti-entropy?** — All writes go through one primary that ships an ordered WAL; standbys replay the identical stream, so they can only *lag*, never *diverge*. With one ordering authority there are no independent writes, hence no conflicts, no read repair, no hinted handoff, no version vectors. Anti-entropy is precisely the price of dropping the single leader.
-27. **When does PostgreSQL reintroduce anti-entropy concerns?** — With multi-master/logical replication (BDR, pglogical, bi-directional setups) where two nodes accept independent writes for the same key without a shared ordering authority. That brings back conflict detection and resolution (last-write-wins, custom handlers) — the same class of problem as leaderless anti-entropy.
-28. **How do all the anti-entropy mechanisms fit together in a Dynamo-style store?** — Hinted handoff proactively fills gaps from transient outages; read repair heals hot keys on access; digest reads keep those reads cheap; scheduled Merkle repair is the backstop that converges even cold, never-read keys (within `gc_grace_seconds`); and gossip continuously propagates membership/liveness so the other three know where to send data. Each covers a gap the others leave.
-
----
-
-## Common Traps
-
-- **Confusing hinted handoff with sloppy quorum.** Hinted handoff is the mechanism (buffer a write for a down node); a sloppy quorum is the *policy* of counting stand-in hint holders toward *W* for availability. In Cassandra, hints do not count toward the consistency level by default, so it uses hinted handoff without a true sloppy quorum in the acking sense.
-- **Claiming R + W > N alone guarantees replicas stay fresh.** It guarantees a read *set* intersects the last write *set* by node, but dropped writes and sloppy quorums can defeat the intersection; only synchronous read repair and background anti-entropy keep replicas actually converged.
-- **Thinking read repair guarantees eventual convergence of all keys.** It only touches keys that get read; a written-once, never-read key is never repaired by it and can diverge indefinitely until Merkle repair sweeps it.
-- **Assuming a Merkle tree transfers only the exact differing keys.** It transfers whole differing *leaf ranges*; coarse leaf granularity over-streams (one changed key drags its entire range), so precision depends on leaf size versus data distribution.
-- **Forgetting that not running repair within `gc_grace_seconds` resurrects deleted data.** Tombstones are purged after the window; a replica that missed the delete can reintroduce the data as a zombie if repair does not reconcile the delete first.
-- **Believing gossip guarantees delivery to every node deterministically.** Gossip converges *probabilistically* with high probability in *O(log n)* rounds; under SIR stop rules or below the percolation fan-out threshold, a few nodes can be missed, which is why anti-entropy (SI-style, never-stopping) backstops it.
-- **Saying gossip is cheaper than broadcast.** Gossip costs *O(n log n)* messages versus a tree's optimal *O(n)*; it is *more* expensive in bandwidth and buys reliability/self-healing with that redundancy, not efficiency.
-- **Treating push and pull gossip as equivalent.** Push has a long tail once most nodes are informed; pull is slow at the start; only push-pull is fast throughout, which is why it is the standard for anti-entropy reconciliation.
-- **Thinking a broadcast tree is strictly better because it uses fewer messages.** Its efficiency is fragile: a single failed internal node severs an entire subtree and the tree must be actively repaired — the maintenance cost gossip avoids entirely.
-- **Assuming every replicated database needs anti-entropy.** Single-leader systems (classic PostgreSQL streaming replication) have one ordering authority, so replicas only lag and never diverge — no read repair, hints, or Merkle trees required. Anti-entropy is specific to leaderless/multi-master replication.
-- **Confusing bitmap version vectors with Bloom filters.** Both are compact set summaries, but a bitmap version vector exactly encodes *which* update dots a replica has seen (base counter + sparse tail bits, no false positives), whereas a Bloom filter (Ch. 21 §21.19) is a probabilistic membership test with false positives — different guarantees for different jobs.
-- **Ignoring hint storms and holder disk pressure.** Hinted handoff has real operational costs: a long outage under load builds huge hint backlogs that can overwhelm the recovering node on replay and fill neighbors' disks, which is why hint windows and replay throttling exist.
+You should be able to trace a missed write through hints, read repair, Merkle
+repair, and tombstone retention; state probabilistic gossip assumptions; and
+design an idempotent, throttled, verifiable range-repair operation. Chapter 73
+adds atomic commit and isolation for work spanning partitions.

@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A TU is the preprocessed result, not the file on disk — which is why a 500-file project with 50k lines of headers each compiles roughly 25M lines. The 'file on disk' answer is the common misconception: a header included by nobody is not a TU, and a .cpp #included into another (unity builds) is not a separate one. The object file is the compiler's output, not its input.",
-      "sourceAnchor": "11-translation-units",
+      "sourceAnchor": "14-source-files-headers-and-translation-units--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The wall is visibility: a TU is compiled in isolation and the compiler never sees the other TU's body. LTO breaks the wall by deferring code generation to link time. The tempting wrong answer is the `inline` one — `inline` does enable cross-TU inlining, but only indirectly, by making it legal to put the body in a header where it becomes visible. The keyword itself is not an inlining instruction.",
-      "sourceAnchor": "11-translation-units",
+      "sourceAnchor": "14-source-files-headers-and-translation-units--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Internal linkage is scoped to the *translation unit*, not the file — and a unity build redefines what the TU is. That is exactly why the 'nothing changes, `static` keeps it private' answer is tempting and wrong: it treats 'private to the file' as the guarantee, which only holds while one file equals one TU. COMDAT dedup applies to `inline`/weak symbols, not to internal-linkage objects, and any failure here happens at compile time, not link time.",
-      "sourceAnchor": "11-translation-units",
+      "sourceAnchor": "14-source-files-headers-and-translation-units--core",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The fallback is the key detail: a quoted include that misses locally still searches the `<>` paths, which is why a typo'd local header can silently resolve to a system one. The 'no fallback' answer is the near-miss. The forms are not equivalent either — beyond lookup, `-isystem` directories typically suppress warnings, which is the one real effect behind the convention of `<>` for third-party code.",
-      "sourceAnchor": "12-header-inclusion-and-include-guards",
+      "sourceAnchor": "14-source-files-headers-and-translation-units--core",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Declaring — not defining — a function with `Widget` parameters or return type by value is fine, because no storage is laid out and no code is generated at the declaration. The by-value member is the tempting one: it looks similar but requires the complete type, since the enclosing class's layout depends on `sizeof(Widget)`. Calling members and `sizeof` both need completeness for the same reason.",
-      "sourceAnchor": "12-header-inclusion-and-include-guards",
+      "sourceAnchor": "14-source-files-headers-and-translation-units--core",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`#pragma once` works on file *identity*, so anything that makes one physical file look like two defeats it. The 'non-standard' answer is the trap: it is technically true that the pragma is not in the standard, but it is universally supported and compilers do not ignore it — the real failure mode is filesystem identity, not compiler support. Same-filename collisions are the failure mode of *include guards*, where two headers picking the same macro name makes one silently vanish.",
-      "sourceAnchor": "12-header-inclusion-and-include-guards",
+      "sourceAnchor": "14-source-files-headers-and-translation-units--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The preprocessor pastes tokens; it has no notion of an expression, so `1+2` is spliced in raw and normal precedence then applies to the resulting soup. Both '9' answers assume the preprocessor understands expressions — it does not evaluate arguments and does not add parentheses, which is precisely why you must parenthesize every parameter *and* the whole macro body yourself.",
-      "sourceAnchor": "13-preprocessor-macros-and-conditional-compilation",
+      "sourceAnchor": "15-preprocessor-conditional-compilation-and-translation-phases--core",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Multiple evaluation is inherent to textual substitution, and no amount of parenthesization removes a duplicated token sequence — this is the primary argument for `constexpr`/`inline` functions and templates over function-like macros. The conditional-operator answer is wrong on its own terms: `?:` evaluates only the selected branch. The duplication comes from `(a)` appearing twice in the macro body, not from the operator.",
-      "sourceAnchor": "13-preprocessor-macros-and-conditional-compilation",
+      "sourceAnchor": "15-preprocessor-conditional-compilation-and-translation-phases--core",
       "difficulty": "trap"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`#if` replaces any surviving identifier with 0, so a typo'd feature macro silently takes the false branch — a top-tier source of 'why is this code not running'. The 'hard error' answer is the intuitive expectation and exactly why the real behaviour bites: nothing warns you by default, which is what `-Wundef` exists to fix.",
-      "sourceAnchor": "13-preprocessor-macros-and-conditional-compilation",
+      "sourceAnchor": "15-preprocessor-conditional-compilation-and-translation-phases--core",
       "difficulty": "trap"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Both `#` and `##` suppress expansion of their operands, which is why the two-level indirection idiom exists — and why `CAT(tmp_, __LINE__)` needs the same treatment to get the line number rather than the literal token `__LINE__`. The phase-ordering answer is a plausible-sounding invention: stringification is part of macro replacement, so it happens in phase 4 along with everything else.",
-      "sourceAnchor": "13-preprocessor-macros-and-conditional-compilation",
+      "sourceAnchor": "15-preprocessor-conditional-compilation-and-translation-phases--core",
       "difficulty": "recall"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the canonical observable consequence of phase ordering — splicing genuinely precedes comment recognition, so the next line vanishes into the comment. The reversed-order answer is the natural guess if you assume comments are stripped first. Splicing is also not restricted to literals and macros; it applies to any backslash-newline in the source.",
-      "sourceAnchor": "14-phases-of-translation",
+      "sourceAnchor": "15-preprocessor-conditional-compilation-and-translation-phases--core",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Deferring instantiation to a later phase is exactly what creates the two binding times, and it is why MSVC's historical habit of deferring everything to phase 8 lets code compile there but fail on GCC/Clang with 'no arguments that depend on a template parameter' — usually fixed with `this->` or a qualified name. String concatenation is phase 6 and include semantics are phase 4; the linker's type-blindness is phase 9.",
-      "sourceAnchor": "14-phases-of-translation",
+      "sourceAnchor": "15-preprocessor-conditional-compilation-and-translation-phases--core",
       "difficulty": "recall"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the most vexing parse: anything that *can* be parsed as a declaration is parsed as a declaration, so the empty parens read as a parameter list. The 'same as `Widget w;`' answer is what everyone expects it to mean, which is what makes the bug survive review. Braces disambiguate because a braced-init-list cannot start a parameter list. The same trap scales up: `Widget w(Gadget());` declares a function taking a pointer-to-function.",
-      "sourceAnchor": "15-declarations-and-definitions",
+      "sourceAnchor": "16-declarations-definitions-and-odr-use--core",
       "difficulty": "trap"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Three containers carve out this permission and the completeness requirement merely moves to first member use rather than disappearing. The 'illegal everywhere' answer describes the pre-C++17 world and is still correct for most *other* containers, which is what makes it tempting — the change was a targeted carve-out, not a general relaxation.",
-      "sourceAnchor": "15-declarations-and-definitions",
+      "sourceAnchor": "16-declarations-definitions-and-odr-use--core",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "IFNDR means the implementation may accept it and produce nonsense, and the linker's dedup-by-name is precisely what makes it silent — half the program ends up calling code compiled against a different layout. The 'duplicate symbol' answer confuses ODR-3 with ODR-2: missing or doubled definitions of non-inline entities *are* friendly link errors. It is exactly the clause with no diagnostic that corrupts memory instead.",
-      "sourceAnchor": "16-the-one-definition-rule-odr",
+      "sourceAnchor": "17-the-one-definition-rule--core",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Odr-use is about whether the entity must exist *in memory* — taking its address or binding a reference to it. The 'any use at all' answer is the common overcorrection: reading `S::N` as a plain value is fine without a definition, and that is why the same constant works in `int y = S::N;` but breaks the moment a `const&` parameter binds to it.",
-      "sourceAnchor": "16-the-one-definition-rule-odr",
+      "sourceAnchor": "17-the-one-definition-rule--core",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The internal-linkage rule is what makes header constants safe in C++ and a duplicate-symbol error in C. The consequence is worth knowing: if the constant is ever odr-used you get N distinct objects at N different addresses, so never rely on such an address being unique — use `inline constexpr` when you need one shared object. Constant folding usually happens too, but it is an optimization, not the linkage rule.",
-      "sourceAnchor": "17-linkage",
+      "sourceAnchor": "18-scope-linkage-and-storage-duration--core",
       "difficulty": "recall"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "ODR-3 has two requirements — same token sequence *and* names resolving to the same entities — and this trap satisfies only the first. That is what makes the 'identical tokens are precisely what ODR-3 requires' answer so tempting: people remember the token rule and stop there. The function itself keeps external linkage; merely mentioning an anonymous-namespace type in its signature does not make it internal.",
-      "sourceAnchor": "17-linkage",
+      "sourceAnchor": "18-scope-linkage-and-storage-duration--core",
       "difficulty": "trap"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the canonical example proving the three axes are independent, and the near-miss is 'internal linkage' — `static` means internal linkage only at *namespace* scope. At block scope it changes storage duration instead, and the variable has no linkage at all because no other declaration can ever refer to it.",
-      "sourceAnchor": "17-linkage",
+      "sourceAnchor": "18-scope-linkage-and-storage-duration--core",
       "difficulty": "recall"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Construct On First Use converts an ordering problem into a lazy-initialization problem, and the guard variable makes concurrent first calls safe. `constinit` is a real fix for a *different* case — it asserts constant initialization, so it applies only when the initializer is already a constant expression; it does not order dynamic init. Neither `extern` nor link order constrains dynamic initialization order across TUs, which is simply unspecified.",
-      "sourceAnchor": "18-storage-duration",
+      "sourceAnchor": "18-scope-linkage-and-storage-duration--core",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the static *de*initialization fiasco — the mirror of the initialization one, and it does not go away just because you fixed startup ordering. That is what makes the 'destruction is the exact reverse of construction' answer tempting: reverse-of-construction is true, but reversing an unspecified order leaves it unspecified. The leaked singleton (`static Registry* r = new Registry;`) trades a one-time report from leak sanitizers for correctness at shutdown.",
-      "sourceAnchor": "18-storage-duration",
+      "sourceAnchor": "18-scope-linkage-and-storage-duration--core",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`inline` is a linkage/ODR keyword, not an optimization directive; inlining is decided by cost heuristics that largely ignore it. The internal-linkage answer describes what `static` does, and the distinction matters enormously: `static` gives each TU its own copy including its own function-local statics, while `inline` gives one shared entity program-wide. Saying it does 'nothing' overshoots — without it, two definitions are a hard duplicate-symbol error.",
-      "sourceAnchor": "19-inline-functions-and-variables",
+      "sourceAnchor": "19-inline-functions-and-variables--core",
       "difficulty": "recall"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`static` in a header is not a substitute for `inline` — it produces N independent functions with N independent statics, which is a genuinely nasty bug because the code compiles, links, and quietly miscounts. The 'equivalent after dedup' answer is the exact misconception: there is nothing to deduplicate, since internal-linkage symbols never collide in the first place. Dropping `static` and keeping `inline` gives the single shared copy.",
-      "sourceAnchor": "19-inline-functions-and-variables",
+      "sourceAnchor": "19-inline-functions-and-variables--core",
       "difficulty": "trap"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Overload resolution needs distinct symbols, and mangling is the mechanism that produces them — remove it and the overloads collapse onto one name. The 'calling convention only' answer gets it backwards: `extern \"C\"` selects both the calling convention *and* the naming scheme, and it is the naming half that forbids overloading. Note it does not change internal/external linkage, which is a separate axis.",
-      "sourceAnchor": "110-name-mangling-and-extern-c",
+      "sourceAnchor": "113-language-linkage-name-mangling-and-extern-c--role-specific",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Unwinding through frames that carry no unwind information is undefined, so every C-callable entry point needs a catch-all. The `noexcept` answer is close enough to be dangerous: adding `noexcept` yourself *does* turn an escape into a deterministic `std::terminate`, which is better than UB — but `extern \"C\"` does not imply it, and terminating is still worse than returning an error code. `extern \"C\"` also does not disable C++ semantics inside the function; RAII, templates, and exceptions all work internally.",
-      "sourceAnchor": "110-name-mangling-and-extern-c",
+      "sourceAnchor": "113-language-linkage-name-mangling-and-extern-c--role-specific",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An archive is not linked wholesale — the linker walks it looking for members that satisfy outstanding undefined symbols, and a purely self-registering object satisfies none. Fix with `--whole-archive`, `-force_load`, `/WHOLEARCHIVE`, or an explicit reference into that object. The `--gc-sections` answer describes a real mechanism applied to the wrong stage: the object is never extracted, so there is nothing for section GC to collect.",
-      "sourceAnchor": "111-static-and-dynamic-libraries",
+      "sourceAnchor": "112-static-and-dynamic-libraries--role-specific",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Independent patching is the major argument distributions make for shared libraries, along with one physical copy of `.text` shared across processes. The other three invert the actual trade-offs: dynamic calls go indirectly through the PLT/GOT and are never cheaper than a direct call, startup is *slower* because the loader must map, relocate, and resolve, and cross-boundary inlining is exactly what you lose — the loader performs no optimization.",
-      "sourceAnchor": "111-static-and-dynamic-libraries",
+      "sourceAnchor": "112-static-and-dynamic-libraries--role-specific",
       "difficulty": "recall"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "On Itanium-ABI platforms type identity is normally a pointer comparison on the type_info name, so duplicating the typeinfo silently breaks matching — this is the highest-value obscure fact in the visibility section, and the rule it implies is that exception types and polymorphic bases must stay at `default` visibility. Exceptions do propagate across module boundaries fine in general; the failure is specifically about type identity, not unwinding.",
-      "sourceAnchor": "112-symbol-visibility-and-weak-symbols",
+      "sourceAnchor": "114-symbol-visibility-and-weak-symbols--deep-dive",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Interposition is the reason: because an exported function could be replaced at load time — which is exactly how `LD_PRELOAD` malloc replacement works — the compiler must assume the definition it can see may not be the one called. The symbol-table answers describe real load-time costs but not codegen effects; eager binding is what `-Wl,-z,now` controls, and it is orthogonal to visibility.",
-      "sourceAnchor": "112-symbol-visibility-and-weak-symbols",
+      "sourceAnchor": "114-symbol-visibility-and-weak-symbols--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Weak/COMDAT emission is both the feature and the hazard: discarding duplicates by name is precisely what makes ODR-3 violations undiagnosable, since comparing them was never part of the linker's job. The internal-linkage answer would break the semantics it is meant to implement — inline functions and vtables must be *one* entity program-wide, or address comparisons and vtable identity would fail.",
-      "sourceAnchor": "112-symbol-visibility-and-weak-symbols",
+      "sourceAnchor": "114-symbol-visibility-and-weak-symbols--deep-dive",
       "difficulty": "recall"
     }
   ]

@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The standard fixes only relative ordering plus minimum widths; `int` is guaranteed a mere 16 bits even though it is 32 everywhere you will realistically work. The `long` answer is the seductive one: the ordering is non-strict (`<=`), so `long` may equal `int` in width — and does on LLP64 Windows. `CHAR_BIT` is only required to be at least 8; some DSPs use 16 or 32.",
-      "sourceAnchor": "21-fundamental-types-and-fixed-width-integers",
+      "sourceAnchor": "25-fundamental-types-and-fixed-width-integers--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 2,
       "explanation": "The LP64/LLP64 split is the single most common cross-platform integer bug: Windows widened pointers and `long long` but deliberately left `long` at 32 bits for source compatibility. The ILP32 answer is the near-miss — ILP32 is the genuine 32-bit model where pointers are also 32 bits, which x64 is not. The fix is to use `int64_t` and never `long` in a portable interface.",
-      "sourceAnchor": "21-fundamental-types-and-fixed-width-integers",
+      "sourceAnchor": "25-fundamental-types-and-fixed-width-integers--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`int8_t` is a typedef, not a distinct type, and on mainstream platforms it aliases `signed char` — which iostreams treat as a character. The `65` answer assumes the fixed-width types are distinct types the way `char16_t` is; they are not. Note `<<` does have overloads for `signed char` and `unsigned char` that print characters, so the 'only plain `char` selects the character overload' answer is wrong in the opposite direction.",
-      "sourceAnchor": "21-fundamental-types-and-fixed-width-integers",
+      "sourceAnchor": "25-fundamental-types-and-fixed-width-integers--core",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Integral promotion converts any type of lower rank than `int` to `int` first, so the addition is 32-bit and 300 survives intact. The `uint8_t`/44 answer is the standard misconception — wrapping only appears if you assign back, as in `uint8_t y = a + b;`. Promotion targets `unsigned int` only when `int` cannot represent all the source type's values, which is not the case for `uint8_t`.",
-      "sourceAnchor": "22-integer-promotions-and-usual-arithmetic-conversions",
+      "sourceAnchor": "217-integer-promotions-and-the-usual-arithmetic-conversions--core",
       "difficulty": "application"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Promotion sends `unsigned short` to *signed* `int` because `int` can represent every `unsigned short` value — turning what looks like well-defined unsigned wraparound into signed overflow, which is UB. The \"promotes to `unsigned int`\" answer is the closest miss: that only happens when `int` cannot hold all source values, e.g. for `unsigned int` operands already at rank `int`. The fix is to write `1u * s * s` or use a wider type.",
-      "sourceAnchor": "22-integer-promotions-and-usual-arithmetic-conversions",
+      "sourceAnchor": "217-integer-promotions-and-the-usual-arithmetic-conversions--core",
       "difficulty": "trap"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Step 4b of the usual arithmetic conversions applies: when the unsigned type's rank is at least the signed type's, the signed operand becomes unsigned, so -1 reads as 4294967295. The `long` answer describes step 4c, which really would rescue you — but only for `unsigned int` versus `long`, where a 64-bit signed type covers the whole unsigned range; here both operands sit at rank `int`. `std::cmp_less` is the correct tool.",
-      "sourceAnchor": "22-integer-promotions-and-usual-arithmetic-conversions",
+      "sourceAnchor": "217-integer-promotions-and-the-usual-arithmetic-conversions--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Both mistakes compound: unsigned subtraction below zero wraps to a huge value, and then the usual arithmetic conversions push `k` to unsigned for the comparison. The \"`k` stays signed\" answer is the tempting half-answer — it gets the wraparound right but forgets that the comparison itself converts the signed operand, which is precisely what removes any chance of the loop terminating early. `-Wsign-compare` catches it, and `std::ssize` avoids it.",
-      "sourceAnchor": "22-integer-promotions-and-usual-arithmetic-conversions",
+      "sourceAnchor": "217-integer-promotions-and-the-usual-arithmetic-conversions--core",
       "difficulty": "trap"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Two's complement makes the add/sub/mul bit patterns identical, which is why the hardware needs only one opcode for each; what differs is comparison (`jl`/`jg` on SF/OF versus `jb`/`ja` on CF), right shift (arithmetic versus logical), and division. The \"add, subtract and multiply differ\" answer inverts the truth and is the common misconception. Separately from hardware, the *language* also differs: signed overflow is UB while unsigned wraps mod 2^n.",
-      "sourceAnchor": "23-signed-and-unsigned-arithmetic",
+      "sourceAnchor": "218-signed-and-unsigned-arithmetic--core",
       "difficulty": "recall"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Right-shifting a negative signed value was implementation-defined before C++20 and is now guaranteed to sign-extend, so -8 >> 1 is -4. `1 << 31` overflows a signed 32-bit `int` and is UB — use `1u << 31`. `1u << 32` is UB because the count reaches the promoted operand's width; it is not defined to be zero, and x86 in fact masks the count so it frequently yields 1. The hand-rolled rotate is UB at `n == 0`, which is why `std::rotl` exists.",
-      "sourceAnchor": "23-signed-and-unsigned-arithmetic",
+      "sourceAnchor": "218-signed-and-unsigned-arithmetic--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The check is post-hoc: to reach the comparison the overflow must already have happened, which is UB, so the optimizer is entitled to reason `a + b < a` implies `b < 0` and emit a sign test. The \"add a check for negative `b`\" answer is the tempting one — it treats this as an incomplete check rather than a fundamentally invalid one, but no amount of extra post-hoc comparisons helps once the UB has occurred. Use `__builtin_add_overflow` or a pre-check against `INT_MAX - b`.",
-      "sourceAnchor": "24-integer-overflow",
+      "sourceAnchor": "219-integer-overflow-failure-trace-and-defences--core",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Unsigned arithmetic is defined to wrap mod 2^n, and the unsigned-to-signed narrowing on the way back — implementation-defined before C++20 — is now guaranteed modular, so the round trip is fully portable. The `long long` answer is the closest miss: the wide addition itself does not overflow, but the narrowing assignment has exactly the same conversion question and only became guaranteed in C++20 too, so it buys nothing extra. UBSan diagnoses, it does not define.",
-      "sourceAnchor": "24-integer-overflow",
+      "sourceAnchor": "219-integer-overflow-failure-trace-and-defences--core",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Normalization guarantees the leading significand bit is 1, so IEEE 754 omits it and gains a bit for free — 52 stored plus 1 implicit gives 53. The exponent-borrowing answer is invented; the exponent field is fixed at 11 bits with bias 1023. Note the implicit bit is exactly what subnormals give up: when the exponent field is all zeros the leading bit is 0 instead.",
-      "sourceAnchor": "25-ieee-754-floating-point",
+      "sourceAnchor": "220-ieee-754-floating-point--core",
       "difficulty": "recall"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Floats are evenly spaced within a binade and the spacing doubles at every power of two; with 53 significand bits the spacing reaches 1.0 exactly at 2^53, so 2^53 + 1 is not representable and rounds back. The saturation answer confuses significand limits with exponent limits — `double` reaches about 1.8e308, so 9e15 is nowhere near overflow. This is precisely why 2^53 is the largest integer `double` can count through reliably.",
-      "sourceAnchor": "25-ieee-754-floating-point",
+      "sourceAnchor": "220-ieee-754-floating-point--core",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 3,
       "explanation": "`max()` is merely the largest finite `double`; `infinity()` is the value with correct comparison semantics for a sentinel. The \"smallest positive normal\" answer describes a different and equally famous trap — `min()` for floating types really is the smallest positive *normal*, not the most negative value, and `lowest()` is what you want there — but that is `min()`, not `max()`. Both members are `constexpr`.",
-      "sourceAnchor": "25-ieee-754-floating-point",
+      "sourceAnchor": "220-ieee-754-floating-point--core",
       "difficulty": "recall"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Gradual underflow into subnormals is the classic cause: many Intel microarchitectures do not handle subnormal operands or results on the fast datapath and take a microcode assist worth 50-100x. The NaN answer is the tempting alternative because NaN is the other \"weird value\" — but NaNs propagate at full speed, they do not trap by default. FTZ/DAZ, or adding a tiny DC offset, are the usual mitigations.",
-      "sourceAnchor": "26-subnormal-denormal-floating-point-values",
+      "sourceAnchor": "221-subnormal-floating-point-values--deep-dive",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Subnormals exist so that any two distinct normals differ by at least one representable value; flushing them to zero makes distinct numbers subtract to exactly 0. The \"per translation unit\" answer is the dangerous misconception: MXCSR is a hardware register belonging to the thread, so a library built with `-ffast-math` links `crtfastmath.o` and silently changes FP behaviour for the whole process when its static initialisers run.",
-      "sourceAnchor": "26-subnormal-denormal-floating-point-values",
+      "sourceAnchor": "221-subnormal-floating-point-values--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 2,
       "explanation": "NaN is unordered with everything including itself, so every ordered comparison is false and `!=` is the one that comes out true — the canonical NaN test, though `std::isnan` says it more readably. The `!(n < 1.0) == (n >= 1.0)` option is the subtle one: both `n < 1.0` and `n >= 1.0` are false, so `!(n < 1.0)` is true while `(n >= 1.0)` is false, and the equality fails. That inequality between a negated comparison and its apparent complement is exactly what NaN destroys.",
-      "sourceAnchor": "27-nan-and-infinity",
+      "sourceAnchor": "222-nan-and-infinity--core",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Introsort's partition loop advances pointers until the comparator says stop; with a NaN in the range no element compares as required, so the loop walks past the end and performs a genuine out-of-bounds write — a memory-safety bug, not just a bad permutation. The `std::max` answer states a true fact about `std::max` returning `b` for unordered operands, but that is a separate hazard and not the mechanism here. `std::map` keys and `std::set` have the same problem.",
-      "sourceAnchor": "27-nan-and-infinity",
+      "sourceAnchor": "222-nan-and-infinity--core",
       "difficulty": "application"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Once the compiler may assume no NaNs or infinities exist, every check for them is provably dead and is removed — validation code silently stops validating. `-fno-math-errno` is the tempting pick because it also removes something, but it is essentially always safe in C++ since nobody inspects `errno` after `sqrt`, and it is the one sub-flag worth enabling alone. Reassociation changes accuracy and reproducibility, not correctness of checks.",
-      "sourceAnchor": "28-fast-math-optimizations",
+      "sourceAnchor": "223-fast-math-optimizations--role-specific",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`std::string` stores `char` code units and `size()` counts them, so U+1F600 encoded as F0 9F 98 80 gives 4. The code-point answer is the standard misconception — code unit, code point, and grapheme cluster are three different counts, and the standard library models only the first. The surrogate-pair answer describes UTF-16's behaviour, which is what `std::u16string` would report.",
-      "sourceAnchor": "29-character-types-and-encodings",
+      "sourceAnchor": "214-character-types-and-encodings--role-specific",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The `<cctype>` functions take an `int` whose value must fit in `unsigned char` or be `EOF`; on platforms where plain `char` is signed, a byte above 127 arrives as a negative number and the call is UB, typically indexing a lookup table out of bounds. The warning-suppression answer is the plausible-but-wrong reading — this is a correctness fix, not cosmetic. Note these functions are also per-code-unit and cannot case-fold non-ASCII correctly.",
-      "sourceAnchor": "29-character-types-and-encodings",
+      "sourceAnchor": "214-character-types-and-encodings--role-specific",
       "difficulty": "trap"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 2,
       "explanation": "For an unscoped enum without a fixed underlying type the value range is the smallest bit-field covering all enumerators, so three bits give 0-7 and `A | B | C` is well defined. The \"only declared enumerators\" answer is the common over-strict reading; if it were true, every bitmask enum in existence would be UB. Values genuinely outside the range are UB, and the optimizer exploits that — a `switch` need not handle them.",
-      "sourceAnchor": "210-scoped-and-unscoped-enumerations",
+      "sourceAnchor": "213-scoped-and-unscoped-enumerations--core",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`nullptr` has type `std::nullptr_t`, which converts to any pointer or pointer-to-member and to no integer, so only `f(char*)` is viable. `f(NULL)` is the classic trap: in C++, `NULL` expands to `0` or `0L`, so it picks `f(int)` on most implementations or is ambiguous at best. `f(0)` picks `f(int)` outright, and `(void*)0` does not implicitly convert to `char*` in C++ at all — that rule belongs to C.",
-      "sourceAnchor": "211-boolean-conversions-and-null-pointers",
+      "sourceAnchor": "216-boolean-conversions-and-null-pointers--core",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 3,
       "explanation": "The optimizer is entitled to assume UB never occurs, so a successful dereference proves `p` non-null and everything downstream that tests it becomes provably dead. The reordering answer is the plausible-sounding alternative but gets the mechanism backwards — nothing is moved, the check is deleted outright. This is the CVE-2009-1897 Linux kernel pattern; `-fno-delete-null-pointer-checks` exists for kernels, and application code should simply check before dereferencing.",
-      "sourceAnchor": "211-boolean-conversions-and-null-pointers",
+      "sourceAnchor": "216-boolean-conversions-and-null-pointers--core",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`const` is a property of the access path, so stripping it to reach a non-const object is fine; but an object *declared* const may live in `.rodata` and the compiler may constant-fold reads of it, so modifying it is UB no matter how you obtained the pointer. The \"both are legal\" answer conflates the cast being permitted with the write being permitted — `const_cast` legalizes the conversion, never the modification. The legitimate use is adapting to a non-const-correct legacy API.",
-      "sourceAnchor": "212-const-and-volatile-qualification",
+      "sourceAnchor": "28-const-and-volatile-qualification--core",
       "difficulty": "recall"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`const` in the standard library effectively means \"thread-safe to read\", so two threads may call the `const` accessor at once and race on the cache — which is exactly why a `mutable std::mutex` member is idiomatic. The \"drop `const` and split the function\" answer inverts the physical/logical constness distinction: a cache does *not* change observable state, which is precisely what makes `mutable` the right tool here rather than a design error. `mutable` needs no `const_cast`.",
-      "sourceAnchor": "212-const-and-volatile-qualification",
+      "sourceAnchor": "28-const-and-volatile-qualification--core",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Binding a temporary directly to a local `const&` or `&&` extends it to the reference's own lifetime — the base case the rule exists for. The reference-member case is the most-missed exception: the temporary dies at the end of the constructor, leaving a dangling member, which is the standard `string_view`/`const T&` member bug. Returns never extend, and in the last case the temporary was bound by `g()`, not by `r`, and extension applies only to the first reference.",
-      "sourceAnchor": "213-references",
+      "sourceAnchor": "29-references--core",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Value category attaches to expressions, not types: `x` names an object, so the expression `x` is an lvalue even when `T&&` collapsed to an rvalue reference. `std::forward` is just a `static_cast` back to `T&&` that restores the original category. The move-constructor answer is the common misreading — neither `forward` nor `move` moves anything or generates any code; they only change the category so that overload resolution picks the moving overload.",
-      "sourceAnchor": "213-references",
+      "sourceAnchor": "29-references--core",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`&a` is one of the contexts where an array does not decay: it yields a pointer to the whole `int[10]` object, and arithmetic on it steps by the full 40-byte array. The `int**` answer is the classic confusion between an array and a pointer-to-pointer, the same error that makes people try to pass `int m[3][4]` to a function taking `int**` when it actually decays to `int(*)[4]`. `sizeof` and `decltype` are the other non-decaying contexts.",
-      "sourceAnchor": "214-pointers-and-arrays",
+      "sourceAnchor": "210-pointers-and-arrays--core",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`bit_cast` is constexpr, UB-free and compiles to nothing, and `memcpy` is recognized by every compiler and lowered to a register move. The `reinterpret_cast` answer is the most tempting: the cast itself is permitted, but *reading through* the new type violates strict aliasing and GCC and Clang genuinely miscompile it at `-O2`. Union punning is legal in C and formally UB in C++, though supported as a documented extension; `static_cast` performs a numeric conversion, not a bit reinterpretation.",
-      "sourceAnchor": "214-pointers-and-arrays",
+      "sourceAnchor": "210-pointers-and-arrays--core",
       "difficulty": "recall"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Array parameters are always rewritten as pointers, so `void f(int a[10])`, `void f(int a[])` and `void f(int* a)` declare the same function and the bound is documentation only — `sizeof(a)` is 8 while `sizeof(a[0])` is still 4, giving 2. The answer of 10 is what everyone expects the declaration to mean, and is exactly why the `sizeof/sizeof` macro is dangerous. A `template<size_t N> void f(int (&a)[N])` parameter, or `std::span`, preserves the size.",
-      "sourceAnchor": "215-array-to-pointer-and-function-to-pointer-decay",
+      "sourceAnchor": "212-array-to-pointer-and-function-to-pointer-decay--core",
       "difficulty": "trap"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Binding to a reference is one of the few non-decaying contexts, so `T` deduces as `int[10]` and the parameter is `int(&)[10]` — the mechanism behind `std::size`, `std::begin`/`std::end` on raw arrays, and the string-literal-length trick. By-value deduction decays, which is the tempting near-miss and the source of the asymmetry between the two templates. `auto` follows by-value rules and yields `int*`; only `auto&` keeps the array type.",
-      "sourceAnchor": "215-array-to-pointer-and-function-to-pointer-decay",
+      "sourceAnchor": "212-array-to-pointer-and-function-to-pointer-decay--core",
       "difficulty": "application"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Case 1 `auto` uses by-value template deduction: the const that qualifies `p` itself is top-level and is dropped, while the const qualifying the pointed-to characters is low-level and must be kept, since you may add low-level const implicitly but never remove it. The \"strips const everywhere\" answer is the standard confusion between the two levels — dropping the low-level const would let you write through a pointer to a string literal.",
-      "sourceAnchor": "216-auto-type-deduction",
+      "sourceAnchor": "224-auto-type-deduction--core",
       "difficulty": "application"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 3,
       "explanation": "N3922 changed direct-list-initialization with a single element to deduce the element type, so `auto x2{27}` is `int`; copy-list-initialization `auto x3 = {27}` still deduces `std::initializer_list<int>` in every version. The \"both are `int`\" answer is the plausible over-generalization — the fix was deliberately narrow. This braced case is also the one place `auto` and template deduction disagree, since `f({1,2,3})` on a plain `template<class T> void f(T)` simply fails to deduce.",
-      "sourceAnchor": "216-auto-type-deduction",
+      "sourceAnchor": "224-auto-type-deduction--core",
       "difficulty": "recall"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The map's `value_type` is `std::pair<const K, V>`, which is a different type from `std::pair<K, V>`; a `const&` will happily bind to a temporary produced by the converting constructor, so you silently copy every element and any address you take points at the temporary. The \"binds directly\" answer is the intuition most people have — that `const&` avoids copies — and it is exactly what makes the bug invisible. `for (const auto& p : m)` is the fix and the strongest practical argument for `auto`.",
-      "sourceAnchor": "216-auto-type-deduction",
+      "sourceAnchor": "224-auto-type-deduction--core",
       "difficulty": "trap"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Rule 1 applies to unparenthesized id-expressions and gives the declared type exactly; anything else falls to rule 2, where an lvalue expression of type `T` yields `T&`. The \"parentheses are just grouping\" answer is the intuition from ordinary expression syntax and is precisely what this question exists to break. The same asymmetry appears with members: `decltype(s.m)` is `int` while `decltype((s.m))` is `int&`.",
-      "sourceAnchor": "217-decltype-and-decltypeauto",
+      "sourceAnchor": "225-decltype-and-decltypeauto--core",
       "difficulty": "recall"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 2,
       "explanation": "`decltype(auto)` applies `decltype` rules to the return expression, and `(x)` is a parenthesized lvalue, so the deduced return type is `int&` referring to a destroyed local — the identical function without parentheses returns `int` and is fine. The \"always copies\" answer is the intuition that makes this so dangerous in review, since the parentheses look like noise. Compilers warn via `-Wreturn-local-addr`, but this is why `decltype(auto)` is a specialist tool.",
-      "sourceAnchor": "217-decltype-and-decltypeauto",
+      "sourceAnchor": "225-decltype-and-decltypeauto--core",
       "difficulty": "trap"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Cross-casts and recovering the most-derived object's address need runtime type information that only `dynamic_cast` consults. The downcast answer is the tempting one: `static_cast` *can* downcast, it simply does so unchecked, and that speed-versus-safety trade is the actual distinction between the two. Neither cast touches const — that is `const_cast`'s exclusive job — and unrelated types are not convertible either way.",
-      "sourceAnchor": "218-explicit-c-casts",
+      "sourceAnchor": "226-explicit-c-casts--core",
       "difficulty": "application"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 1,
       "explanation": "A C-style cast tries `const_cast`, then `static_cast`, then `static_cast` plus `const_cast`, then `reinterpret_cast`, then `reinterpret_cast` plus `const_cast` — so when the `static_cast` interpretation stops being valid it quietly slides down to reinterpreting bits. The \"fails to compile\" answer describes what you would want to happen and is why people assume C-style casts are harmless. This silent escalation, plus being ungreppable, is the entire argument for named casts.",
-      "sourceAnchor": "218-explicit-c-casts",
+      "sourceAnchor": "226-explicit-c-casts--core",
       "difficulty": "trap"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Braces perform list-initialization, and narrowing in a braced initializer is ill-formed — which is why `int8_t x{300};` is a compile error where `int8_t x = 300;` is merely a modular conversion. The functional-notation answer is the near-miss worth knowing: with a single argument `T(e)` is exactly a C-style cast, despite looking like the braced form. `static_cast` is designed to perform narrowing conversions deliberately, so it never complains.",
-      "sourceAnchor": "218-explicit-c-casts",
+      "sourceAnchor": "226-explicit-c-casts--core",
       "difficulty": "recall"
     }
   ]

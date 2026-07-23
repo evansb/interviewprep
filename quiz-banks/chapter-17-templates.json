@@ -12,7 +12,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Function templates may be fully specialized (`template <> void f<int>(int)`) but never partially — that asymmetry is the whole reason `template <class T> void f(T*)` is an overload rather than a specialization. The 'both, exactly as for a class template' option is the tempting one because class templates really do support both; function templates instead lean on overloading plus partial ordering.",
-      "sourceAnchor": "171-function-class-variable-and-alias-templates",
+      "sourceAnchor": "171-kinds-of-templates--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Overload resolution runs over the primary templates only; partial ordering picks (2) as more specialized for a pointer argument. The 'a specialization outranks an overload' option is the classic misconception Sutter warns about: specializations do not participate in overload resolution at all — the compiler picks a primary first, then looks for a specialization of that one, and (3) specializes (1), not (2).",
-      "sourceAnchor": "171-function-class-variable-and-alias-templates",
+      "sourceAnchor": "171-kinds-of-templates--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 3,
       "explanation": "An alias template is not a class: it has neither full nor partial specialization, and `Vec<int>` *is* `std::vector<int, MyAlloc<int>>`, so it cannot create a distinct type to overload on. The `type_identity_t` option is the seductive one — that idiom works because a qualified nested name is a non-deduced context, not because anything is partially specialized.",
-      "sourceAnchor": "171-function-class-variable-and-alias-templates",
+      "sourceAnchor": "171-kinds-of-templates--core",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 1,
       "explanation": "For a by-value parameter the compiler drops top-level cv and applies array/function decay before matching; for a reference parameter neither adjustment happens, so the extent survives. That preservation is exactly what makes `template <class T, size_t N> void arr(T(&)[N])` capture `N = 5`. The 'decay always happens' option confuses the by-value rule for a universal one, and the reversed option has the direction backwards.",
-      "sourceAnchor": "172-template-argument-deduction",
+      "sourceAnchor": "172-template-argument-deduction--core",
       "difficulty": "application"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Deduction is a pattern match: only decay, qualification conversion, and derived-to-`Base<T>` are permitted, so no integral promotion or arithmetic conversion can reconcile `int` with `double`. Writing `max<double>(1, 2.0)` fixes it because supplying `T` explicitly skips deduction and lets ordinary implicit conversions run. The 'first argument wins' option describes nothing the language does — all deductions for one parameter must agree exactly.",
-      "sourceAnchor": "172-template-argument-deduction",
+      "sourceAnchor": "172-template-argument-deduction--core",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The form must be the bare `T&&` with `T` deduced by that very call, or `auto&&` — nothing else. The member-function option is the one that catches people: inside `template <class T> struct S { void m(T&& x); }` the parameter `T` was already fixed when the class was instantiated, so `m` takes a plain rvalue reference and does no deduction. `const T&&` and `std::vector<T>&&` fail the 'bare form' test.",
-      "sourceAnchor": "173-forwarding-references-and-reference-collapsing",
+      "sourceAnchor": "173-forwarding-references-and-reference-collapsing--core",
       "difficulty": "recall"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Forwarding references are greedy: binding `Widget&` to a non-const lvalue is an identity match, whereas the copy constructor needs a qualification conversion to `const Widget&`, so the template wins and the 'copy' silently isn't one. The non-template tiebreaker option states a real rule backwards in scope — non-templates win only when the two candidates are *equally good*, and here they are not. Fix it with `requires (!std::derived_from<std::remove_cvref_t<T>, Widget>)`.",
-      "sourceAnchor": "173-forwarding-references-and-reference-collapsing",
+      "sourceAnchor": "173-forwarding-references-and-reference-collapsing--core",
       "difficulty": "trap"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 3,
       "explanation": "The special rule for `T&&` deduces `T = A&` from an lvalue and `T = A` from an rvalue; collapsing then turns `int& &&` into `int&`. The option claiming `& &&` collapses to `&&` inverts the table — lvalue reference is infectious, so any `&` in the pair wins and only `&& &&` yields `&&`. Note that in *both* cases the named parameter `x` is itself an lvalue, which is precisely why `std::forward` is needed.",
-      "sourceAnchor": "173-forwarding-references-and-reference-collapsing",
+      "sourceAnchor": "173-forwarding-references-and-reference-collapsing--core",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "CTAD's candidate set always includes a copy-deduction candidate, and for a single argument of the same class template it beats the initializer-list candidate — so you get a copy, not a nested vector. The 'nested vector' answer is what most people expect and is the whole reason this is a famous pitfall; `std::pair p{p2}` behaves the same way. Nothing here is ambiguous, so the ill-formed option is wrong too.",
-      "sourceAnchor": "174-class-template-argument-deduction-ctad",
+      "sourceAnchor": "174-class-template-argument-deduction-ctad--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 2,
       "explanation": "CTAD applies only when the template-argument list is entirely absent; a partial list like `std::pair<int>` disables it and simply leaves the class under-specified. The 'fills in the rest' option is the natural guess by analogy with function templates, where you really can supply some arguments explicitly and deduce the remainder — that flexibility exists for function templates, not for CTAD. The other ill-formed option gives a rule that does not exist.",
-      "sourceAnchor": "174-class-template-argument-deduction-ctad",
+      "sourceAnchor": "174-class-template-argument-deduction-ctad--core",
       "difficulty": "recall"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "C++20 admits *structural* types — literal class types whose members are all public, non-mutable and themselves structural, with no user-provided copy/move/destructor — plus floating point. That is what lets a `FixedString` wrapper carry a string literal as a template argument. The 'any literal class type' option is the near-miss: private members and a user-provided copy constructor both disqualify a type, and `std::string` fails on top of that because it allocates.",
-      "sourceAnchor": "175-non-type-template-parameters-nttps",
+      "sourceAnchor": "1710-non-type-template-parameters--reference--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Identity of instantiations is decided by member-wise template-argument equivalence, deliberately bypassing any user-defined comparison — a class does not get to redefine what makes two template arguments the same. The `operator==` option is tempting because the type is otherwise fully constexpr-usable, but overload resolution never enters this decision. Equivalent arguments genuinely do collapse to one type; it is the *criterion*, not the collapsing, that the wrong answers get wrong.",
-      "sourceAnchor": "175-non-type-template-parameters-nttps",
+      "sourceAnchor": "1710-non-type-template-parameters--reference--deep-dive",
       "difficulty": "trap"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Variable templates got both kinds of specialization in C++14 — that is exactly how the one-line `is_same_v` is written, with `template <class T> inline constexpr bool is_same_v<T, T> = true;`. Alias templates support neither. The class-template option is the sharpest distractor because partial specialization is what class templates are famous for, but full specialization (`template <> struct Pair<int,int>`) is equally legal.",
-      "sourceAnchor": "176-full-and-partial-specialization",
+      "sourceAnchor": "176-full-and-partial-specialization--core",
       "difficulty": "recall"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A full specialization must be visible before the first use that would instantiate the primary, in *every* TU; violating that is ill-formed, no diagnostic required. The link-error answer is the most plausible wrong one because differing COMDAT bodies really do exist here — but the linker's job is to fold same-named weak symbols, not to compare them, so it happily keeps whichever it sees first and the bug ships silently.",
-      "sourceAnchor": "176-full-and-partial-specialization",
+      "sourceAnchor": "176-full-and-partial-specialization--core",
       "difficulty": "trap"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Member functions of a class template are instantiated lazily, on use — which is why `std::vector<T>` works for a `T` without a default constructor until you call `resize(n)`. The `std::cout` option is the trap worth dissecting: the name `std::cout` really is non-dependent and really is bound in phase one, but the *expression* `std::cout << v` depends on `T`, so its validity is deferred; binding a name is not the same as type-checking the expression containing it. Virtual members are the genuine exception, since the vtable forces them.",
-      "sourceAnchor": "177-template-instantiation",
+      "sourceAnchor": "175-instantiation-two-phase-lookup-and-dependent-names--core",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Virtuals are the exception to lazy member instantiation: the vtable must be emitted with the class, so every virtual is instantiated whether or not it is called. The 'none at all' option sounds like a stricter version of the correct laziness rule, but it cannot hold — the vtable is a single object emitted at class instantiation and cannot be deferred per call site. Constructors and destructors follow the ordinary lazy rule like any other non-virtual member.",
-      "sourceAnchor": "177-template-instantiation",
+      "sourceAnchor": "175-instantiation-two-phase-lookup-and-dependent-names--core",
       "difficulty": "recall"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Phase two adds only *ADL* at the point of instantiation; ordinary unqualified lookup is not redone there, so the later-declared `g(int)` is invisible and the `int` converts to `double`. The two `g(int)` options both assume plain lookup is repeated at instantiation, which is the single most common misreading of two-phase lookup. The call is not ill-formed either — the definition-point candidate `g(double)` is viable, which is exactly why customization points must be ADL-reachable.",
-      "sourceAnchor": "178-two-phase-name-lookup",
+      "sourceAnchor": "175-instantiation-two-phase-lookup-and-dependent-names--core",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Phase one checks syntax and type-checks every non-dependent construct at the point of definition, so an error there fires even for a template nobody uses. The 'nothing is checked until instantiation' answer describes MSVC's historical non-conforming behaviour, which is why `/permissive-` exists and why code can compile on Windows only. This is also why `static_assert(false)` in an untaken `if constexpr` branch used to fire — it was non-dependent, until CWG2518 carved out an exception.",
-      "sourceAnchor": "178-two-phase-name-lookup",
+      "sourceAnchor": "175-instantiation-two-phase-lookup-and-dependent-names--core",
       "difficulty": "trap"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 3,
       "explanation": "`Base<T>` is dependent, and some specialization of it might not have `value` at all, so phase-one unqualified lookup skips it entirely; `this->value`, `Base<T>::value`, or `using Base<T>::value;` all make the name dependent and defer it to instantiation. The MSVC option has the platforms exactly backwards — this is the archetypal 'works on MSVC, fails on GCC/Clang' bug. `typename` is for dependent *type* names, not for data members.",
-      "sourceAnchor": "179-dependent-names-and-disambiguators",
+      "sourceAnchor": "175-instantiation-two-phase-lookup-and-dependent-names--core",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`extern template` suppresses implicit instantiation in every other TU, so the compiler does the work once instead of N times and the linker has no duplicates to discard — but the call sites now see only a declaration, so the body cannot be inlined without link-time optimization. The 'inlining is unaffected' option is the trap: the template *definition* text is still in the header, yet the whole point of the declaration is to stop this TU from generating code from it.",
-      "sourceAnchor": "1710-explicit-instantiation-and-extern-template",
+      "sourceAnchor": "1714-explicit-instantiation-and-build-tooling--reference--deep-dive",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Explicit instantiation of a class template instantiates *all* its members, so the whole class body must be valid for that argument — the cure is to explicitly instantiate individual members instead of the class. The 'same lazy rule' option is the natural inference from §17.7 and is precisely where it breaks: laziness is a property of *implicit* instantiation, and asking for the class by name is the opposite of implicit.",
-      "sourceAnchor": "1710-explicit-instantiation-and-extern-template",
+      "sourceAnchor": "1714-explicit-instantiation-and-build-tooling--reference--deep-dive",
       "difficulty": "trap"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "SFINAE applies only to the *immediate context* — the signature, return type, and template parameter defaults. `f`'s return type is in that context, so the candidate is quietly dropped; `g`'s body is not, so substitution there produces a diagnosable error. The 'both are substitution failures' option overgeneralizes the rule in the direction people naturally assume, and it is exactly why 'SFINAE-friendly' became a stated API property of things like `std::iterator_traits`.",
-      "sourceAnchor": "1711-sfinae",
+      "sourceAnchor": "1711-sfinae-and-the-detection-idiom--deep-dive",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Default template arguments are not part of the signature, so both declarations declare the same template and the second is a redefinition; the fix is to give the two overloads genuinely different *conditions*. The 'distinct because defaults are part of the signature' option is the appealing one — the declarations do look different in source — but the same reasoning would also make `void h(int = 0)` and `void h(int = 1)` distinct, which nobody expects. (`= nullptr` here would not even typecheck against `int`.)",
-      "sourceAnchor": "1711-sfinae",
+      "sourceAnchor": "1711-sfinae-and-the-detection-idiom--deep-dive",
       "difficulty": "trap"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The failure occurs in the immediate context of the partial specialization's argument list, so the specialization is simply not a match and the primary — inheriting `false_type` — is selected. The 'void_t discards its arguments' option is genuinely tempting because the alias really does throw them away, but CWG1558 settled that unused alias template arguments are still substituted; before that resolution, compilers that skipped the substitution broke this idiom and people needed a helper struct.",
-      "sourceAnchor": "1712-the-detection-idiom-and-void_t",
+      "sourceAnchor": "1711-sfinae-and-the-detection-idiom--deep-dive",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 3,
       "explanation": "The compound form is the one that adds return-type and `noexcept` checking on top of validity, which is exactly what `void_t` detection could only do awkwardly. The 'simple requirement also checks for void' option is the near-miss: a simple requirement checks *only* that the expression is well-formed and says nothing about its type — checking the result is what the compound form is for. A nested requirement genuinely evaluates satisfaction, not mere validity.",
-      "sourceAnchor": "1712-the-detection-idiom-and-void_t",
+      "sourceAnchor": "1711-sfinae-and-the-detection-idiom--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Each `auto` parameter in the abbreviated form invents a fresh template parameter, so this is a two-parameter template and `f(1, 2.0)` is fine. The 'shared parameter' option is the intuitive misreading — the two `auto`s look like one repeated placeholder — and it matters because it is precisely why `template <Arithmetic T> void f(T, T)` and the abbreviated form are *not* interchangeable. The declaration is a template, which is what makes the constraint meaningful at all.",
-      "sourceAnchor": "1713-concepts-and-constraints",
+      "sourceAnchor": "177-concepts-and-constraints--core",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Only the trailing requires-clause appears after the parameter list, so it is the only form in which the parameters are already in scope; the other three are all written before the parameters exist. This matters whenever a constraint depends on more than the template parameters themselves. The leading requires-clause is the closest miss — it is otherwise fully equivalent in expressive power, differing only in placement.",
-      "sourceAnchor": "1713-concepts-and-constraints",
+      "sourceAnchor": "177-concepts-and-constraints--core",
       "difficulty": "recall"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Normalization compares atomic constraints by *identity of source expression plus parameter mapping*; the `is_integral_v<T>` written in the second declaration is a different atom from the one in the first, so no subsumption relation exists and the call is ambiguous. The 'textually contains it' option is the intuitive and wrong model — subsumption does no logical reasoning about what atoms mean, and copy-pasting a clause creates a fresh atom. Factoring the shared part into a named concept and conjoining at the top level is the fix.",
-      "sourceAnchor": "1714-constraint-subsumption",
+      "sourceAnchor": "177-concepts-and-constraints--core",
       "difficulty": "trap"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Only `&&` and `||` appearing at the top level of the constraint-expression decompose into a conjunction or disjunction during normalization; anything buried inside a `bool` expression or inside a `requires`-expression is preserved whole as a single atom. That is the practical argument for defining named *concepts* — which do expand — rather than `constexpr bool` helpers. The 'constraint is dropped entirely' option confuses being opaque with being ignored: the constraint is still checked, it just has no subsumption relationships.",
-      "sourceAnchor": "1714-constraint-subsumption",
+      "sourceAnchor": "177-concepts-and-constraints--core",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 1,
       "explanation": "The ellipsis expands the pattern it follows: `h(args)...` makes `h(args)` the pattern and repeats it per element, while `h(args...)` expands the pack inside `h`'s own argument list. This is the single most useful rule for reading variadic code, and the reversed option is the mistake people make when they read `...` as a suffix on the whole call. Note that neither form guarantees evaluation order — only a comma fold does that.",
-      "sourceAnchor": "1715-parameter-packs-and-pack-expansion",
+      "sourceAnchor": "178-parameter-packs-and-fold-expressions--core",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 2,
       "explanation": "The three empty-pack defaults are `&&` → `true`, `||` → `false`, and `,` → `void()`; every other operator needs the binary form with an explicit identity, so `(v + ... + 0)` is the safe way to write this. The 'compiler supplies the identity' option is the natural expectation and is wrong because the language has no notion of an identity element for arbitrary operators — including user-defined ones. The `void()` answer applies only to the comma fold.",
-      "sourceAnchor": "1716-fold-expressions",
+      "sourceAnchor": "178-parameter-packs-and-fold-expressions--core",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A comma fold has a sequence point between elements and guarantees left-to-right evaluation; a pack expanded into a function call's argument list does not, since argument evaluation order is unspecified. The reversed option is the exact bug that bites people who write `g(f(v)...)` for side effects. The `initializer_list` hack also sequenced correctly, but it was the pre-C++17 workaround, not the only option today.",
-      "sourceAnchor": "1716-fold-expressions",
+      "sourceAnchor": "178-parameter-packs-and-fold-expressions--core",
       "difficulty": "application"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 3,
       "explanation": "`std::forward` is a conditional `static_cast<T&&>`, and the information it needs — how the *caller* passed the argument — lives in `T`, not in the named parameter, which is always an lvalue. Deducing `T` from `x` would therefore always produce an lvalue reference, silently defeating the purpose, so the signature is written to make deduction impossible. The 'well-formed but a no-op' option correctly predicts the behaviour deduction would give, but the library deliberately rejects it rather than letting it compile.",
-      "sourceAnchor": "1717-perfect-forwarding",
+      "sourceAnchor": "173-forwarding-references-and-reference-collapsing--core",
       "difficulty": "recall"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A braced-init-list has no type, so it is a non-deduced context and `A` cannot be solved for — you must declare an `initializer_list` parameter or build the object at the call site. The `const std::string&` option is the plausible-sounding one: const is dropped for *by-value* parameters, but a forwarding reference preserves it, deducing `A = const std::string&`. Move-only types and `nullptr` forward without any trouble; the genuine failures alongside braced lists are `0`/`NULL`, bitfields, and overloaded function names.",
-      "sourceAnchor": "1717-perfect-forwarding",
+      "sourceAnchor": "173-forwarding-references-and-reference-collapsing--core",
       "difficulty": "application"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 1,
       "explanation": "The tags form an inheritance chain in which `random_access` derives from `bidirectional` derives from `forward` derives from `input`, so a bidirectional tag converts to `input_iterator_tag` but *not* to `random_access_iterator_tag`. That one-directional conversion is what gives tag dispatch its automatic fallback ordering. The 'ambiguous' option assumes conversions run both ways along the hierarchy, which would defeat the whole design of `std::advance`.",
-      "sourceAnchor": "1718-tag-dispatch",
+      "sourceAnchor": "1712-tag-dispatch-and-if-constexpr--deep-dive",
       "difficulty": "application"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Discarded-statement semantics apply only within a templated entity; in an ordinary function `if constexpr` merely prunes code generation and both branches are still fully type-checked. This surprises people trying to guard platform-specific code in a plain function. `if constexpr` is legal outside templates, so the ill-formed option is wrong — it just does much less than expected there.",
-      "sourceAnchor": "1719-if-constexpr",
+      "sourceAnchor": "1712-tag-dispatch-and-if-constexpr--deep-dive",
       "difficulty": "application"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 1,
       "explanation": "An `if constexpr` condition must be a constant expression, so evaluating `std::is_constant_evaluated()` there is by definition a constant evaluation and it always yields `true` — the runtime branch is silently discarded. Use a plain `if (std::is_constant_evaluated())` or, in C++23, `if consteval`. The 'does what it says' option is the whole trap: the code reads as if it distinguishes the two contexts while unconditionally choosing one.",
-      "sourceAnchor": "1719-if-constexpr",
+      "sourceAnchor": "1712-tag-dispatch-and-if-constexpr--deep-dive",
       "difficulty": "trap"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 2,
       "explanation": "`conditional_t` is an ordinary alias whose arguments are both written out and must both be well-formed types; `if constexpr` discards the untaken branch at instantiation, so that branch may contain code that would be ill-formed for the current arguments. The 'only the selected arm is checked' option imports the `if constexpr` rule into a context that has no such lazy behaviour — the arms are template arguments, and template arguments are always substituted.",
-      "sourceAnchor": "1720-compile-time-type-traits",
+      "sourceAnchor": "179-compile-time-and-code-size-cost--core",
       "difficulty": "application"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Expression nodes store references precisely so that no copies or allocations occur, which means the tree is only valid while its operands live; the design assumes immediate consumption by an assignment. The 'lifetime extension' option is the tempting near-miss — binding a temporary to a const reference does extend its lifetime, but only for a reference *variable* at the binding site, never through a reference member of a returned node. `auto` also does not force evaluation; it faithfully captures the node type.",
-      "sourceAnchor": "1721-expression-templates",
+      "sourceAnchor": "1713-expression-templates--role-specific--deep-dive",
       "difficulty": "trap"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The template becomes a thin, type-safe façade over an implementation that does not depend on `T` — which is how every `vector<T*>` instantiation can collapse onto one `vector<void*>` body. The `inline`-plus-folding option describes something real but unrelated: the linker already folds *identical* instantiations, and marking templates inline does nothing to make bodies for different `T` identical. Implicit instantiation never happens at link time.",
-      "sourceAnchor": "1722-template-code-bloat-and-compile-time-cost",
+      "sourceAnchor": "179-compile-time-and-code-size-cost--core",
       "difficulty": "recall"
     }
   ]

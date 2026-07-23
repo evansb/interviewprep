@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Replication multiplies read capacity, availability, and durability, but writes must land on every replica, so it does not raise write throughput. Scaling writes requires partitioning/sharding, covered separately in Ch. 73.",
-      "sourceAnchor": "711-why-replicate-and-what-it-costs",
+      "sourceAnchor": "712-why-replicate",
       "difficulty": "application"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A single leader serializes all writes into one order that followers replay, so there is an authoritative sequence to be consistent with. The weakness is that the leader is both the write bottleneck and the failover point.",
-      "sourceAnchor": "712-replication-topologies",
+      "sourceAnchor": "714-replication-topologies",
       "difficulty": "recall"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because several nodes accept writes and exchange them asynchronously, concurrent writes to the same key on different leaders diverge and must be reconciled by last-write-wins, application merge, or CRDTs. Use it only when conflicts are tolerable.",
-      "sourceAnchor": "712-replication-topologies",
+      "sourceAnchor": "714-replication-topologies",
       "difficulty": "application"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Async acknowledges once the leader is locally durable and ships later, so a leader crash before shipping loses acknowledged writes. Sync waits for replica confirmation, achieving RPO 0 at the cost of a replica round trip and a write dependency on that replica.",
-      "sourceAnchor": "713-synchronous-asynchronous-and-semi-synchronous-replication",
+      "sourceAnchor": "715-synchronous-and-asynchronous-are-commit-policies",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Waiting for one specific replica means writes require two nodes instead of one; if that replica is down, writes block. This is why quorum-based (any k of n) or semi-synchronous configurations exist, so any one node can fail without stalling.",
-      "sourceAnchor": "713-synchronous-asynchronous-and-semi-synchronous-replication",
+      "sourceAnchor": "715-synchronous-and-asynchronous-are-commit-policies",
       "difficulty": "trap"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A physical standby is a node in continuous crash recovery, replaying an endless WAL stream of physical block changes rather than a finite one. This makes it a byte-identical copy, but ties it to the same major version and architecture.",
-      "sourceAnchor": "714-postgresql-streaming-replication-physical-wal",
+      "sourceAnchor": "7117-physical-streaming-replication",
       "difficulty": "recall"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Only remote_apply waits for the standby to apply the WAL to its pages, making the change visible to reads there. The on level guarantees the WAL is fsynced on the standby but not yet applied, so an immediate read can still miss it.",
-      "sourceAnchor": "715-synchronous_commit-levels",
+      "sourceAnchor": "7118-postgresql-commit-wait-levels",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Setting off only defers the local fsync, so a crash may lose the last few committed transactions, but WAL ordering guarantees a torn-free, prefix-consistent recovery. It trades a small RPO window for throughput, like group commit; it does not make the database inconsistent.",
-      "sourceAnchor": "715-synchronous_commit-levels",
+      "sourceAnchor": "7118-postgresql-commit-wait-levels",
       "difficulty": "trap"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "ANY k waits for any k of the named standbys to confirm, an availability improvement over waiting for one specific node. But Postgres has no read quorum: it gets strong reads from the single leader, not from R+W>N overlap, so the two mechanisms should not be conflated.",
-      "sourceAnchor": "716-quorum-based-synchronous-replication",
+      "sourceAnchor": "715-synchronous-and-asynchronous-are-commit-policies",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A slot guarantees the primary keeps WAL until the consumer acknowledges it, so a lagging standby never misses recycled segments. The hazard is that a dead or forgotten slot retains WAL indefinitely, filling pg_wal and taking the primary down unless max_slot_wal_keep_size caps it.",
-      "sourceAnchor": "717-replication-slots-and-cascading-replicas",
+      "sourceAnchor": "7119-slots-retention-and-failover-readiness",
       "difficulty": "trap"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Cascading offloads the primary's walsender fan-out and cross-region bandwidth by shipping once to a hub that re-streams locally. The trade is that lag is additive down the tree: each tier trails the one above it.",
-      "sourceAnchor": "717-replication-slots-and-cascading-replicas",
+      "sourceAnchor": "7119-slots-retention-and-failover-readiness",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Logical decoding emits row-level change events, enabling selective, cross-version, cross-architecture replication into a writable subscriber and multi-source consolidation. Notably it does not replicate DDL, and the writable subscriber can conflict like a second leader.",
-      "sourceAnchor": "718-logical-replication-and-logical-decoding",
+      "sourceAnchor": "7120-logical-replication",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Missing your own just-made write on a subsequent read is exactly a read-your-writes violation, the most common bug in read-replica deployments. It is fixed by routing to the primary or a remote_apply standby, or by gating the read on the commit LSN.",
-      "sourceAnchor": "719-read-replicas-and-replication-lag",
+      "sourceAnchor": "7121-read-replica-session-guarantees",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Yield is the probability a request completes (classic availability); harvest is how much of the data the answer reflects. A system can keep yield high by lowering harvest, returning results from reachable shards instead of failing outright.",
-      "sourceAnchor": "7110-achieving-availability-harvest-and-yield",
+      "sourceAnchor": "7115-cap-without-the-slogan",
       "difficulty": "recall"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "CAP is a choice made only during a partition: the affected nodes must pick consistency (refuse) or availability (serve possibly-stale data). When healthy, both are attainable. Since partitions are unavoidable on real networks, the practical choice is CP versus AP.",
-      "sourceAnchor": "7111-the-cap-theorem-stated-precisely",
+      "sourceAnchor": "7115-cap-without-the-slogan",
       "difficulty": "recall"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "CAP's C is specifically linearizability: every read reflects the most recent completed write as if there were one copy. This is different from ACID's C (invariant preservation) and from a general consistency model, and conflating the three is the field's most common error.",
-      "sourceAnchor": "7111-the-cap-theorem-stated-precisely",
+      "sourceAnchor": "7115-cap-without-the-slogan",
       "difficulty": "trap"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "PACELC extends CAP: if Partitioned choose A or C, Else choose Latency or Consistency. Guaranteeing linearizable reads requires per-operation coordination even in perfect health, so strong consistency has a latency cost all the time, not only during partitions.",
-      "sourceAnchor": "7113-pacelc",
+      "sourceAnchor": "7115-cap-without-the-slogan",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Treating the store as a shared register lifts the hardware memory-model mental picture one hop up: operations are intervals that may overlap, and a consistency model is the contract specifying which return-value assignments are legal. Stronger models permit fewer executions.",
-      "sourceAnchor": "7114-the-shared-memory-register-model",
+      "sourceAnchor": "718-consistency-models-are-sets-of-histories",
       "difficulty": "recall"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Strict consistency assumes a write is visible everywhere the instant it happens, ordered by one global clock. That violates the speed of light and the reality of clock skew. Linearizability is the best achievable approximation, keeping real-time ordering but allowing propagation delay.",
-      "sourceAnchor": "7116-strict-consistency",
+      "sourceAnchor": "718-consistency-models-are-sets-of-histories",
       "difficulty": "recall"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Linearizability requires a single linearization point per operation between its invocation and response (atomicity), and that these points honor real time: if A completes before B begins, A is ordered first. It uniquely composes: a system is linearizable iff each object is.",
-      "sourceAnchor": "7117-linearizability",
+      "sourceAnchor": "718-consistency-models-are-sets-of-histories",
       "difficulty": "recall"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "R+W>N guarantees a read sees the latest completed write, but writes not yet reaching W replicas let two overlapping reads observe different values and even go backward. Read-repair on the read path or blocking is needed to make a quorum linearizable.",
-      "sourceAnchor": "7117-linearizability",
+      "sourceAnchor": "718-consistency-models-are-sets-of-histories",
       "difficulty": "trap"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Sequential consistency still needs one global order respecting each client's program order, but that order need not match wall-clock time. So a write that finished in real time before a read began may legally be ordered after it. Unlike linearizability, it does not compose.",
-      "sourceAnchor": "7118-sequential-consistency",
+      "sourceAnchor": "718-consistency-models-are-sets-of-histories",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Causal consistency enforces the happens-before relation, so you never see an effect before its cause, while letting causally independent operations be applied in either order on different replicas. It is the strongest model that stays available during a partition.",
-      "sourceAnchor": "7119-causal-consistency-and-vector-clocks",
+      "sourceAnchor": "7111-logical-clocks-and-conflict-detection",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "If A is elementwise less-than-or-equal to B, then A happens-before B; if neither dominates the other, the operations are concurrent and represent a conflict a resolution policy must handle. This is the same happens-before tracking ThreadSanitizer uses.",
-      "sourceAnchor": "7119-causal-consistency-and-vector-clocks",
+      "sourceAnchor": "7111-logical-clocks-and-conflict-detection",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Monotonic reads promises that reads never go backward in time within a session, preventing a refresh from showing staler data. It can be provided cheaply by pinning the session to one replica, without any global coordination.",
-      "sourceAnchor": "7120-session-client-centric-guarantees",
+      "sourceAnchor": "7110-session-guarantees",
       "difficulty": "recall"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Last-write-wins keeps the write with the highest timestamp and drops the other, so a concurrent update simply vanishes; worse, a skewed clock can let an older write win. Vector clocks or CRDTs are needed when updates must not be silently lost.",
-      "sourceAnchor": "7121-eventual-consistency",
+      "sourceAnchor": "718-consistency-models-are-sets-of-histories",
       "difficulty": "trap"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With N=3, W=2 and R=2 sum to 4, exceeding 3, so any write quorum and any read quorum share at least one node by the pigeonhole principle, and that node holds the latest write. W=1,R=1 sums to 2, which is not greater than 3, so it is only eventually consistent.",
-      "sourceAnchor": "7122-tunable-consistency-dynamo-quorums",
+      "sourceAnchor": "7112-quorums-the-set-proof",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Read/write overlap (R+W>N) lets a read see the latest write, but preventing two writes from committing on disjoint quorums requires write-quorum overlap, W+W>N (i.e. W > N/2). The two conditions serve different purposes and are both needed for the strongest behavior.",
-      "sourceAnchor": "7122-tunable-consistency-dynamo-quorums",
+      "sourceAnchor": "7112-quorums-the-set-proof",
       "difficulty": "trap"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "When fewer than W home replicas are reachable, a sloppy quorum writes to the first W reachable nodes, one of which holds a hint for later handoff. Readers query the home replicas, which may not overlap the stand-ins, so a just-acknowledged write can be missed until handoff completes.",
-      "sourceAnchor": "7123-sloppy-quorums-hinted-handoff-and-witness-replicas",
+      "sourceAnchor": "7112-quorums-the-set-proof",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A witness participates in the agreement vote to maintain an odd voter count and prevent split-brain, but stores only metadata or version info rather than a full replica. It is a cost optimization for reaching quorum, not an extra copy to read from.",
-      "sourceAnchor": "7123-sloppy-quorums-hinted-handoff-and-witness-replicas",
+      "sourceAnchor": "7112-quorums-the-set-proof",
       "difficulty": "recall"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because messages can be reordered, duplicated, and redelivered, the merge must be commutative, associative, and idempotent (a join-semilattice least-upper-bound) so replicas that received the same updates reach the same state regardless of delivery order, with no consensus.",
-      "sourceAnchor": "7124-strong-eventual-consistency-and-crdts",
+      "sourceAnchor": "7113-conflicts-crdts-and-convergence",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A grow-only counter cannot decrement, so a PN-Counter keeps two G-Counters: P accumulates increments and N accumulates decrements, each merged elementwise by max, and the value is sum(P) minus sum(N). This keeps the merge commutative, associative, and idempotent.",
-      "sourceAnchor": "7124-strong-eventual-consistency-and-crdts",
+      "sourceAnchor": "7113-conflicts-crdts-and-convergence",
       "difficulty": "recall"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "LSN watermarking lets the client record the commit LSN and refuse a replica until its pg_last_wal_replay_lsn reaches it, otherwise waiting, retrying, or falling back to the primary. This pays for consistency only per session that needs its own write, not globally.",
-      "sourceAnchor": "7126-replication-lag-anomalies-and-how-session-guarantees-fix-them",
+      "sourceAnchor": "7110-session-guarantees",
       "difficulty": "application"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Isolation is a single-node concurrency property (dirty reads, phantoms, serializability), while CAP consistency is a replication recency property (staleness, linearizability). You can have serializable isolation with stale replica reads, or linearizable per-key reads with no isolation.",
-      "sourceAnchor": "7127-isolation-vs-consistency-two-different-axes",
+      "sourceAnchor": "718-consistency-models-are-sets-of-histories",
       "difficulty": "application"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Read repair writes the newest version back to stale replicas when a read observes divergence, but it never touches keys nobody reads. Anti-entropy periodically compares full datasets, typically via Merkle trees, to converge all keys, read or not. Together they realize eventual convergence.",
-      "sourceAnchor": "7128-read-repair-and-anti-entropy",
+      "sourceAnchor": "7113-conflicts-crdts-and-convergence",
       "difficulty": "recall"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Split-brain is when a partition leaves an old leader still writing while the majority promotes a new one, producing two divergent histories. Requiring a majority to elect a leader (the CP choice, minority refuses writes) plus fencing the old leader with an epoch token prevents it.",
-      "sourceAnchor": "7129-leader-failover-and-split-brain",
+      "sourceAnchor": "7114-failover-freshness-plus-authority",
       "difficulty": "application"
     }
   ]

@@ -1,529 +1,949 @@
 # Chapter 14 — Algorithms and Ranges
 
-*Interview-focused revision notes. The theme: the standard algorithms are a contract between an iterator's capabilities and a complexity guarantee — knowing which guarantee you bought, what the implementation actually does to honor it, and what ranges changed about composing them.*
+Standard algorithms are contracts over sequences. The contract names the required iterator capability, callable semantics, preconditions, postcondition, invalidation behavior, and a complexity measure. Choosing an algorithm means choosing the cheapest postcondition that actually solves the problem: selection instead of full sorting, partitioning instead of ordering, or a lazy view instead of an intermediate container.
+
+This chapter uses C++23. Standard guarantees are stated separately from common implementation techniques and hardware-dependent costs. Chapter 11 owns sequence-container behavior, Chapter 12 owns associative containers, Chapter 13 owns `span` and string-view lifetimes, and Chapter 22 owns derivation of general interview algorithms.
 
 ---
 
-## 14.1 Sorting Algorithms in the Standard Library
+## Why this matters — Core
 
-Four sorting entry points, distinguished by stability and complexity guarantee:
+The name of an algorithm is less important than its contract. `lower_bound` can perform logarithmically many comparisons yet linearly many iterator increments. `nth_element` is linear only on average and does not sort either partition. A comparator that is not a strict weak ordering violates a precondition and can make a sorting call undefined. A range pipeline can avoid temporary allocations, but a stored view may retain references to an owner or callable that has already died.
 
-| Algorithm | Complexity | Stable | Extra memory | Underlying implementation |
-|---|---|---|---|---|
-| `std::sort` | O(n log n) **worst case** (C++11+) | No | O(log n) stack | **Introsort**: quicksort → heapsort on depth overrun → insertion sort on small ranges |
-| `std::stable_sort` | O(n log n) with memory, O(n log²n) without | **Yes** | O(n) if available | Merge sort (adaptive: timsort-like in libc++'s newer code, in-place merge fallback) |
-| `std::partial_sort` | O(n log k) | No | O(1) | Heap-based (§14.2) |
-| `std::sort_heap` / `push_heap` / `pop_heap` | O(n log n) / O(log n) | No | O(1) | Binary heap |
-
-**Introsort** is the detail that separates candidates. C++98 only required *average* O(n log n) for `std::sort`, so a naive quicksort's O(n²) adversarial case was conforming — and exploitable (the "quicksort killer" input, a real DoS vector). C++11 tightened the requirement to worst-case O(n log n), which forced introsort: run quicksort, but track recursion depth, and when it exceeds ~2·log₂n switch that subrange to heapsort. Ranges below a threshold (16 in libstdc++) are left unsorted during recursion and cleaned up with a single final insertion-sort pass over the whole array, which is cache-friendly and exploits the near-sortedness.
-
-`std::sort` requires **random-access iterators** (§14.7), which is why `std::list` has its own member `list::sort` (a bottom-up merge sort that relinks nodes, O(n log n) with no element moves and no allocation).
-
-### Comparator requirements
-
-The comparator must be a **strict weak ordering**: irreflexive (`!comp(a,a)`), asymmetric, transitive, and with transitive incomparability (if `a` and `b` are equivalent and `b` and `c` are equivalent, then `a` and `c` are). Violating it is **undefined behavior, not merely a wrong order** — libstdc++'s introsort will run off the end of the array during partitioning and corrupt memory. The classic violations:
-
-```cpp
-[](const T& a, const T& b){ return a.x <= b.x; }   // WRONG: <= is not irreflexive
-[](const T& a, const T& b){ return a.x < b.x || a.y < b.y; }  // WRONG: not transitive
-// Correct:
-[](const T& a, const T& b){ return std::tie(a.x, a.y) < std::tie(b.x, b.y); }
-```
-
-`_GLIBCXX_DEBUG` and `_LIBCPP_HARDENING_MODE=debug` add comparator validation; C++26's hardened preconditions make several of these diagnosable.
-
-### Sorting performance in practice
-
-- **Comparison cost dominates.** Sorting `vector<string>` with 30-char keys is bound by `memcmp` and pointer-chasing; sorting `vector<uint64_t>` is bound by branch mispredicts in the partition step.
-- **Branch mispredicts are the quicksort tax.** Each partition comparison is a ~50% unpredictable branch, ~15–20 cycles when wrong (Ch. 27). Branchless partitioning (BlockQuicksort, used by pdqsort and adopted by libstdc++ since GCC 14 and libc++) uses `cmov`-style buffered index writes and is 2–3× faster on integers.
-- **Radix / counting sort beats comparison sort** for fixed-width integer keys — O(n·w/b) with no branches. For sorting order-book price levels or 32-bit IDs, a two-pass LSD radix sort is the low-latency answer; the standard has no radix sort.
-- **Sort indices, not objects**, when elements are large: sort a `vector<uint32_t>` of indices with a projection (§14.8), then gather. Moves become 4-byte moves.
-- `std::ranges::sort` (C++20) takes a range and a projection and returns the end iterator; it is otherwise identical and has the same complexity guarantees.
+For low-latency code, asymptotic complexity is only the first filter. Iterator movement, branches, cache misses, element moves, allocation, and parallel scheduling determine the measured distribution. Start by proving the call is valid and identifying the counted operations. Then measure the implementation on representative sizes, layouts, key distributions, and hardware.
 
 ---
 
-## 14.2 Selection and Partial-Sorting Algorithms
+## 90-second screen — Core
 
-When you need the top-k, or the k-th element, sorting everything is wasteful.
+Five facts:
 
-```cpp
-std::nth_element(v.begin(), v.begin()+k, v.end());
-// after: v[k] is the element that would be there if sorted;
-//        everything before is <= it, everything after is >= it. NEITHER SIDE IS SORTED.
+1. A valid half-open range is `[first, last)`: `last` is reachable from `first`, is not dereferenced, and permits empty ranges where `first == last`.
+2. Every algorithm has preconditions. Common ones are a required iterator category, an already partitioned or sorted range, enough output storage, non-invalidated iterators, and a predicate or comparator satisfying its semantic laws.
+3. `std::sort` guarantees `O(N log N)` comparisons in the worst case. `std::nth_element` guarantees `O(N)` comparisons only on average; it has no general standard worst-case bound.
+4. `std::lower_bound` uses logarithmically many comparisons, but on non-random-access iterators it may perform linearly many increments. A tree container's member lookup follows the tree instead.
+5. A view may borrow or own. An adaptor over an lvalue container normally refers to that container; a C++23 pipeline over a movable rvalue container can own it through `owning_view`. In either case, referenced storage and captured callables must outlive use.
 
-std::partial_sort(v.begin(), v.begin()+k, v.end());
-// after: the first k elements are the k smallest, IN SORTED ORDER; the rest is unspecified.
+Two decisions:
 
-std::partial_sort_copy(first, last, out_first, out_last);  // doesn't modify the input
-```
-
-| Algorithm | Complexity | Result | Use when |
-|---|---|---|---|
-| `nth_element` | **O(n) average**, O(n) worst with median-of-medians fallback (libstdc++ uses introselect: quickselect + heapsort fallback) | Partition around the k-th | You need the k-th value, or an unordered top-k |
-| `partial_sort` | O(n log k) | First k sorted | You need the top-k *in order* |
-| `partial_sort_copy` | O(n log k) | Output range filled | Source is read-only or a non-random-access range |
-| Full `sort` then take k | O(n log n) | Everything sorted | k ≈ n |
-
-**`nth_element` is linear on average**, which is the headline fact: quickselect recurses into only one partition, giving the n + n/2 + n/4 + … = 2n expected-comparison series. `partial_sort` maintains a k-element max-heap: push the first k, then for each remaining element compare against the heap top and replace-and-sift only if smaller — so the per-element cost is one comparison when the element loses (the common case for large n), plus O(log k) rarely.
-
-**Interview framing:** "Find the top 100 of 10 million." Answer: `nth_element` (O(n)) if order doesn't matter, `partial_sort` (O(n log k)) if it does, and a bounded max-heap if the data is streaming and you can't hold it all. Do **not** say `sort` then `resize`.
-
-The median is `nth_element(v.begin(), v.begin()+v.size()/2, v.end())` — a classic and a genuinely correct use. Note the postcondition is stated in terms of a *partition*, so the two halves are unsorted; people who then read `v[k-1]` expecting the second-smallest are wrong.
-
-C++20 gives `ranges::nth_element` and `ranges::partial_sort` with projections. Neither is stable, and `nth_element` in particular may reorder equivalent elements arbitrarily — relevant for tie-breaking in price-time priority (Ch. 49), where you must include the sequence number in the key rather than rely on any residual order.
+- For top-k, use `nth_element` when the selected prefix need not be ordered, `partial_sort` or `partial_sort_copy` when it must be ordered, and a bounded heap when input is streaming. Full sort buys an unnecessary postcondition unless the rest of the order is also needed.
+- Use `accumulate` or another fixed-order reduction when replay reproducibility matters. Use `reduce` or a parallel policy only when regrouping, callable restrictions, resource use, and latency variability are acceptable and measured.
 
 ---
 
-## 14.3 Binary-Search Algorithms
+## 14.1 The contract model: iterators, sentinels, and half-open ranges — Core
 
-Four functions, all requiring the range to be **partitioned with respect to the predicate** — a weaker and more precise requirement than "sorted":
-
-```cpp
-std::lower_bound(f, l, v);   // first position where !(*it < v)   — first >= v
-std::upper_bound(f, l, v);   // first position where   v < *it    — first  > v
-std::equal_range(f, l, v);   // the pair {lower_bound, upper_bound} — the run of equivalents
-std::binary_search(f, l, v); // bool: does an equivalent element exist
-std::partition_point(f, l, pred);  // generalization: first element where pred is false
-```
-
-`lower_bound` is the one you almost always want, because it gives you the *insertion position* as well as the found position:
+A classic algorithm receives two iterators:
 
 ```cpp
-auto it = std::lower_bound(v.begin(), v.end(), key);
-if (it != v.end() && *it == key) { /* found */ } else { v.insert(it, key); }
+auto found = std::find(first, last, key);
 ```
 
-### Complexity and the iterator subtlety
+They describe the half-open range `[first, last)`. The convention gives three useful properties:
 
-The guarantee is **O(log n) comparisons** for any forward iterator — but only **O(log n) iterator increments** for random-access iterators. On a `std::list` (bidirectional), `lower_bound` performs O(n) increments while doing only O(log n) comparisons, so it is O(n) overall and pointless. This distinction — comparisons vs iterator movement — is exactly the kind of complexity-guarantee nuance interviewers probe (§14.6).
+```text
+empty:       [first,last) where first == last
+one element: first points here, last points one step beyond
+split at m:  [first,m) followed by [m,last), with no overlap or gap
+```
 
-**Member `find` beats free `binary_search` on ordered containers.** `std::set::find` is O(log n) tree descent; `std::binary_search(s.begin(), s.end(), x)` is O(n) because `set` iterators are bidirectional. Similarly `map::lower_bound` is a member for a reason.
+The caller must supply a **valid range**. Informally, repeated increment from `first` must eventually reach `last` without leaving the sequence, and every iterator before `last` must be dereferenceable as required by the algorithm. `last` itself is a boundary and is not dereferenced.
 
-### Performance reality
+Passing `begin()` from one vector and `end()` from another does not form a valid range. Neither does retaining iterators across a vector reallocation and then passing them to an algorithm. These are caller errors; an implementation need not diagnose them.
 
-Binary search is **branch-mispredict-bound and cache-miss-bound**, not comparison-bound. Each of the log n steps is an unpredictable branch and a cache miss into a fresh region:
-
-- **Branchless binary search** replaces the `if` with arithmetic on the midpoint (`base += (cmp) * half`), turning mispredicts into a data dependency. Typically 2× faster for n in the tens of thousands.
-- **Prefetching both children** (`__builtin_prefetch` on both possible next midpoints) hides latency, since only one is used but both are fetched in parallel — memory-level parallelism (Ch. 29).
-- **Eytzinger (BFS) layout** stores the implicit binary tree breadth-first so the first few levels share cache lines; combined with prefetching it is the fastest known static search layout, several times faster than a sorted array for large n. For a static, rarely-changing table (a symbol table, a tick-size ladder), this is the right structure.
-- For small n (≤ 16–32), **linear search wins** — no mispredicts, one cache line, SIMD-friendly. This is why flat maps (Ch. 12) and B-tree nodes use linear scans inside nodes.
-
-`std::ranges::lower_bound` adds projections. C++20 also permits heterogeneous comparison: passing a `string_view` key to a range of `string` needs a transparent comparator (Ch. 13 §13.3).
-
----
-
-## 14.4 Partitioning Algorithms
-
-**Partitioning** rearranges a range so that all elements satisfying a predicate precede all that don't. It is the primitive under quicksort, `nth_element`, and every "compact the live entries" loop.
+C++20 ranges generalize the endpoint to a **sentinel**, which may have a different type from the iterator. The sentinel must be comparable with the iterator and mark termination. This supports a null-terminated sequence or a counted/predicate endpoint without inventing an iterator value that points into the same representation.
 
 ```cpp
-auto it = std::partition(f, l, pred);        // O(n) swaps, NOT stable, returns the boundary
-auto it = std::stable_partition(f, l, pred); // preserves relative order; O(n) with a buffer,
-                                             // O(n log n) swaps without
-bool b  = std::is_partitioned(f, l, pred);
-auto p  = std::partition_point(f, l, pred);  // O(log n) — requires an already-partitioned range
-std::partition_copy(f, l, out_true, out_false, pred);  // C++11, writes both halves elsewhere
+#include <cassert>
+#include <ranges>
+
+int main() {
+    int values[] = {4, 8, 15, 16, 23, 42};
+    auto first = std::counted_iterator{values, 4};
+    auto range = std::ranges::subrange{
+        first, std::default_sentinel
+    };
+
+    assert(std::ranges::distance(range) == 4);
+    assert(*std::ranges::find(range, 15) == 15);
+}
 ```
 
-`std::partition` needs only **forward iterators** (it uses a find-and-swap loop); the two-pointer Hoare scheme requires bidirectional. `stable_partition` allocates a temporary buffer via `get_temporary_buffer`-style logic and degrades gracefully to an in-place divide-and-conquer if allocation fails — an important detail for `-fno-exceptions` or allocation-free contexts, because **it can allocate**.
+Here the iterator stores a remaining count and `std::default_sentinel` detects when it reaches zero. The algorithm needs no pointer to a one-past element.
 
-### The remove/erase family is partitioning in disguise
+### Preconditions before performance
 
-```cpp
-v.erase(std::remove(v.begin(), v.end(), value), v.end());       // erase-remove idiom
-v.erase(std::remove_if(v.begin(), v.end(), pred), v.end());
-std::erase(v, value);        // C++20 — does the above in one call
-std::erase_if(v, pred);      // C++20 — and works on maps/sets too
-```
+The following checks prevent most algorithm misuse:
 
-`std::remove` does **not** remove anything: it move-assigns the surviving elements forward and returns the new logical end, leaving the tail in a valid-but-unspecified moved-from state. Forgetting the `erase` call is the single most common standard-library bug, and `[[nodiscard]]` on `remove` (added in C++20 via P0600's sweep) now catches it.
-
-`remove` is stable and O(n) with O(n) move-assignments; `partition` is unstable and O(n) with at most n/2 swaps, so if you don't need order preservation, `partition` moves less. For a hot compaction loop over an object pool, `std::partition` (or a hand-written branchless compaction using `cmov`/AVX-512 `vpcompressd`) is the right tool.
-
-### Low-latency angle
-
-Partitioning is where **branchless programming** pays (Ch. 42). The naive loop has one unpredictable branch per element; the branchless form always writes and advances the output pointer by the predicate result:
-
-```cpp
-// branchless compaction: always store, conditionally advance
-for (auto& x : in) { *out = x; out += pred(x); }
-```
-
-This has a store per element regardless (fine — it's an L1 hit) and zero mispredicts. It's the same trick `std::partition_copy` implementations and SIMD filters use, and it wins whenever the predicate is roughly 50/50. When the predicate is heavily skewed (95% true), the branchy version wins because the predictor is right almost always — the general rule that **branchless is a bet on unpredictability, not a universal improvement**.
-
----
-
-## 14.5 Transformation and Accumulation Algorithms
-
-```cpp
-std::transform(f, l, out, unary_op);            // and the binary two-range form
-std::for_each(f, l, fn);
-std::accumulate(f, l, init, binop);             // <numeric>, LEFT fold, sequential
-std::reduce(f, l, init, binop);                 // C++17, UNORDERED — needs associativity
-std::transform_reduce(f, l, init, red, tr);     // C++17 — the fused map-reduce
-std::inner_product(f1, l1, f2, init);           // sequential dot product
-std::partial_sum / std::inclusive_scan / std::exclusive_scan;  // prefix sums
-std::iota(f, l, start);                          // fill with increasing values
-```
-
-### `accumulate` vs `reduce` — the key distinction
-
-| | `std::accumulate` | `std::reduce` |
+| Question | Example requirement | Failure consequence |
 |---|---|---|
-| Order | Strict left fold: `((init⊕a)⊕b)⊕c` | Unspecified order and grouping |
-| Requires | Nothing beyond callable | **Associative and commutative** binop |
-| Parallel | Never | Accepts an execution policy |
-| Floating point | Deterministic, reproducible | **Non-deterministic result** — FP addition is not associative |
-| Init type trap | `accumulate(v.begin(), v.end(), 0)` on `vector<double>` **truncates to `int`** | Same trap; also `reduce`'s default init is `T{}` from the range |
+| Is `[first,last)` valid? | Both endpoints belong to the same live sequence | Undefined behavior |
+| Does the iterator meet the capability? | `sort` needs random access; `reverse` needs bidirectional | Usually a compile-time failure |
+| Does the data satisfy a structural precondition? | `lower_bound` needs partitioning; `merge` needs sorted inputs | Undefined behavior or unspecified result as stated by the algorithm |
+| Does the callable satisfy its laws? | Sorting comparator is a strict weak ordering | Undefined behavior |
+| Is output large enough? | `copy(first,last,out)` needs enough writable positions | Out-of-bounds writes and undefined behavior |
+| Can input and output overlap? | Depends on the algorithm and direction | Undefined behavior if the overlap violates its precondition |
+| Will the callback invalidate the traversal? | `push_back` may reallocate a vector being traversed | Iterator invalidation and undefined behavior |
 
-The `0` vs `0.0` init trap is a perennial interview question: `std::accumulate(d.begin(), d.end(), 0)` deduces `int`, so every partial sum is truncated. Write `0.0`, or `T{}`, or use `reduce` without an init.
+Algorithms generally do not change container size because iterators do not provide a resizing interface. `remove` rearranges values but cannot erase vector elements; `copy` writes through an output iterator but does not know an output container's capacity unless an inserter is used.
 
-The **floating-point determinism** point matters in trading: a parallel `reduce` over P&L gives different last bits on different runs and different core counts, which breaks reconciliation and replay determinism (Ch. 53). Use `accumulate` (or Kahan summation, Ch. 23) when reproducibility is required, and `reduce` only when you have accepted the non-determinism.
+### Invalidation belongs to the underlying range
 
-`std::transform_reduce` is the important C++17 addition: it fuses the map and the fold into one pass, avoiding an intermediate container, and it parallelizes. `transform_reduce(a.begin(), a.end(), b.begin(), 0.0, std::plus{}, std::multiplies{})` is a parallel dot product in one line.
+An algorithm's iterators and references obey the invalidation rules of their source container. Mutating element values is different from structurally mutating the container:
 
-### Scans
+- Sorting a vector reorders its elements. Existing iterators still designate positions in the same allocation, but may now refer to different values.
+- A callback that calls `push_back` on that vector may reallocate and invalidate the algorithm's current iterators.
+- Erasing from a list invalidates iterators to erased nodes; erasing from a vector invalidates the erased position and later positions.
+- A non-owning range or view does not shield its iterators from owner mutation.
 
-`inclusive_scan` and `exclusive_scan` (C++17) are the parallel-friendly counterparts to `partial_sum`. `exclusive_scan` omits the current element (`out[i] = sum of in[0..i-1]`), which is precisely the offset-table computation you need for bucketing, radix sort, and variable-length message framing. `partial_sum` is a strict left fold; the scans are order-relaxed and policy-accepting.
-
-### Codegen and the vectorization story
-
-`std::transform` with a lambda inlines to the same loop you'd write by hand — but **auto-vectorization depends on aliasing** (Ch. 3 §3.8, Ch. 40). `transform(in.begin(), in.end(), out.begin(), f)` where `in` and `out` may overlap forces the compiler to emit a runtime overlap check and a scalar fallback. `__restrict` on the underlying pointers, or using distinct types, removes it. This is why the two-loop pattern (a vectorized body plus a scalar remainder plus an overlap-guarded duplicate) shows up in the disassembly of trivial-looking `transform` calls.
-
-`std::for_each` differs from a range-for only in that it can take an execution policy and returns the functor (useful for stateful accumulation, though `reduce` is cleaner). `ranges::for_each` returns `{in, fun}`.
+Do not modify the traversed structure from a predicate unless the algorithm explicitly permits it. Invocation order and count are constrained only by the algorithm's specification; they are not a safe event protocol.
 
 ---
 
-## 14.6 Algorithm Complexity Guarantees
+## 14.2 Algorithm chooser: buy only the postcondition you need — Core
 
-Every standard algorithm specifies its complexity in terms of **a specific counted operation** — comparisons, applications of the predicate, assignments, or swaps — not wall time and not iterator movement unless stated. Reading the guarantee precisely is the skill.
+The smallest sufficient postcondition usually moves fewer elements or performs fewer comparisons:
 
-| Algorithm | Guaranteed | Not guaranteed |
+| Need | Algorithm | Main contract |
 |---|---|---|
-| `sort` | O(n log n) comparisons, worst case (C++11+) | Stability; number of moves |
-| `stable_sort` | O(n log n) with extra memory, else O(n log² n) | That it won't allocate |
-| `nth_element` | **Linear on average** | Worst case (implementations use introselect to bound it) |
-| `lower_bound` | O(log n) **comparisons** | O(log n) *increments* unless random-access |
-| `find` | At most `last-first` applications | Anything about early exit |
-| `rotate` | Linear | Which of the three algorithms is used |
-| `inplace_merge` | O(n) with memory, O(n log n) without | Non-allocation |
-| `stable_partition` | O(n) with memory, O(n log n) swaps without | Non-allocation |
-| `vector::push_back` | **Amortized** O(1) | Any individual call (Ch. 11 §11.3) |
+| Find/count/test in unsorted input | `find`, `count`, `all_of`, `any_of`, `none_of` | Linear predicate/comparison applications |
+| Sort all elements | `sort` | Worst-case `O(N log N)` comparisons, unstable |
+| Sort all while preserving equivalent order | `stable_sort` | Stable; complexity depends on extra memory |
+| Select the element at rank k | `nth_element` | Average linear comparisons; partitions, does not sort |
+| Sorted top-k | `partial_sort` | Approximately `N log k` comparisons |
+| Sorted top-k into separate storage | `partial_sort_copy` | Source unchanged; output holds best k in order |
+| Find insertion/equivalence boundary | `lower_bound`, `upper_bound`, `equal_range` | Requires partitioning; logarithmic comparisons |
+| Group by a predicate | `partition`, `stable_partition` | Linear predicate applications |
+| Compact survivors | `remove_if` then container `erase`, or `erase_if` | Stable compaction for sequence containers |
+| Map values | `transform` | Linear callable applications |
+| Ordered fold | `accumulate` | Strict left-to-right accumulation |
+| Regroupable reduction | `reduce`, `transform_reduce` | Permits reordering/grouping |
 
-Three traps live here:
+Complexity counts named abstract operations, not elapsed time. For example, a comparison may itself scan a long string, and one iterator increment in a linked list may miss in cache. Big-O also discards constants and input sizes. Use it to reject asymptotically unsuitable choices, then reason about the data path.
 
-1. **Amortized vs per-operation.** Amortized O(1) `push_back` means a single call can be O(n) and can allocate. On a latency-percentile-sensitive path, the amortized average is the wrong statistic entirely — the P99.9 is the reallocation (Ch. 43). `reserve` converts the tail into a startup cost.
-2. **"With sufficient additional memory."** `stable_sort`, `stable_partition`, and `inplace_merge` all *try to allocate* and silently take an asymptotically worse path if they can't. In an allocation-free hot path (Ch. 55), these three are disqualified.
-3. **Complexity is in the counted operation, so a cheap-looking O(log n) can be an expensive O(log n).** `map::find` is O(log n) node hops, each a cache miss (~80 ns); a linear scan of a 64-element flat array is O(n) but one or two cache lines. **Asymptotics do not model the memory hierarchy**, which is the entire argument for flat containers (Ch. 12) and cache complexity (Ch. 23).
+### Sorting contracts
 
-Container-side guarantees worth memorizing alongside: `map`/`set` O(log n) with stable references; `unordered_map` O(1) average / O(n) worst with reference stability but iterator invalidation on rehash; `deque` O(1) push at both ends with reference stability but not iterator stability; `list` O(1) splice.
+`std::sort` and `std::ranges::sort` require random-access iterators and a strict weak ordering. They are not stable: equivalent elements may change relative order. In C++23, the standard requires `O(N log N)` comparisons in the worst case. It does not mandate introsort, quicksort, heapsort, insertion-sort thresholds, or any vendor-specific partition scheme.
 
----
+`std::stable_sort` preserves the relative order of equivalent elements. Its comparison guarantee in C++23 is `O(N log N)` if enough extra memory is available and `O(N log²N)` otherwise. This conditional bound permits implementations to use an auxiliary buffer and an in-place fallback; it is not a portable promise that a particular call allocates or that allocation failure is handled in one specific way.
 
-## 14.7 Iterator Categories
+`std::list::sort` exists because the generic sort requires random access. The list member can reorder by relinking nodes and guarantees `O(N log N)` comparisons. Iterator/reference validity and implementation technique are properties of the list member, not evidence that generic `std::sort` should accept bidirectional iterators.
 
-An iterator category is a **capability contract**; algorithms select implementations by tag dispatch (Ch. 17) or, in C++20, by concept.
-
-```
-input          ──► forward ──► bidirectional ──► random_access ──► contiguous (C++17/20)
-(single-pass)      (multi-pass)   (--)              (+n, it2-it1, <)     (&*it is a raw pointer)
-output
-(single-pass write)
-```
-
-| Category | Required ops | Canonical example | Enables |
+| Operation | Stability | Standard comparison bound | Iterator need |
 |---|---|---|---|
-| Input | `*`, `++`, `==`, single pass | `istream_iterator` | `find`, `copy`, `accumulate` |
-| Output | `*it = v`, `++`, single pass | `back_insert_iterator` | Destination of `copy`/`transform` |
-| Forward | multi-pass, default-constructible, `*it` returns a real reference | `forward_list` | `search`, `replace`, `partition` |
-| Bidirectional | `--` | `list`, `map`, `set` | `reverse`, `prev`, `stable_partition` |
-| Random access | `+n`, `-n`, `it2-it1`, `[]`, relational | `deque` | `sort`, `nth_element`, O(1) `advance` |
-| Contiguous | elements adjacent in memory; `std::to_address` | `vector`, `array`, `span`, `string` | `memcpy`/SIMD fast paths, C-API interop |
+| `sort` | No | `O(N log N)` worst case | Random access |
+| `stable_sort` | Yes | `O(N log N)` with enough memory, otherwise `O(N log²N)` | Random access |
+| `partial_sort` | No | Approximately `N log M`, where M is prefix size | Random access |
+| heap creation `make_heap` | No | At most `3N` comparisons | Random access |
+| `list::sort` | Yes | `O(N log N)` comparisons | List member operation |
 
-**Contiguous** was carved out in C++17 (as a guarantee) and given a real tag in C++20. It is what lets `std::copy` on a `vector<int>` become a single `memmove` and lets you pass `v.data()` to `read()`. `deque` is random-access but **not** contiguous — a distinction that trips people up.
+The standard does not generally give these calls a “no dynamic allocation” label. If a hot-path requirement forbids allocation, test or audit the exact library implementation, provide the scratch/storage policy explicitly where possible, or choose an implementation whose memory contract you control.
 
-### C++20 ranges iterators are a different model
+### Selection and partial sorting
 
-The ranges iterators relaxed the old requirements in ways worth knowing:
+For `nth` inside `[first,last)`, `nth_element` rearranges the range so:
 
-- **`std::input_iterator` no longer requires copyability** — move-only iterators are allowed, which is what makes `views::istream` and generator-backed ranges work.
-- **The sentinel is a separate type.** `ranges::begin(r)` and `ranges::end(r)` may differ in type, so a null-terminated string or a predicate-terminated stream is a valid range with no precomputed end. This eliminates the classic `strlen`-then-iterate double pass.
-- **`std::ranges::forward_iterator` requires equality-preserving `*`**, which is why many views (e.g. `transform_view` with a non-reference-returning function) are only `input_range`, and hence cannot be `sort`ed.
-- `iterator_traits`-based tag detection was supplemented by `iterator_concept`, and a range can advertise `random_access` under the ranges concepts while its `iterator_category` is `input` — a real source of confusion when mixing old and new algorithms.
+- the element at `nth` is the element that would occur there in a fully sorted range;
+- for every iterator `i` in `[first,nth)` and `j` in `[nth,last)`,
+  `comp(*j, *i)` is false;
+- neither side is itself sorted.
 
-**Why an algorithm's category requirement is a design signal:** `std::sort` needs random access because introsort indexes into partitions; `std::list::sort` exists because `list` can't provide it. When an interviewer asks "why can't you `std::sort` a `std::list`?", the answer is the iterator category, and the follow-up is that `list::sort` relinks nodes instead of moving values.
+The formal partition relation matters with equivalent elements and custom comparators. Avoid paraphrasing it as ordinary `<=` unless that is truly the ordering.
+
+```cpp
+#include <algorithm>
+#include <cassert>
+#include <vector>
+
+int main() {
+    std::vector<int> values{9, 1, 7, 3, 8, 2, 6, 4, 5};
+    auto nth = values.begin() + 4;
+    std::nth_element(values.begin(), nth, values.end());
+
+    assert(*nth == 5);
+    assert(std::all_of(values.begin(), nth,
+                       [&](int x) { return x <= *nth; }));
+    assert(std::all_of(nth, values.end(),
+                       [&](int x) { return x >= *nth; }));
+}
+```
+
+The inequalities are valid in this example because the default ordering on `int` is used. They do not say the prefix is `{1,2,3,4}` in that order.
+
+`nth_element` performs `O(N)` comparisons on average. C++23 gives no general worst-case complexity guarantee. A particular implementation may use an introselect-style fallback, but that is not a standard contract.
+
+`partial_sort(first,middle,last)` puts the smallest `M = middle-first` elements into `[first,middle)` in sorted order. It is appropriate when the prefix must be consumed in order. `partial_sort_copy` does the same into a separate output range and accepts weaker input iterators, which is useful when the source is immutable.
+
+### Worked selection decision
+
+Suppose one million immutable orders arrive in a snapshot and a report needs the best 100 in order. The relevant postconditions are:
+
+1. the source must not change;
+2. only 100 results are retained;
+3. those 100 must be ordered.
+
+`nth_element` violates (1) and does not provide (3). Copying all one million elements and sorting them provides far more ordering than needed. `partial_sort_copy` writes only the selected output and performs on the order of `N log k` comparisons. It also needs initialized output storage for `k` objects.
+
+If the orders instead arrive as a stream that cannot be retained, maintain a k-element heap: compare each new order with the current worst retained order and replace when better. The standard heap algorithms provide the operations, while Chapter 22 owns the derivation and invariant.
 
 ---
 
-## 14.8 Custom Comparators and Projections
+## 14.3 Binary search, partitioning, and compaction — Core
 
-A **comparator** answers "does a come before b"; a **projection** answers "which part of the element do I look at". C++20 ranges algorithms take both, and the split removes most of the reason to write comparators at all.
+Binary-search algorithms require a partitioned range with respect to the value and comparator used by that call. A fully sorted range satisfies this for all compatible values, but “sorted” is stronger than the actual per-call precondition.
 
-```cpp
-// Classic:
-std::sort(v.begin(), v.end(), [](const Order& a, const Order& b){ return a.price < b.price; });
-// Ranges with a projection:
-std::ranges::sort(v, {}, &Order::price);              // comparator defaults to ranges::less
-std::ranges::sort(v, std::greater{}, &Order::price);  // descending by price
-std::ranges::max_element(v, {}, [](const Order& o){ return o.qty * o.price; });
+```text
+lower_bound(value v):
+
+[ elements for which elem < v ][ elements for which elem < v is false ]
+ first                         result                              last
+
+upper_bound(value v):
+
+[ elements for which !(v < elem) ][ elements for which v < elem ]
+ first                           result                           last
 ```
 
-The projection can be a **pointer to member, a pointer to member function, or any callable**; it is invoked via `std::invoke` (Ch. 4), which is why `&Order::price` works directly. Projections apply to `find`, `min/max_element`, `sort`, `unique`, `lower_bound`, `count`, and essentially every ranges algorithm.
+The family has distinct postconditions:
 
-### Comparator correctness
-
-The strict-weak-ordering requirement (§14.1) applies to `sort`, `stable_sort`, `nth_element`, the binary searches, `min_element`, `set_*` operations, `map`/`set` keys, and priority queues. Multi-key comparators should be written with `std::tie` (pre-C++20) or `<=>` (C++20):
+- `lower_bound` returns the first position at which the element does not precede the value.
+- `upper_bound` returns the first position at which the value precedes the element.
+- `equal_range` returns both boundaries of the equivalent run.
+- `binary_search` reports whether an equivalent element exists.
+- `partition_point` generalizes the boundary search to a unary predicate that is true and then false.
 
 ```cpp
-struct Level { int64_t price; uint64_t seq; };
-// C++20: one line, correct by construction, and gives all six operators
-auto operator<=>(const Level&, const Level&) = default;   // lexicographic by member order
-// Or explicit multi-key with mixed direction:
-auto cmp = [](const Level& a, const Level& b){
-    return std::tie(b.price, a.seq) < std::tie(a.price, b.seq);  // price desc, seq asc
+#include <algorithm>
+#include <cassert>
+#include <vector>
+
+int main() {
+    std::vector<int> prices{100, 101, 101, 104, 108};
+
+    auto [first, last] =
+        std::equal_range(prices.begin(), prices.end(), 101);
+
+    assert(first - prices.begin() == 1);
+    assert(last - prices.begin() == 3);
+
+    auto insertion = std::lower_bound(
+        prices.begin(), prices.end(), 103);
+    prices.insert(insertion, 103);
+    assert(std::is_sorted(prices.begin(), prices.end()));
+}
+```
+
+The algorithms use `O(log N)` comparisons. With a random-access iterator, finding each midpoint is constant-time arithmetic, giving logarithmically many iterator operations. With a forward or bidirectional iterator, advancing to midpoints can total `O(N)` increments.
+
+For `N = 1,048,576`, a logarithmic comparison bound is around twenty comparisons, but a linked traversal can still advance through a substantial fraction of the nodes. This is why `set::lower_bound` and `map::find` should be used instead of applying the generic algorithm to their iterators: the member follows tree links directly.
+
+On contiguous data, binary search introduces data-dependent branches and non-sequential accesses. A linear scan may beat it for a small range that fits in a few cache lines, but there is no portable crossover size. Measure key distribution, element size, comparator cost, cache residency, and compiler output.
+
+### Partition algorithms
+
+`partition` groups elements satisfying a predicate before the rest and returns the boundary. It does not preserve relative order. `stable_partition` preserves relative order within both groups. `is_partitioned` tests the property, and `partition_copy` writes the two groups to separate outputs.
+
+```cpp
+#include <algorithm>
+#include <cassert>
+#include <vector>
+
+int main() {
+    std::vector<int> values{1, 2, 3, 4, 5, 6};
+    auto even = [](int x) { return x % 2 == 0; };
+
+    auto boundary =
+        std::partition(values.begin(), values.end(), even);
+
+    assert(std::all_of(values.begin(), boundary, even));
+    assert(std::none_of(boundary, values.end(), even));
+}
+```
+
+For C++23, `partition` applies the predicate exactly `N` times. It performs at most `N/2` swaps with bidirectional iterators and at most `N` swaps with forward iterators. `stable_partition` also applies the predicate exactly `N` times; it uses at most `N` swaps if enough extra memory is available and at most `N log N` swaps otherwise.
+
+The conditional memory bound does not expose a portable knob for caller-provided scratch space. An allocation-free path must not infer “no allocation happened” from successful completion. Instrument the target library or use an explicit stable-compaction implementation with caller-owned storage.
+
+### Remove does not erase
+
+`remove` and `remove_if` stably move retained values toward the front and return a new logical end. Elements between that iterator and the old end remain alive but have unspecified values. The container's size is unchanged.
+
+```cpp
+#include <algorithm>
+#include <cassert>
+#include <vector>
+
+int main() {
+    std::vector<int> values{1, 2, 3, 2, 4};
+
+    auto logical_end =
+        std::remove(values.begin(), values.end(), 2);
+    assert(values.size() == 5); // no container operation occurred
+
+    values.erase(logical_end, values.end());
+    assert((values == std::vector<int>{1, 3, 4}));
+
+    std::erase_if(values, [](int x) { return x % 2 != 0; });
+    assert((values == std::vector<int>{4}));
+}
+```
+
+C++20 `std::erase` and `std::erase_if` package the appropriate container operation. There is no C++20 standard guarantee that classic `std::remove` is marked `[[nodiscard]]`; do not depend on a warning to catch a discarded new end.
+
+Choose `remove_if` when survivor order matters. Choose unstable `partition` when only grouping matters and fewer element moves may benefit the measured workload. The actual cost depends on element move/swap cost and predicate distribution, not only the number of predicate applications.
+
+---
+
+## 14.4 Iterator-category consequences — Core
+
+An iterator category or C++20 iterator concept is a capability contract. Stronger capabilities enable different algorithms and different complexity:
+
+```text
+input ──► forward ──► bidirectional ──► random_access ──► contiguous
+output is a separate single-pass writing capability
+```
+
+| Capability | Adds | Typical standard type | Consequence |
+|---|---|---|---|
+| Input | Single-pass reading | `istream_iterator` | Linear scans and one-pass transforms |
+| Output | Single-pass writing | `back_insert_iterator` | Destination for copy/transform |
+| Forward | Multi-pass traversal | `forward_list` iterator | Partitioning, repeated passes |
+| Bidirectional | `--it` | `list`, `map`, `set` iterator | Reverse traversal |
+| Random access | Constant-time jumps and distance, ordering | `vector`, `deque` iterator | Generic sort, heap, selection |
+| Contiguous | Adjacent elements in address order | `array`, `vector`, `span`, `string` iterator | Data-pointer interoperation and optimization opportunities |
+
+`deque` is random access but not contiguous. A random-access algorithm can jump by index across its internal blocks, but one `data()` pointer cannot describe all elements.
+
+The C++20 `contiguous_iterator` concept formally expresses contiguity. Standard containers such as vector guaranteed contiguous storage before that concept existed. A library may optimize operations on contiguous trivially copyable values into bulk moves, but a call to `memmove` is an implementation optimization, not an algorithm-level standard promise.
+
+Legacy algorithms use iterator tags and require the same iterator type for both endpoints. Ranges algorithms use concepts and can accept a distinct sentinel. A custom iterator can expose `iterator_concept` for ranges and `iterator_category` for legacy compatibility; mixing the two interfaces may reveal different effective capabilities.
+
+### Capability changes cost
+
+Consider `std::distance(first,last)`:
+
+- for random-access iterators it can compute `last-first` in constant time;
+- for input, forward, or bidirectional iterators it increments until `last`, taking linear time.
+
+`std::advance` similarly jumps in constant time only for random access. This cost propagates into algorithms such as `lower_bound`, even though the comparison count remains logarithmic.
+
+The ranges concepts also separate properties that are not a simple hierarchy:
+
+- `sized_sentinel_for<S,I>` permits constant-time distance between a sentinel and iterator;
+- `common_range` means iterator and sentinel have the same type;
+- `sized_range` exposes constant-time `ranges::size`;
+- `borrowed_range` concerns whether iterators remain usable after the range object itself is destroyed.
+
+Do not infer one from another. A filtered view is commonly not sized even when its base is sized because finding the number of survivors requires evaluation. A `span` is contiguous, sized, common, and borrowed, but its data still belongs to someone else.
+
+---
+
+## 14.5 Predicates, comparators, and projections — Core
+
+A **predicate** classifies an element. A **comparator** defines an ordering relation between two values. A **projection** maps an element to the value seen by the predicate or comparator.
+
+Ranges algorithms make projection explicit:
+
+```cpp
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <functional>
+#include <vector>
+
+struct Order {
+    std::int64_t price;
+    std::uint64_t sequence;
+};
+
+int main() {
+    std::vector<Order> orders{{102, 3}, {100, 1}, {101, 2}};
+
+    std::ranges::sort(orders, std::ranges::less{}, &Order::price);
+    assert(orders.front().price == 100);
+
+    auto expensive = std::ranges::count_if(
+        orders, [](std::int64_t p) { return p >= 101; },
+        &Order::price);
+    assert(expensive == 2);
+}
+```
+
+The projection is invoked through `std::invoke`, so pointers to data members work directly. It can also be a function object. The algorithm may invoke it many times; a sort does not promise to cache projected keys. If projection computes an expensive normalization or hash, precomputing keys can exchange memory and setup time for fewer repeated computations.
+
+### Predicate discipline
+
+A predicate must accept the values the algorithm supplies and must not invalidate the traversal or mutate through an argument when the algorithm's predicate requirements forbid it. Avoid depending on a particular visitation order or exact number of calls unless the specification gives one.
+
+Stateful counters inside predicates are especially misleading with parallel policies: the callable may be copied, invoked concurrently, or invoked in an unspecified order. For sequential diagnostics, keep observation separate from the decision when possible.
+
+### Strict weak ordering
+
+Sorting, ordered set operations, heaps, and binary-search families rely on a strict weak ordering compatible with the data's existing partition/order. For comparator `comp`:
+
+- **irreflexive:** `comp(a,a)` is false;
+- **asymmetric:** if `comp(a,b)`, then `comp(b,a)` is false;
+- **transitive:** `comp(a,b)` and `comp(b,c)` imply `comp(a,c)`;
+- **transitive incomparability:** if neither value precedes the other, that equivalence relation is transitive.
+
+Using `<=` fails irreflexivity. Combining independent fields with
+`a.x < b.x || a.y < b.y` can fail transitivity. Lexicographic comparison is safer:
+
+```cpp
+struct Level {
+    std::int64_t price;
+    std::uint64_t sequence;
+
+    auto operator<=>(const Level&) const = default;
 };
 ```
 
-`std::greater<>{}` (the transparent, void-specialized form, C++14) is preferred over `std::greater<T>{}` because it deduces argument types and enables heterogeneous comparison — the same mechanism as transparent comparators in `map` (Ch. 12).
+For mixed directions, write and test the cases directly:
 
-### Performance
+```cpp
+auto better = [](const Level& a, const Level& b) {
+    if (a.price != b.price) {
+        return a.price > b.price;      // higher price first
+    }
+    return a.sequence < b.sequence;    // earlier sequence first
+};
+```
 
-- **A comparator lambda inlines; a `std::function` comparator does not.** Storing a comparator as `std::function<bool(const T&, const T&)>` costs an indirect call per comparison — ~n log n indirect calls, each defeating inlining and branch prediction. This is a 3–10× sort slowdown and a common real-world finding.
-- **Stateless comparators are empty**, so `std::set<T, Cmp>` and `std::priority_queue` pay zero storage for them via EBO / `[[no_unique_address]]` (Ch. 3 §3.4). A capturing lambda comparator has size and must be stored.
-- **Projections are zero-cost** when they're member pointers — they inline to a field load. But a projection that *computes* (e.g. `o.qty * o.price`) is re-evaluated on every comparison, i.e. O(n log n) times. If the projection is expensive, precompute a key array (a **Schwartzian transform**) and sort that.
-- **`ranges::sort` with a projection generates the same code** as a hand-written comparator; there is no abstraction penalty, but there is a compile-time and error-message cost.
+Floating-point keys need an explicit NaN policy. Built-in `<` makes a NaN incomparable with every value, which can make the induced equivalence relation non-transitive across NaNs and ordinary numbers. Reject NaNs, normalize them into a chosen bucket, or compare a representation/key that establishes the required ordering.
+
+### A comparator-law test
+
+Concept constraints cannot prove semantic laws. A small cubic test can find counterexamples in representative data:
+
+```cpp
+#include <functional>
+#include <span>
+
+template<class T, class Compare>
+bool obeys_strict_weak_order(
+    std::span<const T> xs, Compare comp) {
+    auto equivalent = [&](const T& a, const T& b) {
+        return !std::invoke(comp, a, b) &&
+               !std::invoke(comp, b, a);
+    };
+
+    for (const T& a : xs) {
+        if (std::invoke(comp, a, a)) return false;
+        for (const T& b : xs) {
+            if (std::invoke(comp, a, b) &&
+                std::invoke(comp, b, a)) return false;
+
+            for (const T& c : xs) {
+                if (std::invoke(comp, a, b) &&
+                    std::invoke(comp, b, c) &&
+                    !std::invoke(comp, a, c)) return false;
+
+                if (equivalent(a, b) && equivalent(b, c) &&
+                    !equivalent(a, c)) return false;
+            }
+        }
+    }
+    return true;
+}
+```
+
+This test is not a proof over all possible values. Use a small set containing equal keys, boundary values, reversed inputs, and invalid/special values. Property-based generation can broaden coverage. The production algorithm still relies on the comparator satisfying the law for every value it receives.
+
+### Callable cost
+
+A directly passed lambda gives the compiler the comparator type and usually allows inlining. Type-erasing it behind `std::function` adds an indirect call unless optimization can recover the target. Sorting performs the comparison many times, so the dispatch can matter for small cheap keys.
+
+This is an implementation cost model, not a fixed penalty. Measure comparisons, projection invocations, branch misses, and element moves. Sorting indices instead of large records can reduce bytes moved but adds a later gather and less direct memory access; it wins only under the corresponding data layout and consumer pattern.
 
 ---
 
-## 14.9 Range Concepts
+## 14.6 Transformation, accumulation, and reduction — Core
 
-A **range** is anything with `begin()` and `end()` (via the `ranges::begin`/`end` customization point objects). The concept hierarchy in `<ranges>` mirrors the iterator hierarchy plus a few orthogonal axes:
+These algorithms describe dataflow while retaining explicit contracts:
 
-```
-range → input_range → forward_range → bidirectional_range → random_access_range → contiguous_range
-        output_range
-Orthogonal: sized_range, common_range, borrowed_range, view, viewable_range
-```
-
-| Concept | Means | Why it matters |
+| Algorithm | Shape | Ordering property |
 |---|---|---|
-| `sized_range` | `ranges::size(r)` is O(1) | Algorithms can preallocate; `views::filter` is **not** sized |
-| `common_range` | `begin` and `end` have the same type | Required to feed a range into a legacy iterator-pair algorithm; `views::common` adapts |
-| `borrowed_range` | Iterators remain valid after the range object dies | Lets an algorithm safely return an iterator into an rvalue range (§14.11) |
-| `view` | O(1) copy/move and destroy; semantically a *reference* to elements | The composability requirement for `|` chaining |
-| `viewable_range` | Can be safely converted to a view — either an lvalue range or an rvalue *view* | Prevents piping a temporary `vector` into an adaptor |
+| `transform` | Map one or two input ranges to output | One result per input position |
+| `for_each` | Apply an operation | Sequential overload visits in order |
+| `accumulate` | Fold a range into one value | Ordered left fold |
+| `reduce` | Reduce a range | May reorder and regroup |
+| `transform_reduce` | Map plus regroupable reduction | No intermediate range required |
+| `inclusive_scan` / `exclusive_scan` | Prefix reduction | Produces all prefixes |
+| `partial_sum` | Ordered prefix accumulation | Left-to-right |
 
-**`view` vs `container`** is the central distinction: a container owns its elements and copying is O(n); a view refers to elements and copying is O(1). `std::ranges::view_interface` is the CRTP base (Ch. 6) that supplies `empty`, `front`, `back`, `operator[]`, and `operator bool` to a custom view given only `begin`/`end`.
-
-**`std::ranges::dangling`** is the safety mechanism: `ranges::find(std::vector{1,2,3}, 2)` returns `std::ranges::dangling` — a type with no members — instead of a dangling iterator, so misuse is a *compile error* rather than a runtime UB. A range opts out by specializing `enable_borrowed_range` (as `string_view`, `span`, and `subrange` do), declaring that its iterators outlive it.
-
-`std::ranges::subrange<I, S>` packages an iterator/sentinel pair as a view and is the standard return type for the "range half" of algorithms. `std::ranges::to<Container>()` (C++23) closes the loop by materializing any range into a container — the long-missing piece that made views practical:
+A loop can often be made more declarative without changing ownership:
 
 ```cpp
-auto v = data | std::views::filter(live) | std::views::transform(&Order::price)
-              | std::ranges::to<std::vector>();     // C++23
+#include <algorithm>
+#include <cassert>
+#include <vector>
+
+int main() {
+    std::vector<int> quantities{2, 3, 5};
+    std::vector<int> doubled(quantities.size());
+
+    // Before:
+    for (std::size_t i = 0; i < quantities.size(); ++i) {
+        doubled[i] = quantities[i] * 2;
+    }
+
+    // After: the same output postcondition is explicit.
+    std::ranges::transform(
+        quantities, doubled.begin(),
+        [](int q) { return q * 2; });
+
+    assert((doubled == std::vector<int>{4, 6, 10}));
+}
 ```
 
-C++23 also relaxed several concepts and added `views::cartesian_product`, `views::zip`, `views::enumerate`, `views::chunk`, `views::slide`, and `views::join_with`. C++26 adds `views::concat` and `ranges::concat_view`.
+The destination must have enough writable elements. `std::back_inserter` changes the destination behavior to repeated insertion and may trigger container growth; reserve first if a no-reallocation requirement and output bound are known.
+
+### `accumulate` versus `reduce`
+
+`std::accumulate(first,last,init,op)` is an ordered left fold. The type of `init` is the result type. An integer initializer for floating input truncates the running state:
+
+```cpp
+#include <cassert>
+#include <numeric>
+#include <vector>
+
+int main() {
+    std::vector<double> values{0.5, 1.5};
+    auto wrong =
+        std::accumulate(values.begin(), values.end(), 0);   // int
+    auto right =
+        std::accumulate(values.begin(), values.end(), 0.0); // double
+
+    assert(wrong == 1);
+    assert(right == 2.0);
+}
+```
+
+`std::reduce` may group operands in an unspecified order even without a parallel execution policy. Its operation must support the combinations required by the overload. Associativity and commutativity are needed if regrouping is to preserve the mathematical result. They are not true of floating-point addition.
+
+### Deterministic floating reduction
+
+If event replay must produce the same result, fix the traversal and grouping:
+
+```cpp
+#include <numeric>
+#include <span>
+
+double replay_sum(std::span<const double> values) {
+    // Fixed left-to-right grouping for this sequence.
+    return std::accumulate(values.begin(), values.end(), 0.0);
+}
+```
+
+This defines an evaluation order at the library level. Reproducibility also assumes the same values, floating environment, relevant compiler options, and compatible floating implementation.
+
+The reason grouping matters can be observed with `{1e16, -1e16, 1.0}` on a typical IEC 60559 binary64 implementation. Left grouping computes `(1e16 + -1e16) + 1.0`, retaining `1.0`; a grouping that first combines `-1e16 + 1.0` commonly loses the unit and later produces zero. These numeric outcomes are an implementation observation, while the standard-level rule is that `reduce` may choose different groupings.
+
+Use `reduce` or `transform_reduce` only after accepting that freedom. A fixed pairwise tree can improve numerical error and remain reproducible if the tree is specified, but standard `reduce` does not expose its tree. Chapter 23 owns compensated summation and detailed numerical analysis.
+
+### Fusion and locality
+
+`transform_reduce` can avoid an intermediate transformed container. That removes allocation and one memory round trip when the compiler/library produces a fused loop. The gain depends on vectorization, alias analysis, callable inlining, and cache behavior.
+
+Scans express prefix dependencies. `exclusive_scan` is useful for computing offsets from record lengths; each output gets the reduction of preceding inputs. Parallel scan implementations require more scheduling and temporary state than a serial loop. Compare throughput and tail latency for the actual range length rather than inferring speed from the API name.
 
 ---
 
-## 14.10 Lazy Range Views
+## 14.7 Range algorithms and range concepts — Core
 
-A **view adaptor** wraps a range and produces a new range whose iterators do work on demand. Nothing is computed at composition time; elements are produced one at a time as the consuming loop advances.
+Ranges algorithms replace many iterator-pair calls with a range argument and constrain invalid combinations through concepts:
 
 ```cpp
-auto result = orders
-            | std::views::filter([](const Order& o){ return o.side == Buy; })
-            | std::views::transform(&Order::price)
-            | std::views::take(10);
-// No work has happened. No allocation. Iterating `result` runs filter→transform per element.
+std::sort(values.begin(), values.end(), comp); // classic
+std::ranges::sort(values, comp);               // range overload
 ```
 
-Laziness gives three concrete wins: **no intermediate containers** (a `filter`+`transform` chain that would need two temporary vectors needs zero), **short-circuiting** (`take(10)` stops the pipeline after ten survivors, so the filter never examines the rest), and **infinite ranges** (`views::iota(0)` with `take_while`).
+They often return richer result types. For example, `ranges::copy` returns both the final input iterator and final output iterator. Projections are a regular parameter across many algorithms.
 
-### The adaptor catalogue (C++20 unless noted)
+The range overload does not change the underlying algorithmic postcondition or invalidate fewer iterators. `ranges::sort` still requires random access and a sortable relation. Concepts improve diagnostics and overload participation; they do not prove runtime preconditions such as “this range is partitioned.”
 
-| Adaptor | Semantics | Cost note |
+### Core concepts
+
+| Concept | Meaning | Practical consequence |
 |---|---|---|
-| `views::all`, `views::counted` | Wrap / take n from a pointer | Free |
-| `views::filter` | Skip non-matching | Not `sized_range`; **`begin()` is O(n)** and cached |
-| `views::transform` | Apply f on dereference | Only `input_range` if f returns by value |
-| `views::take`, `drop` | Prefix / suffix | O(1) on random access, O(n) `drop` otherwise |
-| `views::take_while`, `drop_while` | Predicate-bounded | `drop_while::begin()` is O(n), cached |
-| `views::reverse` | Reversed traversal | Requires bidirectional |
-| `views::join` | Flatten range-of-ranges | |
-| `views::split`, `lazy_split` | Tokenize by delimiter | `split` (C++20 fixed by P2210) is the usable one |
-| `views::elements`, `keys`, `values` | Tuple element projection | Free |
-| `views::zip`, `enumerate`, `adjacent`, `chunk`, `slide`, `stride`, `chunk_by`, `repeat`, `cartesian_product` | C++23 | |
-| `views::concat` | C++26 | |
+| `range` | `ranges::begin` and `ranges::end` form a range | Base requirement |
+| `input_range` | Single-pass readable iterator | Linear scans |
+| `forward_range` | Multi-pass iterator | Repeat traversal |
+| `random_access_range` | Constant-time jumps | Sorting and selection |
+| `contiguous_range` | Elements contiguous in memory | Pointer/data interoperation |
+| `sized_range` | Constant-time `ranges::size` | Consumers can know output bounds |
+| `common_range` | Iterator and sentinel have same type | Easier legacy interoperation |
+| `view` | Lightweight range type meeting view semantics | Cheap pipeline composition |
+| `borrowed_range` | Iterators do not depend on range-object lifetime | Safe iterator return from an rvalue range object, subject to storage lifetime |
+| `viewable_range` | Can be converted to a view by `views::all` | Accepted by view adaptors |
 
-### The performance caveat that must be stated
+A view is not synonymous with non-owning. `ref_view` and `span` refer to external storage. `owning_view` owns a moved-in range. `single_view` owns one element. The design question is always concrete: what state does this view contain, and what does that state refer to?
 
-Views are **usually** zero-overhead, and **sometimes not**. The known issues:
+### Borrowed iterators and `dangling`
 
-- **`filter_view::begin()` is amortized-O(1) only because it caches** the first satisfying position. That cache makes `filter_view` non-const-iterable (`begin()` is non-const), which cascades: you can't pass a `const filter_view&` to an algorithm, and you can't use it in a const member function.
-- **`filter | transform` compiles to worse code than a hand-written loop in some compilers**, because the filter's per-increment predicate check creates a loop structure the vectorizer can't handle. Range pipelines over trivially-transformable data frequently fail to vectorize where the equivalent raw loop does. Always check the assembly (Compiler Explorer, Ch. 44) before putting a view chain on a hot path.
-- **Debug builds are catastrophically slow** — every layer is a separate iterator class with several inlined calls per increment, and at `-O0` none of it inlines. A 10–50× debug slowdown is normal, which matters if you run tests unoptimized.
-- **Compile time and error messages** are the real tax; a deep pipeline instantiates dozens of templates (Ch. 17 §17.22).
+Ranges algorithms prevent one common temporary mistake in their return type:
 
-**When to use views:** expressive non-hot-path code, and pipelines where laziness eliminates a real allocation or enables real short-circuiting. **When not to:** the innermost loop of a feed handler, where a hand-written loop over a `span` is both faster and easier to reason about.
+```cpp
+#include <ranges>
+#include <type_traits>
+#include <vector>
+
+int main() {
+    auto result = std::ranges::find(
+        std::vector{1, 2, 3}, 2);
+
+    static_assert(std::same_as<
+        decltype(result), std::ranges::dangling>);
+}
+```
+
+The temporary vector is not a borrowed range, so the algorithm returns the marker type `ranges::dangling` rather than an iterator into destroyed storage.
+
+For a `span`, `string_view`, or suitable `subrange`, destroying the range object does not itself destroy the referenced storage, so these types model `borrowed_range`. That does not make their iterators immortal. If the actual array/string/vector owner dies or reallocates, they still dangle.
 
 ---
 
-## 14.11 Range View Lifetimes
+## 14.8 Lazy views, composition, materialization, and lifetime — Core
 
-Views borrow. Every lifetime hazard in Ch. 13 §13.3 applies, plus two that are specific to pipelines.
+A view pipeline constructs adaptor objects first and evaluates elements when a consumer iterates:
 
-**1. A view over a temporary container dangles.**
-
-```cpp
-auto bad = make_vector() | std::views::filter(pred);   // the vector is destroyed here
-for (int x : bad) { /* UB */ }
-```
-The language partially protects you: `viewable_range` rejects piping an lvalue-less non-view *container* in most cases, and C++20's rules make `make_vector() | views::filter(...)` ill-formed for named use — but the protection is incomplete, and `owning_view` (C++20 DR, P2415) was added precisely to make rvalue containers *safe* by taking ownership:
-
-```cpp
-auto ok = make_vector() | std::views::filter(pred);   // filter over owning_view — the vector
-                                                       // is moved into the pipeline and kept alive
-```
-So an rvalue *container* is now safe (it's owned); an rvalue *view over something else* is not, because the view owns nothing.
-
-**2. Range-for over a temporary's subobject was UB until C++23.**
-
-```cpp
-for (auto c : get_object().get_string()) { ... }   // pre-C++23: UB. get_object()'s temporary
-                                                    // died before the loop body ran.
-```
-The range-for expansion binds the range to `auto&& __range = expr`, which extends the lifetime of the *final* temporary only — not intermediate ones in the expression. **P2718 (C++23)** extends the lifetime of all temporaries in the range expression to the end of the loop, fixing a decade-old footgun. Until your toolchain is C++23, name the intermediate:
-
-```cpp
-auto obj = get_object();
-for (auto c : obj.get_string()) { ... }
+```text
+owner/range
+    │
+    ▼
+filter(predicate) ── advances until a survivor
+    │
+    ▼
+transform(projection) ── computes one exposed value
+    │
+    ▼
+take(k) ── stops after k exposed values
+    │
+    ▼
+consumer: loop, algorithm, or materialization
 ```
 
-**3. Captured references in adaptor callables.** A lambda inside `views::filter` capturing by reference outlives the enclosing scope if the view is stored. Views are frequently stored in members or returned; a by-reference capture then dangles exactly like §13.3.
+Laziness can avoid intermediate containers and stop upstream work early. It also means work is repeated if the pipeline is traversed again, and the pipeline retains any references or callable state needed for later evaluation.
 
-**4. `ranges::dangling`.** Algorithms taking an rvalue non-borrowed range return `std::ranges::dangling` rather than an iterator. Using the result is a compile error — the design deliberately converts a runtime UB into a type error. `views::all_t`, `subrange`, `span`, `string_view`, and `iota_view` are `borrowed_range`s (marked with `enable_borrowed_range`), so returning iterators from them is fine.
+```cpp
+#include <cassert>
+#include <ranges>
+#include <vector>
 
-**Rule:** treat a stored view exactly like a stored raw pointer. Name the owner, and if you can't, materialize with `ranges::to<std::vector>()`.
+int main() {
+    std::vector<int> values{1, 2, 3, 4, 5, 6};
+
+    auto pipeline =
+        values
+        | std::views::filter([](int x) { return x % 2 == 0; })
+        | std::views::transform([](int x) { return x * x; })
+        | std::views::take(2);
+
+    auto it = pipeline.begin();
+    assert(*it++ == 4);
+    assert(*it == 16);
+}
+```
+
+The pipeline refers to the lvalue vector. Destroying or reallocating `values` before iteration invalidates its use. Mutating element values without invalidating iterators can change future results because filtering and transformation are lazy.
+
+### Common adaptors and capability effects
+
+| Adaptor | Behavior | Important condition/effect |
+|---|---|---|
+| `filter` | Exposes matching elements | Usually not sized; searches during advancement |
+| `transform` | Exposes projected values/references | Does not preserve contiguity |
+| `take` / `drop` | Keeps/skips a prefix | Cost depends on base iterator capability |
+| `take_while` / `drop_while` | Predicate-bounded prefix | Predicate evaluated lazily |
+| `reverse` | Reverses traversal | Requires bidirectional range |
+| `join` | Flattens range-of-ranges | Inner-range lifetime matters |
+| `split` / `lazy_split` | Produces token subranges | Tokens commonly refer to source |
+| `keys` / `values` | Selects tuple-like component | Projection view |
+| `zip`, `enumerate`, `adjacent`, `chunk`, `slide`, `stride`, `chunk_by`, `cartesian_product` | C++23 composition tools | Each imposes its own range constraints |
+
+Adaptor composition is normally allocation-free at construction, but that is not a blanket guarantee about callables or later consumers. A captured object may allocate when copied; materialization allocates according to its destination; the underlying owner may allocate independently.
+
+### Rvalue ownership and lvalue borrowing
+
+In C++23, piping a movable rvalue container through a standard adaptor can move it into an `owning_view`:
+
+```cpp
+#include <cassert>
+#include <ranges>
+#include <vector>
+
+int main() {
+    auto owned =
+        std::vector{1, 2, 3, 4}
+        | std::views::filter([](int x) { return x % 2 == 0; });
+
+    assert(*owned.begin() == 2); // moved-in vector is still alive
+}
+```
+
+Keeping `owned` alive keeps the moved vector subobject alive. This differs from adapting an lvalue, which normally creates a `ref_view` referring to the existing container.
+
+`owning_view` does not repair a view that was deliberately built over someone else's reference. This function returns a pipeline referring to `source`:
+
+```cpp
+auto first_three(const std::vector<int>& source) {
+    return source | std::views::take(3);
+}
+
+auto dangling =
+    first_three(std::vector{1, 2, 3, 4}); // temporary owner then dies
+```
+
+The parameter is an lvalue expression inside the function, so the adaptor refers to it; it cannot recover ownership of the caller's temporary. Iterating `dangling` later has undefined behavior.
+
+Captured references create the same hazard:
+
+```cpp
+auto make_filter(int threshold,
+                 const std::vector<int>& source) {
+    return source | std::views::filter(
+        [&](int x) { return x >= threshold; }); // also captures threshold by ref
+}
+```
+
+Both `source` and the local `threshold` are invalid after return. Capture small configuration by value and require the source owner to outlive the view, or materialize before returning.
+
+### Materialization
+
+C++23 `ranges::to` creates an owning destination:
+
+```cpp
+#include <cassert>
+#include <ranges>
+#include <vector>
+
+int main() {
+    std::vector<int> values{-2, 3, 4};
+    auto squares =
+        values
+        | std::views::filter([](int x) { return x > 0; })
+        | std::views::transform([](int x) { return x * x; })
+        | std::ranges::to<std::vector>();
+
+    assert((squares == std::vector<int>{9, 16}));
+}
+```
+
+Materialization trades laziness for ownership, stable repeated access, and destination storage cost. If the source is sized and the library can exploit that information, it may reserve appropriately; a filtered range usually cannot know its result count without evaluating.
+
+When the deployment library does not yet implement this C++23 facility, construct a destination and use `ranges::copy` with an inserter. That is a toolchain limitation, not a change to the C++23 standard.
+
+### Hot-path trade-offs
+
+After optimization, a short view pipeline can compile to the same loop as hand-written code. The standard does not guarantee this. Filtering creates a data-dependent branch, transformations may be recomputed, and deep adaptor types increase compile time and diagnostic size.
+
+Use a benchmark that checks generated work, allocation calls, branch behavior, and latency distribution. The comparison should use equivalent ownership and postconditions. A view chain that eliminates an intermediate vector is not comparable to a loop that was already fused manually.
 
 ---
 
-## 14.12 Parallel Algorithms and Execution Policies
+## 14.9 Worked low-latency design: sorted top-k without full sort — Core
 
-C++17 added an overload set taking an **execution policy** as the first argument:
+The following function returns the best `k` immutable orders, ordered by descending price and then ascending sequence number:
 
 ```cpp
-#include <execution>
-std::sort(std::execution::par, v.begin(), v.end());
-std::reduce(std::execution::par_unseq, v.begin(), v.end(), 0.0);
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <vector>
+
+struct Order {
+    std::int64_t price;
+    std::uint64_t sequence;
+};
+
+std::vector<Order> top_k_orders(
+    std::span<const Order> input, std::size_t k) {
+    const std::size_t count = std::min(k, input.size());
+    std::vector<Order> result(count);
+
+    auto better = [](const Order& a, const Order& b) {
+        if (a.price != b.price) return a.price > b.price;
+        return a.sequence < b.sequence;
+    };
+
+    std::partial_sort_copy(
+        input.begin(), input.end(),
+        result.begin(), result.end(), better);
+    return result;
+}
+
+int main() {
+    std::vector<Order> orders{
+        {101, 8}, {103, 9}, {103, 4}, {100, 1}
+    };
+
+    auto top = top_k_orders(orders, 2);
+    assert(top.size() == 2);
+    assert(top[0].price == 103 && top[0].sequence == 4);
+    assert(top[1].price == 103 && top[1].sequence == 9);
+}
 ```
 
-| Policy | Threads | Vectorization / interleaving | Constraints on your callable |
+Reason from the requirements:
+
+- The input is a `span<const Order>`, so mutating selection algorithms cannot be used directly.
+- The output must be ordered, eliminating plain `nth_element`.
+- `partial_sort_copy` retains only `min(k,N)` output objects and provides them in comparator order.
+- `k == 0` creates an empty output range; the algorithm performs no output writes.
+- `k >= N` creates `N` outputs and orders all input values in the result.
+
+The comparator is irreflexive because no order has a different price from itself and no sequence is less than itself. It is lexicographic across descending price and ascending sequence, so transitivity and equivalence follow from the corresponding integer orderings.
+
+The operation performs approximately `N log(min(N,k))` comparisons and requires dynamic storage for the result vector when the result is nonempty. The standard does not specify an exact number of allocator calls here. For a steady-state handler, let the caller provide a preallocated output span or reusable vector and state its capacity precondition. That removes allocator variability but shifts failure handling to an explicit capacity check.
+
+### Cost model and rollback
+
+Expected costs are:
+
+- one sequential read of the input;
+- comparator branches on price equality and ordering;
+- maintenance of a selected heap/prefix inside the library;
+- moves/copies among `k` result objects;
+- result-storage allocation behavior determined by the vector implementation and allocator.
+
+If `Order` is large, store compact indices or keys and gather later; this reduces movement but adds indirection. If input is already mostly sorted or `k` approaches `N`, full sorting a copy may compete. If input streams indefinitely, maintain a bounded heap instead.
+
+Measure representative `N`, `k`, tie frequency, record size, cache residency, and result reuse. Compare p50 and tail latency, comparisons, bytes moved, allocation calls, and cache/branch counters. Roll back to the simpler full-sort implementation if the selection path does not produce a meaningful benefit or creates unacceptable complexity.
+
+---
+
+## 14.10 Parallel algorithms and execution policies — Deep dive
+
+C++17 added standard execution-policy overloads; C++20 added `unseq`. They change permissible execution, not only performance:
+
+| Policy | Where invocations may run | Sequencing | Main callable obligation |
 |---|---|---|---|
-| `seq` | 1 | No | None (still no exception escape semantics) |
-| `unseq` (C++20) | 1 | Yes — element operations may interleave in one thread | **No mutexes, no allocation, no order dependence** |
-| `par` | Many | No interleaving within a thread | Must be data-race free; may use locks |
-| `par_unseq` | Many | Both | No locks, no allocation, no vectorization-unsafe ops |
+| `seq` | Calling thread | Indeterminately sequenced | No uncaught exception under the policy overload |
+| `unseq` | Calling thread | May be unsequenced/interleaved | No vectorization-unsafe operations or order dependence |
+| `par` | Implementation-selected threads, possibly one | Indeterminately sequenced within a thread | Data-race free; synchronization permitted |
+| `par_unseq` | Implementation-selected threads | May be unsequenced within a thread | Data-race free and no vectorization-unsafe operations |
 
-The `unseq` constraint is the sharp one: because operations from different elements may be interleaved within a single thread's instruction stream, **taking a lock inside a `par_unseq` callable can self-deadlock** — the same thread may attempt to acquire the mutex for element *i+1* before releasing it for element *i*. This is stated in the standard as "vectorization-unsafe" operations.
+The standard permits an implementation to execute a parallel policy with limited or no parallelism. It does not specify a worker count, scheduling strategy, partition size, affinity, or thread-pool lifetime.
 
-### Semantics and failure modes
+### Correctness constraints
 
-- **Exceptions.** If an element access throws and it escapes a parallel algorithm, `std::terminate` is called. There is no propagation. Handle errors inside the callable.
-- **Allocation failure.** If the implementation can't obtain resources for parallelism, it may fall back to sequential execution — or throw `std::bad_alloc`. It is not required to parallelize at all: **a conforming implementation may ignore the policy entirely**, and libstdc++ did exactly this until it gained a TBB dependency.
-- **Determinism.** `reduce(par, …)` over floats is non-reproducible (§14.5).
-- **Which algorithms parallelize well:** `sort`, `transform`, `reduce`, `transform_reduce`, `for_each`, `count_if`, the scans. Which don't: anything with a serial dependency, and anything where the per-element work is a few nanoseconds — the fork/join and cache-coherence overhead dominates below roughly 10⁴–10⁵ elements of nontrivial work.
+Element-access functions may be copied and invoked in unspecified order. Under `par` or `par_unseq`, unsynchronized writes to shared non-atomic state are data races. Under `unseq` and `par_unseq`, invoking vectorization-unsafe standard-library operations can make behavior undefined. Operations that synchronize with another function are vectorization-unsafe, with specific exceptions in the standard such as memory allocation/deallocation functions. Locks are therefore not valid inside these unsequenced calls.
 
-### Tooling reality
+If a user function invoked by an algorithm exits with an uncaught exception under one of the standard execution policies, `std::terminate` is called, including for the `seq` policy overload. Allocation failure internal to the algorithm may be reported as `std::bad_alloc`. Custom execution policies have implementation-defined behavior.
 
-- **libstdc++ requires linking Intel TBB** (`-ltbb`) for the parallel policies; without it you get link errors or silent sequential behavior.
-- **libc++** shipped `<execution>` late and partially; check your version.
-- **NVIDIA nvc++** maps `par`/`par_unseq` to GPU execution, which is the most interesting real use of the feature.
+These rules make the policy overload meaningfully different from calling the ordinary sequential overload. Do not add `execution::seq` as decoration when exception propagation is required.
 
-### Low-latency verdict
+### Reduction and determinism
 
-Parallel algorithms are **almost never right on a trading hot path**. The hot path is a pinned, isolated single thread (Ch. 31, Ch. 55); introducing a thread pool means scheduler interaction, cross-core cache traffic, unpredictable tail latency, and NUMA effects (Ch. 29). They belong in batch/offline work — backtests, risk recomputation, historical replay — where throughput matters and jitter doesn't. What *is* on the hot path is `unseq`-style vectorization, and there you want explicit SIMD (Ch. 42, and `std::simd` in Ch. 15 §15.8), not a policy tag whose behavior depends on your standard library vendor.
+Parallel `reduce` and `transform_reduce` partition and regroup work. For integers, overflow still follows the underlying type rules. For floating point, regrouping can alter rounding. For any stateful/non-associative operation, result meaning may depend on the permitted execution order.
 
----
+Parallel scans preserve their specified prefix semantics but need coordination between partitions. An implementation may allocate temporary state and schedule work across cores. None of that provides a tail-latency bound.
 
-## Key Interview Questions
+### Decision framework
 
-1. **What algorithm does `std::sort` use, and what changed in C++11?** — Introsort (quicksort → heapsort past a depth limit → final insertion-sort pass). C++11 upgraded the requirement from average to **worst-case** O(n log n), which is what forced the heapsort fallback.
-2. **Why can't you `std::sort` a `std::list`?** — `sort` requires random-access iterators; `list` is bidirectional. `list::sort` is a merge sort that relinks nodes instead of moving values.
-3. **What happens if your comparator isn't a strict weak ordering?** — UB, not just a wrong order: libstdc++'s partition loop can run past the end and corrupt memory. `a <= b` and non-transitive multi-key comparisons are the usual culprits.
-4. **Top-100 of 10 million: which algorithm?** — `nth_element` (O(n) average) if order doesn't matter, `partial_sort` (O(n log k)) if it does. Never sort-then-truncate.
-5. **What exactly does `nth_element` guarantee?** — Only that position k holds the k-th element and the range is partitioned around it; **neither side is sorted**.
-6. **`lower_bound` vs `upper_bound` vs `equal_range`?** — First `>= v`, first `> v`, and the pair delimiting the equivalent run. `lower_bound` doubles as the insertion point.
-7. **Is `std::lower_bound` on a `std::set` O(log n)?** — No: the free function does O(log n) comparisons but O(n) increments on bidirectional iterators. Use `set::lower_bound`.
-8. **Why is binary search slower than its asymptotics suggest, and how do you fix it?** — Every step is an unpredictable branch and a cache miss; use branchless midpoint arithmetic, prefetch both children, or an Eytzinger layout; use linear search below ~32 elements.
-9. **What does `std::remove` actually remove?** — Nothing. It compacts survivors forward and returns the new logical end; you must `erase`, or use C++20 `std::erase`/`erase_if`.
-10. **`accumulate` vs `reduce`?** — Left fold with defined order vs unordered/unspecified-grouping fold requiring associativity and commutativity; `reduce` can be parallel and is non-deterministic for floats.
-11. **Why does `std::accumulate(v.begin(), v.end(), 0)` on a `vector<double>` give the wrong answer?** — `init` deduces `int`; every partial sum truncates.
-12. **What is `transform_reduce` for?** — A fused map-then-fold in one pass, no intermediate container, parallelizable — e.g. a dot product.
-13. **What does "amortized O(1)" hide, and why does it matter for latency?** — Any single call can be O(n) and can allocate; the percentile tail is the reallocation, not the average.
-14. **Which standard algorithms can allocate?** — `stable_sort`, `stable_partition`, `inplace_merge` (all degrade to a worse complexity if allocation fails).
-15. **What is a contiguous iterator and what does it unlock?** — Elements adjacent in memory (C++17 guarantee, C++20 tag): `memmove` fast paths, SIMD, and passing `data()` to C APIs. `deque` is random-access but not contiguous.
-16. **What did ranges change about iterators?** — Sentinels may differ in type from iterators, input iterators need not be copyable, and `iterator_concept` supplements `iterator_category`.
-17. **What is a projection and how does it differ from a comparator?** — It selects what to compare (invoked via `std::invoke`, so `&T::member` works); the comparator orders the projected values. Projections are re-evaluated per comparison, so expensive ones want a precomputed key array.
-18. **What distinguishes a `view` from a container?** — O(1) copy/move/destroy and reference semantics; that's the requirement for `|` composition.
-19. **Why is `views::filter` not const-iterable?** — `begin()` caches the first satisfying element, so it is non-const and the view is not a `sized_range` either.
-20. **What is `std::ranges::dangling` and `enable_borrowed_range`?** — Algorithms over rvalue non-borrowed ranges return `dangling`, converting a runtime UB into a compile error; borrowed ranges (`span`, `string_view`, `subrange`) opt out because their iterators outlive them.
-21. **What did P2718 fix in C++23?** — Range-for over a temporary's subobject (`for (auto c : f().g())`) was UB; all temporaries in the range expression now live to the end of the loop.
-22. **Why can a mutex inside a `par_unseq` callable deadlock?** — Element operations may interleave within one thread, so the same thread can re-enter the lock before releasing it.
-23. **What happens if an exception escapes a parallel algorithm?** — `std::terminate`. No propagation.
-24. **Would you use parallel algorithms on a trading hot path?** — No: thread-pool scheduling, cross-core coherence traffic, and NUMA effects destroy tail latency. They belong in batch work; on the hot path use explicit SIMD.
+```text
+Is the operation valid under arbitrary permitted ordering/grouping?
+  ├─ no → ordinary sequential algorithm or explicitly designed schedule
+  └─ yes
+       ├─ must exceptions propagate? → ordinary overload, not policy overload
+       ├─ callable synchronizes? → exclude unseq/par_unseq
+       ├─ workload too small or latency-sensitive? → prefer measured serial path
+       └─ throughput-oriented batch? → benchmark policies on deployment library
+```
+
+Parallel policies fit throughput-oriented batch work when per-element work dominates scheduling, partition, and coherence overhead. They are usually a poor default for a pinned latency-sensitive event loop: worker wake-up, shared queues, cache-line migration, and load imbalance widen the latency distribution. This is a workload conclusion, not a ban. Measure the actual implementation because some libraries execute a policy sequentially unless built with a backend.
 
 ---
 
-## Common Traps
+## 14.11 Contract and cost reference — Reference
 
-- **A comparator using `<=`** — not a strict weak ordering; UB, and it really does corrupt memory.
-- **Non-transitive multi-key comparators** (`a.x < b.x || a.y < b.y`) — use `std::tie` or `<=>`.
-- **`std::remove` without `erase`** — the container's size never changes.
-- **Reading a "sorted" prefix after `nth_element`** — the partition halves are unsorted.
-- **`std::binary_search`/`lower_bound` on `set`/`map`/`list`** — O(n) iterator increments.
-- **`accumulate(..., 0)` on floating-point ranges** — integer truncation.
-- **`reduce` over floats where reproducibility matters** — non-associative, non-deterministic.
-- **Assuming `stable_sort` doesn't allocate** — it does, and quietly degrades if it can't.
-- **`std::function` as a comparator** — an indirect call per comparison, killing inlining.
-- **An expensive projection** — re-evaluated O(n log n) times; precompute the keys.
-- **Storing a view over a temporary that isn't owned** — dangles; only rvalue *containers* are rescued by `owning_view`.
-- **Range-for over `f().g()` before C++23** — the intermediate temporary dies first.
-- **By-reference captures in `views::filter`/`transform` callables** on a stored view.
-- **Expecting `const` iteration over `views::filter`** — `begin()` is non-const because it caches.
-- **Assuming range pipelines vectorize** — filter chains often defeat the vectorizer; check the assembly.
-- **Running range-heavy code at `-O0`** — 10–50× slower; debug builds are not representative.
-- **Locks or allocation inside a `par_unseq` callable** — vectorization-unsafe; can self-deadlock.
-- **Letting an exception escape a parallel algorithm** — `std::terminate`.
-- **Forgetting `-ltbb`** with libstdc++ parallel policies.
-- **Treating asymptotic complexity as the performance model** — `map`'s O(log n) pointer chase loses to a flat array's O(n) scan at realistic sizes.
+### Complexity vocabulary
+
+| Wording | What it constrains | What it does not constrain |
+|---|---|---|
+| At most `N` predicate applications | Callable invocation count | Callable cost, branches, cache misses |
+| `O(log N)` comparisons | Asymptotic comparison count | Iterator increments or memory locality |
+| Average `O(N)` | Average under the specification's model | Worst-case call latency |
+| Amortized constant | Total over a sequence of operations | Any single operation |
+| Stable | Relative order of equivalent elements | Iterator/reference stability |
+| In-place | Usually limited auxiliary storage in context | A universal no-allocation promise unless specified |
+
+An amortized bound is particularly dangerous in a tail-sensitive path. `vector::push_back` is amortized constant time, yet a capacity growth moves/copies existing elements and may allocate. Reserve or use a fixed-capacity representation when capacity is bounded, then verify that nested element operations also avoid allocation.
+
+### Common traps
+
+| Trap | Violated contract | Repair |
+|---|---|---|
+| Binary search on unsorted/incompatibly ordered input | Range is not partitioned for the call | Sort with the same relation or use linear search |
+| `sort` with `<=` | Comparator is reflexive | Use a strict relation |
+| Floating comparator ignores NaNs | Induced equivalence may not be transitive | Reject or assign NaNs an explicit total position |
+| Discarding `remove`'s return | Container size never changed | Erase the returned tail or use `erase_if` |
+| Reading `nth_element`'s prefix as sorted | Selection gives partition only | Sort the selected prefix if needed |
+| Applying generic `lower_bound` to `set` iterators | Log comparisons hide linear increments | Use the member function |
+| Writing through `copy` to `out.begin()` of an empty vector | No output storage exists | Resize or use a suitable inserter |
+| Predicate structurally mutates its source vector | Iterator invalidation | Separate traversal from mutation |
+| Returning a view over a reference parameter fed a temporary | Owner dies at full-expression end | Require an lvalue owner or materialize |
+| Capturing a local by reference in a stored view | Callable holds a dangling reference | Capture by value or shorten view lifetime |
+| Assuming `borrowed_range` owns storage | It only decouples iterator validity from range-object lifetime | Track the actual storage owner |
+| Using `reduce` for replay-sensitive floats | Grouping is unspecified | Use a fixed ordered/fixed-tree reduction |
+| Throwing from a policy-overload callable | Standard policy calls `terminate` | Use ordinary overload or contain errors |
+| Locking inside `par_unseq`/`unseq` work | Vectorization-unsafe operation | Redesign callable or use another policy |
 
 ---
 
-## Compact Recall Summary
+## Recall and practice
 
-**Sorting.** `sort` = introsort (quicksort + heapsort depth fallback + final insertion pass), worst-case O(n log n) since C++11, unstable, random-access only. `stable_sort` = merge sort, allocates. Comparators must be strict weak orderings or you get UB. Modern implementations use branchless (BlockQuicksort/pdqsort) partitioning; radix sort still beats all of them on fixed-width integer keys, and sorting indices beats sorting fat objects.
+### Recall card
 
-**Selection.** `nth_element` = quickselect, **O(n) average**, produces only a partition. `partial_sort` = heap-based, O(n log k), first k sorted. Top-k of a large set is one of these, never a full sort.
+1. `[first,last)` is valid only when `last` is reachable from `first`; `last` is never dereferenced.
+2. Check iterator capability, structural preconditions, callable laws, output capacity, overlap, and invalidation before considering speed.
+3. `sort` is worst-case `O(N log N)` comparisons; `nth_element` is average `O(N)` and only partitions.
+4. `lower_bound` gives logarithmic comparisons, not necessarily logarithmic iterator increments.
+5. `remove` compacts without shrinking; `partition` groups without sorting.
+6. A strict weak ordering includes transitive incomparability; projections may be recomputed many times.
+7. `accumulate` fixes a left-fold order; `reduce` permits regrouping, which matters for floating point and stateful operations.
+8. Views may own or borrow. Track source storage, adaptor callable captures, owner mutation, and materialization explicitly.
 
-**Binary search.** `lower_bound` (first ≥), `upper_bound` (first >), `equal_range`, `partition_point`. Requires only a partitioned range. O(log n) *comparisons*, but O(n) *increments* on non-random-access iterators, so use the member functions on node-based containers. Real cost is mispredicts and misses: branchless search, prefetching, Eytzinger layout, linear scan below ~32.
+### Questions
 
-**Partitioning.** `partition` (unstable, forward iterators, ≤ n/2 swaps) vs `stable_partition` (allocates). `remove`/`remove_if` compact and return the new end — always pair with `erase`, or use C++20 `erase`/`erase_if`. Branchless compaction (`*out = x; out += pred(x);`) wins when the predicate is unpredictable, loses when it's skewed.
+1. Why does a half-open range represent both an empty range and two adjacent subranges without special cases?
+2. Which preconditions would you check before calling `ranges::lower_bound` with a custom projection?
+3. A report needs an unordered best 50 from a mutable million-element vector. Which postcondition makes `nth_element` preferable to sorting?
+4. Why can generic `lower_bound` perform linear work on a list despite logarithmic comparisons?
+5. Compare `remove_if`, `partition`, and `stable_partition` for compacting expensive records when survivor order may or may not matter.
+6. Give a three-value counterexample for a comparator whose incomparability is not transitive.
+7. Why can a projection that looks syntactically cheap dominate a sorting call?
+8. Under what ownership path is a pipeline over an rvalue vector safe, and why can a function returning a view over `const vector&` still dangle?
+9. Which additional assumptions are needed for an ordered floating sum to be replay-reproducible?
+10. Why does using the `execution::seq` overload change exception behavior compared with the ordinary overload?
 
-**Transform/accumulate.** `accumulate` is an ordered left fold; `reduce`/`transform_reduce`/the scans are order-relaxed, policy-accepting, and require associativity — hence non-deterministic for floats. `exclusive_scan` is the offset-table primitive. Watch the `init` type. Vectorization of `transform` hinges on aliasing.
+### Code-reading puzzle
 
-**Complexity guarantees.** Stated in counted comparisons/assignments/swaps, not time and not iterator movement. Amortized O(1) hides an O(n) tail (a latency-percentile problem). `stable_sort`, `stable_partition`, `inplace_merge` allocate and silently degrade. Asymptotics ignore the memory hierarchy.
+```cpp
+std::vector<int> values{5, 3, 8, 1, 9, 2};
+auto boundary = std::partition(
+    values.begin(), values.end(),
+    [](int x) { return x % 2 == 0; });
 
-**Iterator categories.** input/output → forward → bidirectional → random access → contiguous. Contiguous unlocks `memmove` and C interop. Ranges added sentinels of a distinct type, move-only input iterators, and `iterator_concept`.
+bool a = std::is_sorted(values.begin(), boundary);
+bool b = std::all_of(
+    values.begin(), boundary,
+    [](int x) { return x % 2 == 0; });
+```
 
-**Comparators and projections.** Comparator = ordering, projection = what to look at (via `std::invoke`, so `&T::member` works). Transparent `less<>`/`greater<>` for heterogeneous comparison; never `std::function`; precompute expensive projections.
+Which of `a` and `b` is guaranteed true, and which has no guaranteed value? State the exact `partition` postcondition that determines the answer.
 
-**Range concepts.** `range` + the iterator ladder, plus orthogonal `sized_range`, `common_range`, `borrowed_range`, `view`, `viewable_range`. A view is O(1) to copy; a container isn't. `ranges::to<C>()` (C++23) materializes.
+### Design exercise
 
-**Views.** Lazy, allocation-free, short-circuiting, composable with `|`. Costs: `filter_view::begin()` caches (so it's non-const and unsized), pipelines often fail to vectorize, debug builds are 10–50× slower, compile times and diagnostics suffer. Great above the hot path, suspect inside it.
+Implement two forms of `top_k_orders` for a caller-defined `Order`:
 
-**View lifetimes.** Views borrow; treat a stored view as a stored pointer. Rvalue containers are rescued by `owning_view`; rvalue views are not. `ranges::dangling` turns a class of dangling-iterator UB into compile errors. P2718 (C++23) fixed range-for over a temporary's subobject.
+1. an immutable-input function returning a sorted owning vector;
+2. a steady-state function writing into caller-provided fixed-capacity storage without allocation.
 
-**Parallel algorithms.** `seq`/`unseq`/`par`/`par_unseq`. `unseq` forbids locks and allocation (interleaving can self-deadlock); escaping exceptions call `std::terminate`; implementations may ignore the policy entirely; libstdc++ needs TBB. Wrong for hot paths — right for batch, backtests, and replay.
+Order by descending price and ascending sequence. Handle `k == 0`, `k > input.size()`, insufficient output capacity, duplicate keys, and invalid prices. State each function's iterator/range preconditions, comparator policy, postcondition, complexity, ownership, and failure behavior. Then propose a benchmark that distinguishes comparison count, bytes moved, allocation, and tail latency.
+
+### Next prerequisite
+
+Chapter 15 assumes comfort with value versus reference semantics and with the difference between owning and non-owning results. Before continuing, be able to identify what an algorithm returns, which objects own the referenced storage, and when a lazy or vocabulary type must be materialized into an owning value.

@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "L = λ·W is distribution-free: 64 items in flight at 10⁶/s gives W = 64 µs, so the quoted 1 µs cannot be end-to-end. The claim that the numbers are consistent because a batch drains in 64 ns inverts the arithmetic — 64 messages at 1 M msg/s take 64 µs to accumulate, not 64 ns. Little's Law makes no assumption about the arrival distribution at all.",
-      "sourceAnchor": "431-latency-versus-throughput",
+      "sourceAnchor": "431-start-with-a-falsifiable-performance-question",
       "difficulty": "application"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Queueing delay is what couples latency to load, and it grows without bound as utilisation approaches one, so measuring at 50% and at 95% are different experiments with roughly 10× different tails. The 'linear rescaling' answer is the tempting one because it sounds quantitative, but 1/(µ − λ) is strongly nonlinear — that is the entire point of the knee.",
-      "sourceAnchor": "431-latency-versus-throughput",
+      "sourceAnchor": "431-start-with-a-falsifiable-performance-question",
       "difficulty": "recall"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Waiting for all N legs means the observed latency is the maximum of N samples, so the survival probability is 0.99¹⁰⁰ ≈ 0.37 and about 63% of users see the p99 — Dean and Barroso's 'tail at scale' argument. Quoting 1% is the classic error: that is the per-leg rate, and the fan-out is exactly what amplifies it.",
-      "sourceAnchor": "432-tail-latency-percentiles",
+      "sourceAnchor": "434-summarize-distributions-without-erasing-them",
       "difficulty": "application"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Resolving p99.9 means 0.1% of samples sit beyond it, and you want 10–100 of those, so 10⁴–10⁵ samples is the working range; 10⁶–10⁷ is the budget for p99.999. The 10³ answer sounds right because 1000 × 0.1% = 1, but a single sample beyond the boundary is the maximum, not an estimate of anything.",
-      "sourceAnchor": "432-tail-latency-percentiles",
+      "sourceAnchor": "434-summarize-distributions-without-erasing-them",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "0.01% of 1000 is 0.1 samples, so nothing at all populates the tail beyond that quantile and the estimator collapses onto the single worst observation. The 'biased high' answer is tempting because small-sample percentile estimates do misbehave, but the direction is not the issue — the number simply carries no information beyond the max. p99.99 is a perfectly standard reporting point when N supports it.",
-      "sourceAnchor": "432-tail-latency-percentiles",
+      "sourceAnchor": "434-summarize-distributions-without-erasing-them",
       "difficulty": "trap"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The defining mechanism is the feedback loop: because the next request cannot start until the previous one finishes, the requests that a stall would have delayed are never issued, and the tail they would have populated vanishes. Dropping timed-out replies is a different bug that also loses tail data, but coordinated omission needs no drops at all — every sample taken is honest, and it is the samples never taken that lie.",
-      "sourceAnchor": "433-coordinated-omission",
+      "sourceAnchor": "435-warmup-state-and-coordinated-omission",
       "difficulty": "recall"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "At 10 000/s a 100 ms stall should have produced roughly 1000 delayed requests spread from 100 ms down toward 0.1 ms, so the corrected p99.9 lands near 90 ms — about two orders of magnitude above the closed-loop figure. The 'a single event cannot move a percentile' answer states something true of one sample and draws the wrong conclusion: the correction adds a thousand samples, not one.",
-      "sourceAnchor": "433-coordinated-omission",
+      "sourceAnchor": "435-warmup-state-and-coordinated-omission",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The queue is exactly where a stall's backlog accumulates, so starting the clock at dequeue makes every message look fast no matter how long it waited — the same omission as a closed loop, wearing a different costume. Fix by timestamping at the earliest possible point, ideally a NIC hardware receive timestamp. The probe-cost answer names a real effect but it is tens of nanoseconds and symmetric, not the source of a 100× tail error.",
-      "sourceAnchor": "433-coordinated-omission",
+      "sourceAnchor": "435-warmup-state-and-coordinated-omission",
       "difficulty": "trap"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The floating-point-like layout is what buys constant *relative* precision: every magnitude gets the same number of sub-buckets, so 0.1% holds at 1 µs and at 1 s alike. The 'coarser in the tail' answer is the tempting one because pure power-of-two bucketing does degrade that way — but that is exactly the naive design HdrHistogram replaces, and its relative guarantee is uniform across the range.",
-      "sourceAnchor": "434-histograms-and-hdr-histogram",
+      "sourceAnchor": "434-summarize-distributions-without-erasing-them",
       "difficulty": "recall"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A reservoir keeps a bounded random subset, and rare tail samples are precisely the ones most likely to be thrown away or over-weighted, giving unstable p99.9 estimates. Unbounded memory is the opposite of what a reservoir does — that is the failure mode of keeping raw samples. Exact mergeability is a property of same-configuration histograms, which is one of the reasons HdrHistogram is preferred here.",
-      "sourceAnchor": "434-histograms-and-hdr-histogram",
+      "sourceAnchor": "434-summarize-distributions-without-erasing-them",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A quantile is a nonlinear order statistic, so the p99 of a union is not any function of the members' p99s — you need the underlying distributions (ship histograms and recompute). The 51 ms average is the near-universal dashboard bug; the max-of-percentiles answer at least gives a usually-conservative bound but it is a heuristic tracking the worst host, not the true combined value.",
-      "sourceAnchor": "435-correct-quantile-aggregation",
+      "sourceAnchor": "434-summarize-distributions-without-erasing-them",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The distinction is where the quantile is computed: `histogram_quantile()` over `_bucket` series merges counters first and quantises afterward, which is correct, while a summary has already collapsed to quantiles that no longer combine. The 'coarser buckets' answer misses the point — a summary has no buckets to aggregate at all, so it is not a precision problem but a structural one.",
-      "sourceAnchor": "435-correct-quantile-aggregation",
+      "sourceAnchor": "434-summarize-distributions-without-erasing-them",
       "difficulty": "recall"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Google Benchmark chooses an iteration count for a target duration and averages all of it — warmup is *not* excluded, so short benchmarks carry cold caches, cold predictors, and page-fault cost in their mean. The 'discards the first half' answer is what people assume the harness does; assuming it is exactly how cold-start cost silently ends up in the number. Fix by plotting per-iteration time and discarding the prefix explicitly.",
-      "sourceAnchor": "436-benchmark-warmup",
+      "sourceAnchor": "435-warmup-state-and-coordinated-omission",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "SMIs execute in System Management Mode, are not maskable, are not counted as CPU time, and leave no kernel trace — a stall visible in TSC deltas and in nothing else is their signature, and reading MSR 0x34 before and after is the definitive test. THP compaction is a real jitter source of this magnitude but it runs in the kernel and does show up in `/proc/vmstat` and in traces, so 'leaves no kernel trace' is where that reasoning breaks.",
-      "sourceAnchor": "437-outliers-and-jitter-sources",
+      "sourceAnchor": "432-design-the-experiment-before-collecting-data",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "In latency work the outlier *is* the finding: each one names a mechanism you can identify by correlating its timestamp against `/proc/interrupts`, `perf sched`, or C-state residency. The 'drop only 0.1% instead' answer concedes the wrong premise — the problem is not the threshold but the act of discarding. A flight-recorder ring buffer that dumps context on every threshold breach is the production form of doing it right.",
-      "sourceAnchor": "437-outliers-and-jitter-sources",
+      "sourceAnchor": "432-design-the-experiment-before-collecting-data",
       "difficulty": "trap"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Blocked ordering means every slow drift over the session lands entirely on one arm, so the 3% cannot be separated from thermal or fragmentation drift; alternating A/B/A/B and using a paired nonparametric test is the fix. The central-limit answer is the tempting one — averaging does shrink the standard error of the mean — but it does nothing about a systematic between-block bias, which no amount of within-block sampling removes.",
-      "sourceAnchor": "438-benchmark-isolation",
+      "sourceAnchor": "432-design-the-experiment-before-collecting-data",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Alignment and layout effects are real, several-percent, and independent of anything semantic — the Mytkowicz 'Producing Wrong Data Without Doing Anything Obviously Wrong' result — which is why environment size and link order also move results. The PLT explanation is tempting since lazy binding is a genuine measurement hazard, but resolution happens once per symbol at first call, not inside a hot loop, and a never-called function adds no calls at all.",
-      "sourceAnchor": "438-benchmark-isolation",
+      "sourceAnchor": "432-design-the-experiment-before-collecting-data",
       "difficulty": "trap"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`cycles`/`ref-cycles` is a per-interval measurement of actual frequency relative to nominal, and it is what catches thermal throttling, AVX downclocking, and a governor that silently did not apply. The IPC answer inverts the logic: IPC is roughly frequency-independent, which is exactly why it cannot detect a frequency change. `/proc/cpuinfo` is an instantaneous sample taken after the fact, not a measurement of the run.",
-      "sourceAnchor": "439-cpu-affinity-and-frequency-control-for-benchmarks",
+      "sourceAnchor": "432-design-the-experiment-before-collecting-data",
       "difficulty": "application"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "CPU numbering is not topological, and low-numbered logical CPUs are commonly the two hyperthreads of one physical core — the single most frequent pinning mistake. Check `/sys/devices/system/cpu/cpuN/topology/thread_siblings_list` or `lscpu -e` before choosing cores. The NUMA answer describes a real cost but rests on a false premise: nothing guarantees CPUs 0 and 1 are on different nodes, and on many layouts they are on the same one.",
-      "sourceAnchor": "439-cpu-affinity-and-frequency-control-for-benchmarks",
+      "sourceAnchor": "432-design-the-experiment-before-collecting-data",
       "difficulty": "trap"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A page is physically placed on the node of the thread that first *writes* it, not the one that called `malloc`, so a serial init loop puts the whole dataset on one node — the standard STREAM correctness rule is to parallel-initialise with the same decomposition as the compute. The `malloc`-time-placement answer is the common misconception, and its suggested fix makes things worse: `--preferred` falls back silently, turning a controlled experiment into an uncontrolled one.",
-      "sourceAnchor": "4310-numa-aware-benchmarking",
+      "sourceAnchor": "432-design-the-experiment-before-collecting-data",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Neither `DoNotOptimize` nor `ClobberMemory` stops the CPU from having many independent operations in flight, so a 4-cycle-latency unit with 2/cycle throughput measures at throughput speed — feed each iteration's output into the next input to measure latency. The 'DoNotOptimize serialises' answer is the tempting near-miss: it is a *compiler* barrier that forces the value to exist, and it says nothing to the hardware scheduler.",
-      "sourceAnchor": "4311-google-benchmark-barriers",
+      "sourceAnchor": "436-a-compact-measurement-harness",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "When the operation's effect is a store, only the memory clobber makes it observable; `DoNotOptimize` on the destination *pointer* keeps the pointer value alive but leaves the compiler free to conclude the stores through it are dead. The 'opaque library call' answer is false in practice — compilers model `memcpy` as a builtin with known semantics and will happily elide a provably unread copy.",
-      "sourceAnchor": "4311-google-benchmark-barriers",
+      "sourceAnchor": "436-a-compact-measurement-harness",
       "difficulty": "recall"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`RDTSCP` waits for previous instructions to retire but does not stop later ones from hoisting above it, so the trailing `LFENCE` is what closes the region — and the leading `LFENCE` stops the opening read from drifting after work has begun. The all-`RDTSCP` answer is the common near-miss because it gets the retire semantics right and then over-claims the later-instruction half. `CPUID; RDTSC` works but costs 100+ cycles and varies by leaf, which is why `LFENCE` is preferred.",
-      "sourceAnchor": "4312-rdtsc-and-rdtscp-timing",
+      "sourceAnchor": "433-choose-and-validate-the-clock",
       "difficulty": "recall"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A TSC delta converts to *time*, not to core cycles: it ticks at the nominal reference frequency, so 3000 ticks at a 3.0 GHz reference is 1 µs, which at an actual 4.2 GHz is ~4200 cycles. The 'exactly 3000' answer misreads `constant_tsc`, which means constant *despite* P-state changes, not equal to the core clock. If you want core cycles, use the PMU's `CPU_CLK_UNHALTED.THREAD` event instead.",
-      "sourceAnchor": "4312-rdtsc-and-rdtscp-timing",
+      "sourceAnchor": "433-choose-and-validate-the-clock",
       "difficulty": "trap"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Error scales as roughly twice the timer resolution divided by the interval, so 1 ms gives ~5×10⁻⁵ while 200 ms gives ~0.25 ppm; and a single preemption inflates one trial's elapsed time, which a mean absorbs and a median rejects. The `CLOCK_REALTIME` answer inverts the advice — realtime is the clock to *avoid*, since NTP slewing moves its rate by up to 500 ppm.",
-      "sourceAnchor": "4313-tsc-to-time-calibration",
+      "sourceAnchor": "433-choose-and-validate-the-clock",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The distinction is availability versus scheduling: one says the PMU has no such event here, the other says the kernel time-sliced your event set and this one never got a slice. The 'fired zero times' reading is the tempting one, but a genuine zero prints as `0`, not as `<not counted>` — seeing it is a signal to reduce your event count or group events with `{}`.",
-      "sourceAnchor": "4314-perf-stat",
+      "sourceAnchor": "438-hardware-counters-and-linux-perf",
       "difficulty": "recall"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Cycles = instructions / IPC, so halving instructions while IPC goes 3.0 → 2.0 gives 0.5/(2/3) = 0.75 of the original cycles — a 25% improvement. Calling it a regression is the classic mistake of optimising the ratio instead of the wall time; IPC is diagnostic, useful for explaining *why* a number moved, never the objective itself.",
-      "sourceAnchor": "4314-perf-stat",
+      "sourceAnchor": "438-hardware-counters-and-linux-perf",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Forcing every instrumented function to exist as a real call is the decisive distortion: inlining is the optimisation C++ leans on hardest, and disabling it reshapes the program before you measure it. Running on a synthetic CPU is true of Cachegrind and Callgrind specifically but not of instrumentation generally, and aliasing plus blindness to off-CPU time are *sampling's* weaknesses, not instrumentation's.",
-      "sourceAnchor": "4315-perf-record-report-and-annotate",
+      "sourceAnchor": "438-hardware-counters-and-linux-perf",
       "difficulty": "recall"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The concern is aliasing: a sampling rate that shares a period with the timer tick or a 1 kHz poll loop observes the same phase repeatedly and can produce a spectacularly wrong profile, so a prime-ish rate decorrelates them. The overhead answer is quantitatively silly — one extra sample per second is nothing — and 1000 Hz is well inside the default max sample rate.",
-      "sourceAnchor": "4315-perf-record-report-and-annotate",
+      "sourceAnchor": "438-hardware-counters-and-linux-perf",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Flame graphs are aggregate and their x-axis is sorted alphabetically by symbol, not by time, so there is no 'late' region to look at and a rare tail event contributes an invisible sliver of width. The plateau answer also fails on a second count: an ordinary on-CPU flame graph shows no blocked time at all unless you deliberately build the off-CPU variant.",
-      "sourceAnchor": "4316-flame-graphs",
+      "sourceAnchor": "437-profiling-asks-where-experiments-ask-why",
       "difficulty": "trap"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "HITM ('hit modified in another core's cache') events are the hardware signature of a line bouncing between cores, and `perf c2c` aggregates them down to line, offset, and thread pair — it will name the struct field. Raw `cache-misses` will indeed rise, but it is a scalar with no attribution, so it can tell you something is wrong and never what; that is where that inference breaks.",
-      "sourceAnchor": "4317-hardware-performance-counters",
+      "sourceAnchor": "438-hardware-counters-and-linux-perf",
       "difficulty": "recall"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "PEBS has the hardware write the record itself, so on later parts you get the data address, the observed latency, and the cache level that served it — turning 'loads miss' into 'this load misses, from DRAM'. `OFFCORE_RESPONSE` is a genuinely useful event for local/remote breakdown, but it is a counter that aggregates, not a per-load record, so 'for every retired load' is where that option becomes false.",
-      "sourceAnchor": "4317-hardware-performance-counters",
+      "sourceAnchor": "438-hardware-counters-and-linux-perf",
       "difficulty": "application"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "That percentage is the fraction of time the event was actually enabled; the kernel extrapolates each count to full time, so bursty behaviour occurring while an event was descheduled is invisible and then scaled as though absent. Ratios are the worst casualty because numerator and denominator come from disjoint intervals. The 'halves without scaling' answer gets the mechanism backwards — perf does scale, which is precisely why the numbers look plausible and are not.",
-      "sourceAnchor": "4318-pmu-multiplexing-skid-and-sampling-bias",
+      "sourceAnchor": "438-hardware-counters-and-linux-perf",
       "difficulty": "application"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Skid is exactly this signature — the sample lands on the instruction executing when the interrupt is finally taken, which systematically over-attributes to whatever follows a stall rather than to the stall's cause. `cycles:pp` (PEBS) or AMD IBS removes most of it. Taking the branch attribution at face value is the trap: a mispredict is real but costs ~15-20 cycles against an L3 miss's hundreds, so the ranking claimed there is false.",
-      "sourceAnchor": "4318-pmu-multiplexing-skid-and-sampling-bias",
+      "sourceAnchor": "438-hardware-counters-and-linux-perf",
       "difficulty": "trap"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Slot-based accounting is the whole idea: a cycle could naively be counted as both 'stalled on L3' and 'stalled on the divider', and pre-TMA methodology routinely produced attributions summing past 200%. The multiplexing answer is the tempting inversion — TMA needs *several* events simultaneously and is therefore especially exposed to multiplexing, which is why `toplev.py` groups events and runs multiple passes.",
-      "sourceAnchor": "4319-top-down-microarchitecture-analysis",
+      "sourceAnchor": "438-hardware-counters-and-linux-perf",
       "difficulty": "recall"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Following the dominant branch is the point of the hierarchy, and Back-End Bound at 63% splits into Memory Bound (layout, tiling, prefetch) versus Core Bound (dependency chains, divides, port pressure). Attacking the front end first sounds right because the front end precedes the back end in the pipeline, but the slot accounting already tells you only 9% of slots were lost there — fixing all of it caps out at a 9% gain. Retiring under ~50% signals room to improve, not efficiency.",
-      "sourceAnchor": "4319-top-down-microarchitecture-analysis",
+      "sourceAnchor": "438-hardware-counters-and-linux-perf",
       "difficulty": "application"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Cachegrind is a *model* — no prefetcher, no out-of-order execution, no TLB, no store buffers — so it will faithfully count misses the real machine hides, which is why it must never be used to predict runtime. Thread serialisation is a genuine Cachegrind limitation but it hides concurrency effects rather than misattributing counts, and it is irrelevant to a single-threaded layout change. Its value is as a stable, deterministic CI regression number.",
-      "sourceAnchor": "4320-cachegrind-and-callgrind",
+      "sourceAnchor": "4311-skippable-reference-match-the-tool-class-to-the-question",
       "difficulty": "trap"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Same silicon, same counters — the advantage is packaged expertise plus a coherent uncore UI and memory-object attribution that maps misses to allocations rather than instructions. The CI-scripting claim inverts reality: licensing and result-directory friction make VTune *harder* to gate on than `perf stat -r`, and its sampling overhead is comparable to perf's few percent, not near zero.",
-      "sourceAnchor": "4321-intel-vtune",
+      "sourceAnchor": "4311-skippable-reference-match-the-tool-class-to-the-question",
       "difficulty": "recall"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 0,
       "explanation": "DDIO behaviour is an uncore property that per-core counters cannot see, and `pcm-pcie` is built for exactly this — PCIe traffic with DDIO hit/miss accounting. The LIKWID `MEM` group is a real and useful bandwidth view but it aggregates core-side memory traffic and cannot separate DMA writes or say where they landed, which is where that reasoning fails.",
-      "sourceAnchor": "4322-likwid-and-intel-pcm",
+      "sourceAnchor": "4311-skippable-reference-match-the-tool-class-to-the-question",
       "difficulty": "application"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Mean allocation cost is irrelevant here: the one call in ten thousand that takes the `mmap` path costs tens of microseconds, which is invisible in a time-weighted profile and decisive in the tail — so trace the syscall slow paths and assert zero hot-path allocations with a `NoAllocScope`-style hook. The Callgrind answer gives exact *counts*, which is the wrong axis; you already know allocation happens, and what you need is the latency distribution of the rare path.",
-      "sourceAnchor": "4323-allocation-profiling",
+      "sourceAnchor": "437-profiling-asks-where-experiments-ask-why",
       "difficulty": "application"
     },
     {
@@ -572,7 +572,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Access density is DHAT's distinguishing output — 'you allocated 400 MB and read 3% of it' is a conclusion no other tool in the list reaches. Massif and heaptrack are both correctly described and both genuinely useful, but they measure *how much and where from*, not how much of it was ever touched; heaptrack's temporary-allocation view is its actionable metric and is a different question.",
-      "sourceAnchor": "4323-allocation-profiling",
+      "sourceAnchor": "437-profiling-asks-where-experiments-ask-why",
       "difficulty": "recall"
     },
     {
@@ -586,7 +586,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Every waiter blocks for the whole of a rare long hold, so one faulting or allocating critical section produces exactly this fine-mean/awful-tail signature — audit critical sections for syscalls, allocation, and anything that can fault before reaching for a lock-free redesign. Cache-line bouncing is real but it raises the *typical* cost roughly uniformly, so it would move the mean too, which is where that explanation stops fitting the data.",
-      "sourceAnchor": "4324-lock-contention-profiling",
+      "sourceAnchor": "437-profiling-asks-where-experiments-ask-why",
       "difficulty": "application"
     },
     {
@@ -600,7 +600,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Hold time × acquisition rate is the lock's utilisation: 8 µs × 10⁵/s = 0.8, and past roughly 80% the wait-time tail of a single-server queue blows up exactly as it does for any other queue. The 'cannot be derived' answer is tempting because measuring the wait distribution genuinely is what you should do next, but utilisation follows from the two numbers you already have, and it is what predicts the tail.",
-      "sourceAnchor": "4324-lock-contention-profiling",
+      "sourceAnchor": "437-profiling-asks-where-experiments-ask-why",
       "difficulty": "application"
     },
     {
@@ -614,7 +614,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A blocked thread generates no samples at all, so a CPU profiler is structurally silent about the thing causing the delay — scheduler tracing is what closes that blind spot, and runqueue latency is a third category distinct from both on-CPU and blocked. Broken stacks do also produce a useless graph, which makes the DWARF answer tempting, but that yields a *flat* graph while the cores stay busy; here the cores are idle, which points at wall time spent not running.",
-      "sourceAnchor": "4325-off-cpu-profiling",
+      "sourceAnchor": "437-profiling-asks-where-experiments-ask-why",
       "difficulty": "application"
     },
     {
@@ -628,7 +628,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The blocked stack identifies the victim's wait, not the cause — thread A sitting in `futex_wait` says nothing about thread B holding the lock for 40 ms, which is why BCC's `offwaketime`/`wakeuptime` exist to record and join the waker's stack. Reading the 40 ms as the holder's hold time is the tempting inference: A's wait could be the sum of several holds or of scheduling delay after the release.",
-      "sourceAnchor": "4325-off-cpu-profiling",
+      "sourceAnchor": "437-profiling-asks-where-experiments-ask-why",
       "difficulty": "trap"
     },
     {
@@ -642,7 +642,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The fenced pair costs roughly 40–60 cycles and, worse, `LFENCE` prevents the surrounding code from overlapping, so a short region is dominated and distorted by its own probe — the rule of thumb is not to time anything shorter than ~100 cycles this way. The TSC-versus-core-cycles answer invokes a real distinction but pushes it the wrong way: at turbo the core runs *faster* than the reference, so a reference-tick delta corresponds to *more* core cycles, not fewer.",
-      "sourceAnchor": "4326-probe-effects",
+      "sourceAnchor": "436-a-compact-measurement-harness",
       "difficulty": "application"
     }
   ]

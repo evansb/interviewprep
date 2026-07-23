@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Each step discards a whole row of candidates in O(1), and that discard is sound only because the values are ordered: when a[lo]+a[hi] is below target, monotonicity is what proves a[lo] can pair with nothing large enough. The distinct-values claim is the tempting near-miss — duplicates are harmless, because the argument needs ordering, not strictness. Contiguity helps the prefetcher but is not a correctness requirement.",
-      "sourceAnchor": "221-two-pointers",
+      "sourceAnchor": "221-two-pointers--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Floyd's tortoise and hare meet within O(λ+μ) steps, and the head-restart phase then lands on the cycle entry — all in two pointers' worth of space. The hash-set answer is the tempting one because it genuinely detects cycles, but it costs O(n) memory, which is exactly what the constraint forbids. Two pointers moving at the same speed never converge, and comparing only against the head misses any cycle whose entry is not the head itself.",
-      "sourceAnchor": "221-two-pointers",
+      "sourceAnchor": "221-two-pointers--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The amortized O(n) bound comes from lo never moving backward, and that in turn comes from the predicate being monotone in the window. Negatives destroy monotonicity: a shorter window can have a smaller sum, so shrinking is no longer a safe move. The invertibility answer is the tempting one — but sums form a group and subtraction still restores the previous value exactly; invertibility is what breaks for max/min, not for sums.",
-      "sourceAnchor": "222-sliding-windows",
+      "sourceAnchor": "222-sliding-windows--core",
       "difficulty": "application"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Sums form a group with an inverse; maxima form only a semigroup, so once the current maximum leaves the window there is no arithmetic that recovers the runner-up. The O(log k) answer is tempting because a multiset really does cost O(log k) — but that is a different data structure, not the running-scalar scheme described, which is simply wrong rather than slow. Max never overflows and window size has nothing to do with it.",
-      "sourceAnchor": "222-sliding-windows",
+      "sourceAnchor": "222-sliding-windows--core",
       "difficulty": "trap"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With integer division mid < hi always holds and mid + 1 > lo always holds, so each branch shrinks the interval by at least one and the loop must reach lo == hi. The hi = mid - 1 answer is the tempting one because that update appears in the other common convention — but mixing it with `lo < hi` and `hi = mid` is exactly the off-by-one that skips the answer; the loop condition here is strict, not `lo <= hi`.",
-      "sourceAnchor": "223-binary-search",
+      "sourceAnchor": "223-binary-search--core",
       "difficulty": "recall"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The algorithm only needs ForwardIterator, so it compiles and is correct — but reaching each midpoint costs a linear walk, and the total advance work is O(n), which swamps the O(log n) comparisons. The compile-failure answer is the near-miss: people remember that binary search \"needs random access\" and conclude the interface forbids it, when the standard deliberately allows it and merely loses the complexity benefit.",
-      "sourceAnchor": "223-binary-search",
+      "sourceAnchor": "223-binary-search--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Binary search's branch is ~50/50 by construction and each iteration's address depends on the previous comparison, so it is both mispredict-bound and serialized; at 32 elements the whole array is a couple of cache lines and a branchless scan wins outright. The asymptotics answer is the tempting one — O(n) never beats O(log n) asymptotically; the crossover is a constant-factor effect, not a complexity one, which is precisely the point.",
-      "sourceAnchor": "223-binary-search",
+      "sourceAnchor": "223-binary-search--core",
       "difficulty": "trap"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the canonical \"smallest capacity such that X is achievable\" phrasing, which signals binary search on the answer: more capacity never makes delivery infeasible, so the predicate is monotone and one O(n) simulation decides each candidate. The knapsack answer is the tempting one because a capacity appears in the statement, but nothing here is a selection problem — the package order is fixed and every package must ship.",
-      "sourceAnchor": "224-binary-search-on-the-answer",
+      "sourceAnchor": "224-binary-search-on-the-answer--core",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A fixed trip count is deterministic and needs no tolerance: 100 halvings shrink any starting interval below a double's representable resolution, and ~60 is already exact. The absolute-epsilon answer is the tempting one, and it is the classic bug — for bounds around 1e18 the gap 1e-9 is far below one ULP, so the condition can never be satisfied and the loop spins forever. Loosening or widening the comparison does not change that.",
-      "sourceAnchor": "224-binary-search-on-the-answer",
+      "sourceAnchor": "224-binary-search-on-the-answer--core",
       "difficulty": "trap"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Introsort is quicksort with an insertion-sort base case and a heapsort escape hatch at depth 2·log n, which buys a hard worst-case bound while giving up stability. The O(n²) answer is the tempting one because it correctly remembers quicksort's adversarial blow-up — but that is exactly what the depth-triggered heapsort fallback closes off, and it has been a standard requirement since C++11. Stability requires `std::stable_sort`.",
-      "sourceAnchor": "225-sorting-properties-and-tradeoffs",
+      "sourceAnchor": "225-sorting-properties-and-tradeoffs--core",
       "difficulty": "recall"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The Ω(n log n) bound comes from a decision tree with n! leaves, so it constrains only algorithms whose sole primitive is comparison; radix sort reads digits and typically beats `std::sort` by 2-4x on a million 32-bit keys. The \"bound applies to everything\" answer is the standard misconception. Extra scratch space does not escape the bound either — `std::stable_sort` is still a comparison sort, and heapsort's guarantee comes with the worst cache behaviour of the set.",
-      "sourceAnchor": "225-sorting-properties-and-tradeoffs",
+      "sourceAnchor": "225-sorting-properties-and-tradeoffs--core",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Quickselect recurses into only the side containing k, so its expected cost is n + n/2 + n/4 + … = 2n, and a median-of-medians or heapselect fallback protects the worst case. The O(n log k) answer describes `std::partial_sort`, which is the neighbouring algorithm and the easiest confusion. Median of medians is used only as a fallback precisely because its constant is roughly 10-20x quickselect's, never as the primary path.",
-      "sourceAnchor": "226-selection-and-partial-sorting",
+      "sourceAnchor": "226-selection-and-partial-sorting--core",
       "difficulty": "recall"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A p99 is a rank statistic over a distribution, and ranks are not linear, so no combination of per-thread p99s reconstructs the global one — a thread with ten samples and one with ten million contribute incomparable quantiles. The sample-count weighting answer is the most tempting because weighting genuinely fixes averaging *means*; it does nothing for quantiles. Mergeable fixed-bucket histograms are the production answer, at O(1) per sample.",
-      "sourceAnchor": "226-selection-and-partial-sorting",
+      "sourceAnchor": "226-selection-and-partial-sorting--core",
       "difficulty": "trap"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Backtracking mutates one shared structure in place and restores it on exit, so the resident working set is proportional to depth rather than to the number of nodes visited. The pruning answer is the tempting one because pruning is what controls node count in backtracking generally — but the undo is bookkeeping, not pruning; it changes memory, not the number of nodes, and permutation enumeration stays factorial either way.",
-      "sourceAnchor": "227-recursion-and-backtracking",
+      "sourceAnchor": "227-recursion-and-backtracking--core",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "GCC and Clang do perform the transform at -O2, but nothing in the language requires it, and a single local `std::string` whose destructor must run after the call silently disables it — so correctness must never depend on it. The \"catchable as an exception\" answer is the dangerous misconception: stack overflow hits the guard page and raises SIGSEGV with no unwinding, no destructors, and no exception to catch.",
-      "sourceAnchor": "227-recursion-and-backtracking",
+      "sourceAnchor": "227-recursion-and-backtracking--core",
       "difficulty": "trap"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With a = 2 and b = 2, n^(log_b a) = n, which is exactly the merge cost, so every level does Θ(n) work across log n levels. The leaves-dominate answer is the tempting one because mergesort really does bottom out in n leaves — but case 1 requires f(n) to be polynomially *smaller* than n^(log_b a), and here they are equal, which is what introduces the log factor rather than eliminating it.",
-      "sourceAnchor": "228-divide-and-conquer",
+      "sourceAnchor": "228-divide-and-conquer--core",
       "difficulty": "recall"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Both paradigms decompose into subproblems; the distinguishing property is whether those subproblems reach the same sub-subproblems along multiple paths, which is exactly what turns naive Fibonacci from Θ(n) into Θ(φⁿ). The balanced-split answer is tempting because unbalanced splits are indeed a divide-and-conquer failure mode — but an unbalanced split is still divide and conquer, just a slow one; it never becomes DP.",
-      "sourceAnchor": "228-divide-and-conquer",
+      "sourceAnchor": "228-divide-and-conquer--core",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Optimal substructure lets an optimal answer be assembled from optimal sub-answers, and overlap is what makes storing them worthwhile — without overlap the same recursion is plain divide and conquer and a cache saves nothing. The greedy-choice pairing is the tempting one: that property is precisely what makes a problem greedy rather than DP, which is why fractional knapsack is greedy and 0/1 knapsack is not.",
-      "sourceAnchor": "229-dynamic-programming",
+      "sourceAnchor": "229-dynamic-programming--core",
       "difficulty": "recall"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The rolling array overwrites the previous row in place, so downward iteration guarantees dp[c-w] is still the pre-item value; going upward means dp[c-w] may already have this item folded in, which is exactly the unbounded-knapsack recurrence. The \"nothing changes\" answer is the tempting one because the direction genuinely looks like an arbitrary style choice — interviewers ask precisely because it is not.",
-      "sourceAnchor": "229-dynamic-programming",
+      "sourceAnchor": "229-dynamic-programming--core",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Earliest-finish is the only key with an exchange argument: swapping the earliest-finishing activity into any optimal solution never reduces its size, because it releases the resource no later than whatever it replaced. Shortest-duration is the most seductive alternative and has a small counterexample — one brief activity straddling the boundary between two long ones kills a size-two solution. Earliest-start fails on a single very long first activity.",
-      "sourceAnchor": "2210-greedy-algorithms",
+      "sourceAnchor": "2210-greedy-algorithms--core",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "{1,3,4} making 6 is the minimal counterexample and the one to have ready: greedy commits to the 4 and cannot recover. The \"just add a unit coin\" answer is the most tempting, since a unit coin does guarantee that *some* representation exists — but {1,3,4} already contains a 1 and greedy still loses, so existence and optimality are different claims. Optimality depends on the system being canonical, not on its size or divisibility.",
-      "sourceAnchor": "2210-greedy-algorithms",
+      "sourceAnchor": "2210-greedy-algorithms--core",
       "difficulty": "trap"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Subtracting one flips the lowest set bit to zero and turns every bit below it to one, so the AND clears exactly that bit — iterate while x is nonzero and you get O(popcount) iterations, which is Kernighan's trick and still the right answer for sparse masks without hardware POPCNT. Isolating the lowest set bit is the neighbouring identity `x & (-x)`, which is the easiest of these to swap by mistake.",
-      "sourceAnchor": "2211-bit-manipulation-techniques",
+      "sourceAnchor": "2220-bit-manipulation-techniques--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Shifting by an amount greater than or equal to the operand width is undefined regardless of signedness, and k == 0 walks straight into it — compilers really do miscompile the idiom, which is why C++20 added `std::rotl`. The signedness answer is tempting because signed shifts have their own separate hazards, but they are not what breaks here: the bug is present in the fully unsigned form.",
-      "sourceAnchor": "2211-bit-manipulation-techniques",
+      "sourceAnchor": "2220-bit-manipulation-techniques--deep-dive",
       "difficulty": "trap"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An element that is both older and smaller than the arrival can never again be the window maximum, so back-popping is free amortized work and every index is pushed and popped at most once — O(n). The heap answer is the acceptable second-best in an interview but does not meet the stated bound: a binary heap cannot delete an arbitrary expired element, so it needs lazy deletion and lands at O(n log n).",
-      "sourceAnchor": "2212-monotonic-stacks-and-queues",
+      "sourceAnchor": "2211-monotonic-stacks-and-queues--core",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is an amortization argument, not a per-iteration one: a single arrival can pop many elements, but that work is charged to the pushes that put them there, and there are only n pushes in total. The \"at most one violator\" answer is the tempting misreading — a large arrival can legitimately clear the entire stack in one step, which is why the bound has to be argued globally rather than per element.",
-      "sourceAnchor": "2212-monotonic-stacks-and-queues",
+      "sourceAnchor": "2211-monotonic-stacks-and-queues--core",
       "difficulty": "recall"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The access pattern is all-updates-then-one-read, which is precisely the difference array's shape: each update is two O(1) writes and a single final scan reconstructs everything. The segment tree answer is the tempting one because lazy propagation genuinely handles range addition — but at O(log n) per update, not O(1), and it is not needed at all when no queries are interleaved with the updates.",
-      "sourceAnchor": "2213-prefix-sums",
+      "sourceAnchor": "2212-prefix-sums--core",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Both prefixes carry the rounding error of everything summed before them, and subtracting two huge nearly equal values leaves a result whose magnitude is far smaller than that accumulated error — the correct digits cancel away. The \"subtraction is inexact\" answer is the near-miss: IEEE-754 subtraction is in fact correctly rounded and exact for nearby operands; the error was already present in the two prefixes before the subtraction ran.",
-      "sourceAnchor": "2213-prefix-sums",
+      "sourceAnchor": "2212-prefix-sums--core",
       "difficulty": "trap"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Under [s, e) a meeting ending at time t does not occupy t, so its -1 must land before any +1 at t, and sorting by (x, delta) achieves that since -1 < +1. The \"either order works\" answer has a true premise and a broken inference: the counter does land on the same value after both events, but the maximum is sampled *between* them, so start-first records a phantom overlap of one extra room.",
-      "sourceAnchor": "2214-sweep-line-algorithms",
+      "sourceAnchor": "2218-sweep-line-algorithms--deep-dive",
       "difficulty": "trap"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Both approaches are O(n log n) asymptotically; the difference is entirely locality — the sorted vector streams, and the heap's sift-up/sift-down touch scattered indices with poor prefetch behaviour. The insertion answer is exactly backwards, and that reversal is the point: mid-sweep event generation is the one case that *forces* a heap, which is why Bentley-Ottmann needs a priority queue rather than a presorted vector.",
-      "sourceAnchor": "2214-sweep-line-algorithms",
+      "sourceAnchor": "2218-sweep-line-algorithms--deep-dive",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Overlap is the negation of disjointness, and under the half-open convention disjoint means one interval ends at or before the other begins, which negates to the two strict inequalities. The closed-interval form with `<=` is the tempting near-miss: it reports adjacent intervals such as [0,5) and [5,9) as overlapping, which is exactly the ambiguity half-open notation exists to remove. Containment is a strictly stronger relation than overlap.",
-      "sourceAnchor": "2215-interval-algorithms",
+      "sourceAnchor": "2219-interval-algorithms--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The two algorithms rest on different arguments: merging is a scan that needs candidates to arrive in positional order so an overlap can only be with the current run, while selection's optimality comes from an exchange argument that specifically requires the earliest-finishing choice. The \"same count either way\" answer is the tempting one and is false — one long early-starting interval can swallow two short later ones and cut the count.",
-      "sourceAnchor": "2215-interval-algorithms",
+      "sourceAnchor": "2219-interval-algorithms--deep-dive",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Between a node's first enqueue and its dequeue it carries no mark, so every other neighbour that scans it enqueues it again — on a dense graph the queue can hold a copy per in-edge. The DFS answer is the tempting one because the queue contents genuinely do become disordered, but the frontier is still FIFO and the first dequeue still happens at the correct distance, so the computed distances stay right; what breaks is work and memory.",
-      "sourceAnchor": "2216-breadth-first-and-depth-first-search",
+      "sourceAnchor": "2213-breadth-first-and-depth-first-search--core",
       "difficulty": "trap"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A deque keeps the frontier sorted by distance with only two distinct weights, so the log factor disappears entirely and the traversal is O(V+E). The Dijkstra answer is the tempting one because Dijkstra is correct here — but its optimality claim is false, since 0-1 BFS solves the same problem strictly faster. Plain BFS counts hops and would treat a zero-weight edge as costing one, and zero weights are non-negative, so Dijkstra needs no rescuing.",
-      "sourceAnchor": "2216-breadth-first-and-depth-first-search",
+      "sourceAnchor": "2213-breadth-first-and-depth-first-search--core",
       "difficulty": "application"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The settled-set argument says a node popped with minimum tentative distance can never be improved, which holds only when every remaining path can only add non-negative length. The infinite-loop answer is the tempting one because negative *cycles* really do cause unbounded improvement in other algorithms — but Dijkstra never revisits a settled node, so it terminates normally and just reports wrong distances, which is far worse than crashing.",
-      "sourceAnchor": "2217-shortest-paths",
+      "sourceAnchor": "2214-shortest-paths--core",
       "difficulty": "recall"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Adding any positive weight to INT64_MAX is signed overflow, and the wrapped value compares as less than everything, so unreached nodes get bogus finite distances that then propagate. The \"saturates in practice\" answer is the dangerous one: signed overflow is undefined behaviour, not saturation, and optimizers actively assume it cannot happen — so the observed behaviour can change with flags. Reserving headroom in the sentinel is the standard fix.",
-      "sourceAnchor": "2217-shortest-paths",
+      "sourceAnchor": "2214-shortest-paths--core",
       "difficulty": "application"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Nodes on a cycle mutually keep each other's indegree above zero, so they can never enter the ready queue and the emitted count falls short of V — the count is already being maintained, so the check costs nothing. The \"empty queue with nothing emitted\" answer is the tempting partial truth: it catches a graph that is entirely cyclic, but misses the usual case where a large acyclic portion is emitted first and only a small cycle stalls.",
-      "sourceAnchor": "2218-topological-sorting",
+      "sourceAnchor": "2215-topological-sorting--core",
       "difficulty": "recall"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 0,
       "explanation": "DP over a topological order is the general form of \"DP on DAGs\": when a vertex is processed all its predecessors are final, so shortest *and* longest paths both fall out in linear time with no restriction on edge signs. The NP-hardness answer is the most tempting because longest path genuinely is NP-hard on general graphs — acyclicity is exactly what removes the hardness. Negating weights makes them negative, which is precisely what Dijkstra cannot handle.",
-      "sourceAnchor": "2218-topological-sorting",
+      "sourceAnchor": "2215-topological-sorting--core",
       "difficulty": "application"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Turning transitions into data means every (state, event) pair has an explicit cell, so illegal pairs are marked rather than silently falling through, and the table can be asserted over exhaustively at build time. The O(states) claim is the tempting one — compilers routinely lower a dense `switch` on a small enum to a jump table, so the `switch` is not linear; the real advantage is checkability, not raw dispatch cost.",
-      "sourceAnchor": "2219-finite-state-machines",
+      "sourceAnchor": "2216-finite-state-machines--role-specific",
       "difficulty": "application"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 0,
       "explanation": "On x86-64 Linux plain `char` is signed, so byte 0xFF converts to -1 and `table[-1]` reads memory before the array — a genuine out-of-bounds read on any non-ASCII or adversarial input. The signedness answer stated backwards is the trap: `char` signedness is implementation-defined and is unsigned on ARM, which is exactly why the `uint8_t` cast has to be written explicitly rather than assumed.",
-      "sourceAnchor": "2220-table-driven-parsing",
+      "sourceAnchor": "2217-table-driven-parsing--role-specific",
       "difficulty": "recall"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The table trades a data-dependent branch for a fixed-latency L1 load, which wins on high-entropy input and loses when the predictor already gets the branch right nearly every time or when the table stops fitting in cache — a 100-state by 256-symbol table of `uint32_t` is 100 KB and misses constantly. The small-alphabet answer is the tempting inversion: a compact table is the best case, since a single resident line is what makes the lookup cheap.",
-      "sourceAnchor": "2220-table-driven-parsing",
+      "sourceAnchor": "2217-table-driven-parsing--role-specific",
       "difficulty": "application"
     }
   ]

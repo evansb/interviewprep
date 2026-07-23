@@ -1,906 +1,588 @@
 # Chapter 31 — Processes, Threads and Scheduling
 
-*Interview-focused revision notes. The theme: Linux has one scheduling entity — the task — and everything from `fork` to core isolation is a policy decision about what tasks share, when they run, and who is allowed to take the CPU away from them.*
+## Why this matters
+
+Linux exposes each user thread as a task that the scheduler places and accounts. Everything from `fork` to core isolation becomes a policy decision about what tasks share, when they may run, and what can delay them. For a latency-sensitive service, code execution time is only part of the result: you must also ask what can preempt or block the task, for how long, and how you would know. This chapter ends with the part many treatments skip—verifying that the applied configuration is actually effective.
+
+## 90-second screen — Core
+
+Five facts:
+
+1. Linux schedules tasks. Threads in one process are tasks that deliberately share resources; process and thread are user-space groupings, not two scheduler object types.
+2. `R` means *running or runnable*. Run-queue competition is one component of wakeup latency, not the whole interval.
+3. A context switch has direct kernel work and workload-dependent after-effects from displaced microarchitectural state. Neither has a universal duration.
+4. Fair scheduling targets proportional service over time, not a hard upper bound on runnable waiting.
+5. Real-time policies can take precedence over fair-class work, but add starvation, throttling, inversion, and recovery hazards.
+
+Two decisions:
+
+- For each thread in the system: which core, which policy, and whether it polls or blocks — with a stated reason for each.
+- For the deployment: which cores are isolated, where the displaced kernel work runs, and what measurement proves the isolation is real.
+
+Latency values belong to Chapter 30. NUMA belongs to Chapter 29; virtual memory, page faults, and locking pages to Chapter 32; IPC and signals to Chapter 33; measurement method to Chapter 43; time sources and the wider host-tuning workflow to Chapter 35.
+
+**Claim labels.** POSIX specifies portable process, pthread, and scheduling interfaces but leaves many policy details implementation-defined. C++23 specifies `std::thread`, synchronization, and atomics without Linux task IDs, affinity, scheduler classes, or futexes. Linux user-space APIs are a kernel ABI; `/proc`, `/sys`, tracepoints, scheduler algorithms, kernel configuration, and internal task fields are Linux/version/configuration behavior. A vendor topology or cache-sharing claim is architecture behavior. Keep those layers separate.
 
 ---
 
-## 31.1 Processes and Address Spaces
+## 31.1 Tasks, Sharing, and States — Core
 
-A **process** is the pairing of an *address space* with one or more *threads of execution*, plus a bundle of kernel-managed resources: a file-descriptor table, a signal disposition table, a working directory, credentials, a namespace set, and resource limits.
-
-Linux does not represent this as "process" internally. The kernel's unit is `struct task_struct`, a **task**, and each task holds *pointers* to the resource structures:
+The kernel's unit is `struct task_struct`. It holds pointers to resource structures, and what a task shares determines whether userspace calls it a thread or a process:
 
 ```
 task_struct
- ├── mm_struct*      → address space (page tables, VMAs)     [shared by threads]
- ├── files_struct*   → fd table                              [shared by threads]
- ├── sighand_struct* → signal handlers                       [shared by threads]
- ├── signal_struct*  → per-process signal state, rlimits     [shared by threads]
- ├── fs_struct*      → cwd, root, umask                      [shared by threads]
- ├── nsproxy*        → namespaces
- ├── thread_struct   → saved registers, FPU state            [PRIVATE per task]
- └── kernel stack    → 16 KB on x86-64                       [PRIVATE per task]
+ ├── mm_struct*      → address space          [shared by threads]
+ ├── files_struct*   → descriptor table       [shared by threads]
+ ├── sighand_struct* → signal handlers        [shared by threads]
+ ├── signal_struct*  → process-wide signal state, rlimits  [shared by threads]
+ ├── thread_struct   → saved registers, FPU state          [private]
+ └── kernel stack    → private; size is architecture- and config-dependent
 ```
 
-A **thread** is a task that shares `mm`, `files`, `sighand`, and `signal` with its peers. A **process** is a task that shares none of them. There is no third mechanism — this is the single most important structural fact in this chapter, and §31.6 shows the syscall that expresses it.
+Each task needs a kernel execution stack, but its size and allocation scheme vary with architecture, kernel configuration, and features such as virtually mapped stacks. Do not quote one size as a fact about “Linux.”
 
-Terminology that trips people up:
+At the Linux ABI level, clone-family operations can select which resources a new task shares. The following is **schematic**, not the glibc source or a stable promise that these wrappers make exactly this syscall:
 
-| Term | Meaning |
+```
+fork():            clone-like creation + SIGCHLD           — new process resources
+pthread_create():  clone(CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND
+                       |CLONE_THREAD|CLONE_SETTLS|..., ...) — thread-group sharing
+```
+
+Two consequences follow. There is no separate “thread scheduler”: both kinds of task can be runnable on CPU run queues and each can have affinity and policy attributes. Sharing an address space can reduce some switch work, but the actual cost depends on architecture, address-space tagging, working sets, and mitigations. Containers use namespaces, cgroups, capabilities, and filesystem setup around ordinary tasks; reducing them to one clone flag is misleading.
+
+The naming is genuinely confusing and worth stating once: in a multithreaded Linux process, `getpid()` returns the thread-group ID (TGID), while `gettid()` returns the caller's kernel task ID. `/proc/<tgid>/task/<tid>/` exposes members. Many scheduling APIs select one task when passed a TID, but process-wide tools and library APIs differ; read each interface rather than applying a single PID rule universally.
+
+Choose a process boundary for failure containment, privilege separation, independently replaceable lifecycles, or an explicit IPC contract. Choose threads when direct shared-memory access and a common lifetime are the intended ownership model.
+
+| Decision | Separate processes | Threads in one process |
+|---|---|---|
+| Address isolation | Hardware-enforced mappings and explicit sharing | Same address space; any thread can corrupt shared state |
+| Communication | IPC protocol, handles, copies or shared mappings (Ch. 33) | Ordinary objects plus synchronization |
+| Failure | Many faults/signals stay within one process, subject to supervisor design | A fatal process-wide failure normally ends every thread |
+| Deployment | Can exec/restart/credential-separate components | One image and process-wide resources |
+| Scheduling | Tasks still receive individual policy and affinity | Tasks still receive individual policy and affinity |
+| Cost question | Creation, IPC, mappings, and working sets | Stack/TLS, synchronization, and shared-resource contention |
+
+Neither column is “faster” without a workload. The scheduler sees tasks; the software architecture decides which resources and failures should be shared.
+
+### States, and the two that matter
+
+| Code | Meaning |
 |---|---|
-| **PID** (kernel: TGID) | Thread *group* ID — what userspace calls "the process ID". `getpid()` returns this. |
-| **TID** (kernel: PID) | The per-task ID. `gettid()` returns this. For the main thread, TID == TGID. |
-| **PPID** | Parent's TGID. |
-| **PGID** | Process group ID (§31.7). |
-| **SID** | Session ID (§31.7). |
+| `R` | Running **or runnable** — on a run queue |
+| `S` | Interruptible sleep — the normal blocked state |
+| `D` | Uninterruptible sleep — typically I/O or a kernel lock |
+| `T` / `t` | Stopped by a signal / by a debugger |
+| `Z` | Terminated, exit status not yet reaped |
 
-The confusion is real and historical: the kernel's `pid` field is what POSIX calls a TID, and the kernel's `tgid` is what POSIX calls a PID. `/proc/<tgid>/task/<tid>/` is the directory structure that exposes it, and `perf`, `gdb`, and `top -H` all switch between the two views.
+**`R` is the trap.** If more tasks are runnable than eligible CPUs can execute, some wait. That queueing delay contributes to the wake-to-run interval in §31.4. Linux load average includes runnable tasks and tasks in uninterruptible sleep, which is why heavy I/O can raise load while CPUs are not saturated.
 
-### The address space
+**`D` is diagnostic evidence.** Signals may remain pending while a task is in an uninterruptible wait; the task normally acts on them only after the wait completes. With sufficient permission, `/proc/<pid>/stack` may show the kernel wait site. Persistent `D` points investigation toward I/O or a kernel wait, not toward scheduler priority.
 
-Every process gets a private virtual address space (Ch. 32 §32.1–§32.2). On x86-64 with 4-level paging, user space is the low 128 TiB (`0x0000_0000_0000_0000`–`0x0000_7fff_ffff_ffff`) and the kernel occupies the top half; with 5-level paging (LA57) user space extends to 128 PiB but only for mappings explicitly requested above `0x7fff_ffff_ffff`, precisely so that programs that stuff tag bits into high pointer bits (Ch. 3 §3.10) don't break.
-
-**Why address-space isolation costs something:** switching between processes requires reloading `CR3`, which invalidates TLB entries unless **PCID** (process-context identifiers) is in use. With PCID, the CPU tags TLB entries with a 12-bit context ID and can keep entries from several address spaces resident, turning a process switch from "flush the TLB" into "change the tag". Linux uses PCID on all modern x86-64. Thread switches within a process don't touch `CR3` at all, which is a large part of why they're cheaper (§31.13).
+For latency work the states matter less than the transitions: how long from wakeup to executing, and how often you leave `Running` involuntarily.
 
 ---
 
-## 31.2 Process States
+## 31.2 Context Switches — Core
 
-Linux task states, as reported in `/proc/<pid>/stat` and by `ps`:
+A context switch replaces the running task on a CPU. Distinguish it from a privilege transition: a syscall can enter and leave the kernel without selecting another task. Either can trigger additional work, and their costs must be taken from a named platform and workload (Chs. 30 and 34).
 
-| Code | Kernel name | Meaning |
-|---|---|---|
-| `R` | `TASK_RUNNING` | Running **or runnable** — on a run queue. `ps` does not distinguish. |
-| `S` | `TASK_INTERRUPTIBLE` | Sleeping, will wake on signal or event. The normal blocked state. |
-| `D` | `TASK_UNINTERRUPTIBLE` | Sleeping, **will not wake for signals**. Typically blocked in I/O or on a kernel mutex. |
-| `T` | `TASK_STOPPED` | Stopped by `SIGSTOP`/`SIGTSTP`. |
-| `t` | `TASK_TRACED` | Stopped by a debugger. |
-| `Z` | `EXIT_ZOMBIE` | Terminated, exit status not yet reaped (§31.5). |
-| `X` | `EXIT_DEAD` | Being torn down; never observable. |
-| `I` | `TASK_IDLE` | Idle kernel thread; `TASK_UNINTERRUPTIBLE` but excluded from load average. |
+Conceptually: enter scheduler context, account the outgoing task, choose an eligible task, change architectural execution context, switch address-space state when required, and resume. Exactly which registers are saved eagerly, how translation tags are used, and what mitigations run are architecture/kernel details.
 
-```
-        ┌──────────┐  schedule in   ┌─────────┐
-        │ Runnable │ ─────────────▶ │ Running │
-        │   (R)    │ ◀───────────── │   (R)   │
-        └──────────┘  preempted     └─────────┘
-             ▲                          │ blocks
-             │ wakeup (event, signal)   ▼
-        ┌────┴───────────────────────────────┐
-        │  Sleeping: S (interruptible)       │
-        │            D (uninterruptible)     │
-        └────────────────────────────────────┘
-                                        │ exit()
-                                        ▼
-                                   Zombie (Z) ── reaped ──▶ gone
-```
-
-**`R` is the trap.** It means *runnable*, not *on a CPU*. A machine with 200 tasks in `R` on 16 cores has 184 tasks waiting, and that queueing delay is the wakeup latency of §31.16. The Linux **load average** is the exponentially-decayed count of tasks in `R` *plus* `D` — the inclusion of `D` is why heavy disk I/O inflates load average without consuming CPU, and it's a favourite interview question.
-
-**`D` state is the diagnostic signature of blocked I/O or a stuck kernel lock.** A task in `D` cannot be killed, not even with `SIGKILL`, because signal delivery requires the task to reach a signal check point and an uninterruptible sleep never does. `cat /proc/<pid>/stack` or `echo w > /proc/sysrq-trigger` (which dumps blocked-task stacks) tells you where. Persistent `D` on a trading host usually means an NFS mount, a failing disk, or a kernel-mutex convoy — none of which your process can recover from.
-
-For latency work, the states you care about are the *transitions*: how long between `wakeup` and `Running` (§31.16), and how often you involuntarily leave `Running`. `perf stat` gives `context-switches` split by voluntary (`nvcsw`/`nivcsw` in `/proc/<pid>/status`); a busy-polling thread should show ~zero involuntary switches.
-
----
-
-## 31.3 `fork` and Copy-on-Write
-
-`fork()` creates a new process that is a near-duplicate of the caller: same memory contents, same open descriptors (sharing file *descriptions*, hence a shared file offset), same signal dispositions. It returns 0 in the child and the child's PID in the parent.
-
-Naïvely this means copying the entire address space. **Copy-on-write (COW)** avoids that:
-
-1. The kernel allocates a new `mm_struct` and copies the **VMA list** (the map of regions) and the **page tables**.
-2. Every writable private page-table entry in *both* parent and child is marked **read-only**, and the underlying `struct page` refcount is incremented.
-3. Execution resumes. The first *write* to such a page traps as a protection fault; the kernel sees the VMA is writable but the PTE is not and the page is shared, allocates a fresh page, copies 4 KiB, and remaps it writable in the faulting process (Ch. 32 §32.6).
-
-```
-before fork:      parent PTE ──▶ page P (rw)
-after fork:       parent PTE ──▶ page P (ro)   refcount 2
-                  child  PTE ──▶ page P (ro)
-after child write: child PTE ──▶ page P' (rw)  ← 1.5–3 µs fault + copy
-```
-
-**Costs, with numbers.** `fork()` itself is O(mapped pages) because the page tables must be copied, not O(1): a process with 1 GiB resident in 4 KiB pages has ~262,000 PTEs across ~512 PMD pages, and `fork` runs 300 µs–2 ms. Huge pages help enormously (one PMD entry per 2 MiB). Each subsequent COW fault costs 1.5–3 µs. A parent that forks while holding a 100 GiB heap can stall for hundreds of milliseconds.
-
-**Latency implications that matter in interviews:**
-
-- **`fork` in a latency-sensitive process is forbidden.** Not only does it stall, it also marks the parent's own pages read-only, so the parent then takes COW faults on its own hot data — the stall lands on the *parent's* critical path after `fork` returns.
-- **`fork` in a multithreaded process only clones the calling thread.** All other threads vanish in the child. If any of them held a `malloc` lock or a `std::mutex`, the child inherits it *locked forever*. This is why POSIX says the child may call only async-signal-safe functions before `exec` (Ch. 33 §31.15 and Ch. 33 §33.15). `pthread_atfork` handlers are a partial mitigation and are widely considered unfixable in general.
-- **`vfork()`** suspends the parent and shares its address space until the child `exec`s or `_exit`s — no page-table copy at all. Dangerous and largely superseded by **`posix_spawn`**, which uses `CLONE_VFORK|CLONE_VM` internally and is the correct way to launch a child from a latency-sensitive process.
-- **Huge pages and `fork` interact badly**: a COW fault on a 2 MiB THP copies 2 MiB (~50–100 µs) or splits the huge page. `MADV_DONTFORK` on large data regions avoids both.
-
-`getrusage`/`/proc/<pid>/stat` fields `min_flt` (minor faults) count COW faults; a spike after `fork` is the signature.
-
----
-
-## 31.4 `exec` and Process Replacement
-
-`execve(path, argv, envp)` **replaces** the current process image. It does not create a process; the PID, PPID, PGID, SID, and (mostly) the open descriptors survive.
-
-What happens:
-
-1. The kernel parses the file header (ELF, or `#!` interpreter, or a registered `binfmt_misc` handler).
-2. The **entire address space is torn down** and a new one built: new VMAs for the text (file-backed, read-only, executable), data, BSS, stack, and the ELF interpreter `ld.so`.
-3. Signal *handlers* are reset to default (there is no code left to run them); signal *masks* and pending signals are preserved. Ignored signals stay ignored.
-4. Descriptors with `FD_CLOEXEC` are closed; the rest survive. **This is the mechanism behind shell redirection**: `fork`, rearrange descriptors with `dup2`, then `exec`.
-5. Threads other than the caller are terminated. Memory locks (`mlock`), timers, and `MAP_SHARED` mappings are dropped.
-6. Setuid/setgid bits on the binary change credentials here — the only place they can.
-7. Control transfers to `ld.so`, which maps shared libraries, performs relocations (Ch. 41 §41.13), and jumps to `_start`.
-
-**The `FD_CLOEXEC` race.** `open()` followed by `fcntl(F_SETFD, FD_CLOEXEC)` is not atomic: another thread forking in between leaks the descriptor to the child. Every descriptor-creating syscall therefore has an atomic variant — `open(O_CLOEXEC)`, `socket(SOCK_CLOEXEC)`, `pipe2(O_CLOEXEC)`, `accept4(SOCK_CLOEXEC)`, `epoll_create1(EPOLL_CLOEXEC)`. **Always use them.** Descriptor leaks into children are both a resource leak and a security issue (a leaked listening socket lets a child hold a port open after the parent restarts).
-
-**Cost.** A bare `fork`+`exec` of a small dynamically linked binary is ~1–3 ms wall time, dominated by `ld.so` relocation and page faults on first touch, not by the syscalls. Static linking, prelinking, or `-Wl,-z,now` with `BIND_NOW` changes the distribution (all relocation up front rather than lazily via the PLT). For a latency-sensitive service, launch every child process at startup, never on the hot path.
-
-`strace -f -e trace=execve,clone` shows the sequence; `LD_DEBUG=statistics` quantifies the dynamic-linking share.
-
----
-
-## 31.5 Process Reaping, Zombies and Orphans
-
-When a process terminates, the kernel frees its memory and descriptors immediately but **retains the `task_struct` and exit status** until the parent collects it. That retained shell is a **zombie** (`Z`). It consumes no memory beyond the task struct but does consume a PID.
-
-```c
-pid_t pid = fork();
-if (pid == 0) { _exit(0); }
-// parent never calls wait() → child is a zombie until the parent dies
-```
-
-**Reaping** is `wait()`, `waitpid()`, `wait4()`, or `waitid()`. `waitid(P_PID, pid, &info, WEXITED|WNOWAIT)` is the precise modern form — it can peek without consuming.
-
-| Situation | Outcome |
+| Cost component | Character |
 |---|---|
-| Parent calls `wait*` | Zombie reaped, status delivered |
-| Parent ignores `SIGCHLD` (`SIG_IGN` explicitly) | Kernel auto-reaps; **`wait` then fails with `ECHILD`** |
-| Parent sets `SA_NOCLDWAIT` | Same auto-reap behaviour |
-| Parent exits first | Child is **orphaned**, reparented to `init`/`systemd` (or the nearest **subreaper**), which reaps it |
-| Parent alive but never reaps | Zombies accumulate until the PID limit (`/proc/sys/kernel/pid_max`, default 4194304 on 64-bit) |
+| Direct scheduler work | Save/select/restore plus accounting and mitigation work |
+| Address-space change | Architecture- and tagging-dependent translation effects |
+| Extended register state | Depends on ISA, kernel strategy, and state used by the task |
+| Cache, TLB, and predictor displacement | Workload-dependent degraded execution after resumption |
+| Migration | Different caches and possibly different memory locality (Ch. 29) |
 
-A **child subreaper** (`prctl(PR_SET_CHILD_SUBREAPER, 1)`) makes a process the reparenting target for its descendants instead of PID 1 — this is how `systemd` user sessions and container supervisors track process trees. It's the correct answer to "how does a supervisor know when a double-forked daemon dies?"
+**Voluntary versus involuntary** is the distinction that turns this into a diagnostic:
 
-**`SIGCHLD` handling correctly** is a classic bug source. Signals do not queue: three children exiting while your handler runs may produce one `SIGCHLD`. The handler must loop:
+- *Voluntary*: the task blocked. It had nothing to do.
+- *Involuntary*: the scheduler preempted it mid-work. This is the one that costs you.
 
-```c
-void sigchld(int) {
-    int saved = errno;                       // handlers must preserve errno
-    while (waitpid(-1, nullptr, WNOHANG) > 0) {}
-    errno = saved;
-}
+```bash
+$ grep ctxt /proc/<pid>/status          # voluntary_ctxt_switches / nonvoluntary_ctxt_switches
+$ perf stat -e context-switches,cpu-migrations -p <pid>
+$ perf sched record -- sleep 5 && perf sched latency --sort max
 ```
-`WNOHANG` plus the loop is mandatory. `signalfd` or `SIGCHLD` via a self-pipe integrates this into an event loop without async-signal-safety constraints (Ch. 33 §33.9).
 
-**Diagnostics.** `ps -eo pid,stat,comm | grep ' Z'` finds zombies; `ps -ef --forest` shows reparenting. A process with hundreds of zombies has a missing `wait` loop, and the failure mode is eventual PID exhaustion producing `EAGAIN` from `fork` — which looks like a memory problem and isn't.
+For a continuously runnable, dedicated hot-path thread, a growing involuntary-switch count is a useful alarm. It means another schedulable task, policy action, throttle, or explicit control operation displaced it. Interrupt handlers can delay a task without causing a task-to-task context switch, so a zero counter does not prove an undisturbed CPU.
+
+One subtlety: with SMT enabled, your thread does not need to be switched out to be slowed down. The sibling competes for the same private cache and execution ports continuously (Ch. 27), and no context-switch counter will show it.
 
 ---
 
-## 31.6 Linux `clone` and Task Sharing
+## 31.3 Scheduling Classes — Core
 
-`clone()` is the primitive; `fork`, `vfork`, and `pthread_create` are all thin wrappers over it. Its power is the flags word, which selects **which resources the new task shares** with the caller.
-
-| Flag | Effect when set |
-|---|---|
-| `CLONE_VM` | Share the address space (`mm_struct`) |
-| `CLONE_FS` | Share cwd, root, umask |
-| `CLONE_FILES` | Share the descriptor table |
-| `CLONE_SIGHAND` | Share signal handlers (requires `CLONE_VM`) |
-| `CLONE_THREAD` | Join the same thread group — same TGID, shared signal delivery, no `SIGCHLD` to parent |
-| `CLONE_SETTLS` | Set the new task's TLS base (`FS_BASE` on x86-64) |
-| `CLONE_PARENT_SETTID` / `CLONE_CHILD_CLEARTID` | Write the TID into a supplied address / clear it and `FUTEX_WAKE` on exit |
-| `CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWNET`, … | New namespaces — the container primitive |
-| `CLONE_IO` | Share the I/O scheduler context |
-
-The two canonical combinations:
+Linux maintains per-CPU scheduling state and balances eligible tasks across topology domains. Internally, mainline kernels consult scheduling classes in an order broadly represented as:
 
 ```
-fork():            clone(SIGCHLD, ...)                      — shares nothing
-pthread_create():  clone(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND
-                       | CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS
-                       | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID, ...)
+stop class      (special stop-machine/CPU control work)
+ → deadline class  (SCHED_DEADLINE)
+ → real-time class (SCHED_FIFO, SCHED_RR: static priorities 1–99)
+ → fair class      (SCHED_OTHER / SCHED_BATCH / SCHED_IDLE)
+ → idle class
 ```
 
-**"A thread and a process are the same thing to the Linux scheduler"** is the sentence to have ready. Both are `task_struct`s on a run queue; the scheduler doesn't know or care which resources they share, except that switching between tasks sharing an `mm` skips the `CR3` reload.
+This is an internal Linux ordering, not a POSIX priority scale. Stopper work, interrupts, non-preemptible regions, and firmware activity are outside the simple “my numeric priority is larger” model. The policy and priority of visible per-CPU kernel threads can vary by kernel configuration and real-time patch level; do not memorize a migration-thread priority.
 
-`CLONE_CHILD_CLEARTID` is the mechanism behind `pthread_join`: the kernel clears a word in the thread's TLS on exit and issues a `FUTEX_WAKE` on it, so `join` is just a futex wait (Ch. 33 §33.7) — no polling, no signal.
+Each runnable task has an eligibility mask. Wake placement chooses an allowed run queue; periodic and idle balancing may migrate eligible tasks across **scheduling domains** that reflect topology. The scheduler weighs load, capacity, locality, and energy using an implementation that changes across kernels and hardware classes. Migration is therefore neither random nor forbidden by “last ran on CPU 4.” Affinity and cpusets constrain the candidate set; isolation can remove CPUs from ordinary balancing; neither stops all kernel execution on those CPUs.
 
-`clone3()` (kernel 5.3+) replaces the flag-argument mess with a versioned struct and adds `CLONE_INTO_CGROUP` and explicit stack size. Container runtimes use it.
+### Fair scheduling
 
-**Where this shows up in interviews:** explaining that Linux has no separate thread scheduler, that namespaces are just more `clone` flags (so a container is a process with an unusual flag set, not a virtual machine), and that `CLONE_VM` without `CLONE_THREAD` gives you the strange middle ground of two "processes" sharing memory — which is exactly what `vfork` and some sandboxes use.
+The default policy distributes CPU proportionally to weight, derived from nice value. Two implementations exist in kernels you will meet, and the details are version-gated:
 
----
+- The classic CFS model tracks weighted virtual runtime and favors tasks that have received less service relative to their weight.
+- Mainline Linux began transitioning the fair class to EEVDF in 6.6. EEVDF reasons about lag, eligibility, and virtual deadlines while retaining weighted-fairness goals.
 
-## 31.7 Process Groups, Sessions and Daemons
+This is explicitly **versioned Linux behavior**. Vendor kernels backport scheduler changes, exposed tunables change, and documentation describes a moving implementation. Record the kernel build and inspect the interfaces it actually exports before using advice for CFS or EEVDF. Nice values remain relative weights; they are not deadlines, fixed percentages, or real-time priorities.
 
-These exist for **job control** and **terminal signal delivery**, and they matter operationally even in headless services.
+Two mechanisms attached to fair scheduling cause more production tail latency than the policy itself:
 
-- A **process group** is a set of processes that receive terminal-generated signals together. `Ctrl-C` sends `SIGINT` to the *foreground process group* of the terminal, not to one process. `kill(-pgid, sig)` targets a group.
-- A **session** is a set of process groups sharing a **controlling terminal**. Each session has one leader (the process whose PID == SID). Exactly one process group in the session is the foreground group.
-- **`SIGHUP`** is sent to the foreground group when the controlling terminal is lost, and to a session's members when the leader exits. This is why background jobs die when an SSH connection drops, and why `nohup`, `setsid`, and `disown` exist.
+- **cgroup CPU bandwidth.** On cgroup v2, `cpu.max` expresses quota and period. Exhausting the group's available runtime delays further service until replenishment. Inspect the documented fields in `cpu.stat`; field names and accounting detail are kernel-version facts. Aggregate host utilization can hide this local throttling.
+- **Hierarchical grouping and autogrouping** can make a task's nice change behave differently from a naive global-share calculation.
 
-```
-Session (SID=100, controlling tty /dev/pts/3)
- ├── Process group 100 (leader: shell)         ← background
- ├── Process group 105 (foreground)  ← gets SIGINT/SIGTSTP/SIGHUP from tty
- └── Process group 110                          ← background; SIGTTIN if it reads the tty
-```
+**The conclusion that matters:** fair scheduling pursues weighted fairness, not a hard wakeup deadline. Runnable competitors, grouping, migration, and throttling can create tails well beyond a task's ordinary slice behavior. That is why policy must follow a stated service objective rather than a nice-value slogan.
 
-Background processes that *read* from the terminal get `SIGTTIN`; those that write get `SIGTTOU` if `TOSTOP` is set. Both stop the process — an obscure but real cause of a "hung" background service.
-
-### The classic daemonization sequence
-
-```
-1. fork(); parent _exit()          → child is not a process-group leader
-2. setsid()                        → new session + new group, NO controlling terminal
-3. fork() again; parent _exit()    → child cannot ever acquire a controlling tty
-4. chdir("/")                      → don't hold a mount busy
-5. umask(0)
-6. close/redirect fds 0,1,2 to /dev/null
-7. optionally write a pidfile, install signal handlers
-```
-
-Step 3 is the one candidates omit: only a session leader can acquire a controlling terminal, so forking a second time and letting the leader exit permanently forecloses it. The double-fork also orphans the daemon so `init` reaps it (§31.5).
-
-**Modern practice inverts all of this.** Under `systemd`, `Type=simple` services should **not** daemonize: staying in the foreground lets the supervisor track the main PID directly, capture stdout/stderr into the journal, apply cgroup limits, and restart deterministically. Daemonizing under a supervisor is an anti-pattern that breaks PID tracking. Knowing both the classic sequence *and* why it's obsolete is the complete answer.
-
-For trading systems, the operational point is that the service must survive terminal loss and must not be in the foreground group of anything interactive — `systemd`, `KillMode=`, and cgroup membership (Ch. 35 §35.20) are what actually control lifecycle.
-
----
-
-## 31.8 Kernel and User Threads
-
-**Kernel threads** are tasks with no user address space (`mm == NULL`); they run only in kernel mode and borrow the previous task's page tables ("lazy TLB" mode). They appear in `ps` in square brackets: `[kworker/2:1]`, `[ksoftirqd/0]`, `[rcu_sched]`, `[migration/4]`, `[kswapd0]`.
-
-These matter enormously for latency, because they are the tasks that will preempt yours:
-
-| Kernel thread | What it does | Latency risk |
-|---|---|---|
-| `ksoftirqd/N` | Deferred softirq processing when the softirq load is high | Network RX offload can preempt your polling thread |
-| `kworker/N:M` | Generic deferred work (workqueues) | Unbounded; can run anything |
-| `migration/N` | Stop-machine, CPU hotplug, task migration | `SCHED_FIFO` priority 99 — preempts *everything* |
-| `rcu_sched`, `rcuc/N` | RCU grace-period processing | Offloadable to housekeeping CPUs (`rcu_nocbs`) |
-| `kswapd0` | Page reclaim | Can stall allocations for milliseconds |
-| `khugepaged` | THP collection/compaction | Notorious source of multi-ms stalls (Ch. 32 §32.11) |
-| `watchdog/N` | Hard/soft lockup detector | Small periodic wakeup; disable on isolated cores |
-
-**Threading models** — historical but still asked:
-
-| Model | Description | Where seen |
-|---|---|---|
-| **1:1** | One kernel task per user thread | Linux NPTL, Windows, macOS |
-| **N:1** | Many user threads multiplexed onto one kernel thread by a userspace scheduler | Old GNU Pth, green threads. A blocking syscall blocks everyone; no multicore. |
-| **M:N** | M user threads over N kernel threads | Solaris LWPs, old FreeBSD KSE, Go's goroutines, Java's virtual threads |
-
-Linux chose 1:1 deliberately: the scheduler is fast enough, blocking syscalls stay simple, and debugging/profiling tools see real tasks. M:N gets you cheap creation (goroutines ~2 KB stack, ~200 ns to spawn) and cheap switching (~50–100 ns, just a register swap in user space) at the cost of needing every blocking operation to be intercepted. §31.12 covers the user-space half of this.
-
----
-
-## 31.9 Linux NPTL
-
-**NPTL** (Native POSIX Thread Library, Drepper & Molnar, glibc 2.3.2, 2003) is the current Linux threading implementation, replacing **LinuxThreads**, whose defects define what NPTL had to fix:
-
-| LinuxThreads problem | NPTL fix |
-|---|---|
-| Each thread had a distinct PID; `getpid()` differed per thread | `CLONE_THREAD` gives one TGID for all threads |
-| A dedicated "manager thread" serialized creation and cleanup | Kernel handles it via `CLONE_CHILD_CLEARTID` |
-| Signals were per-thread only; process-directed signals didn't work | Kernel-level thread groups deliver process-directed signals to any eligible thread |
-| Synchronization used signals — slow and racy | **Futexes** (Ch. 33 §33.7): no syscall in the uncontended case |
-| 8192-thread limit | Limited only by memory and `threads-max` |
-| `exec` from a non-main thread was broken | Correct |
-
-**The futex is the central idea.** A `pthread_mutex_t` is a word in user memory. Locking is a `cmpxchg`; if it succeeds (uncontended) *no syscall occurs* — that's the 15–25 ns figure from Ch. 30 §30.2. Only on contention does the thread call `futex(FUTEX_WAIT)` and pay ~2–8 µs. Everything NPTL exposes — mutexes, condition variables, barriers, semaphores, `pthread_join`, `pthread_once` — is built on this pattern.
-
-NPTL details worth knowing:
-
-- **TLS** (`__thread`, C++ `thread_local`) is implemented with a per-thread block reached via `%fs` on x86-64 (`tpidr_el0` on AArch64). Access to a static-TLS variable in the main executable is a single `mov %fs:offset` — as cheap as a global. Access from a `dlopen`ed shared library uses the **general dynamic** TLS model and calls `__tls_get_addr`, which is 5–20× slower. `-ftls-model=initial-exec` on hot libraries fixes it; `local-exec` is fastest but only valid in the executable.
-- **Thread-local destructors** for C++ objects run at thread exit via `__cxa_thread_atexit`, which can resurrect surprising ordering problems at shutdown.
-- **`pthread_cancel`** is implemented by sending a real signal (`SIGRTMIN`) and unwinding the stack — it interacts with C++ destructors through forced unwinding, and in practice is unusable in C++. Use a `std::stop_token` (Ch. 24 §24.1) instead.
-- **`set_robust_list`** supports robust mutexes: if a thread dies holding one, the kernel marks it `EOWNERDEAD` for the next acquirer. This is the only sane basis for process-shared mutexes (Ch. 33 §33.5).
-
----
-
-## 31.10 Pthreads
-
-The POSIX threads API, which `std::thread` is implemented over on Linux. Interviews use it to test whether you know what the C++ abstraction hides.
-
-| POSIX | C++ equivalent | Gap |
-|---|---|---|
-| `pthread_create` | `std::thread` ctor | C++ has no attribute object — no stack size, no scheduling policy, no affinity at creation |
-| `pthread_join` | `std::thread::join` | Same |
-| `pthread_detach` | `std::thread::detach` | Same |
-| `pthread_mutex_t` | `std::mutex` | POSIX has types: `NORMAL`, `ERRORCHECK`, `RECURSIVE`, `ADAPTIVE`, plus `PTHREAD_PRIO_INHERIT` and `PROCESS_SHARED` — **C++ exposes none of these** |
-| `pthread_cond_t` | `std::condition_variable` | POSIX lets you choose the clock (`pthread_condattr_setclock(CLOCK_MONOTONIC)`); C++ `wait_until` on `steady_clock` may still convert to realtime internally |
-| `pthread_rwlock_t` | `std::shared_mutex` | POSIX exposes reader/writer preference |
-| `pthread_key_t` | `thread_local` | `thread_local` is faster and typed |
-| `pthread_setaffinity_np` | — | **No C++ equivalent**; `native_handle()` is the escape hatch |
-| `pthread_setschedparam` | — | Same |
-| `pthread_barrier_t` | `std::barrier` | C++20 version has a completion function |
-
-**The three attributes you must set manually for low latency**, none of which C++ exposes:
-
-```cpp
-pthread_attr_t attr;
-pthread_attr_init(&attr);
-pthread_attr_setstacksize(&attr, 1 << 20);            // §31.11
-cpu_set_t set; CPU_ZERO(&set); CPU_SET(7, &set);
-pthread_attr_setaffinity_np(&attr, sizeof set, &set);  // §31.17
-pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
-sched_param sp{ .sched_priority = 50 };
-pthread_attr_setschedparam(&attr, &sp);
-pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);  // ← easy to forget
-pthread_create(&tid, &attr, fn, arg);
-```
-
-`PTHREAD_EXPLICIT_SCHED` is the classic gotcha: the default is `PTHREAD_INHERIT_SCHED`, so your carefully specified policy and priority are silently ignored and the thread inherits the creator's. Candidates who name this have used the API.
-
-With `std::thread`, the equivalent is to set affinity/policy from *inside* the thread function (`sched_setaffinity(0, ...)`, `pthread_setschedparam(pthread_self(), ...)`) or via `native_handle()`. Setting it from inside means the thread runs briefly on the wrong CPU and may allocate its first-touch pages on the wrong NUMA node (Ch. 32 §32.26) — pin before touching memory.
-
-**`PTHREAD_PRIO_INHERIT`** is the mutex attribute that enables priority inheritance and is the standard mitigation for priority inversion (Ch. 24 §24.18, §31.22). `std::mutex` cannot do it. That alone justifies dropping to pthreads in a real-time process.
-
----
-
-## 31.11 Thread Stacks and Guard Pages
-
-Each thread needs its own stack. The main thread's stack is created by the kernel at `exec` and **grows dynamically** (Ch. 32 §32.21) up to `RLIMIT_STACK` (default 8 MiB). Non-main thread stacks are **fixed-size `mmap` regions** allocated by pthreads — they never grow.
-
-```
-default pthread stack = RLIMIT_STACK (8 MiB), capped; overridable per-attr
-layout:  [guard page(s)] [ ......... stack, grows down ......... ] [TLS block][pthread struct]
-              PROT_NONE                                              at the top
-```
-
-**Guard pages** are `PROT_NONE` mappings placed at the low end of each thread stack. Overflowing into one raises `SIGSEGV` instead of silently corrupting the adjacent mapping. Size is one page by default (`pthread_attr_setguardsize`); the kernel's main-thread `stack_guard_gap` is 256 pages (1 MiB) since the 2017 Stack Clash work.
-
-**Guard pages are not sufficient.** A function with a large local array can skip *past* the guard page in a single `sub %rsp, N` and write into whatever is below:
-
-```cpp
-void f() { char buf[65536]; buf[0] = 1; }   // may jump the 4 KiB guard entirely
-```
-The fix is **stack probing** — `-fstack-clash-protection` (GCC 8+/Clang) makes the compiler touch each page as it extends the frame, guaranteeing the guard is hit. This is a hardening flag with essentially zero steady-state cost and should be on.
-
-### Cost model
-
-| Property | Value |
-|---|---|
-| Default stack size | 8 MiB **virtual**; RSS grows by touched pages only |
-| Actual initial RSS per thread | 4–12 KiB (one or two pages) |
-| Cost of 1,000 threads at default size | 8 GiB of VSZ, ~10 MiB of RSS |
-| Stack allocation cost | One `mmap` (~2–5 µs); glibc **caches** freed stacks for reuse |
-| Guard page cost | One VMA, no physical memory |
-
-Because stacks are demand-paged, a large default size is mostly harmless for memory — but it consumes address space and, more importantly, **each first touch of a new stack page is a minor page fault (0.5–2 µs)**. A hot thread that recurses deeply for the first time under load takes a burst of faults exactly when you can least afford it. The mitigations: pre-fault the stack at startup by touching it (an `alloca` + `memset` of the expected depth, or `MAP_POPULATE`/`mlock`), and set `MCL_CURRENT|MCL_FUTURE` via `mlockall` (Ch. 32 §32.15).
-
-`ulimit -s`, `pthread_attr_setstacksize`, and `/proc/<pid>/maps` (look for the 8 MiB `PROT_NONE`-preceded regions) are the tools. Deep recursion, large stack buffers, and ASAN (which inflates frames) are the usual overflow causes; ASAN's `stack-overflow` report or a `SIGSEGV` with a fault address just below a mapped stack is the signature.
-
----
-
-## 31.12 Fibers and User-Space Scheduling
-
-A **fiber** (a.k.a. coroutine with its own stack, green thread, user-level thread) is a unit of execution scheduled entirely in user space. Switching one means saving and restoring callee-saved registers and swapping the stack pointer — **no kernel involvement, no `CR3` change, no scheduler**.
-
-| | Kernel thread switch | Fiber switch |
-|---|---|---|
-| Cost | 1–3 µs direct, 10–100 µs indirect | **20–100 ns** |
-| Mechanism | `schedule()`, register + FPU save, possible `CR3` | `swapcontext`-style register swap |
-| Preemptible | Yes (timer interrupt) | **No** — cooperative only |
-| Blocking syscall | Blocks one thread | **Blocks the whole carrier thread** |
-| Scales to cores | Yes | Only with a carrier thread per core |
-| Stack | 8 MiB VSZ, kernel-managed, guard page | User-allocated; often segmented or small |
-| Debugger/profiler support | Native | Poor — one kernel stack, many logical ones |
-
-Implementations: `ucontext` (`makecontext`/`swapcontext` — POSIX but slow, since `swapcontext` does a `sigprocmask` syscall), Boost.Context / Boost.Fiber (hand-written assembly, ~20 ns), folly Fibers, Go's goroutines, Java virtual threads.
-
-**C++20 coroutines are not fibers.** They are *stackless*: the compiler transforms the function into a state machine and heap-allocates a frame containing only the locals that live across suspension points (Ch. 19 §19.7–§19.9). Consequences:
-
-| | Stackful fiber | Stackless coroutine (C++20) |
-|---|---|---|
-| Can suspend from a nested call | **Yes** | **No** — only from the coroutine body |
-| Memory per instance | Whole stack (KiB–MiB) | Frame size only (tens of bytes possible) |
-| Switch cost | ~20–100 ns (register swap) | ~2–10 ns (an indirect call; often inlined away) |
-| Allocation | Stack, up front | Heap frame, elidable via HALO |
-| Debuggability | Poor | Improving; frames are visible types |
-
-For low latency the honest position is that **neither is usually the right answer on the hot path**. A single-writer busy-polling event loop (Ch. 52 §52.8, Ch. 55 §55.3) with explicit state machines has no switch cost at all and no allocation. Fibers earn their keep when you have many thousands of logically blocking flows (a gateway multiplexing 10,000 sessions) and the alternative is 10,000 kernel threads. Coroutines earn theirs when they make an async state machine readable without heap traffic — verify with `-Wno-coroutine-frame-size` diagnostics or by checking for the elided allocation in the assembly.
-
----
-
-## 31.13 Context Switches
-
-A **context switch** is the kernel replacing the currently running task on a CPU with another. Distinguish it from a **mode switch** (user↔kernel transition, e.g. a syscall), which does *not* change the running task and costs 40–350 ns (Ch. 30 §30.2, Ch. 34 §34.3).
-
-### What actually happens
-
-```
-1. Enter kernel (interrupt, syscall, or explicit schedule())
-2. Save the outgoing task's user registers on its kernel stack
-3. Update accounting (runtime, vruntime, cgroup stats)
-4. pick_next_task()  — run-queue selection, §31.16
-5. switch_mm()  — if the address space differs: load CR3 (with PCID tag)
-6. switch_to()  — swap kernel stack, callee-saved registers, TLS base (FS_BASE),
-                  and lazily the FPU/AVX state (XSAVE/XRSTOR, up to ~2.5 KB with AVX-512)
-7. Return to user mode
-```
-
-| Cost component | Magnitude |
-|---|---|
-| Direct kernel work | 1–3 µs |
-| `CR3` reload without PCID | +100–200 cycles + full TLB refill |
-| `CR3` reload with PCID | +~200 cycles, TLB entries preserved |
-| FPU/AVX-512 state save+restore | 100–300 cycles |
-| **Cache pollution (L1/L2 evicted)** | **10–100 µs of degraded execution** |
-| Branch predictor and BTB pollution | 1–10 µs of extra mispredicts |
-| Migration to a different NUMA node | Working set becomes remote; 1.4–2× until re-faulted |
-
-**Voluntary vs involuntary** is the distinction to make:
-
-- **Voluntary** (`nvcsw`): the task blocked — waited on a futex, a socket, a page fault. It gave up the CPU because it had nothing to do.
-- **Involuntary** (`nivcsw`): the scheduler preempted it — quantum expired, a higher-priority task woke, or an interrupt arrived. This is the one that hurts, because it happens mid-computation.
-
-```
-$ perf stat -e context-switches,cpu-migrations ./app
-$ grep ctxt /proc/<pid>/status         # voluntary_ctxt_switches / nonvoluntary_ctxt_switches
-$ perf sched record -- sleep 5; perf sched latency
-$ bpftrace -e 'tracepoint:sched:sched_switch /args->prev_comm == "myapp"/ { @[kstack] = count(); }'
-```
-
-**The target for a hot-path thread is zero involuntary switches per second.** Any nonzero number means something is sharing the core — another task, a kernel thread, an IRQ handler, or the timer tick — and each event costs you a 10–100 µs latency outlier. Sections §31.19–§31.20 are entirely about driving that number to zero.
-
-A subtlety worth mentioning: on a machine with **SMT enabled**, your thread doesn't need to be switched out to be slowed down — the sibling hyperthread competes for the same L1, µop cache, and execution ports continuously. `perf stat` will not show a context switch; it will show elevated `cycles` per instruction. Disable SMT or isolate both siblings of a core.
-
----
-
-## 31.14 Linux Fair Scheduling
-
-`SCHED_OTHER` (also called `SCHED_NORMAL`) is the default policy and what almost every process uses.
-
-### CFS (kernel < 6.6)
-
-The **Completely Fair Scheduler** models an ideal multitasking CPU where every runnable task receives an equal share. It tracks per-task **`vruntime`** — the task's accumulated runtime, scaled inversely by its weight (derived from its nice value) — and always runs the task with the smallest `vruntime`, kept in a red-black tree keyed by `vruntime`.
-
-```
-vruntime += delta_exec × (NICE_0_WEIGHT / task_weight)
-nice 0 → weight 1024;  each nice level is ~1.25× weight  → ~10% CPU per level
-```
-
-Tunables (`/proc/sys/kernel/`):
-
-| Knob | Default | Meaning |
-|---|---|---|
-| `sched_latency_ns` | 6 ms (scaled ×log2(ncpus) → often 24 ms) | Target period in which every runnable task runs once |
-| `sched_min_granularity_ns` | 0.75 ms (scaled → 2.25–3 ms) | Minimum slice; caps the number of tasks in one latency period |
-| `sched_wakeup_granularity_ns` | 1 ms | How much `vruntime` advantage a waking task needs to preempt the current one |
-| `sched_migration_cost_ns` | 0.5 ms | How recently-run a task must be to be considered cache-hot and not migrated |
-
-With N runnable tasks, each slice ≈ `max(sched_latency/N, min_granularity)`. So the **effective quantum is 0.75–3 ms with few tasks, and floors at `min_granularity` once N is large** — at which point the actual latency period stretches beyond 6 ms. Those are the numbers to quote.
-
-### EEVDF (kernel 6.6+)
-
-CFS was replaced by **EEVDF** (Earliest Eligible Virtual Deadline First). Each task has a **lag** (how much service it is owed) and a **virtual deadline** = eligible time + its request size. The scheduler runs the *eligible* task with the earliest deadline. The practical differences: latency-sensitive tasks can request smaller slices and get better wakeup latency without abusing nice; `sched_latency_ns`/`sched_min_granularity_ns` are replaced by `sched_base_slice_ns` (default ~0.75–3 ms); and `sched_setattr` gains a per-task slice request (`SCHED_FLAG_KEEP_ALL` / custom slice).
-
-### Related mechanisms
-
-- **Group scheduling / cgroup CPU controller**: `cpu.weight` (v2) distributes shares between cgroups first, then within. `cpu.max` sets a hard quota (`quota/period`), and **exceeding the quota throttles the whole group until the period rolls over** — producing multi-millisecond stalls that look like GC pauses. This is the #1 cause of mysterious tail latency in containerized services. `cpu.stat`'s `nr_throttled`/`throttled_usec` is the diagnostic.
-- **`autogroup`** (`/proc/sys/kernel/sched_autogroup_enabled`) groups tasks by session, which can make nice values within a session appear ineffective.
-- **`SCHED_BATCH`** hints that the task is throughput-oriented (no wakeup preemption); **`SCHED_IDLE`** gives it minimal weight.
-
-**The conclusion for low latency:** fair scheduling guarantees *fairness*, not *latency*. Nothing in CFS or EEVDF bounds how long a runnable task waits. A hot thread under `SCHED_OTHER` on a shared core can be delayed by milliseconds. That's why §31.15 exists.
-
----
-
-## 31.15 Real-Time Scheduling Policies
-
-Linux implements POSIX real-time policies with static priorities 1–99, **all of which outrank every `SCHED_OTHER` task** (which effectively sit at priority 0).
+### Real-time policies
 
 | Policy | Selection rule |
 |---|---|
-| **`SCHED_FIFO`** | Highest priority runs until it blocks, yields, or is preempted by a *higher* priority task. No timeslice. Same-priority tasks run FIFO. |
-| **`SCHED_RR`** | Like FIFO, but same-priority tasks round-robin with a quantum (`/proc/sys/kernel/sched_rr_timeslice_ms`, default 100 ms). |
-| **`SCHED_DEADLINE`** | EDF + constant-bandwidth server. Per-task `(runtime, deadline, period)`; the kernel admission-controls to guarantee the set is schedulable. Outranks FIFO/RR. |
+| `SCHED_FIFO` | The highest-priority runnable task runs until it blocks, yields, or a higher-priority task wakes. No timeslice. |
+| `SCHED_RR` | As FIFO, but equal-priority tasks round-robin with a quantum. |
+| `SCHED_DEADLINE` | Earliest-deadline-first with admission control: you declare runtime, deadline, and period, and the kernel refuses an unschedulable set. Outranks FIFO and RR. |
 
 ```bash
-chrt -f 80 -p <pid>            # set SCHED_FIFO prio 80 on a running process
-chrt -f 80 ./app               # launch under FIFO
-chrt -p <pid>                  # query
+$ chrt -p <tid>                 # query
+# Mutation example; requires authority and an operational safety plan:
+$ chrt -f 60 ./feed_handler
 ```
+
+Permissions come from `CAP_SYS_NICE`, `RLIMIT_RTPRIO`, or the service manager's equivalent setting.
+
+**Treat `SCHED_FIFO` as a hazardous operational policy, not a performance flag.** It is the right tool in a narrow case and a reliable way to make a machine unreachable outside it. §31.9 enumerates the failure modes; the two that must be understood before enabling it are:
+
+*Starvation.* A FIFO task that spins without blocking prevents lower-priority tasks eligible only on that CPU from running. If critical recovery or kernel work is affected, the host can become unmanageable. Prerequisites include protected housekeeping capacity, bounded/error-tested task behavior, and out-of-band recovery.
+
+*Runtime limiting.* Linux can reserve part of CPU time for non-real-time work through real-time bandwidth controls such as `sched_rt_period_us` and `sched_rt_runtime_us`. Defaults and cgroup interactions depend on the distribution and configuration. A CPU-bound real-time task that exhausts its permitted runtime can show periodic throttling aligned with replenishment. Disabling a safety limit removes recovery margin and can make the host unmanageable; it requires an explicit starvation analysis, housekeeping capacity, rollback, and out-of-band access.
+
+`SCHED_DEADLINE` declares runtime, deadline, and period and uses admission control. It is not “FIFO but better”: affinity/root-domain constraints, bandwidth enforcement, fork behavior, permissions, and the `sched_setattr` ABI all matter. Use it only when the workload has a defensible reservation model and the deployment can validate admission and overrun behavior.
+
+---
+
+## 31.4 Wakeup Latency — Core
+
+Wakeup latency is the interval from the event that makes a task runnable to that task executing its first user instruction. For any design that blocks, it is the number that sets your tail.
+
+```
+event (interrupt, futex wake, timer)
+   │  interrupt entry, handler, wake-up path
+   ▼
+choose a target CPU  ──► may require an inter-processor interrupt
+   │
+   ▼
+enqueue on that CPU's run queue; request rescheduling
+   │  delay depends on preemptibility, eligible competitors, policy, and throttling
+   ▼
+context switch in, then execute with cold caches
+```
+
+| Condition | Character of the latency |
+|---|---|
+| Idle target CPU | Dispatch can begin after wakeup, interrupt, idle-exit, and scheduler work |
+| Higher-class wakee eligible | It can request preemption, subject to non-preemptible and interrupt context |
+| Fair wakee behind competitors | Delay reflects eligibility, weights, grouping, and current service |
+| Throttled cgroup or policy | Runnable does not imply eligible for immediate CPU time |
+| Migrated wakee | Add placement and cold-state effects |
+
+Two mechanisms are worth naming. *Wake placement* may trade an idle CPU against locality to the waker and previous CPU; details evolve with the scheduler. Affinity narrows that choice but does not eliminate IRQs, throttling, or kernel activity. *Preemptibility* determines where kernel execution can be displaced. Mainline configurations have included non-preemptible, voluntary, full/dynamic preemption, and PREEMPT_RT variants; available names and semantics are kernel-version/configuration facts.
+
+```bash
+$ cyclictest --help                    # select flags for the installed rt-tests version
+$ perf sched record -- sleep 5 && perf sched latency --sort max
+```
+
+`cyclictest` measures a timer-wakeup workload, not the worst case of every application and not the end-to-end latency of a feed handler. Report kernel build/configuration, CPU and firmware, duration, load, histogram/tail definition, policy, affinity, and clock. Chapter 43 owns the experiment design. The durable conclusion is narrower: blocking adds a scheduler-mediated wake path whose tail must fit the budget; polling removes that path by spending CPU continuously.
+
+---
+
+## 31.5 Affinity and Topology — Core
+
+Affinity is the set of CPUs a task may run on.
+
 ```cpp
-sched_param sp{ .sched_priority = 80 };
-pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
-// or sched_setattr() for SCHED_DEADLINE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <cerrno>
+#include <sched.h>
+#include <stdexcept>
+#include <system_error>
+
+void pin_current_thread(unsigned cpu) {
+    if (cpu >= CPU_SETSIZE) throw std::out_of_range("CPU_SETSIZE");
+    cpu_set_t set{};
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    // Linux: pid 0 selects the calling task.
+    if (sched_setaffinity(0, sizeof set, &set) == -1)
+        throw std::system_error(errno, std::generic_category());
+}
 ```
 
-Permissions: `CAP_SYS_NICE`, or `RLIMIT_RTPRIO` set in `/etc/security/limits.conf`, or `systemd`'s `LimitRTPRIO=`.
+This is a Linux-specific function, not standard C++. Fixed-size `cpu_set_t` is sufficient only within its representable range; GNU dynamic CPU-set macros exist for larger configured CPU spaces. For an existing multithreaded process, applying a task-level affinity interface to one TID does not configure every peer; set policy as each thread starts or enumerate deliberately. Effective affinity is also intersected with online CPUs, cpusets, and other restrictions.
 
-### Priority selection
+If memory placement matters, establish affinity before the workload initializes its working set, then verify locality using Chapter 29's method. Do not turn “pin before first touch” into a claim that every page remains forever on one node: policy, migration, reclaim, and explicit placement can change it.
 
-Priorities are only meaningful relative to the kernel's own RT threads:
+Why pin: stable cache locality, controlled topology, fewer task migrations, and a match between an isolated CPU and its intended task. The size of any benefit belongs to measurement.
 
-| Priority | Occupant |
-|---|---|
-| 99 | `migration/N` (stop-machine), watchdog |
-| 50 | Default for many IRQ threads under `PREEMPT_RT` |
-| 1–98 | Yours |
+What pinning costs: the scheduler cannot balance the task outside its mask, a failed or overloaded CPU set has less spare capacity, and static layouts require topology-aware deployment. Placing hot threads on SMT siblings creates workload-dependent contention rather than a universal “half throughput.” An empty intersection with cpuset or online constraints can make affinity fail.
 
-Running your application at 99 above `migration/N` is a good way to hang the machine. **Pick something in the 40s–80s and stay below the kernel's stop-machine threads.**
-
-### The throttle
-
-`SCHED_FIFO` has no timeslice, so a spinning RT task can monopolize a CPU and lock out `kworker`, `ksoftirqd`, and even `sshd`. Linux therefore ships **RT throttling**:
-
-```
-/proc/sys/kernel/sched_rt_period_us    = 1000000   (1 s)
-/proc/sys/kernel/sched_rt_runtime_us   =  950000   (0.95 s)
-```
-RT tasks get at most 95% of each second per CPU; the remaining 5% is forced to non-RT. For a busy-polling thread this means **the kernel will preempt you for 50 ms out of every second** — a catastrophic, perfectly periodic latency spike that people spend days chasing. Setting `sched_rt_runtime_us = -1` disables the throttle and hands you the responsibility of never starving the housekeeping work (which you then must move off the isolated core; §31.20).
-
-**`SCHED_DEADLINE`** is the principled alternative: you declare a budget, the kernel admission-controls, and there's no global throttle — but a task cannot fork under it, affinity is restricted, and the API (`sched_setattr`) has no glibc wrapper. Rare in trading, common in industrial control.
-
----
-
-## 31.16 Scheduler Run Queues and Wakeup Latency
-
-Linux keeps a **per-CPU run queue** (`struct rq`), which is why scheduling scales: there is no global lock on the common path. Each `rq` contains sub-queues per scheduling class, consulted in strict order:
-
-```
-pick_next_task():
-   stop_sched_class     (migration/N)
-   → dl_sched_class     (SCHED_DEADLINE, EDF)
-   → rt_sched_class     (FIFO/RR, 100 priority bitmapped lists)
-   → fair_sched_class   (CFS/EEVDF red-black tree)
-   → idle_sched_class
-```
-
-**Wakeup latency** — the interval from the event that makes a task runnable to the task executing its first user instruction — is the number that determines your tail:
-
-```
-event (IRQ / futex wake / timerfd)
-   │ 0.5–2 µs   interrupt entry, handler, ttwu()
-   ▼
-select_task_rq()  ← which CPU should run it?
-   │ 0–3 µs      may need an IPI to the target CPU (reschedule_ipi)
-   ▼
-enqueue on target rq; set need_resched
-   │ 0 µs (preemptible kernel) … up to full quantum (if the current task can't be preempted)
-   ▼
-context switch in  (1–3 µs) + cache-cold execution (10–100 µs)
-```
-
-| Condition | Typical wakeup latency |
-|---|---|
-| Idle target CPU, `SCHED_FIFO` waker and wakee | 2–5 µs |
-| Idle target CPU in **C6**, must be woken | +50–150 µs |
-| Target busy with a `SCHED_OTHER` task, wakee is RT | 3–8 µs (immediate preemption) |
-| Target busy, wakee is `SCHED_OTHER`, insufficient vruntime lag | up to `sched_wakeup_granularity` (~1 ms) |
-| Loaded box, 10 runnable per core, `SCHED_OTHER` | 1–20 ms |
-| `PREEMPT_RT` kernel, tuned, isolated core | 5–30 µs worst case (`cyclictest`-measured) |
-
-**`select_task_rq_fair`** implements wake affinity: it prefers to place a waking task on a CPU sharing cache with the waker (`wake_affine`), balancing cache locality against run-queue depth. `sched_migration_cost_ns` controls how "hot" a task is considered. This heuristic is usually right and occasionally disastrous — it can pile producer and consumer onto one core, or bounce a thread between NUMA nodes. Pinning (§31.17) removes the heuristic from the equation entirely.
-
-**Measurement:**
-```bash
-perf sched record -- sleep 5 && perf sched latency --sort max   # per-task max wakeup delay
-cyclictest -p 99 -t 4 -m -n -i 200 -D 60 -h 400                 # canonical RT latency test (Ch. 35 §35.18)
-bpftrace -e 'tracepoint:sched:sched_wakeup { @w[args->pid] = nsecs; }
-             tracepoint:sched:sched_switch /@w[args->next_pid]/ {
-                 @lat = hist(nsecs - @w[args->next_pid]); delete(@w[args->next_pid]); }'
-trace-cmd record -e sched_wakeup -e sched_switch                 # ftrace, full timeline
-```
-
-The `cyclictest` max is the honest headline number for a tuned box: **a stock kernel gives 50–500 µs worst case; a tuned `PREEMPT_RT` box with isolation gives 10–30 µs.** Neither is good enough for a 2 µs tick-to-trade budget, which is exactly why hot paths busy-poll and never sleep (§31.21).
-
----
-
-## 31.17 CPU Affinity
-
-**Affinity** is the set of CPUs a task is permitted to run on, held as a bitmask in the `task_struct`.
-
-```c
-cpu_set_t set;
-CPU_ZERO(&set);
-CPU_SET(7, &set);
-sched_setaffinity(0, sizeof(set), &set);      // 0 = calling thread
-pthread_setaffinity_np(tid, sizeof(set), &set);
-```
-```bash
-taskset -c 7 ./app          # launch pinned
-taskset -pc 7 <pid>         # repin a running process
-taskset -pc <pid>           # query
-```
-
-Note `sched_setaffinity`'s first argument is a **TID**, not a PID: passing a PID sets only the main thread. `taskset -p` on a multithreaded process likewise affects only one thread unless you iterate `/proc/<pid>/task/*`. This catches people constantly.
-
-### Why pin at all
-
-1. **Cache locality.** An unpinned thread migrates and arrives with cold L1/L2 — 10–100 µs of degraded execution per migration (§31.13).
-2. **NUMA locality.** First-touch allocation (Ch. 32 §32.26) binds pages to the node where they were first written. Migrating the thread makes every access remote: 1.4–2× latency, permanently, until the pages are moved.
-3. **Determinism.** The scheduler's placement heuristics are a source of variance you cannot model.
-4. **Prerequisite for isolation.** `isolcpus`/`nohz_full` (§31.19) only helps if your thread actually lands there.
-
-### What pinning costs
-
-- **Reduced flexibility**: a pinned thread on a busy CPU will not be load-balanced away, even if fifteen other cores are idle. Over-pinning creates its own hotspots.
-- **Hidden serialization**: pinning two threads to the two SMT siblings of one physical core halves their throughput while looking like two cores in `top`.
-- **`cpuset` interaction**: cgroup `cpuset.cpus` intersects with your mask. If it excludes your target, `sched_setaffinity` returns `EINVAL`. Under Kubernetes, this is why pinning fails inside a container.
-
-**Order of operations matters:** pin the thread, *then* allocate and touch its memory, *then* start work. Pinning after first touch leaves the pages on the wrong node.
-
-`/proc/<pid>/status` shows `Cpus_allowed_list`; `ps -eLo pid,tid,psr,comm` shows which CPU each thread last ran on (`psr`); `perf stat -e cpu-migrations` counts violations.
-
----
-
-## 31.18 CPU Topology-Aware Pinning
-
-Pinning to "core 7" is meaningless without knowing what core 7 *is*. Linux numbers logical CPUs in whatever order the firmware presents them, and the two common enumerations are:
-
-```
-Interleaved (common on Intel 2-socket, SMT on):
-  CPU 0..N-1   = one thread of every core, node 0 then node 1
-  CPU N..2N-1  = the sibling threads, same order
-  → CPU 0 and CPU N are SMT siblings of the SAME physical core
-
-Sequential (common on AMD, some BIOSes):
-  CPU 0,1 = siblings of core 0;  CPU 2,3 = siblings of core 1; ...
-```
-
-**Never assume.** Read it:
+**Logical CPU numbers do not encode portable topology.** Enumeration depends on firmware and kernel discovery; assuming adjacency or a fixed offset can place two hot threads on one physical core.
 
 ```bash
-lscpu -e=CPU,NODE,SOCKET,CORE,L1d:L2:L3      # the definitive table
-lstopo-no-graphics                            # hwloc, shows cache/PCI topology visually
-cat /sys/devices/system/cpu/cpu7/topology/{core_id,physical_package_id,thread_siblings_list}
-cat /sys/devices/system/cpu/cpu7/cache/index*/shared_cpu_list
-numactl --hardware                            # node ↔ CPU ↔ memory map and distance matrix
-cat /sys/class/net/eth0/device/numa_node      # which node the NIC is on
+$ lscpu -e=CPU,NODE,SOCKET,CORE,MAXMHZ         # inspect discovered topology
+$ cat /sys/devices/system/cpu/cpu7/topology/thread_siblings_list
+$ cat /sys/devices/system/cpu/cpu7/cache/index3/shared_cpu_list
+$ cat /sys/class/net/eth0/device/numa_node
 ```
 
-### The placement rules
+The placement rules, each with its reason:
 
 | Rule | Reason |
 |---|---|
-| Never place two hot threads on **SMT siblings** | They share L1, L2, µop cache, and execution ports; 1.2–2× slowdown with no visible context switch |
-| Place producer and consumer on **cores sharing an L3** (same socket / same CCX on AMD) | Cache-line handoff is 40–80 ns intra-socket vs 200–400 ns cross-socket (Ch. 30 §30.2) |
-| Place the NIC-polling thread on the **NUMA node the NIC is attached to** | Avoids cross-socket DMA and remote descriptor reads; DDIO only lands in the local L3 (Ch. 29 §29.24) |
-| Allocate ring buffers and packet pools on the **same node as the consuming thread** | First touch (Ch. 32 §32.26) |
-| On AMD Zen, keep a thread group within one **CCX/CCD** | Cross-CCD L3 is not shared; a transfer goes through Infinity Fabric |
-| Avoid **core 0** for hot threads | Many IRQs, RCU callbacks, and legacy timers default there |
-| Keep siblings of an isolated core **also isolated** | Otherwise a housekeeping task on the sibling steals half your core |
+| Avoid co-locating two independently saturated threads on SMT siblings unless measured | They compete for core resources (Ch. 27) |
+| Compare nearby producer/consumer placement with separated placement | Local handoff may benefit from shared cache; competition may offset it |
+| Include device locality in the polling-thread placement decision | Device and memory topology can affect the data path (Ch. 29) |
+| Allocate buffers from the thread that will consume them, after pinning | First touch |
+| On chiplet parts, inspect actual cache-sharing IDs | Product topology cannot be inferred from package marketing |
+| Consider keeping boot/default-housekeeping CPUs out of the hot set | Default kernel work often accumulates there; verify on the host |
+| Account for every SMT sibling of an isolated CPU | Sibling activity is invisible to task migration counters |
 
-A realistic layout for a two-socket box with the NIC on node 0:
+A realistic layout for a two-socket machine with the NIC on node 0:
 
 ```
-node 0: cpu 0      housekeeping, IRQs, logging          (not isolated)
-        cpu 2      feed handler / NIC busy-poll         (isolated, FIFO 80)
-        cpu 4      book builder + strategy              (isolated, FIFO 80)
-        cpu 6      order gateway TX                     (isolated, FIFO 80)
-        cpu 1,3,5,7  SMT siblings of the above — isolated and left IDLE
-node 1: everything else — metrics, journal writer, control plane
+node 0: cpu 0        housekeeping, interrupts, logging      (not isolated)
+        cpu 2        feed handler / NIC polling             (isolated)
+        cpu 4        book build + strategy                  (isolated)
+        cpu 6        order gateway transmit                 (isolated)
+        cpu 1,3,5,7  SMT siblings of the above — isolated and left idle
+node 1: metrics, journal writer, control plane
 ```
 
-Leaving SMT siblings idle "wastes" cores and is standard practice; the alternative is unpredictable ~1.5× slowdowns. Many shops simply disable SMT in BIOS (`nosmt` boot parameter) to remove the possibility.
-
-`hwloc-bind`, `numactl --cpunodebind=0 --membind=0`, and `taskset` are the operational tools; `perf c2c` verifies that the cache lines you expect to be shared actually are.
+That layout is illustrative, not a prescription. Leaving siblings idle trades throughput capacity for reduced interference; firmware SMT disable is a different, host-wide rollback decision. Chapter 27 owns the underlying contention.
 
 ---
 
-## 31.19 Core Isolation
+## 31.6 Isolation, Housekeeping, and Polling — Core
 
-Isolation means removing a CPU from the general-purpose scheduler and from as many kernel activities as possible, so that the one thread you place there runs uninterrupted.
+### Isolation
 
-### The layers
+Isolation is a collection of controls that reduce selected sources of work on selected CPUs. No single flag makes a CPU silent.
 
-| Mechanism | What it removes | How |
-|---|---|---|
-| **`isolcpus=2-7`** | The CPU from the load balancer's domains; nothing is placed there unless explicitly pinned | Boot parameter |
-| **`nohz_full=2-7`** | The **1000 Hz timer tick** on CPUs running exactly one runnable task | Boot parameter; requires `CONFIG_NO_HZ_FULL` |
-| **`rcu_nocbs=2-7`** | RCU callback processing (offloaded to `rcuo` kthreads on housekeeping CPUs) | Boot parameter |
-| **`irqaffinity=0,1`** | Interrupt handling | Boot parameter + `/proc/irq/*/smp_affinity` |
-| **cgroup v2 `cpuset.cpus.partition=isolated`** | Same as `isolcpus` but dynamic, no reboot | `cpuset` controller |
-| **`nosmt` or per-core `cpu/online=0`** | Sibling interference | Boot parameter or sysfs |
-| **`workqueue.cpumask`, `kthread_cpus`** | Unbound kernel work | Boot parameters |
-
-`nohz_full` is the highest-value item and the most misunderstood. The tick normally fires 250–1000 times per second per CPU to do accounting, run timers, and check preemption; each is a ~1–5 µs interrupt plus cache pollution. `nohz_full` suppresses it — **but only while exactly one task is runnable on that CPU**. Two runnable tasks (including a stray kernel thread) and the tick comes back at full rate. Verify, don't assume:
-
-```bash
-cat /sys/devices/system/cpu/nohz_full
-perf stat -e irq_vectors:local_timer_entry -C 4 -- sleep 10   # should be ~1/s, not 1000/s
-cat /proc/interrupts | grep LOC                                # local timer count per CPU
-```
-
-Residual interrupts you cannot remove: NMI (watchdog — disable with `nmi_watchdog=0`), machine-check, IPIs for TLB shootdowns (Ch. 32 §32.9) and `smp_call_function`, and the ~1 Hz residual tick `nohz_full` keeps for scheduler accounting.
-
-### The full boot line, as used in practice
-
-```
-isolcpus=nohz,domain,2-7 nohz_full=2-7 rcu_nocbs=2-7 rcu_nocb_poll
-irqaffinity=0-1 nosoftlockup nmi_watchdog=0 mce=ignore_ce
-intel_pstate=disable idle=poll processor.max_cstate=1 intel_idle.max_cstate=0
-tsc=reliable clocksource=tsc audit=0 nowatchdog skew_tick=1
-mitigations=off transparent_hugepage=never default_hugepagesz=1G hugepagesz=1G hugepages=32
-```
-
-`idle=poll` keeps the CPU in C0 (busy-looping in the idle thread) to avoid the 50–150 µs C-state exit latency — at the cost of ~100 W and heat, which reduces turbo headroom for the other cores. `skew_tick=1` staggers the residual ticks across CPUs so they don't all fire simultaneously and contend on the same locks.
-
-**Measured effect.** On a stock kernel, a busy-poll loop sees interruptions of 50–500 µs at p99.99. Fully isolated with `nohz_full` and `idle=poll`, the same loop sees 5–20 µs, and the remaining outliers are IPIs and SMIs. **SMIs (System Management Interrupts)** are firmware-level and invisible to the OS — they can take 100 µs–1 ms and are detectable only via `hwlatdetect` or the `SMI count` MSR (`msr 0x34`). Checking for them is a strong interview answer to "you've isolated everything and still see 200 µs spikes."
-
----
-
-## 31.20 Housekeeping CPUs
-
-Isolation is only half the design: the work you removed from the isolated cores still has to run somewhere. **Housekeeping CPUs** are the non-isolated cores that absorb it.
-
-What lands there:
-
-| Work | Directed by |
+| Mechanism | What it removes |
 |---|---|
-| All device interrupts | `irqaffinity=` boot param, `/proc/irq/N/smp_affinity_list`, `irqbalance` (**disable it** — it will undo your work) |
-| RCU callbacks | `rcu_nocbs=` offloads to `rcuo/N` kthreads, which must themselves be pinned |
-| Unbound workqueues | `/sys/devices/virtual/workqueue/cpumask` |
-| `kswapd`, `khugepaged`, writeback | Kernel threads; pin with `taskset` at boot or via a systemd unit |
-| Timer callbacks, deferred work | Follows the tick |
-| Your own logging, metrics, control plane, admin RPC | Application design |
-| `systemd` and all system services | `systemd.conf` `CPUAffinity=0-1` — applies to PID 1 and everything it spawns |
+| `isolcpus=domain,...` | Boot-time scheduler-domain isolation; the kernel documentation discourages it in favor of cpusets for reversible domain control |
+| `nohz_full=` | Suppresses eligible scheduling ticks while a suitable single user task runs; constraints apply |
+| `rcu_nocbs=` | Offloads RCU callbacks; current `nohz_full` setups may imply this for selected CPUs |
+| `irqaffinity=` and per-IRQ affinity | Device interrupt handling |
+| cgroup v2 isolated cpuset partition | Runtime partitioning of scheduler load balancing, subject to cgroup rules |
+| Firmware SMT disable, or offlining siblings | Sibling interference (Ch. 27 — offlining may be weaker than a firmware disable) |
+
+`nohz_full` is commonly misunderstood. Current kernel documentation describes constraints including a compatible kernel configuration, a stable clock source, a single task in userspace, avoidance of POSIX CPU timers, and limited kernel entry. Accounting and RCU work move elsewhere or become more expensive at kernel boundaries. Treat the exact behavior as versioned Linux behavior and verify rather than assume:
 
 ```bash
-systemctl set-property --runtime user.slice AllowedCPUs=0-1
-systemctl set-property --runtime system.slice AllowedCPUs=0-1
-systemctl set-property --runtime init.scope AllowedCPUs=0-1
-echo 0-1 > /sys/devices/virtual/workqueue/cpumask
-for i in /proc/irq/*/smp_affinity_list; do echo 0-1 > $i 2>/dev/null; done
-systemctl stop irqbalance && systemctl disable irqbalance
+$ cat /sys/devices/system/cpu/nohz_full
+$ cat /sys/devices/system/cpu/isolated
+$ cat /proc/cmdline
+$ test -d /sys/kernel/tracing/events/sched && echo "sched tracepoints available"
 ```
 
-**Sizing.** Housekeeping needs real capacity: on a 32-core box, 2–4 housekeeping cores is typical, more if the NIC generates heavy interrupt load or you run a chatty logging pipeline. Under-provisioning them produces a subtle failure: kernel work backs up, `ksoftirqd` starts running, and eventually the kernel schedules it *onto an isolated core* anyway because nothing else can make progress — reintroducing exactly the jitter you eliminated.
+Even a well-isolated CPU can receive interrupts, inter-processor calls, exceptions, and firmware activity. Some device interrupts are managed by drivers and expose limited affinity control. Firmware stalls may not appear in ordinary scheduler traces. Use Chapter 35's host-tuning runbook and Chapter 43's layered measurements rather than assigning every unexplained gap to the scheduler.
 
-**The `nohz_full` dependency.** A `nohz_full` CPU still needs a housekeeping CPU to be running its timekeeping; if all CPUs were `nohz_full` there would be no one to advance `jiffies`. Linux enforces this by refusing to make CPU 0 `nohz_full`.
+Other frequently-applied boot settings — disabling deep idle states, fixing the frequency governor, choosing a clock source, disabling speculation mitigations, configuring huge pages — belong to Chapter 35's tuning workflow and Chapter 32's memory policy, and each needs its own hypothesis, cost, and rollback. Copying someone else's kernel command line is the definition of cargo cult.
 
-**Verification** is the part candidates forget. After configuration:
+| Change | Expected benefit | Cost / prerequisite | Rollback and success measure |
+|---|---|---|---|
+| Narrow a task's affinity | Fewer migrations and known placement | Capacity plan and correct topology | Restore mask; compare migrations and application tail |
+| Create an isolated cpuset partition | Less scheduler competition | Reserved CPUs and cgroup-v2 support | Move tasks back/destroy partition; trace runnable competitors |
+| Enable full dynticks for a CPU set | Fewer eligible scheduler ticks | Boot/config support and mostly user-space single-task workload | Remove boot setting/reboot; compare timer/scheduler traces |
+| Move device IRQs | Remove device-handler interference | Know queue-to-IRQ mapping; some IRQs are managed | Restore masks/irqbalance; compare per-CPU interrupt deltas |
+| Offload RCU callbacks | Move callback execution | Housekeeping capacity | Restore boot/config setting; compare RCU and application tails |
+| Use real-time policy | Preempt lower classes | Authority, bounded runtime, no unsafe blocking, recovery path | Restore `SCHED_OTHER`; compare wake/switch tail and starvation alarms |
+
+### Housekeeping
+
+The work removed from isolated cores still has to run somewhere. Housekeeping cores should have capacity for the work deliberately directed there: selected device interrupts, offloaded RCU callbacks, unbound kernel work, reclaim and compaction threads, timer callbacks, and the application's logging, metrics, and control plane. Some work remains per-CPU, driver-managed, or otherwise difficult to move, so inventory the actual host rather than assuming complete displacement.
+
+Start with read-only inventory:
 
 ```bash
-watch -n1 'cat /proc/interrupts | awk "{print \$1, \$5, \$6}"'   # no IRQs on isolated CPUs
-ps -eLo pid,tid,psr,rtprio,comm | awk '$3 ~ /^[2-7]$/'           # nothing unexpected on 2-7
-perf stat -a -C 2-7 -e context-switches,cpu-migrations -- sleep 60   # expect 0
-turbostat --interval 1                                            # confirm C0 residency, actual MHz
+$ systemctl is-active irqbalance
+$ cat /sys/devices/virtual/workqueue/cpumask
+$ grep -H . /proc/irq/*/smp_affinity_list
+$ systemctl show system.slice -p AllowedCPUs
 ```
 
-Any nonzero context-switch count on an isolated core is a bug in the configuration, and finding *what* switched in is a `bpftrace` on `sched_switch` filtered by CPU.
+Do not mutate every IRQ mask with a shell loop: IRQ numbering changes, some affinities are driver-managed, and moving a storage or control-path IRQ can damage recoverability. Build a queue/IRQ ownership map, change one class at a time through deployment configuration, and retain a housekeeping CPU set large enough for observed interrupt, RCU, workqueue, logging, and control-plane load. There is no portable core count.
 
----
+### Busy polling versus blocking
 
-## 31.21 Busy Polling versus Blocking
-
-The fundamental tradeoff: **blocking** costs a wakeup (2 µs to 20 ms depending on load) but frees the CPU; **busy polling** costs a whole core but responds in the time it takes to read a memory location.
-
-| | Blocking (`epoll_wait`, futex, `read`) | Busy polling |
+| | Blocking | Busy polling |
 |---|---|---|
-| Response latency | 3 µs – 20 ms (wakeup path, §31.16) | 20–200 ns (one cache-line read) |
-| Jitter | High — depends on run-queue state, C-states, IRQ timing | Very low |
-| CPU cost | ~0 when idle | 100% of a core, always |
-| Power | Low | +80–150 W per core; heat reduces turbo for neighbours |
-| Scales to many flows | Yes | No — one core per polled queue |
-| Syscall count | 1+ per event | 0 |
-| Cache state on arrival | Cold (was descheduled) | **Hot** — this is an underrated second-order win |
+| Response | Includes wakeup latency (§31.4) | Detection at a polling iteration |
+| Jitter | Scheduler and idle-state effects enter the distribution | Avoids sleeping, but not IRQ/firmware/interference effects |
+| CPU cost | Low while blocked | Up to one logical CPU continuously |
+| Power and thermals | Low | High, and it reduces turbo headroom for neighbours |
+| Scales to many flows | Yes | No — one core per polled source |
+| Cache state on arrival | Cold | **Hot**, which is an underrated second benefit |
 
-**Polling wins twice**: no wakeup latency *and* the code, data, and branch predictors are already warm. A blocked thread waking after 500 µs of idleness finds its L1 evicted and pays another 10–50 µs re-warming; that hidden cost is often larger than the wakeup itself.
+Polling can avoid scheduler wakeup and keep some working state warm. The benefit depends on arrival pattern and interference; it is not a guarantee that every access hits nearby cache.
 
-### The spectrum
-
-```
-pure block  ──▶ spin-then-park ──▶ kernel busy-poll ──▶ user-space poll ──▶ FPGA
-epoll_wait      adaptive mutex     SO_BUSY_POLL       DPDK/ef_vi/spin      no CPU at all
-20 µs–ms        50 ns–5 µs         2–4 µs             0.7–2 µs             30–120 ns
-```
-
-- **Spin-then-park** (Ch. 24 §24.15): spin for N iterations, then block. The right N is roughly the cost of a park+wake (≈2 µs ≈ 6,000 cycles), because spinning longer than the sleep cost is never worse. glibc adaptive mutexes and `std::atomic::wait` do this.
-- **`SO_BUSY_POLL` / `/proc/sys/net/core/busy_poll`**: the kernel polls the NIC driver inside `recvmsg`/`epoll_wait` for N microseconds before sleeping, removing the interrupt and wakeup from the path while keeping the socket API.
-- **Full user-space polling** (Ch. 47): the application reads the NIC descriptor ring directly. No kernel involvement at all.
-
-### Writing a correct spin loop
+The spectrum between them is pure blocking; adaptive spin-then-park; kernel-side socket polling (Ch. 45); and user-space polling of a device ring (Ch. 47). A spin budget must be derived from the arrival distribution, power/core budget, and measured park/wake distribution—not one universal crossover (Ch. 24).
 
 ```cpp
-while (!queue.try_pop(msg)) {
-    _mm_pause();                      // ~40 cycles on Skylake+; yields SMT resources,
-                                      // avoids memory-order machine clears on loop exit
+// Schematic only: queue semantics and cancellation are application-specific.
+while (!stop_requested && !queue.try_pop(msg))
+    cpu_relax();   // target-specific spin-loop hint
+```
+
+Use the target's documented spin-loop hint where appropriate; its latency and power effect are microarchitecture-specific (Ch. 27). It does not fix an overloaded design. `sched_yield()` changes scheduler state and has policy-dependent semantics; it is not a short hardware pause.
+
+Prefer blocking for control-plane work, when runnable flows substantially exceed available cores, or when measured wakeup tails fit the budget. Polling a sparse source can waste capacity and thermal headroom, eventually forcing harmful co-scheduling elsewhere.
+
+---
+
+## 31.7 Choosing and Validating a Policy: A Worked Case — Core
+
+The chapter's actual skill. A feed handler must consume market data from one multicast group and hand parsed messages to a strategy thread on the same socket. Decide its scheduling configuration.
+
+**Step 1 — state the requirement as a distribution, not a number.** "p99.9 of handler wake-to-parse under 5 µs, no outlier above 50 µs in a trading session." Without this you cannot tell whether a change helped.
+
+**Step 2 — choose polling or blocking, and say why.** The arrival rate is high and the stated wake-to-parse tail budget is tight. The hypothesis is that the measured blocking wake path consumes too much of that budget, so compare it with polling under a production-shaped arrival trace. Choose polling only if the tail improvement pays for a reserved logical CPU, power, and thermal impact.
+
+**Step 3 — choose the policy.** A polling thread on a core that nothing else can run on does not need a real-time priority to avoid preemption; isolation already provides that. Prefer the *lowest*-privilege configuration that meets the requirement:
+
+- Isolated CPU plus default fair policy: avoids real-time starvation and bandwidth hazards while removing known fair-class competitors, if the isolation is verified.
+- Add `SCHED_FIFO` only when the remaining schedulable competition is understood and evidence shows class priority addresses it; then design for §31.9's hazards.
+
+That ordering is the opposite of the folklore ("set FIFO 99 for low latency"), and it is the defensible answer.
+
+**Step 4 — place it.** Use host topology and device locality to choose candidate CPUs, account for SMT siblings, and compare producer/consumer placements. Establish affinity before workload initialization. Chapter 29 owns the NUMA placement and verification details.
+
+**Step 5 — remove hidden blocking.** A polling thread can still enter allocation, synchronous logging, or fault paths. Prove which operations remain on the hot path. Chapter 32 owns any prefault/locking policy and its failure limits; Chapter 59 owns asynchronous logging design.
+
+**Step 6 — verify, and keep verifying.** This is what distinguishes a configuration from a claim:
+
+```bash
+$ ps -eLo pid,tid,cls,rtprio,psr,stat,comm
+$ taskset -pc <tid>
+$ chrt -p <tid>
+$ grep ctxt /proc/<tid>/status
+$ perf list | grep -E 'context-switches|cpu-migrations'
+$ grep -H . /proc/irq/*/smp_affinity_list
+```
+
+These commands are read-only inventory. Capture before/after deltas and use scheduler tracepoints to name the displaced and incoming tasks; event availability and tracing syntax depend on the installed kernel and tools. Correlate task switches, IRQ deltas, throttling, and application latency. A nonzero count is a lead, not proof that it caused the tail. Wire stable checks into startup validation (Ch. 60).
+
+---
+
+## 31.8 Wait/Wake and Kernel Contexts — Reference
+
+Skippable on a first pass. User code does not acquire kernel spinlocks directly, but these mechanisms explain why a blocked thread wakes, why a nominally local syscall can be delayed, and why one observation rarely identifies the root cause.
+
+### Futexes, wake queues, and inheritance
+
+A futex is a Linux facility for blocking on a user-space word. A typical mutex fast path uses user-space atomics; it enters the kernel only when it must wait or wake contended peers. The essential wait protocol is:
+
+```
+user space: observe contended state
+kernel:     atomically compare futex word with expected value
+            mismatch → return; user space retries
+            match    → enqueue waiter and sleep
+waker:      publish user-space state, then wake a bounded number of waiters
+```
+
+The compare-before-sleep closes the lost-wakeup race: a state change between the user's first observation and the syscall becomes a mismatch rather than an indefinite sleep. Futex wake does not transfer ownership by itself; the user-space synchronization protocol defines ownership and memory ordering. C++ does not require `std::mutex`, `std::atomic::wait`, or condition variables to use futexes, although Linux standard libraries commonly build blocking slow paths on them.
+
+`FUTEX_REQUEUE` can wake a limited number of tasks and move other waiters to another futex queue. Condition-variable implementations use this kind of mechanism to avoid waking every waiter only to have them contend on one mutex. Waking more tasks than can make progress creates a **thundering herd**: runnable count, context switches, and cache-line contention all rise while useful completion does not.
+
+A priority-inheritance (PI) futex addresses one specific inversion: a high-priority waiter is blocked by a lower-priority owner. The kernel can temporarily propagate priority through the PI-aware lock chain. It does not make critical sections bounded, cure deadlock, or give `std::mutex` portable real-time semantics. POSIX mutex attributes can request `PTHREAD_PRIO_INHERIT` where supported; all participants must use the compatible protocol and error handling.
+
+### Restartable sequences
+
+Linux restartable sequences (`rseq`) register per-thread user-space state with the kernel so a short critical sequence can operate on per-CPU data. If migration, preemption with scheduling, or signal delivery disrupts the sequence, control is redirected to an abort path and user space retries. This can avoid a heavyweight atomic read-modify-write for operations such as updating a per-CPU counter.
+
+`rseq` is a Linux ABI, not a general transaction and not protection against concurrent access on the same CPU. Registration details and newer optimized modes are versioned; libraries may already own the per-thread registration. Prefer a library abstraction unless implementing a runtime or allocator, and test migration and signal abort paths. The official kernel documentation and selftests are the source of truth for the deployed ABI.
+
+### Context determines which synchronization is legal
+
+| Context / primitive | May sleep? | Purpose and trap |
+|---|---:|---|
+| Hard interrupt context | No | Urgent device handling; defers substantial work |
+| Softirq context | No | Deferred networking/timer work; can delay user tasks without a task switch |
+| Process context | Usually, subject to current state | Syscalls and kernel threads can block where permitted |
+| Raw spinlock / spinlock | No while held | Protect short kernel critical regions; PREEMPT_RT can change ordinary spinlock implementation semantics |
+| Kernel mutex / semaphore | Yes | Sleeping mutual exclusion or counting resource |
+| Wait queue / completion | Yes for waiter | Event wait/wake patterns; condition must still be checked correctly |
+| Sequence counter | Readers retry; writer synchronization external | Fast consistent snapshots; long/preempted writers can starve readers |
+| RCU read-side section | Flavor-dependent restrictions | Cheap reads; reclamation waits for a grace period, callbacks run later |
+
+Interrupt, softirq, and process context are execution contexts, not scheduler classes. A packet may be handled partly in interrupt/softirq context and later wake a user task. Moving that task's priority does not automatically move the interrupt work or eliminate backlog. Under load, networking work can also run in per-CPU kernel threads depending on configuration.
+
+RCU offloading moves callback execution; it does not eliminate grace periods or all RCU bookkeeping. A sequence counter provides consistency, not mutual exclusion. A completion represents an event, not ownership. These distinctions matter when a trace names a kernel wait site: diagnose the actual protocol before suggesting a priority change.
+
+For kernel development, establish a global lock order and use lockdep-enabled test kernels to detect circular dependency patterns, invalid context use, and some IRQ-state mistakes. Lockdep is dynamic coverage, not a proof: an unexecuted path remains unchecked, and production kernels may disable it because of overhead. User-space race detection and the C++ memory model remain Chapters 24–26.
+
+---
+
+## 31.9 Real-Time Failure Modes — Role-specific
+
+If you do adopt a real-time policy, these are the failure modes to design against. Each has been a real outage.
+
+1. **Kernel lockout.** A continuously runnable real-time task can starve lower-class work on an eligible CPU. Keep recovery and housekeeping capacity outside the real-time set and retain out-of-band access.
+2. **Runtime throttling.** If configured real-time bandwidth is exhausted, service can pause until replenishment. A period-aligned gap suggests this hypothesis; confirm the configured controls and throttle accounting before changing them.
+3. **Priority inversion.** A high-priority task blocks on a lock held by a low-priority task that is itself preempted. Priority inheritance (`PTHREAD_PRIO_INHERIT`) and priority-ceiling protocols address defined cases—neither is exposed portably by `std::mutex`. Avoiding cross-class ownership is often simpler, but may require redesign.
+4. **Inversion inside the kernel.** Blocking on a kernel resource can reproduce the problem below the API. PREEMPT_RT changes many locking and interrupt-context behaviors, but not every raw/non-preemptible region; use documentation for the exact kernel.
+5. **Hidden blocking on a “lock-free” algorithm.** Allocation, synchronous logging, page faults, and container growth can invoke locks, syscalls, or faults even when the application queue is lock-free. Voluntary-switch and syscall/fault traces provide evidence, not a universal zero-switch assertion.
+6. **Frequency and idle-state interaction.** Polling, policy, power control, and thermals interact in platform-specific ways. Chapter 35 owns the hypothesis and rollback; do not prescribe a fixed governor here.
+7. **Unexpected faults.** A fault can block or invoke substantial kernel work regardless of task priority. Chapter 32 owns locking, prefaulting, limits, and failure policy.
+8. **Hostile debugging.** A spinning high-priority thread can make a machine unresponsive to the tools you would use to diagnose it. Develop at a lower priority; raise it only in the production configuration.
+
+---
+
+## 31.10 Threads in Practice: Stacks, Attributes, and Alternatives — Role-specific
+
+**What standard C++ does not expose.** C++23 does not standardize stack size, CPU affinity, Linux scheduling policy, or priority-inheriting mutex attributes. A Linux standard library commonly implements `std::thread` using pthreads and may expose a native handle, but code using it is platform-specific.
+
+```cpp
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <pthread.h>
+#include <sched.h>
+#include <cstddef>
+#include <exception>
+#include <stdexcept>
+#include <system_error>
+
+using Entry = void* (*)(void*);
+
+pthread_t start_pinned(Entry entry, void* arg,
+                       unsigned cpu, std::size_t stack_bytes) {
+    if (cpu >= CPU_SETSIZE) throw std::out_of_range("CPU_SETSIZE");
+
+    pthread_attr_t attr{};
+    int ec = pthread_attr_init(&attr);
+    if (ec) throw std::system_error(ec, std::generic_category());
+
+    cpu_set_t set{};
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    if (!(ec = pthread_attr_setstacksize(&attr, stack_bytes)))
+        ec = pthread_attr_setaffinity_np(&attr, sizeof set, &set);
+
+    pthread_t tid{};
+    if (!ec) ec = pthread_create(&tid, &attr, entry, arg);
+    const int destroy_ec = pthread_attr_destroy(&attr);
+    if (ec) throw std::system_error(ec, std::generic_category());
+    if (destroy_ec) std::terminate(); // initialized attributes should destroy
+    return tid; // caller must join or detach
 }
 ```
-`_mm_pause()` (`YIELD` on ARM) is mandatory, not optional: without it the spinning core saturates its load ports, starves its SMT sibling, and suffers a memory-ordering machine clear when the value finally changes. `sched_yield()` in a spin loop is an anti-pattern — it is a syscall (200–350 ns), and under `SCHED_FIFO` it moves you to the tail of your priority's run queue, which can be worse than not yielding.
 
-**When to block anyway:** control-plane threads, anything handling more flows than you have cores, and anything where a 100 µs response is acceptable. Burning a core to poll a channel that sees one message per second is how you run out of cores and start co-scheduling hot threads — the failure mode that busy polling was supposed to prevent.
+This uses the GNU `pthread_attr_setaffinity_np` extension. Every pthread function returns its own error number; it does not necessarily report through `errno`. A production wrapper also defines ownership if later setup fails. If policy and priority are set through attributes, `PTHREAD_EXPLICIT_SCHED` is required to use them instead of inheriting the creator's settings. Creating with affinity avoids an initial run on an arbitrary eligible CPU.
 
----
+**Stacks.** Linux pthread stacks normally use bounded mappings with configurable size and guard region, while the initial thread follows process stack/resource-limit behavior. Pages need not be resident merely because virtual space is reserved. If fault-free steady state is required, Chapter 32 owns the stack-touch, memory-locking, resource-limit, and failure plan.
 
-## 31.22 Real-Time Scheduling Operational Hazards
+Guard regions are necessary and not sufficient against jumping over a guard with a large frame. Compiler stack-clash protection adds probing according to target/compiler rules and has a workload-dependent cost. Stack mapping, guard size, residency, and fault behavior belong to Chapter 32.
 
-Turning on `SCHED_FIFO` is easy; the failure modes are what interviews probe.
+**Thread-local storage** is reached through per-thread runtime state. ELF TLS models permit different access sequences depending on whether the linker can assume static placement. Forcing a restrictive TLS model may improve a named binary but constrains dynamic loading and is a compiler/linker/ABI decision, not a portable fix. Inspect the generated code before treating TLS as a bottleneck.
 
-**1. Locking out the kernel.** A `SCHED_FIFO` thread that spins without blocking prevents every lower-priority task on that CPU from running — including `kworker`, `ksoftirqd`, and `sshd`. If it also happens to hold a lock the kernel needs, the machine wedges. The RT throttle (§31.15) exists to prevent exactly this, and disabling the throttle (`sched_rt_runtime_us=-1`) removes the safety net. **Always leave a housekeeping core out of your RT set, and always have an out-of-band way in (IPMI/serial).**
+**Fibers and coroutines.** A user-space stackful fiber can switch without asking the kernel scheduler, but it is cooperative, a blocking syscall blocks the carrier thread, and tooling must understand the extra stacks. C++20 coroutines are stackless state machines; their frame storage may be dynamically allocated or elided depending on lifetime and compiler proof. Neither has a universal switch cost (Chs. 19–20).
 
-**2. The 50 ms periodic spike.** The default throttle yields 950 ms of RT time per 1 s per CPU. A busy-polling FIFO thread is therefore forcibly descheduled for ~50 ms once per second. Diagnostic signature: a *perfectly periodic* 1 Hz latency spike of tens of milliseconds, visible in `perf sched` as an involuntary switch to `swapper` or a fair task.
-
-**3. Priority inversion.** A high-priority RT thread blocks on a mutex held by a low-priority thread, which is itself preempted by a medium-priority thread; the high-priority thread waits indefinitely. This is the Mars Pathfinder failure. Mitigations: `PTHREAD_PRIO_INHERIT` (priority inheritance — the holder is temporarily boosted), `PTHREAD_PRIO_PROTECT` (priority ceiling), or — best for a hot path — **never share a lock between RT and non-RT threads at all**. `std::mutex` supports neither protocol (§31.10).
-
-**4. Unbounded priority inversion via the kernel.** Your RT thread calls into the kernel and blocks on a kernel mutex held by a `SCHED_OTHER` task. On a stock kernel most kernel locks are non-preemptible spinlocks without inheritance; `PREEMPT_RT` converts them to `rt_mutex` with inheritance, which is one of its main reasons to exist.
-
-**5. Hidden blocking on the "lock-free" path.** The archetypal bug: a hot path that is carefully lock-free but calls `malloc` (which takes an arena lock and can `mmap`), or logs through `std::cout` (locale lock, `write` syscall), or touches a page for the first time (page fault, `mmap_lock`), or grows a `std::vector`. Each is a syscall or a lock you didn't intend. Detect with `perf trace` filtered to the hot thread, `bpftrace` on `sys_enter`, or by asserting zero `voluntary_ctxt_switches` growth in steady state.
-
-**6. Priority and CPU-frequency interaction.** RT tasks don't drive the `schedutil` governor's frequency estimate the way you'd expect, and a busy-poll loop that executes few instructions can leave the core at a low P-state. Pin the frequency (`intel_pstate=disable` + `cpupower frequency-set -g performance`, or `performance` governor) rather than trusting the governor (Ch. 35 §35.11).
-
-**7. Debugging becomes hostile.** A `SCHED_FIFO` 99 thread that spins makes `gdb` attach, `perf record`, and even `ssh` unresponsive on that CPU. Develop at a lower priority; raise it only in production configuration.
-
-**8. `mlockall` is a prerequisite, not an optional extra.** An RT thread that takes a major page fault has just done a 30 µs–10 ms blocking disk read at priority 99. `mlockall(MCL_CURRENT|MCL_FUTURE)` plus pre-faulting (Ch. 32 §32.15–§32.16) is part of the RT setup, not a separate optimization.
-
-**The operational checklist**, worth reciting: pin, isolate, move IRQs and kernel threads to housekeeping cores, disable `irqbalance`, disable C-states and fix the frequency, `mlockall` and pre-fault, preallocate every buffer, no syscalls and no allocation on the hot path, decide about the RT throttle deliberately, disable SMT or idle the siblings, and then **verify with `cyclictest`, `perf stat -e context-switches`, `/proc/interrupts`, and `turbostat`** rather than trusting the configuration.
+For a hot path, compare explicit state machines, coroutines, fibers, and kernel threads by blocking behavior, ownership, cancellation, frame allocation, observability, and tail measurements. Fibers or coroutines can make many logically waiting flows manageable, but only if carrier-thread blocking and allocation are controlled.
 
 ---
 
-## Key Interview Questions
+## 31.11 Process Lifecycle — Reference
 
-1. **What is the difference between a process and a thread on Linux?** — Both are `task_struct`s; a thread is one that shares `mm`, `files`, `sighand`, and `signal` via `CLONE_*` flags. The scheduler treats them identically.
-2. **What does `getpid()` return in a thread, and how do you get the thread's own ID?** — The TGID (shared by all threads); `gettid()` returns the kernel PID, which is the per-thread ID.
-3. **What does `D` state mean and why can't you kill such a process?** — Uninterruptible sleep, usually in I/O or a kernel lock; signals are only checked on return to user mode, which never happens. `D` also inflates the load average.
-4. **How does `fork` avoid copying memory, and what does it still cost?** — COW: page tables are copied and both sides marked read-only; cost is O(mapped pages) for the page-table copy (300 µs–2 ms for 1 GiB) plus 1.5–3 µs per later COW fault.
-5. **Why is `fork` dangerous in a multithreaded program?** — Only the calling thread survives; any lock held by another thread (notably the allocator's) is inherited locked. Only async-signal-safe calls are legal before `exec`.
-6. **What survives `exec`?** — PID/PPID/PGID/SID, non-`CLOEXEC` descriptors, signal mask and pending signals, `nice`, cwd, credentials (unless setuid). Handlers reset; address space, threads, and locks are gone.
-7. **Why does every descriptor-creating syscall have an `O_CLOEXEC` variant?** — Setting the flag afterwards is racy against a concurrent `fork`+`exec`, leaking the descriptor.
-8. **What is a zombie and how do you avoid accumulating them?** — A terminated task retained for its exit status; `wait`/`waitpid` in a loop with `WNOHANG` from a `SIGCHLD` handler, or `SIG_IGN`/`SA_NOCLDWAIT` for auto-reap.
-9. **Why must a `SIGCHLD` handler loop?** — Standard signals don't queue; several exits can coalesce into one delivery.
-10. **What problems did NPTL fix relative to LinuxThreads?** — Real thread groups (one PID), no manager thread, correct process-directed signals, and futex-based synchronization with no syscall in the uncontended case.
-11. **Why is an uncontended `pthread_mutex_t` lock ~20 ns?** — It's a `cmpxchg` on a user-space word; the futex syscall only happens on contention.
-12. **What's the default thread stack size and what does it actually cost?** — 8 MiB of virtual address space, a few KiB of RSS; the cost is minor page faults on first touch and address-space consumption, not memory.
-13. **What is a guard page and why isn't it enough?** — A `PROT_NONE` page below the stack that turns overflow into `SIGSEGV`; a large stack frame can jump over it, so you also need `-fstack-clash-protection`.
-14. **Stackful fibers vs C++20 coroutines?** — Fibers switch a real stack (~20–100 ns) and can suspend from nested calls; coroutines are compiler-generated state machines with heap frames that can only suspend in the coroutine body but cost near-zero per switch.
-15. **Direct vs indirect cost of a context switch?** — 1–3 µs of kernel work vs 10–100 µs of cache/TLB/branch-predictor recovery; the indirect cost dominates.
-16. **Voluntary vs involuntary context switches — which matters?** — Involuntary; it means something preempted you mid-work. Target zero per second on a hot thread.
-17. **What is the CFS/EEVDF timeslice?** — Roughly `max(sched_latency_ns/N, sched_min_granularity_ns)` — 0.75–3 ms typically. EEVDF replaces it with `sched_base_slice_ns` plus per-task deadlines. Neither bounds latency.
-18. **Why does fair scheduling not help latency?** — It guarantees proportional share, not bounded waiting. A runnable task can wait milliseconds behind other runnable tasks.
-19. **`SCHED_FIFO` vs `SCHED_RR` vs `SCHED_DEADLINE`?** — FIFO runs until it blocks or is preempted by higher priority; RR adds a round-robin quantum among equals; DEADLINE is EDF with admission control and outranks both.
-20. **What is RT throttling and what does it look like when it bites?** — 950 ms of RT time per second per CPU by default; a busy-polling FIFO thread sees a perfectly periodic ~50 ms stall once per second.
-21. **How do you avoid priority inversion?** — Priority inheritance (`PTHREAD_PRIO_INHERIT`) or priority ceilings; better, don't share locks between RT and non-RT threads. `std::mutex` supports neither.
-22. **What does `nohz_full` do and when does it stop working?** — Suppresses the 1000 Hz tick, but only while exactly one task is runnable on the CPU. Verify with `perf stat -e irq_vectors:local_timer_entry`.
-23. **You've isolated a core and still see 200 µs spikes. What's left?** — IPIs (TLB shootdowns), NMI watchdog, residual ticks, the SMT sibling, C-state exits, and firmware **SMIs** — check with `hwlatdetect` and the SMI-count MSR.
-24. **Why must housekeeping cores be provisioned properly?** — The kernel work you moved still has to run; if it backs up, the kernel schedules it onto your isolated cores anyway.
-25. **When should you busy-poll and when should you block?** — Poll when latency below ~10 µs matters and you can afford a core; block for control-plane work and when flows outnumber cores. Spin-then-park for the middle, with a spin budget of about one park+wake (~2 µs).
-26. **Why `_mm_pause()` in a spin loop?** — Frees SMT execution resources, reduces power, and avoids the memory-ordering machine clear when the awaited value changes.
+Skippable unless you are writing a supervisor or debugging process management. The latency-relevant conclusions are stated first; the mechanics follow.
+
+**What matters for a latency-sensitive service:** move process launch out of the measured hot interval. `fork` duplicates process metadata and establishes copy-on-write mappings; work scales with the address-space shape and later writes can fault in either parent or child. Chapter 32 owns page-table and copy-on-write mechanics. In a multithreaded process, only the calling thread exists in the child, while inherited library state may reflect locks held by vanished threads. POSIX sharply restricts what the child may safely call before `exec`. `posix_spawn` offers a higher-level launch contract, but its implementation and cost are libc/platform facts—measure if launch latency matters.
+
+The rest, compressed:
+
+- **`exec`** replaces the image while preserving the process ID and specified process attributes. Open descriptors without close-on-exec survive; caught signal dispositions reset, while details such as masks and pending signals follow POSIX/Linux rules. Prefer atomic close-on-exec creation interfaces where available (`O_CLOEXEC`, `SOCK_CLOEXEC`, `accept4`, `pipe2`, `epoll_create1`) because a later `fcntl` can race with concurrent process creation.
+- **Reaping.** A terminated task is retained as a zombie until its parent collects the status with a `wait`-family call, or until the parent arranges automatic reaping. Standard signals do not queue, so a `SIGCHLD` handler must loop with `WNOHANG` and must preserve `errno`. An orphan is reparented to the nearest subreaper, which is how supervisors track double-forked daemons.
+- **Process groups and sessions** exist for terminal signal delivery: terminal-generated signals go to the foreground process *group*, and losing a controlling terminal sends `SIGHUP`. The classic double-fork daemonization sequence (fork, `setsid`, fork again, chdir, umask, redirect the standard descriptors) exists to permanently foreclose acquiring a controlling terminal.
+- **Modern practice inverts that.** Under a service manager, a service should stay in the foreground so the supervisor can track its main process directly, capture its output, apply cgroup limits, and restart it deterministically. Daemonizing under a supervisor breaks process tracking. Knowing both the sequence and why it is obsolete is the complete answer.
+- **`clone3` and pidfds.** Linux `clone3` passes a sized argument structure and can request a pidfd for the child. A pidfd is a stable kernel handle that avoids races caused by numeric PID reuse when signaling or polling child state. Feature availability depends on kernel and libc versions; use runtime error handling rather than a version-string guess.
+- **NPTL and thread runtime state.** On mainstream glibc/Linux, NPTL implements POSIX threads over Linux tasks. Each user thread also has a user-space stack, thread-control block, TLS state, cancellation state, and library bookkeeping. Those are implementation/ABI details above `task_struct`.
+- **Kernel threads** often appear with bracketed names in `ps`, but display convention is not an ABI. Workers, RCU callback threads, migration/control threads, reclaim, and threaded interrupt handlers can compete with application tasks. Their policy, affinity, and movability depend on function, kernel configuration, and driver; inventory before changing them (§31.6).
 
 ---
 
-## Common Traps
+## 31.12 Deployment Verification Runbook — Reference
 
-- **Assuming `R` state means "on a CPU".** It means runnable; the queue depth is your wakeup latency.
-- **Forgetting `D` state counts toward the load average**, so heavy I/O inflates load with no CPU use.
-- **Calling `fork()` from a multithreaded program and then doing anything but `exec`** — inherited locked mutexes, especially the allocator's.
-- **`fork()` in a latency-sensitive parent** — the parent's own pages become read-only and it pays COW faults afterwards.
-- **Setting `FD_CLOEXEC` with `fcntl` after `open`** instead of using `O_CLOEXEC` — racy with concurrent `fork`.
-- **Not looping in a `SIGCHLD` handler**, so coalesced signals leave zombies.
-- **Not preserving `errno` in a signal handler.**
-- **`sched_setaffinity(getpid(), ...)` on a multithreaded process** — it only pins one thread; iterate `/proc/<pid>/task/*`.
-- **Pinning after allocating and touching memory** — first-touch already placed the pages on the wrong NUMA node.
-- **Pinning two hot threads to SMT siblings** — looks like two cores, performs like 1.2.
-- **Forgetting `PTHREAD_EXPLICIT_SCHED`** — your policy and priority are silently ignored.
-- **Running `SCHED_FIFO` at priority 99**, above `migration/N`, and hanging the machine.
-- **Leaving RT throttling at default and chasing a 1 Hz 50 ms spike for a week.**
-- **Disabling RT throttling without moving kernel work to housekeeping cores** — starves `kworker`/`ksoftirqd` and wedges the box.
-- **Leaving `irqbalance` running** — it silently rewrites your IRQ affinities.
-- **Assuming `nohz_full` is working** without checking `local_timer_entry` counts.
-- **Isolating a core but not its SMT sibling.**
-- **Calling `malloc`, logging, or touching a fresh page on a "lock-free" RT path** — every one is a hidden lock, syscall, or fault.
-- **Forgetting `mlockall` on an RT thread** — a major fault at priority 99 is a millisecond of blocking disk I/O.
-- **`sched_yield()` in a spin loop** — a syscall, and under FIFO it sends you to the back of your priority queue.
-- **Daemonizing under `systemd`** — breaks main-PID tracking and journal capture.
-- **Ignoring cgroup `cpu.max` throttling** in containers — the classic multi-millisecond tail with no visible CPU saturation (`cpu.stat: nr_throttled`).
-- **Trusting the configuration instead of measuring it** — `cyclictest`, `/proc/interrupts`, `perf stat -e context-switches -C <core>`, `turbostat`.
+Skippable until operating a Linux host. Run this read-only sequence before and after a scheduling change; adapt paths and events to the deployed kernel.
+
+1. **Freeze identity.** Record `uname -a`, `/proc/cmdline`, CPU/firmware identity, cgroup mode, service-manager unit, and relevant package versions. Vendor kernels can backport EEVDF, PREEMPT_RT, and isolation work, so a release number alone is insufficient.
+2. **Map topology and eligibility.** Save `lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE` and the topology `*_siblings_list` files. For each TID, record `taskset -pc`, `chrt -p`, cgroup membership, and effective cpuset. Confirm that the intended mask is nonempty and contains the CPU actually reported by `ps`.
+3. **Inventory competing work.** List tasks by last CPU, class, state, and priority. Snapshot `/proc/interrupts`, per-IRQ affinity, workqueue masks, full-dynticks/isolated CPU lists, and SMT sibling activity. Do not infer “quiet” from task affinity alone.
+4. **Check throttles and transitions.** Read the applicable cgroup `cpu.max` and `cpu.stat`, kernel real-time bandwidth controls, and per-task voluntary/nonvoluntary switch counters. Take deltas over the same interval as the application latency histogram.
+5. **Trace the tail.** Trigger on an application-latency outlier and collect the minimum evidence needed: scheduler switch/wakeup tracepoints, IRQ/softirq activity, throttling, and application phase markers. Chapter 43 owns warm-up, controls, clocks, distributions, and causal experiment design.
+6. **Change one mechanism.** State benefit, cost, prerequisite, rollback, and success metric before changing affinity, cpusets, IRQ routing, tick isolation, RCU offload, polling, or scheduling class. Keep the previous boot entry/unit configuration and a recovery CPU path.
+
+The current official references are the kernel's [CPU isolation guide](https://docs.kernel.org/admin-guide/cpu-isolation.html), [EEVDF description](https://docs.kernel.org/scheduler/sched-eevdf.html), [PI-futex documentation](https://docs.kernel.org/locking/pi-futex.html), and [restartable-sequences ABI guide](https://docs.kernel.org/userspace-api/rseq.html). “Current” matters: archive the documentation matching the deployed build where operations depend on details.
 
 ---
 
-## Compact Recall Summary
+## 31.13 Recall and Practice — Core
 
-**Tasks.** Linux schedules `task_struct`s. A thread shares `mm`/`files`/`sighand`/`signal` via `clone` flags; a process shares none. `getpid()` = TGID, `gettid()` = the kernel's PID. Kernel threads have `mm == NULL` and are the tasks that will preempt yours (`ksoftirqd`, `kworker`, `migration/N` at FIFO 99, `khugepaged`).
+### Recall card
 
-**States.** `R` = runnable (not necessarily running); `S` interruptible; `D` uninterruptible and unkillable, and counted in the load average; `Z` awaiting reap. Transitions, not states, are what latency work measures.
+1. Linux schedules tasks; threads in one process are tasks sharing selected resources such as the address space and descriptor table. They are not a second scheduler object type.
+2. `R` means running or runnable. Wakeup latency also includes event handling, placement, preemptibility, policy eligibility, and switch-in work.
+3. Context-switch cost has direct kernel work and workload-dependent after-effects. Interrupt delay need not increment the context-switch counter.
+4. Fair scheduling targets weighted service, not bounded waiting. cgroup CPU bandwidth can throttle a group even when host utilization looks low.
+5. Numeric real-time priority does not outrank interrupts, non-preemptible regions, stopper work, firmware, or higher scheduler classes.
+6. Period-aligned stalls suggest bandwidth throttling, but configuration and accounting must confirm the cause.
+7. Affinity is a task mask intersected with system constraints. Establish placement before workload initialization, then verify CPU and memory locality separately.
+8. Isolation is a bundle: scheduler domains/cpusets, ticks, RCU callbacks, IRQs, workqueues, SMT siblings, and housekeeping must be treated and measured separately.
 
-**Creation.** `fork` = COW: page tables copied (O(mapped pages), 300 µs–2 ms per GiB), later writes fault at 1.5–3 µs each. Unsafe in multithreaded programs. `exec` replaces the image, keeps PID and non-`CLOEXEC` fds, resets handlers, kills other threads. `posix_spawn` beats `fork`+`exec`. Zombies need a `waitpid(WNOHANG)` loop or `SA_NOCLDWAIT`.
+### Common traps
 
-**Threads.** NPTL is 1:1 over `clone`, futex-based: uncontended mutex 15–25 ns with no syscall, contended 2–8 µs. Pthreads exposes stack size, affinity, policy, and `PTHREAD_PRIO_INHERIT`, none of which `std::thread`/`std::mutex` do — remember `PTHREAD_EXPLICIT_SCHED`. Stacks are 8 MiB virtual with a `PROT_NONE` guard page; add `-fstack-clash-protection`. Fibers switch in 20–100 ns but block a whole carrier thread on a syscall; C++20 coroutines are stackless state machines that can't suspend from nested calls.
+- Treating a numeric PID as if every API necessarily targets the whole thread group.
+- Reading `R` as proof a task was executing rather than eligible to execute.
+- Raising priority before identifying the task, IRQ, throttle, or wait that caused delay.
+- Applying an isolation boot flag without reserving and observing housekeeping capacity.
+- Calling a source-level lock “a futex” or assuming every futex wake transfers mutex ownership.
 
-**Scheduling.** Context switch: 1–3 µs direct, 10–100 µs of cache recovery. CFS/EEVDF gives fairness, not latency bounds; slices are 0.75–3 ms and cgroup `cpu.max` throttling produces multi-ms stalls. `SCHED_FIFO/RR` priorities 1–99 outrank everything fair, subject to RT throttling (950 ms/s → a 1 Hz 50 ms stall). Wakeup latency is 2–5 µs to an idle isolated core and milliseconds on a loaded fair queue; `cyclictest` measures the truth.
+### Reasoning questions
 
-**Placement.** Pin with `sched_setaffinity` (per-TID) before touching memory. Read topology from `lscpu -e`, `lstopo`, and `/sys/.../topology/`; never place hot threads on SMT siblings, keep producer/consumer within one L3, and keep the polling thread on the NIC's NUMA node. Isolate with `isolcpus` + `nohz_full` + `rcu_nocbs` + `irqaffinity`, then give the displaced work real housekeeping cores and disable `irqbalance`.
+1. How does Linux represent process threads as tasks, and which resources remain shared or private?
+2. Why does a machine with a high load average sometimes show low CPU utilization?
+3. Decompose context-switch cost and explain why no component is universally dominant.
+4. Why does fair scheduling not provide a hard wakeup deadline?
+5. A containerized service shows multi-millisecond p99.9 spikes with CPU utilization under 40%. What do you check first and why?
+6. A real-time task shows period-aligned gaps. What evidence would distinguish runtime throttling from an unrelated periodic interrupt?
+7. Why can raising a thread to the highest real-time priority fail to prevent preemption?
+8. Explain the lost-wakeup race that futex compare-and-sleep prevents, and why waking every waiter can reduce throughput.
+9. Under what workload and kernel conditions can `nohz_full` suppress eligible ticks, and how would you verify behavior?
+10. You isolated a CPU and still see outliers. Name four remaining mechanisms and one corroborating observation for each.
 
-**Polling.** Blocking costs 3 µs–20 ms of wakeup plus a cold cache; polling costs a core and responds in 20–200 ns. Spin-then-park with a budget of roughly one park+wake (~2 µs). Always `_mm_pause()`; never `sched_yield()`.
+### Applied exercise
 
-**RT hazards.** Kernel lockout, the 1 Hz throttle stall, priority inversion (use `PTHREAD_PRIO_INHERIT` or don't share the lock), hidden `malloc`/log/page-fault blocking, frequency governors that don't ramp for poll loops, and firmware SMIs that no kernel setting can remove. Configure, then verify.
+Specify the complete scheduling configuration for a three-thread trading process: a NIC-polling feed handler, a strategy thread, and a journal writer. For each thread, state: core assignment with a topology justification, scheduling policy with a reason for choosing the *least* privileged option that works, blocking versus polling, and memory placement. Then write the validation script — the exact commands and the expected output — that a deployment must run before the process is allowed to take traffic (Ch. 60). Finally, state which single configuration item you would remove first if measurement showed it was not helping, and what measurement would show that.
+
+### Scenario puzzle: the obvious optimization is wrong
+
+A team raises every trading thread to the same high `SCHED_FIFO` priority. The median improves slightly. It then observes replenishment-period-aligned stalls, a host that becomes unreachable when one thread spins, and strategy delays correlated with a journal writer holding a shared mutex. Form and verify three hypotheses: real-time bandwidth throttling, starvation of recovery/control work, and same-priority contention or priority inversion around the lock. Design a lower-privilege configuration using placement and isolation first; state the rollback and success measure for every remaining real-time setting.
+
+### Prerequisites for the next chapter
+
+Chapter 32 assumes you can state why a page fault on a runnable hot path is also a scheduling disturbance (§31.9), and what “establish affinity before workload initialization” means (§31.5). It owns page faults, translation, locking, and huge pages, all of which this chapter deferred.

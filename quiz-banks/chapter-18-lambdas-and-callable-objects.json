@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Capture creates closure members out of automatic-storage variables of the enclosing function. Objects with static or thread storage duration have addresses valid for the whole program, so the body just names them — nothing is copied. The tempting answer is the one giving each closure its own copy of a `static`: that is precisely the misconception behind believing `[=]` makes a `static` counter per-closure or thread-safe, when in fact every closure touches the same object.",
-      "sourceAnchor": "181-lambda-capture-modes",
+      "sourceAnchor": "182-capture-modes-and-init-capture--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 2,
       "explanation": "The copy into the closure member happens when the closure object is constructed, so the later assignment to `a` is invisible to `f`. The lazy-read answer is the classic misreading: capture is not deferred name lookup. And `mutable` is only needed to *modify* a value capture; reading one through the `const` `operator()` is always fine.",
-      "sourceAnchor": "181-lambda-capture-modes",
+      "sourceAnchor": "182-capture-modes-and-init-capture--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Default capture applies only to automatic-storage variables; a `static` local is simply named, so every closure refers to the one object and concurrent `++` is a race. The 'each closure gets a copy' option is the trap — `[=]` looks like it snapshots everything the body mentions. There is also no ill-formedness here, and `mutable` is irrelevant because the object being modified is not a closure member at all.",
-      "sourceAnchor": "181-lambda-capture-modes",
+      "sourceAnchor": "182-capture-modes-and-init-capture--core",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Captures are ordinary members: by value stores the object, by reference stores a reference (a pointer in practice), trading a copy for a pointer chase that can cost a cache miss in a stored callback. Member order is explicitly unspecified, which kills the layout-guarantee option. And nothing about a lambda implies heap storage — a three-`int` closure is 12 bytes of stack; heap allocation only appears when something like `std::function` must erase it.",
-      "sourceAnchor": "181-lambda-capture-modes",
+      "sourceAnchor": "182-capture-modes-and-init-capture--core",
       "difficulty": "application"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Init-capture declares a brand-new member with an initializer, decoupling the member's name and value from any enclosing variable — which is exactly why it can capture an expression rather than a variable. The 'lazy evaluation' option confuses capture with a deferred computation: the initializer runs eagerly at closure construction. Nor is the initializer restricted to naming a local; `[n = 42]` and `[c = compute()]` are the point of the feature.",
-      "sourceAnchor": "182-init-capture",
+      "sourceAnchor": "182-capture-modes-and-init-capture--core",
       "difficulty": "recall"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`[n = expr]` deduces the member's type exactly as `auto n = expr;` would, and plain `auto` strips references and top-level cv, yielding an independent mutable copy. Preserving const is the most tempting near-miss because it feels like const-correctness propagating, but that is `decltype(auto)` behaviour, not `auto`. Writing `[&n = expr]` is how you ask for a reference member instead.",
-      "sourceAnchor": "182-init-capture",
+      "sourceAnchor": "182-capture-modes-and-init-capture--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 3,
       "explanation": "The capture succeeded; the failure is constness. In a non-`mutable` lambda `operator()` is `const`, so `p` is `const unique_ptr`, `std::move(p)` produces a `const unique_ptr&&`, and overload resolution falls back to the deleted copy constructor. The 'unique_ptr cannot be captured' answer is the appealing wrong one — move-capture is the very feature that made capturing `unique_ptr` possible; the fix is just `() mutable`.",
-      "sourceAnchor": "182-init-capture",
+      "sourceAnchor": "182-capture-modes-and-init-capture--core",
       "difficulty": "trap"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`[=]` captures `this` — the pointer by value — and every member access goes through it, so the closure only looks self-contained. Believing it copies the object is the single most common lambda lifetime bug; a real copy requires `[*this]` (C++17), and copying only the member requires the explicit `[t = timeout]`. Something *is* captured, so the 'nothing at all' option is wrong even though its premise about members not being automatic variables is what forces the `this` capture in the first place.",
-      "sourceAnchor": "183-capturing-this-and-this",
+      "sourceAnchor": "183-capturing-this-and-lifetime--core",
       "difficulty": "trap"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Only an owning handle extends lifetime, and `shared_from_this()` yields a `shared_ptr` member that keeps the original object alive (`weak_from_this()` plus `lock()` is the cancellable variant). `[*this]` is the strongest distractor: it is safe, but it snapshots a *copy*, so the original is not kept alive and later mutations are invisible. `[=, this]` only silences the C++20 deprecation — it captures the same dangling pointer — and `[&]` captures `this` as a pointer too.",
-      "sourceAnchor": "183-capturing-this-and-this",
+      "sourceAnchor": "183-capturing-this-and-lifetime--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 3,
       "explanation": "`[*this]` copy-constructs the entire object into a closure member, so the closure is self-contained but is a snapshot taken at creation. Seeing later mutations is exactly what it gives up — that option describes `[this]`. There is no runtime lifetime checking anywhere in the language here, and because a whole-object copy is made, `[*this]` requires the type to be copy-constructible rather than working around it.",
-      "sourceAnchor": "183-capturing-this-and-this",
+      "sourceAnchor": "183-capturing-this-and-lifetime--core",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The deprecation targets `[=]` specifically because that spelling *suggests* a self-contained copy while storing a pointer; `[&]` never implied independence, so it was left alone. Deprecation is also not removal — `[=]` still compiles, just with `-Wdeprecated-this-capture`. Nothing was said about `[this]` itself, which remains the ordinary explicit form.",
-      "sourceAnchor": "183-capturing-this-and-this",
+      "sourceAnchor": "183-capturing-this-and-lifetime--core",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 2,
       "explanation": "The closure type is a fresh unnamed class generated at the point of the lambda expression, and its `operator()` is `const` by default, which is what makes value captures read-only. Layout order is explicitly unspecified and the type is not standard-layout in general. A captureless lambda *converts* to a function pointer, but it is still a class type — conflating the conversion with the type itself is the tempting error.",
-      "sourceAnchor": "184-lambda-closure-types",
+      "sourceAnchor": "181-the-closure-model--core",
       "difficulty": "recall"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 3,
       "explanation": "P0624 defaulted the default constructor and copy assignment for *captureless* closures, so `std::map`'s default constructor can create a comparator of that type. The copy-constructor option is the near-miss: closure types have always had defaulted copy/move constructors, which is why the pre-C++20 workaround of passing `cmp` into the constructor worked. `decltype` on the variable was likewise always fine, and no change was made to `std::map`.",
-      "sourceAnchor": "184-lambda-closure-types",
+      "sourceAnchor": "181-the-closure-model--core",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Every lambda *expression* yields its own closure type — even textually identical ones, and even across instantiations of the same template. Believing identical text implies an identical type is the standard misconception, and it is also why heterogeneous lambdas need type erasure or `std::variant` to share a container. No interconversion exists either; only the captureless-to-function-pointer conversion is generated, and both would have to go through that to meet.",
-      "sourceAnchor": "184-lambda-closure-types",
+      "sourceAnchor": "181-the-closure-model--core",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 2,
       "explanation": "A captureless closure has no members, so it is an empty class; implementations hold the comparator as a base (or `[[no_unique_address]]` member) and EBO shrinks it to zero — plus the call inlines completely. The `sizeof` 0 option is the trap: every complete object type has `sizeof >= 1`, so a standalone closure object still occupies a byte; only the *subobject* is free. `std::function` by contrast stores a buffer and a thunk and dispatches indirectly per comparison.",
-      "sourceAnchor": "184-lambda-closure-types",
+      "sourceAnchor": "181-the-closure-model--core",
       "difficulty": "trap"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The conversion works by giving the closure type a static function holding the body; that static has no implicit `this`, so there is no room for captured state. Reference captures are the tempting exception — they are small, but they are still members that `operator()` reaches through the closure object, so a bare code address cannot carry them. This is the same reason a non-static member function pointer is not a function pointer, and why C callback APIs pair a function pointer with `void* user_data`.",
-      "sourceAnchor": "185-captureless-lambda-conversion",
+      "sourceAnchor": "185-captureless-conversion-and-the-c-bridge--core--role-specific",
       "difficulty": "recall"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Built-in unary `+` accepts a pointer, and the only viable conversion from a captureless closure is to a function pointer, so `+[]{}` yields `int(*)()` on both arms and the conditional has a common type. The original fails purely because the two closure types are unrelated — there is no common base and no shared closure type, which is what the other options invent. The same trick is used to defeat template deduction of a closure type.",
-      "sourceAnchor": "185-captureless-lambda-conversion",
+      "sourceAnchor": "185-captureless-conversion-and-the-c-bridge--core--role-specific",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Passing the closure as a template parameter keeps its unique type, so the call is resolved statically and inlines; converting to a function pointer erases that and leaves an indirect call the optimizer generally cannot see through. Nothing is allocated — the pointer names a static member function of the closure type — and the conversion operator has been `constexpr` since C++17, so the pointer is a perfectly good constant. Convert only at a genuine C boundary.",
-      "sourceAnchor": "185-captureless-lambda-conversion",
+      "sourceAnchor": "185-captureless-conversion-and-the-c-bridge--core--role-specific",
       "difficulty": "application"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 1,
       "explanation": "`mutable` is a qualifier change on `operator()` and nothing more: dropping `const` makes the value-capture members writable through `this`. Reference captures were never affected — `[&x]{ x = 1; }` compiles without `mutable`, since the referred-to object's constness is its own. And lambda `mutable` is unrelated to the `mutable` storage-class specifier on class members despite sharing the keyword.",
-      "sourceAnchor": "186-mutable-lambdas",
+      "sourceAnchor": "184-mutable-and-generic-lambdas--core",
       "difficulty": "recall"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 3,
       "explanation": "`mutable` makes `operator()` non-const, and a non-const member function cannot be called on a const object — so the two qualifiers collide at the call. Expecting `mutable` to win is the tempting reading; it changes the member function, not the object. This bites whenever a closure is stored as a const member or taken by `const F&`. Init-captures and `mutable` compose freely, which is the normal move-capture idiom.",
-      "sourceAnchor": "186-mutable-lambdas",
+      "sourceAnchor": "184-mutable-and-generic-lambdas--core",
       "difficulty": "trap"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 2,
       "explanation": "Predicates are passed by value and implementations may copy them freely, so a predicate whose result depends on accumulated state gives unspecified results — libstdc++ and libc++ genuinely differ here. The 'by reference' option inverts the actual convention, and no fixed copy count is guaranteed, so nothing about the behaviour is portable. It does compile, so it is not rejected; the standard states the requirement as a precondition on the caller.",
-      "sourceAnchor": "186-mutable-lambdas",
+      "sourceAnchor": "184-mutable-and-generic-lambdas--core",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`std::for_each` is the documented exception: it takes the functor by value like everything else, but its return value is the (possibly moved-from-and-copied) functor, so the accumulated state is retrievable. The 'by reference' variant is the tempting misstatement — it reaches the right algorithm for the wrong reason. `std::transform` returns only the output iterator, and `std::sort` returns nothing at all.",
-      "sourceAnchor": "186-mutable-lambdas",
+      "sourceAnchor": "184-mutable-and-generic-lambdas--core",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Each `auto` parameter adds an invented template parameter to `operator()`; the closure is still one ordinary class with a templated call operator, which is why `auto plus = ...` needs no explicit types. That distinction kills the 'closure becomes a class template' answer. There is no type erasure and no one-shot deduction — the cost is instead the usual template one, a fresh body instantiated per argument-type combination.",
-      "sourceAnchor": "187-generic-lambdas",
+      "sourceAnchor": "184-mutable-and-generic-lambdas--core",
       "difficulty": "recall"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 1,
       "explanation": "The explicit list recovers everything `auto` parameters discarded: a name for `T` instead of `std::decay_t<decltype(a)>`, same-type enforcement across parameters, deduction of an NTTP such as an array extent, pack naming, and direct concept constraints. Recursion is the strongest distractor — that is what C++23 deducing-this (`[](this auto&& self, ...)`) buys, a different feature. `operator()` remains a template, so the bloat exposure is unchanged.",
-      "sourceAnchor": "187-generic-lambdas",
+      "sourceAnchor": "184-mutable-and-generic-lambdas--core",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 1,
       "explanation": "The catch-all compiles for every alternative, so adding a new one to the variant no longer breaks the build — the message just falls into the fallback at run time. Omitting the arm makes exhaustiveness a compile-time check, usually what you want for a dispatcher. The 'generic arm wins' option states overload resolution backwards: a non-template exact match beats a template, which is exactly why the pattern works at all rather than being ambiguous.",
-      "sourceAnchor": "187-generic-lambdas",
+      "sourceAnchor": "184-mutable-and-generic-lambdas--core",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 3,
       "explanation": "C++17 made `operator()` implicitly `constexpr` when it qualifies, so `static_assert(square(4) == 16)` works with no annotation; writing the keyword is only useful to get a hard diagnostic when the body is not in fact eligible. Captures do not automatically defeat it — a captured `constexpr int` is usable in constant evaluation; it is the closure *object* being `constexpr` that demands literal-type captures. C++20 broadened the surrounding contexts, but it was not the starting point.",
-      "sourceAnchor": "188-constexpr-lambdas",
+      "sourceAnchor": "187-constexpr-lambdas--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Placement decides what is qualified: before `auto` it constrains the object, which must then be a literal type — all captures literal and the closure trivially destructible, always satisfied by a captureless lambda. After the parameter list it constrains `operator()`. The swapped option is the whole point of the question; the two are independent, since a runtime-only closure object can still have a `constexpr` call operator and vice versa.",
-      "sourceAnchor": "188-constexpr-lambdas",
+      "sourceAnchor": "187-constexpr-lambdas--deep-dive",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 2,
       "explanation": "`const T& r = f();` extends the temporary to `r`'s scope, but an init-capture is not one of the reference bindings that trigger extension, so the string is destroyed at the semicolon and `f` holds a dangling reference. Expecting extension to carry through is the trap, and it is tempting precisely because the syntax looks like a reference initialization. The capture is well-formed, and `&` is certainly not ignored — there is no silent copy.",
-      "sourceAnchor": "189-dangling-lambda-captures",
+      "sourceAnchor": "183-capturing-this-and-lifetime--core",
       "difficulty": "trap"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 3,
       "explanation": "Coroutine parameters are copied into the frame, but the closure object — which is where captures live, reached via the implicit object parameter — is not; a temporary closure invoked immediately is gone by the first suspension, leaving the captures dangling. The 'frame copies the closure' answer is the natural assumption and is exactly the one that fails. The fix is to pass state as coroutine parameters or keep the closure alive explicitly.",
-      "sourceAnchor": "189-dangling-lambda-captures",
+      "sourceAnchor": "183-capturing-this-and-lifetime--core",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 1,
       "explanation": "Typical inline capacity is around 16 bytes, so `[this, id]` generally fits while four small members generally do not — capturing three or four things is the practical crossover, and the allocation happens at assignment. Capturing `this` does not by itself force allocation, and a captureless closure is the easiest case of all to store inline. Note the buffer is not mandated by the standard, and libstdc++ additionally requires the target be nothrow-movable to use it.",
-      "sourceAnchor": "1810-small-object-optimization-in-callable-wrappers",
+      "sourceAnchor": "186-callable-wrapper-ownership-and-cost--core",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 2,
       "explanation": "`std::function` mandates a copyable target because `std::function` itself is copyable, and capturing a `unique_ptr` makes the closure move-only — which is precisely the gap `std::move_only_function` (and, for the copyable case with qualifier support, C++26 `copyable_function`) was added to close. The `inplace_function` option confuses a size problem with a copyability one: `std::function` handles oversized targets fine, it just heap-allocates. The requirement is copy-constructibility, not trivial copyability or default construction.",
-      "sourceAnchor": "1810-small-object-optimization-in-callable-wrappers",
+      "sourceAnchor": "186-callable-wrapper-ownership-and-cost--core",
       "difficulty": "recall"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`function_ref` stores an object pointer plus a thunk pointer, owns nothing, is trivially copyable and passes in two registers — the right parameter type for a callback used only during the call. Its hazard is exactly the view semantics: outliving the referent is the same bug class as a dangling reference capture, which rules out the 'safest for a long-lived registered callback' option. It does not own or move its target; owning move-only closures is `std::move_only_function`'s job.",
-      "sourceAnchor": "1810-small-object-optimization-in-callable-wrappers",
+      "sourceAnchor": "186-callable-wrapper-ownership-and-cost--core",
       "difficulty": "trap"
     }
   ]

@@ -1,516 +1,898 @@
 # Chapter 18 — Lambdas and Callable Objects
 
-*Interview-focused revision notes. The theme: a lambda is a compiler-generated class with an `operator()`, so every question about capture, mutability, cost, and lifetime is really a question about that class's members, qualifiers, and storage.*
+*A lambda expression creates a closure object with a generated call operator. Reason from that object's stored state, call-operator qualifiers, and lifetime—not from the brevity of the syntax.*
 
 ---
 
-## 18.1 Lambda Capture Modes
+## Why this matters in an HFT interview — Core
 
-A **lambda expression** creates an unnamed **closure type** (§18.4) and a closure object of that type. The capture list declares which enclosing automatic variables become **members** of that class.
+Lambdas are the default callable in modern C++: algorithm predicates, event callbacks, task-queue entries, and comparator template arguments. The interview problem is rarely syntax. It is whether a closure still refers to live objects when invoked, whether storing it introduces allocation or indirection, and whether a generic callable multiplies code across many instantiations.
 
-```cpp
-int a = 1, b = 2;
-auto f1 = [ ]        { };            // captures nothing
-auto f2 = [a]        { return a; };  // a by VALUE — a copy stored as a member
-auto f3 = [&b]       { b = 3; };     // b by REFERENCE — a reference member (or pointer)
-auto f4 = [=]        { return a+b; };// default capture by value: only ODR-USED variables
-auto f5 = [&]        { a=b; };       // default capture by reference
-auto f6 = [=, &b]    { };            // value default, b by reference
-auto f7 = [&, a]     { };            // reference default, a by value
-auto f8 = [a, a]     { };            // ERROR — duplicate
-auto f9 = [=, a]     { };            // ERROR pre-C++20; LEGAL in C++20 (redundancy allowed
-                                     //   for explicitness; still an error with `&` default)
-```
+The two failure classes must remain separate. A reference capture can dangle even when the wrapper performs no allocation. An owning capture can be lifetime-safe while `std::function` still allocates during registration. Correctness comes first; only then choose storage and dispatch.
 
-### The rules that matter
+Type erasure itself—the mechanism used to hide a concrete type—is Chapter 6's topic; this chapter only applies it to callables. Perfect forwarding inside generic lambdas is Chapter 17's topic; this chapter uses it, not re-derives it.
 
-- **Only automatic-storage-duration variables of the enclosing function can be captured.** Globals, `static` locals, `thread_local`s, and `constexpr` variables are *not* captured — they are simply referenced. This is why `[=]` does not make a `static` counter thread-safe: every closure refers to the same object. It is also why a lambda that "captures" only globals is still captureless (§18.5).
-- **Default captures capture only what is odr-used.** A variable read in a discarded `if constexpr` branch, or used only in an unevaluated `decltype`/`sizeof`, is not captured. Conversely, an integral `constexpr` local used by value is generally not odr-used and thus not captured — until you bind a reference to it, which requires capture.
-- **Capture by value copies at the point the lambda is *created*, not when it is called.** Mutating `a` afterwards does not change what `f2` returns.
-- **Capture by reference is a dangling risk** the moment the closure outlives the frame (§18.9).
-- **A capture-by-value member is `const`** unless the lambda is `mutable` (§18.6), because `operator()` is `const` by default.
-- **Structured bindings** could not be captured in C++17 (a defect); C++20 permits capturing them by value or reference.
-- **Parameter packs** may be captured in C++20 via init-capture pack expansion (§18.2).
-- **`[=]` capturing `this` is deprecated in C++20** (see §18.3) because it silently captures a pointer, not the object.
+**Baseline:** C++23. Non-standard callable views and fixed-capacity wrappers are labeled as such.
 
-### What the capture list is not
+## 90-second screen — Core
 
-Capture is **not** an overload set, **not** lazy, and **not** a name-lookup mechanism: `[x = y]` introduces a *new* variable in the closure's scope (§18.2), while `[y]` copies `y` under its own name. Names in the body are looked up in the enclosing scope first; a capture does not shadow anything at namespace scope.
+Five facts:
 
-### Cost model
+1. Each lambda expression has a unique unnamed closure type. Copy captures correspond to stored state; the representation of reference captures is unspecified.
+2. The generated `operator()` is `const` by default. `mutable` permits mutation of stored value captures; it does not repair a dangling reference or provide synchronization.
+3. `[this]` stores the pointer. `[*this]` stores a snapshot of the object. Neither automatically gives the intended asynchronous ownership policy.
+4. Immediate callbacks may borrow when completion is guaranteed before the borrowed objects die. Returned, stored, queued, or cross-thread callbacks must make every captured lifetime explicit.
+5. A captureless lambda can convert to a matching function pointer. Owning wrappers such as `std::function` and `std::move_only_function` add type-erased storage and indirect invocation; their inline-storage thresholds are not portable contracts.
 
-Each captured value adds a member; the closure's size and alignment follow the ordinary layout rules of Ch. 3 §3.4 (order is implementation-defined for default captures, declaration order for explicit ones — the standard leaves it unspecified either way). A closure capturing three `int`s by value is 12 bytes and lives on the stack; passing it to a template parameter inlines completely and costs nothing at `-O2`. The cost only appears when it must be *stored*: a closure larger than the SBO buffer of `std::function` heap-allocates (§18.10). **Capturing by reference keeps the closure small (one pointer per capture) but converts a copy into an indirection** — a genuine trade-off in a callback stored in a container, where the extra pointer chase is a cache miss.
+Two decisions:
+
+- **Capture decision:** borrow only under a synchronous completion contract; otherwise copy the needed value, transfer ownership, capture a strong/weak handle, or redesign around an ID.
+- **Storage decision:** use a template when the callable type can remain static; use an owning erased wrapper for genuine runtime heterogeneity; use a measured fixed-capacity wrapper when storage must be bounded.
 
 ---
 
-## 18.2 Init-Capture
+## 18.1 The closure model — Core
 
-C++14 **init-capture** (also "generalized lambda capture") declares a new closure member with an initializer, decoupling the member's name and value from any enclosing variable:
-
-```cpp
-auto f = [n = 42]              { return n; };
-auto g = [p = std::move(uptr)] { p->run(); };            // MOVE into the closure
-auto h = [c = compute()]       { return c; };            // compute ONCE at creation
-auto k = [&r = obj.member]     { r++; };                 // capture a sub-object by reference
-auto m = [self = shared_from_this()] { self->tick(); };  // extend lifetime for an async callback
-```
-
-The declared type is deduced with `auto` rules (Ch. 2 §2.16), so `[n = expr]` deduces by value and `[&n = expr]` by reference. `auto` semantics mean top-level cv and references are stripped: `[n = someConstRef]` gives a non-const, non-reference copy.
-
-### Why it exists
-
-1. **Move-capture.** Before C++14 there was no way to move a `unique_ptr` into a closure; the workaround was a `shared_ptr` or a hand-written functor class. `[p = std::move(p)]` is the reason `unique_ptr` can be captured at all, and is what makes lambdas usable as move-only task types in a thread pool (Ch. 24 §24.4).
-2. **Capturing an expression, not a variable.** `[len = v.size()]` avoids storing a reference to `v` just to call `size()`.
-3. **Capturing a member without capturing `this`.** `[m = this->member]` or `[&m = this->member]` gives you the sub-object with an explicit lifetime relationship, rather than a `this` pointer that dangles when the object dies (§18.3).
-4. **Renaming for clarity**, and capturing a `const` view of a mutable variable: `[&cr = std::as_const(v)]`.
-
-### Pack expansion in init-capture (C++20)
+A lambda expression produces a closure object of a unique, unnamed, non-union class type generated at that point in the source:
 
 ```cpp
-template <class... Args>
-auto bind_all(Args&&... args) {
-    return [...xs = std::forward<Args>(args)] () mutable { target(std::move(xs)...); };
-}
-```
-Before C++20 the standard workaround was to capture a `std::tuple` and unpack with `std::apply` (Ch. 15 §15.2) — still the pattern in C++14/17 code, and worth being able to write:
+#include <utility>
 
-```cpp
-return [t = std::make_tuple(std::forward<Args>(args)...)] () mutable {
-    std::apply([](auto&&... xs){ target(std::forward<decltype(xs)>(xs)...); }, std::move(t));
+auto f = [x = 1](int y) mutable noexcept -> int { return x + y; };
+
+// A useful mental model for this copy capture:
+class __lambda_N {
+    int x;
+public:
+    explicit __lambda_N(int x_) : x(x_) {}
+    int operator()(int y) noexcept { return x + y; }
 };
 ```
 
-### The `mutable` interaction
+This hand-written class is explanatory, not a promised transformation. A copy capture produces an unnamed non-static data member whose type follows the capture rules. For a reference capture, the implementation may or may not use a data member; the closure's size and layout remain unspecified.
 
-A move-captured `unique_ptr` used in a way that modifies it (moving out of it, resetting it) requires `mutable`, because the closure member is `const` in a non-`mutable` lambda (§18.6). `[p = std::move(p)] { return std::move(p); }` compiles but *copies*... except `unique_ptr` has no copy, so it fails to compile — a common confusion whose real answer is "the member is `const`, add `mutable`."
+| Property | Rule |
+|---|---|
+| `operator()` | Public and inline; `const` unless `mutable`; may be `noexcept`, constrained, templated, or have an explicit return type |
+| Copy/move construction | Implicitly declared under the ordinary member rules; a move-only capture makes the closure move-only |
+| Assignment/default construction | A closure with a non-empty capture list—including a capture default—has no default constructor and has deleted copy assignment; `[]` closures gain default construction and assignment in C++20 |
+| Capture member order/layout | Unspecified; do not serialize, compare representations, or infer offsets |
+| Object size | Nonzero as a complete object; empty-base and `[[no_unique_address]]` optimizations can eliminate storage overhead in enclosing types |
+| Conversion to function pointer | Only if captureless (§18.5) |
 
-Init-capture is also the reason a lambda can be **non-copyable**: capturing a move-only type makes the closure move-only, which is exactly why `std::function` (which requires copyability) cannot hold it and `std::move_only_function` (C++23) was added (§18.10).
+Every lambda **expression** has its own type. Two adjacent expressions with identical text still have different types. A lambda expression inside a function template also yields a closure type dependent on that instantiation. Normal inline-definition and one-definition-rule machinery makes lambdas usable in headers; do not invent a per-translation-unit mismatch rule. The practical consequence is simpler: use `auto` or `decltype(expression)` locally, and use a named function object when a public API needs a stable, readable type.
+
+The C++20 default-constructibility and copy-assignability of captureless closures unlock using a lambda directly as a comparator type:
+
+```cpp
+#include <set>
+
+using Descending =
+    decltype([](int a, int b) noexcept { return a > b; });
+
+std::set<int, Descending> values;
+```
+
+A container implementation can exploit empty-base or no-unique-address storage for a stateless comparator. Inlining is an optimizer decision, but preserving the concrete comparator type gives the optimizer direct visibility that erased `std::function` does not normally provide.
+
+### Function objects and callable concepts
+
+A **function object** is any object usable with call syntax, usually because its type defines `operator()`. A lambda creates one kind of function object; a named class is often better when behavior needs documentation, multiple constructors, shared use, or a stable API name.
+
+```cpp
+#include <concepts>
+#include <functional>
+#include <utility>
+
+struct Above {
+    int threshold;
+    constexpr bool operator()(int value) const noexcept {
+        return value > threshold;
+    }
+};
+
+template <class F>
+requires std::predicate<F&, int>
+constexpr bool any_of_three(F&& pred) {
+    return std::invoke(pred, 1) ||
+           std::invoke(pred, 2) ||
+           std::invoke(pred, 3);
+}
+
+static_assert(any_of_three(Above{2}));
+```
+
+`std::invocable<F, Args...>` checks whether `std::invoke` can form the call. `std::regular_invocable` adds a semantic expectation that invocation is equality-preserving and does not modify the function object or arguments; the compiler cannot verify that semantic promise. `std::predicate` additionally requires a Boolean-testable result. Concepts improve diagnostics and state intent, but they do not guarantee `noexcept`, thread safety, allocation behavior, or lifetime.
+
+`std::invoke` unifies ordinary function objects, function pointers, and pointers to members. Overload-resolution fundamentals belong to Chapter 4; the interview point here is that a generic callable API should constrain the operation it performs rather than require a particular callable spelling.
+
+| Callable form | Carries state | Static type visible at call | Ownership/lifetime | Typical trade-off |
+|---|---:|---:|---|---|
+| Named function object | In object members | Yes | Value semantics chosen by the class | Clear reusable type; can inline; may add template instantiations |
+| Lambda closure | In captures | Yes unless erased | Closure owns copy captures and borrows reference captures | Local and concise; unnamed type |
+| Function pointer | No context beyond code address | Signature visible, target often runtime | Does not own external state | C-compatible; indirect unless optimized through |
+| `std::reference_wrapper<F>` | Refers to external `F` | Wrapper type visible | Non-owning | Copyable reference semantics; can dangle |
+| `std::function<Sig>` | Yes, erased | No concrete target type | Owns a copyable target | Uniform copyable storage; possible allocation and indirection |
+| `std::move_only_function<Sig>` | Yes, erased | No concrete target type | Owns a movable target | Supports move-only captures; possible allocation and indirection |
 
 ---
 
-## 18.3 Capturing `this` and `*this`
-
-Inside a non-static member function, the lambda body may name members. It does so through a captured **`this` pointer**:
+## 18.2 Capture modes and init-capture — Core
 
 ```cpp
-struct Session {
-    int timeout;
-    auto make_checker() {
-        return [this]  { return timeout > 0; };   // captures the POINTER
-        return [=]     { return timeout > 0; };   // ALSO captures `this` — deprecated in C++20
-        return [&]     { return timeout > 0; };   // ALSO captures `this` (as a pointer)
-        return [*this] { return timeout > 0; };   // C++17: captures a COPY of the object
-        return [t = timeout] { return t > 0; };   // captures just the member, by value
+void capture_examples() {
+    int a = 1;
+    int b = 2;
+    auto f1 = []         { return 0; };
+    auto f2 = [a]        { return a; };
+    auto f3 = [&b]       { b = 3; };
+    auto f4 = [=]        { return a + b; };
+    auto f5 = [&]        { a = b; };
+    auto f6 = [=, &b]    { return a + b; };
+    auto f7 = [&, a]     { return a + b; };
+
+    f3();
+    f5();
+    (void)f1; (void)f2; (void)f4; (void)f6; (void)f7;
+}
+```
+
+Rules that matter:
+
+- **Only automatic-storage-duration variables of the enclosing function can be captured.** Globals, `static` locals, and `thread_local`s are referenced directly, not captured — `[=]` does not make a shared `static` counter thread-safe, because every closure still refers to the same object.
+- **A capture default does not eagerly copy the entire scope.** An entity is implicitly captured when the lambda body requires capture under the language rules. “Only what the body uses” is a sound working model; details involving dependent expressions, discarded statements, and constant expressions belong to language-lawyer reference material, not closure-layout prediction by inspection.
+- **Value capture copies at closure creation, not at call.** Mutating `a` afterward does not change what `f2` returns.
+- **Reference-capture representation is unspecified.** The standard does not require a reference member to be implemented as a pointer; treat it as an opaque reference with pointer-like lifetime risk, not literally a pointer you can reason about at the ABI level.
+- **Capture syntax does not change the source object's lifetime.** `[&x]` does not retain `x`; `[p = raw_pointer]` copies the pointer, not the pointee; `[view = span]` copies a view, not its backing storage.
+- With a `=` default, an additional named variable capture must use `&`; C++20 also permits explicit `this`. Thus `[=, &x]` and `[=, this]` are valid, while `[=, x]` is redundant and ill-formed. With a `&` default, a named exception is captured by value, so `[&, x]` is valid and `[&, &x]` is ill-formed.
+- C++20 permits capturing structured bindings. Their lifetime consequences follow what they name: copying the bound value differs from retaining a reference to an element.
+
+```cpp
+struct Counter {
+    int value{};
+    auto reader() {
+        return [=, this] { return value; };
     }
 };
 ```
 
-**The critical fact: `[=]` does not copy the object.** It captures `this` by value — the *pointer* by value — so every member access is an indirection through a pointer that dangles as soon as the `Session` is destroyed. The lambda looks self-contained and is not. This is the single most common lambda lifetime bug in asynchronous code:
+### Init-capture (C++14)
+
+Init-capture declares a new closure member with its own initializer, decoupled from any enclosing variable's name:
 
 ```cpp
-void Session::start() {
-    io.async_read(buf, [=](auto ec, size_t n) { handle(ec, n); });  // `this` may be gone
+#include <memory>
+#include <utility>
+
+auto make_reader(std::unique_ptr<int> p) {
+    return [owned = std::move(p)] { return *owned; };
+}
+
+auto make_counter(int initial) {
+    return [n = initial]() mutable { return n++; };
 }
 ```
 
-Because the misleading appearance of `[=]` is so damaging, **C++20 deprecates implicit `this` capture via `[=]`** (P0806); `[=, this]` is the explicit form, and compilers emit `-Wdeprecated-this-capture`. `[&]` still captures `this` implicitly and is not deprecated, on the grounds that `[&]` never suggested independence.
+`auto`-style deduction applies to a value init-capture, so `[n = some_const_reference]` normally produces a plain value member. A reference init-capture such as `[&r = object.member]` continues to borrow the referenced subobject and is safe only while that subobject exists at the same address.
+
+Init-capture is how a closure takes ownership of a move-only object or stores a computed result under a useful name. Evaluation occurs when the closure is created. If creating the closure happens per event, the initializer's construction, allocation, and reference-count costs also happen per event.
+
+C++20 permits pack expansion in init-capture:
+
+```cpp
+#include <tuple>
+#include <utility>
+
+template <class... Args>
+auto bind_all(Args&&... args) {
+    return [...xs = std::forward<Args>(args)]() mutable {
+        return std::tuple{std::move(xs)...};
+    };
+}
+```
+The forwarding mechanism is owned by Chapter 17. Here the important consequence is storage: each expanded `xs` is state inside the closure.
+
+A move-captured member is observed through a `const operator()` unless the lambda is `mutable`, so moving from or resetting that member normally requires `mutable`. A lambda that owns a `unique_ptr` is move-only and cannot be stored as a `std::function` target; C++23's `std::move_only_function` is the standard owning wrapper for that signature when the deployment library implements it. Check `__cpp_lib_move_only_function` in toolchains that predate complete C++23 library support.
+
+### Capture cost is object cost
+
+A lambda expression by itself performs no hidden allocation. Its closure contains stored captures, subject to ordinary object layout and padding. Capturing a `std::string` by value copies or moves a string; that operation may allocate according to the string's state. Capturing a `shared_ptr` changes a reference count. Capturing an `array<char, 64>` copies 64 characters into the closure. The allocation belongs to the captured type or later wrapper, not to “lambda syntax.”
+
+```text
+[seq, symbol = std::move(name), &stats]
+┌──────────────── closure object ────────────────┐
+│ seq value │ owned std::string │ borrowed stats │
+└────────────────────────────────────────────────┘
+   copy          move/copy cost       lifetime risk
+
+Exact offsets, padding, and reference representation are unspecified.
+```
+
+Measure `sizeof(closure)` only as a target-specific observation. The more durable question is which resources each capture owns, borrows, or shares.
+
+---
+
+## 18.3 Capturing `this` and lifetime — Core
+
+```cpp
+struct Session {
+    int timeout;
+    auto check_by_pointer() {
+        return [this] { return timeout > 0; };
+    }
+    auto check_by_copy() {
+        return [*this] { return timeout > 0; };
+    }
+    auto check_by_member() {
+        return [t = timeout] { return t > 0; };
+    }
+};
+```
+
+`[this]` stores the pointer, not the object. An implicit member access under `[=]` also captures that pointer; C++20 deprecates this implicit `[=]` spelling because it looks like an independent copy. `[&]` can also capture `this` implicitly, but the pointer is still captured by value—the `&` does not turn it into a reference-to-pointer capture.
+
+Every later member access goes through the stored pointer. If the original object dies before invocation, the closure dangles. If another thread mutates the live object without synchronization, keeping it alive does not prevent a data race.
+
+Write `[this]` or `[=, this]` when pointer semantics are intentional. A warning for deprecated implicit `this` capture can catch the `[=]` spelling, but it cannot decide whether the object's lifetime is adequate.
 
 ### `[*this]` (C++17)
 
-Captures a *copy of the whole object* as a closure member. Members are then accessed on that copy, and the closure is self-contained.
+Captures a copy of the whole object as a closure member; the closure becomes self-contained.
 
-| | `[this]` / `[=, this]` | `[*this]` | `[m = member]` |
+| | `[this]` / `[=, this]` | `[*this]` |
+|---|---|---|
+| Stored | pointer | full copy of `*this` |
+| Dangles when object dies | Yes | No |
+| Sees later mutations of the original | Yes | No — snapshot at creation |
+| Const-ness of the copy | n/a | const **iff the enclosing member function is const**, regardless of whether the lambda is `mutable` |
+
+In a `const` member function, the captured object is const; `mutable` removes the closure call operator's implicit const qualification but cannot remove const from the captured object. In a non-const member function, a mutable lambda can modify its private snapshot. Neither case modifies the original.
+
+`[*this]` is not a general asynchronous fix. Copying a large object adds work and produces snapshot semantics. Copying an object that contains raw pointers still copies those pointers, so transitive pointees can dangle. For an object managed by `shared_ptr`, `[self = shared_from_this()]` keeps the same object alive; `[weak = weak_from_this()]` plus `lock()` avoids extending lifetime and permits cancellation when the object is gone. Chapter 9 owns the smart-pointer contracts, including the precondition that `shared_from_this()` has an established shared owner.
+
+An explicit object parameter (C++23) lets a lambda recurse without erasure:
+
+```cpp
+auto fib = [](this auto&& self, int n) -> int {
+    return n < 2 ? n : self(n - 1) + self(n - 2);
+};
+```
+This removes the need to capture a wrapper merely for recursion. It does not imply that an alternative `std::function` formulation must allocate; wrapper storage remains implementation-dependent.
+
+### The stored-vs-immediate checklist
+
+The chapter's one governing rule:
+
+- **An immediate callback may borrow.** If the receiving API guarantees all invocations finish before it returns, the creating frame outlives invocation. Ordinary standard algorithms have that completion shape. With parallel execution, lifetime may still be adequate while unsynchronized access remains a data race.
+- **A stored or cross-thread callback must make lifetime explicit.** If the closure is queued, handed to another thread, or returned, capture values, ownership, or a weak handle with a liveness check. Thread bodies, timers, I/O callbacks, and continuations are stored unless their API explicitly proves otherwise.
+- Ask, for every capture: does this closure's lifetime end before or after the thing it references? If you cannot answer confidently, it does not go by reference.
+
+Before accepting a callback API, write down the contract:
+
+| Question | Why it changes capture design |
+|---|---|
+| Can the receiver retain or copy the callable? | A call-scoped borrow may become an escaping reference |
+| Can invocation begin after the registering call returns? | Locals and by-value parameters from that frame are gone |
+| Can callbacks overlap or run concurrently? | Mutable captures and referenced objects need synchronization |
+| How is cancellation acknowledged? | Destroying the owner is unsafe until in-flight invocation is excluded |
+| Which thread destroys captured owners? | Destructors can perform reclamation or release the last shared reference on a latency-sensitive thread |
+| Does the receiver move its stored entries? | A C `void*` pointing at an entry can become invalid even though the entry's value remains alive |
+| What happens on queue rejection? | Moved captures may already have transferred ownership; retry semantics must be explicit |
+
+“Asynchronous” is not the only danger word. A synchronous API that stores the callable for a later phase is an escaping API; a worker API that joins before returning can permit borrowing, subject to data-race rules.
+
+### Dangling-capture failure trace
+
+```text
+producer frame          task queue                 worker
+──────────────          ──────────                 ──────
+int sequence = 42
+enqueue([&sequence]) ──► stores closure
+return; sequence dies
+                                                  pop closure
+                                                  read sequence → undefined behavior
+```
+
+The queue may correctly own the closure while the closure incorrectly borrows its state. Copying the `std::function` or moving the task does not repair that inner reference.
+
+| Symptom | Violated invariant | Detection | Repair |
 |---|---|---|---|
-| Stored | 8-byte pointer | Full copy of `*this` | Just the members used |
-| Lifetime safety | Dangles if the object dies | Safe | Safe |
-| Sees later mutations | Yes | No — snapshot at creation | No |
-| Cost | 1 pointer + an indirection per access | `sizeof(*this)` copy | Minimal |
-| Requires | Nothing | Copy-constructible object | Copyable members |
-| Const-ness | Members are const iff the enclosing member function is const | Copy is a const member unless `mutable` | Member is const unless `mutable` |
+| Intermittent wrong ID after queue delay | Captured local died before invocation | Delay/stress test; compiler lifetime warning where available | Capture ID by value |
+| ASan stack-use-after-return | Closure dereferenced a dead frame | ASan with stack-use-after-return support | Copy/own the needed state |
+| Callback accesses freed session | Stored `this` outlived object | Object-destruction race test; ASan may help | Strong owner, weak lock, or cancellation/join |
+| Correct address but wrong packet bytes | Buffer stayed allocated but was reused | Generation counters and ownership assertions | Retain slot or copy retained fields |
+| Race report on live object | Lifetime was valid; synchronization was not | ThreadSanitizer and review | Immutable snapshot, lock, atomics, or confinement |
 
-`[*this]` is not a general fix — copying a large object per callback is expensive, and copying an object that owns resources changes semantics. For asynchronous work the idiomatic answer is `[self = shared_from_this()]` (Ch. 9 §9.7), which keeps the *same* object alive rather than snapshotting it. That requires `enable_shared_from_this` and a `shared_ptr`-owned object; calling `shared_from_this()` on a stack object or during the constructor throws `std::bad_weak_ptr`.
-
-For a **cancellable** callback, `[weak = weak_from_this()]` plus a `lock()` check is better still: the callback becomes a no-op if the object died, rather than keeping a dead object alive (Ch. 9 §9.5).
-
-**Deducing this** (C++23, Ch. 19 §19.11) gives a related tool: an explicit object parameter on `operator()` lets a lambda recurse without `std::function` or the Y-combinator trick:
+Common bug shapes:
 
 ```cpp
-auto fib = [](this auto&& self, int n) -> int { return n < 2 ? n : self(n-1) + self(n-2); };
-```
-This is the modern answer to "how do you write a recursive lambda," superseding `std::function<int(int)> f = [&f](int n){…};` (which allocates and indirects) and the `y_combinator` pattern.
+#include <functional>
 
----
-
-## 18.4 Lambda Closure Types
-
-The closure type is a **unique, unnamed, non-union class type** generated at the point the lambda expression appears. Its properties are fully specified:
-
-```cpp
-auto f = [x = 1](int y) mutable noexcept -> int { return x + y; };
-
-// approximately equivalent to:
-class __lambda_N {
-    int x;                                                    // captures become members
-public:
-    explicit __lambda_N(int x_) : x(x_) {}
-    int operator()(int y) noexcept { return x + y; }           // non-const because `mutable`
-    __lambda_N(const __lambda_N&) = default;
-    __lambda_N(__lambda_N&&) = default;
-    __lambda_N& operator=(const __lambda_N&) = delete;         // pre-C++20
-};
-```
-
-| Property | Rule |
-|---|---|
-| Class kind | Unique unnamed non-union class, at the smallest enclosing scope |
-| `operator()` | Public inline; `const` unless `mutable`; `constexpr` if it qualifies (§18.8); may be `noexcept`, may have a trailing return type, may be a template (§18.7) |
-| Copy/move constructors | Defaulted; the closure is copyable iff all captures are |
-| Copy assignment | **Deleted** in C++11/14/17; **defaulted for captureless lambdas in C++20** |
-| Default constructor | **Deleted** pre-C++20; **defaulted for captureless lambdas in C++20** |
-| Destructor | Implicitly declared, defaults from members |
-| `sizeof` | ≥ 1; captureless lambdas are empty classes, so EBO / `[[no_unique_address]]` shrinks them to zero as members (Ch. 3 §3.4) |
-| Layout | Order of members is **unspecified**; not standard-layout in general |
-| Conversion to function pointer | Only if captureless (§18.5) |
-
-### The C++20 change and why it matters
-
-C++20 (P0624) makes **captureless** closure types default-constructible and copy-assignable. That unlocks:
-
-```cpp
-auto cmp = [](const Order& a, const Order& b) { return a.px < b.px; };
-std::map<Order, int, decltype(cmp)> m;                  // C++20: no need to pass cmp
-std::set<int, decltype([](int a, int b){ return a > b; })> s;   // lambda in an unevaluated context
-```
-Two further C++20 relaxations enable that second line: **lambdas in unevaluated contexts** (inside `decltype`, `sizeof`, template arguments) and **lambdas in constant expressions**. Before C++20 you had to name a functor struct to use it as a comparator template argument.
-
-Note the **stateless-comparator size win**: `std::map<K,V,Cmp>` stores the comparator; if `Cmp` is a captureless lambda (an empty class) it costs zero bytes via EBO, whereas `std::function<bool(K,K)>` costs 32 bytes plus an indirect call per comparison. Passing comparators as *types*, not as `std::function`, is the standard low-latency practice (Ch. 12 §12.1, Ch. 14 §14.8).
-
-### Uniqueness consequences
-
-Every lambda expression yields a *distinct* type, even textually identical ones — including in different instantiations of the same template. Therefore:
-- Two lambdas never have the same type; you cannot declare a variable of "the lambda type" without `auto`/`decltype`.
-- A lambda in a header used as a default template argument produces a different type in each TU, which can be an **ODR violation** (this is why lambdas in inline functions and in NTTPs have careful special rules; C++20 P0315 permits lambdas in unevaluated operands but requires them to be the same entity across TUs when in an inline function).
-- Storing heterogeneous lambdas in one container requires erasure (§18.10) or `std::variant`.
-
----
-
-## 18.5 Captureless Lambda Conversion
-
-A lambda with an **empty capture list** has an implicit, `constexpr` (since C++17), non-explicit conversion operator to a **plain function pointer** with the same signature:
-
-```cpp
-auto f = [](int x) { return x * 2; };
-int (*fp)(int) = f;                            // implicit conversion
-::qsort(p, n, sz, [](const void* a, const void* b) { … });   // C API callback
-std::signal(SIGINT, [](int) { g_stop = 1; });                // C callback
-```
-The mechanism: the closure type gets a static member function with the lambda's body plus `operator T(*)(Args...)` returning its address. `noexcept` lambdas convert to `noexcept` function pointers; C++17 added conversion to pointers with other calling conventions on implementations that need it (`__stdcall` etc.).
-
-**Why the restriction is fundamental:** a function pointer is a bare code address with no room for state. A capturing lambda's `operator()` needs the closure object as its implicit `this`, and there is nowhere in a raw function pointer to put it. This is exactly the same reason a non-static member function pointer is not a function pointer (Ch. 4 §4.10), and it is the reason C callback APIs universally take a `void* user_data` alongside the function pointer.
-
-### The idiomatic C-callback bridge
-
-```cpp
-template <class F>
-void register_cb(F&& f) {
-    static auto stored = std::forward<F>(f);          // or store in a context struct
-    c_api_register(+[](void* ud) { (*static_cast<decltype(&stored)>(ud))(); }, &stored);
+std::function<int()> bad_factory() {
+    int x = 42;
+    return [&x] { return x; }; // x dies on return
 }
-// or, the standard trampoline shape:
-c_api_register([](void* ud) { (*static_cast<F*>(ud))(); }, &f_object);
-```
-The trampoline pattern: pass a *captureless* lambda as the function pointer and the closure's address as `void* user_data`; the trampoline casts it back and invokes. This is how every C++ wrapper over `pthread_create`, `epoll` user data, `libuv`, and DPDK callbacks works, and being able to write it on demand is a common interview task.
 
-**The unary `+` trick:** `+[]{ … }` forces the conversion to a function pointer (the built-in unary `+` accepts a pointer, and the closure's only viable conversion is to a function pointer). It appears in code that needs to defeat template deduction of the closure type, or to make two lambdas in a ternary have a common type:
-
-```cpp
-auto p = cond ? +[]{ return 1; } : +[]{ return 2; };   // both convert to int(*)(); OK
-auto q = cond ? []{ return 1; } : []{ return 2; };     // ERROR — unrelated closure types
+std::function<int()> good_factory() {
+    int x = 42;
+    return [x] { return x; };
+}
 ```
 
-**Latency note:** converting to a function pointer *discards the type* and therefore discards inlining — the call becomes an indirect branch that must be predicted by the BTB (Ch. 27 §27.9). Passing the lambda as a template parameter (`template <class F> void run(F f)`) keeps the type, inlines the body, and costs nothing. Convert to a function pointer only at a genuine C boundary.
+Build the bad version under AddressSanitizer and invoke the result only as a diagnostic exercise. A report is likely on supported configurations, not guaranteed for every stale capture. Buffer reuse can remain entirely inside live storage and evade ASan.
+
+`std::bind` has the same ownership questions: bound ordinary arguments are stored by decay-copy, while `std::ref` deliberately stores reference semantics. Lambdas usually make that decision more visible.
 
 ---
 
-## 18.6 Mutable Lambdas
+## 18.4 `mutable` and generic lambdas — Core
 
-`operator()` of a closure is **`const` by default**. Consequently, by-value captures are non-modifiable inside the body. `mutable` removes the `const`:
+`operator()` is `const` by default, so a by-value capture is read-only inside the body. `mutable` removes that:
 
 ```cpp
-auto counter = [n = 0]() mutable { return n++; };   // stateful; each CALL increments
-counter(); counter();   // returns 0, then 1
-auto copy = counter;    // copies the state — the copy continues from 2 independently
+auto counter = [n = 0]() mutable { return n++; };
+const int first = counter();
+const int second = counter(); // 0, then 1
+auto copy = counter;
+const int copy_value = copy(); // copy has independent state
 ```
 
-### The four subtleties
+- `mutable` affects only value captures; `[&x]{ x = 1; }` needs no `mutable` because `x` itself is not a closure member.
+- A `mutable` lambda cannot be invoked through a `const` closure or `const F&` because its call operator is non-const.
+- `mutable` says nothing about thread safety. Concurrent calls that mutate one closure object require synchronization.
+- Standard algorithms generally receive function objects by value and may copy them. Do not observe accumulated predicate state from the original object or assume all calls use one physical copy. A state-changing predicate can also violate the semantic stability expected by predicate concepts. `std::for_each` is the deliberate exception for accumulation: it returns its function object after applying it, so inspect the returned object.
+- `mutable` the lambda qualifier and `mutable` the class-member specifier share a keyword and nothing else.
 
-1. **`mutable` affects only value captures.** A reference capture refers to an object outside the closure, whose constness is its own; `[&x]{ x = 1; }` compiles without `mutable`.
-2. **A `mutable` lambda cannot be invoked through a const reference.** `const auto f = [n=0]() mutable { return n++; };` — calling `f()` fails, because `operator()` is non-const. This bites when a closure is stored as a const member or passed as `const F&`.
-3. **Algorithms may copy the functor.** `std::for_each`, `std::remove_if`, `std::sort` take the predicate **by value** and are permitted to copy it internally. A stateful mutable predicate therefore has **unspecified** accumulated state — the standard explicitly says predicates must not have state that affects the result. `std::for_each` is the exception: it *returns* the functor, so `auto f = std::for_each(b, e, Counter{});` recovers the final state. Using a stateful mutable lambda with `std::remove_if` (e.g. "remove every other element") is a classic bug: libstdc++ and libc++ can produce different results.
-4. **`mutable` and `const` member functions.** In a `const` member function, `[*this]` captures a `const` copy, so `mutable` on the lambda does not make the captured members writable — the copy's type is `const Session`.
-
-### When you actually want it
-
-Genuinely useful for: a memoizing or accumulating closure passed to a template (not an algorithm), a one-shot move-out (`[p = std::move(p)]() mutable { return std::move(p); }`), and any closure that owns a move-only resource it must modify. In hot code, a mutable lambda held by value in a template parameter is fully inlined and its state lives in registers — it is not a "heavier" lambda in any runtime sense; `mutable` is purely a compile-time qualifier change.
-
-A common misconception: `mutable` on a lambda has nothing to do with the `mutable` *storage-class specifier* on class members (which excepts a member from a const object's constness). They share a keyword and nothing else.
-
----
-
-## 18.7 Generic Lambdas
-
-C++14 **generic lambdas** allow `auto` parameters; each `auto` parameter makes `operator()` a template with an invented parameter (Ch. 17 §17.13):
+Moving a captured owner out makes a closure naturally single-use:
 
 ```cpp
-auto plus = [](auto a, auto b) { return a + b; };        // template<class T,class U> operator()(T,U) const
-auto fwd  = [](auto&&... xs) { g(std::forward<decltype(xs)>(xs)...); };   // generic + variadic
+#include <memory>
+
+auto make_consumer(std::unique_ptr<int> value) {
+    return [p = std::move(value)]() mutable {
+        return std::move(p);
+    };
+}
 ```
-Note the forwarding idiom: with `auto&&` you must write `std::forward<decltype(xs)>(xs)` because there is no named `T`.
 
-### Template-parameter lambdas (C++20)
+The first call transfers the pointer; later calls return an empty `unique_ptr`. Encode or document such state transitions instead of presenting the callable as a reusable predicate.
 
-C++20 (P0428) adds an explicit template parameter list, recovering everything `auto` parameters lost:
-
-```cpp
-auto f = []<class T>(std::vector<T>& v) { v.reserve(1024); };      // constrain the SHAPE
-auto g = []<class T, size_t N>(T (&arr)[N]) { return N; };         // deduce an NTTP
-auto h = []<class T>(T a, T b) { return a + b; };                  // force the SAME type
-auto i = []<std::integral T>(T x) { return x + 1; };               // concept-constrained
-auto sum = []<class... Ts>(Ts... xs) { return (xs + ... + 0); };   // name the pack
-```
-With `auto` alone, `[](auto a, auto b)` allows mismatched types and gives you no name for `T` — you had to write `std::decay_t<decltype(a)>` everywhere. Explicit template parameters are strictly better whenever the body needs the type.
-
-Constraints work on `auto` parameters too: `[](std::integral auto x){ … }` (abbreviated syntax) and a trailing `requires` clause are both legal.
-
-### The overloaded-visitor idiom
-
-Generic lambdas compose with pack expansion into the standard `std::variant` visitor (Ch. 15 §15.4, Ch. 17 §17.15):
+### Generic lambdas (C++14) and template parameter lists (C++20)
 
 ```cpp
-template <class... Fs> struct overloaded : Fs... { using Fs::operator()...; };
-template <class... Fs> overloaded(Fs...) -> overloaded<Fs...>;   // unneeded in C++20
+auto plus = [](auto a, auto b) { return a + b; };
 
-std::visit(overloaded{
-    [](const Add& a)    { book.add(a); },
-    [](const Cancel& c) { book.cancel(c); },
-    [](auto&&)          { /* fallback */ }
-}, msg);
-```
-The generic `[](auto&&)` arm is the catch-all, and it works because a non-template exact match beats a template (Ch. 17 §17.1). Omitting it makes the visit exhaustive at compile time — usually what you want for a message dispatcher, since adding a variant alternative then fails to build rather than silently falling through.
+auto same_type_max = []<class T>(T a, T b) {
+    return a < b ? b : a;
+};
 
-### `if constexpr` inside a generic lambda
-
-```cpp
-auto serialize = [](auto&& v, Buffer& b) {
-    using T = std::remove_cvref_t<decltype(v)>;
-    if constexpr (std::is_trivially_copyable_v<T>) b.raw(&v, sizeof v);
-    else                                          v.serialize(b);
+auto positive = []<class T>(T value)
+    requires requires { value > 0; }
+{
+    return value > 0;
 };
 ```
-This inline type switch (Ch. 17 §17.19) is one of the most common modern patterns and is a natural thing to be asked to write.
+Each `auto` parameter invents a template parameter for `operator()`. C++20's explicit template parameter list lets the lambda name and constrain those types or require two parameters to have the same type. Chapter 17 owns deduction and constraints.
 
-**Cost:** generic lambdas instantiate one `operator()` body per argument-type combination — the same code-bloat exposure as any template (Ch. 17 §17.22). A generic lambda used across many types in a header multiplies accordingly.
+A forwarding generic lambda uses `decltype(parameter)` because the invented template parameter has no source-level name:
+
+```cpp
+#include <utility>
+
+auto call_once = []<class F, class Arg>(F&& f, Arg&& arg)
+    -> decltype(auto)
+{
+    return std::forward<F>(f)(std::forward<Arg>(arg));
+};
+```
+
+This example is intentionally small; `std::invoke` is needed for the full family of pointer-to-member callables.
+
+The standard `std::variant` visitor idiom often uses an overload helper:
+
+```cpp
+#include <variant>
+
+template <class... Fs>
+struct overloaded : Fs... {
+    using Fs::operator()...;
+};
+
+struct Add { int quantity; };
+struct Cancel { int quantity; };
+struct Heartbeat {};
+
+struct Book {
+    void add(const Add&);
+    void cancel(const Cancel&);
+};
+
+using Message = std::variant<Add, Cancel, Heartbeat>;
+
+void dispatch(Book& book, const Message& message) {
+    std::visit(overloaded{
+        [&](const Add& add) { book.add(add); },
+        [&](const Cancel& cancel) { book.cancel(cancel); },
+        [](const Heartbeat&) {}
+    }, message);
+}
+```
+An `auto&&` fallback would silently absorb newly added alternatives; explicit alternatives make missed message types fail during compilation.
+
+Each distinct argument-type combination can instantiate another call-operator specialization. The optimizer may merge identical generated code, but broad generic use can increase compile time, instruction-cache footprint, and binary size. Confirm with object-size reports, linker maps, or compiler time traces rather than assuming generic syntax is free.
 
 ---
 
-## 18.8 Constexpr Lambdas
+## 18.5 Captureless conversion and the C bridge — Core / Role-specific
 
-Since **C++17**, a lambda's `operator()` is **implicitly `constexpr`** whenever it satisfies the requirements for a `constexpr` function — you need not write the keyword. You may write it explicitly to get a hard error when the body is not in fact constexpr-eligible:
-
-```cpp
-auto square = [](int n) { return n * n; };                  // implicitly constexpr (C++17)
-static_assert(square(4) == 16);
-constexpr auto cube = [](int n) constexpr { return n*n*n; }; // explicit; diagnoses failure
-constexpr int arr[square(3)] = {};                           // usable in a constant expression
-```
-
-Three distinct things are being qualified, and conflating them is a common error:
-
-| Placement | Meaning |
-|---|---|
-| `constexpr auto f = [] { … };` | The closure **object** is a constant expression — requires the closure to be a literal type (captureless, or with literal-type captures) |
-| `[] () constexpr { … }` | The **`operator()`** is constexpr — invocable at compile time |
-| `[] () consteval { … }` (C++20) | `operator()` is an immediate function — *must* be evaluated at compile time |
-| `constinit` | Not applicable to lambdas directly; see Ch. 19 §19.12 |
-
-### Requirements and interactions
-
-- A `constexpr` closure **object** must be a literal type: all captures must be literal types, and the closure must be trivially destructible. A captureless lambda always qualifies.
-- Captures may be used in constant evaluation only if they are themselves constant: `constexpr int n = 4; auto f = [n]{ return n; }; static_assert(f() == 4);` works, but `int n = 4;` does not.
-- **C++20 relaxations** that made constexpr lambdas far more usable: lambdas in unevaluated contexts, lambdas in constant expressions generally, `constexpr` virtual functions, `constexpr` allocation (transient, must be freed within the same evaluation), `constexpr` try/catch bodies, and `std::is_constant_evaluated()`.
-- **C++23** added `constexpr` `std::unique_ptr`, more constexpr `<cmath>`, and the ability for a constexpr function to contain code that would be invalid at compile time provided it is not reached — softening the old "must be constexpr-evaluable for at least one argument set, else IFNDR" rule.
-- A lambda inside a `consteval` function, or one marked `consteval`, cannot be called at runtime at all — useful for compile-time validation helpers (parsing a format string, checking a protocol table).
-
-**Low-latency angle:** a lambda used as a compile-time table generator eliminates static-initialization order problems (Ch. 5 §5.10) and runtime setup cost:
+A lambda with an empty capture list has a conversion to a matching function pointer:
 
 ```cpp
-constexpr auto make_lut = [] {
-    std::array<uint8_t, 256> t{};
-    for (int i = 0; i < 256; ++i) t[i] = /* … */;
-    return t;
-}();                                        // IIFE evaluated at compile time
-constexpr auto kLut = make_lut;             // lands in .rodata, zero startup cost
+#include <csignal>
+
+volatile std::sig_atomic_t stop_requested = 0;
+
+int main() {
+    auto twice = [](int x) noexcept { return x * 2; };
+    int (*fp)(int) noexcept = twice;
+    std::signal(SIGINT, [](int) { stop_requested = 1; });
+    return fp(3) == 6 ? 0 : 1;
+}
 ```
-The immediately-invoked lambda expression (IILE) as a `constexpr` initializer is the idiomatic way to build a complex constant with imperative code, and also the standard way to initialize a `const` member that needs several statements.
+
+A function pointer has no context slot for captured state. The empty capture list matters syntactically: `[=] { return 1; }` has a capture default and does not gain this conversion even if it happens to capture no entity. A `noexcept` call operator can convert to a pointer-to-`noexcept` function. A captureless generic lambda has a conversion-function template and can convert when the destination function-pointer signature selects a valid specialization:
+
+```cpp
+auto identity = [](auto value) { return value; };
+int (*int_identity)(int) = identity;
+double (*double_identity)(double) = identity;
+```
+
+C++23 permits `static` on a captureless lambda's call operator:
+
+```cpp
+auto add_one = [](int x) static noexcept { return x + 1; };
+```
+
+Conversion produces callable behavior equivalent to invoking a default-constructed closure. It does not retain a particular closure object's address or state.
+
+### The C-callback bridge
+
+Many C callback APIs pair a function pointer with `void*` user data. The function pointer is the **trampoline**; user data carries state:
+
+```cpp
+#include <utility>
+
+using CCallback = void (*)(void*);
+void c_register(CCallback callback, void* context);
+
+template <class F>
+struct CallbackContext {
+    F callable;
+    static void invoke(void* raw) {
+        auto* self = static_cast<CallbackContext*>(raw);
+        self->callable();
+    }
+};
+
+template <class F>
+void register_context(CallbackContext<F>& context) {
+    c_register(&CallbackContext<F>::invoke, &context);
+}
+```
+
+The API stores `&context`, so the caller must keep that exact object alive and at a stable address until unregistration and until all in-flight callbacks finish. Moving a containing vector can invalidate the context even if the callable itself is safely movable. Stable owner objects, nodes, or explicitly managed registration storage solve that address-stability problem.
+
+### Why a function-local static is not per registration
+
+A tempting adapter initializes a function-local static from the first callable:
+
+```cpp
+#include <utility>
+
+template <class F>
+void invoke_bad(F&& f) {
+    static auto stored = std::forward<F>(f);
+    stored();
+}
+
+void arm(int id) {
+    invoke_bad([id] { (void)id; });
+}
+```
+
+The lambda expression in `arm` has the same closure type on every call, so the template specialization and its static object are also the same. `arm(1)` initializes `stored`; later calls do not replace its captured ID. This is a storage-duration error, not type erasure. Store context per registration and give the callback API a pointer to that context.
+
+**The unary `+` trick.** `+[]{ … }` forces the function-pointer conversion (unary `+` requires an arithmetic/pointer operand, and the closure's only such conversion is to a function pointer). It is needed to give two lambdas in a ternary a common type:
+
+```cpp
+int select(bool first) {
+    auto p = first ? +[]{ return 1; } : +[]{ return 2; };
+    return p();
+}
+```
+
+The source-level function-pointer call is indirect when the target value is only known at run time. If constant propagation, whole-program optimization, or profile information proves the target, an optimizer may devirtualize and inline it. Keeping a concrete callable type makes that optimization easier and avoids requiring it for direct dispatch.
 
 ---
 
-## 18.9 Dangling Lambda Captures
+## 18.6 Callable wrapper ownership and cost — Core
 
-The dominant lambda bug class: a closure outlives what it refers to. There is no lifetime tracking; the reference member is a raw reference or pointer.
-
-### The four shapes
+A closure has a unique type. When one variable must hold different callable types behind one signature, the program needs a closed sum such as `variant` or type erasure. Chapter 6 owns the erasure mechanism; this section chooses storage.
 
 ```cpp
-// 1. Reference capture escaping the frame
-std::function<int()> make() { int x = 42; return [&x]{ return x; }; }   // dangles immediately
+#include <functional>
 
-// 2. Implicit `this` capture in an async callback
-void Session::start() { timer.async_wait([=](auto){ retry(); }); }      // `this` may be freed
-
-// 3. Reference to a temporary bound at the call site
-auto f = [&s = get_string()] { return s.size(); };   // temporary dies at the end of the
-                                                     // full-expression; lifetime extension
-                                                     // does NOT apply to init-captures
-
-// 4. Reference capture of a loop variable, deferred
-for (auto& item : items) tasks.push_back([&item]{ process(item); });
-// `item` is fine only while `items` lives AND is not reallocated/erased
+std::function<int(int)> transform =
+    [offset = 7](int value) { return value + offset; };
 ```
 
-Shape 3 deserves emphasis: **reference lifetime extension does not extend through a lambda capture.** `const T& r = f();` extends the temporary's life to `r`'s scope, but `[&r = f()]` does not — the init-capture is not the kind of reference binding that triggers extension. Compilers now diagnose the direct cases (`-Wdangling`, Clang's `-Wreturn-stack-address`), but not through indirection.
+### What the standard actually guarantees
 
-### Detection and prevention
+`std::function` owns a copyable target. Its construction does not allocate when the target is a function pointer or `std::reference_wrapper`; implementations ordinarily provide inline storage for other small targets, but the standard exposes no capacity, alignment, or “fits inline” query. For a lambda target, allocation behavior is implementation-dependent even when `sizeof(lambda)` looks small.
 
-| Tool / technique | Catches |
-|---|---|
-| `-Wdangling`, `-Wreturn-stack-address`, `-Wdangling-gsl` (Clang) | Directly returned/obvious cases |
-| **AddressSanitizer** with `detect_stack_use_after_return=1` | The runtime workhorse for shapes 1 and 4 (Ch. 44 §44.2) |
-| Clang `[[clang::lifetimebound]]` / C++26 lifetime annotations | API-level marking of returned references |
-| `-Wdeprecated-this-capture` (C++20) | Implicit `this` via `[=]` |
-| Convention: **never `[&]` or `[=]` in a closure that is stored** | All shapes — the highest-value rule |
-
-### The discipline
-
-- **`[&]` is safe for immediately-consumed closures only** — algorithm predicates, `std::sort` comparators, scope guards (Ch. 10 §10.13), parallel-algorithm bodies. It is fastest and it is the right default *there*, because the enclosing frame provably outlives the call.
-- **Any closure that is stored, queued, or passed across a thread boundary must capture by value or by owning handle.** For a thread pool task, `std::thread`, `std::async`, or a coroutine's continuation, capture by value or `[self = shared_from_this()]`.
-- **`std::thread`/`jthread` with `[&]` is a classic race** — the launching frame may return before the thread reads the reference. Detached threads make it certain.
-- **Coroutines amplify this** (Ch. 19 §19.7): a lambda coroutine's *closure object* is destroyed at the first suspension unless it is kept alive, so a capturing lambda coroutine dangles its own captures. The fix is to pass state as coroutine parameters (which are copied into the frame) or to keep the closure alive explicitly.
-- **`std::bind` has the same hazards** with the added confusion that it copies by default and `std::ref` opts into references — another reason lambdas superseded it.
-
-**Interview framing:** "Your callback crashes intermittently after a reconnect" is nearly always shape 2 — `[=]` capturing `this` on an object destroyed by the reconnect path — and the expected answers are `shared_from_this`/`weak_from_this`, `[*this]` where a snapshot is acceptable, and the C++20 deprecation as the language's acknowledgement of the trap.
-
----
-
-## 18.10 Small-Object Optimization in Callable Wrappers
-
-A closure has a unique type, so storing heterogeneous callables requires **type erasure** (Ch. 6 §6.20). The standard wrappers apply a **small-object optimization (SOO/SBO)**: a fixed inline buffer holds small callables; larger ones heap-allocate.
-
-```cpp
-std::function<void()> f = [a, b, c] { … };   // fits the SBO buffer → no allocation
-std::function<void()> g = [big_array] { … }; // exceeds it → operator new
-```
+Size is not the only condition an implementation may use. Alignment and whether a target can be relocated without throwing can affect inline-storage eligibility. Never derive a portable crossover from `sizeof(std::function)` or from one vendor's threshold.
 
 ### The wrappers
 
-| Type | Since | Owns? | Copyable | Allocates | Notes |
+| Type | Since | Owns? | Copyable | Allocation | Notes |
 |---|---|---|---|---|---|
-| `std::function<R(A...)>` | C++11 | Yes | **Requires copyable target** | Yes, above SBO | The default; `target_type`/`target<T>` give RTTI-based access |
-| `std::move_only_function<R(A...) cv ref noexcept>` | C++23 | Yes | No — move-only | Yes, above SBO | Holds move-only closures (`unique_ptr` captures); supports cv/ref/noexcept qualifiers in the signature, which `std::function` cannot |
-| `std::copyable_function` | C++26 | Yes | Yes | Yes, above SBO | The intended replacement for `std::function`, with the qualifier support and without `target()` |
-| `std::function_ref<R(A...)>` | C++26 | **No** | Trivially copyable | **Never** | Non-owning: two pointers (object + thunk). The correct parameter type for a callback that is only used during the call |
-| Template parameter `F` | — | n/a | n/a | Never | Zero cost, full inlining — always preferable when the type can be static |
+| `std::function<R(A...)>` | C++11 | Yes | wrapper and target are copyable | Inline or dynamic; only limited targets have a no-allocation guarantee | Empty invocation throws `bad_function_call` |
+| `std::move_only_function<Sig>` | C++23 | Yes | Move-only | Inline or dynamic; no portable inline threshold | Accepts move-only targets; signature can express cv/ref and `noexcept`; invoking an empty wrapper is undefined |
+| Library-specific `function_ref<Sig>`-style view | Non-standard in C++23 | No | Usually cheap to copy | The view itself needs no target allocation | Borrowed callable; store only if external lifetime is proved |
+| Fixed-capacity `inplace_function<Sig, N>`-style wrapper | Non-standard in C++23 | Usually yes | Design choice | No heap fallback when designed strictly | Rejects targets exceeding size/alignment/policy |
+| Template parameter `F` | Language mechanism | Determined by caller/API | Determined by use | The abstraction itself adds no allocation | Concrete type visible; can increase instantiations and code size |
 
-### SBO sizes and why they are not guaranteed
+`std::move_only_function` is not merely “`std::function` without copying.” Qualifiers in its signature constrain invocation. For example, `std::move_only_function<void() &&>` represents a callable intended to be invoked on an rvalue wrapper, which can express consumption. Its empty-call precondition also differs from `std::function`; check before calling if emptiness is possible.
 
-The standard does **not** mandate any inline buffer; it only says implementations "should" avoid allocation for small callables and that `std::function`'s constructor from a "small" object should not throw. Typical sizes:
+### Cost of invoking through erasure
 
-| Implementation | `sizeof(std::function)` | Inline capacity |
-|---|---|---|
-| libstdc++ | 32 bytes | 16 bytes (one `union { void* ; char[16] }`), and **only for trivially-copyable / nothrow-move types** |
-| libc++ | 32 bytes | ~16–24 bytes depending on version |
-| MSVC | 64 bytes | ~40 bytes |
+An erased wrapper ordinarily invokes a thunk through an indirect function pointer. When the target is not proven, this blocks cross-boundary inlining and can create a branch-prediction problem if one call site sees many targets. Dynamically stored state can add pointer chasing and less-local memory. Optimizers can sometimes devirtualize when construction and use are visible, so “erasure always prevents inlining” is too strong.
 
-So `[this, id]` (16 bytes) generally fits; `[this, id, price, qty]` (32 bytes) generally does not, and you get a heap allocation per assignment plus a cache miss per invocation. **Capturing three or four small members is the crossover point at which `std::function` starts allocating** — worth stating precisely, because it is the practical rule.
+Construction, copy, move, assignment, and destruction have separate costs from invocation. A system that constructs handlers once and calls them millions of times has a different bottleneck from a task queue that creates and destroys a wrapper per task. Measure:
 
-### Cost of invocation
-
-`std::function::operator()` is an **indirect call through a stored function pointer** (the invoker/thunk), preceded by a null check that may throw `std::bad_function_call`. Consequences:
-
-- **Not inlinable** across the erasure boundary, so the callee's body is opaque; the optimizer cannot propagate constants or vectorize through it.
-- **An indirect branch**, predicted by the BTB; a polymorphic call site with many distinct targets mispredicts (Ch. 27 §27.9–27.10) at ~15–20 cycles each.
-- **An extra cache miss** if the target is heap-allocated, since the closure state lives elsewhere.
-- Roughly: template parameter ≈ 0 ns (inlined); `function_ref` ≈ 1–2 ns (one indirect call, no miss); `std::function` inline-buffer ≈ 2–3 ns; `std::function` heap ≈ 5–15 ns with a miss.
+- allocation count and bytes during wrapper construction/assignment;
+- target distribution at each call site, not globally;
+- typical and tail invocation latency with realistic cache state;
+- binary size and instruction-cache behavior for the template alternative;
+- destruction and reclamation on the thread where they actually occur.
 
 ### The low-latency prescription
 
-1. **Hot path: template parameter.** `template <class F> void for_each_tick(F&& f)` inlines the body entirely.
-2. **Callback parameter used only during the call: `function_ref`** (C++26; `tl::function_ref`/`absl::FunctionRef` today). It never allocates, never owns, is trivially copyable, and passes in two registers. Its hazard is that it is a *view* — storing one is the same dangling class as §18.9.
-3. **Stored heterogeneous callbacks: preallocate.** Either use a fixed-capacity `inplace_function`-style wrapper (`sg14::inplace_function<void(), 64>`, `folly::Function` variants) with a compile-time-asserted capacity, or a hand-rolled vtable-plus-inline-storage struct sized to your workload. This gives you erasure without heap traffic — the standard trading-system pattern.
-4. **Never a `std::function` in a per-message path.** If you must, pre-construct and reuse rather than assigning per event, since assignment is where the allocation happens.
-5. **`std::move_only_function` (C++23) for task queues**, since tasks own `unique_ptr`s and promises and are moved, not copied — it also avoids the copyability requirement forcing `shared_ptr`.
+1. **Concrete template parameter:** choose when the caller's type can remain part of the API and code-size multiplication is acceptable.
+2. **Borrowed callable view:** choose only under a call-scoped completion contract. The view's non-allocation property does not make storing it safe.
+3. **Fixed-capacity owning wrapper:** choose when runtime heterogeneity is required and a hard storage bound is part of the design. Reject excess size, alignment, or throwing-move policy explicitly.
+4. **`std::function`:** choose for copyable, owning, heterogeneous callbacks when implementation-dependent allocation is acceptable or measured away.
+5. **`std::move_only_function`:** choose for owning task/callback slots that transfer move-only state. Do not introduce `shared_ptr` solely to make a target copyable without considering the changed lifetime and atomic reference-count traffic.
+
+### Small-object optimization: how to verify, not guess
+
+The following closure sizes are valid only as observations on the build that prints them:
+
+```cpp
+#include <array>
+#include <cstddef>
+
+void observe_sizes() {
+    auto empty = [] {};
+    auto one = [x = 1] { return x; };
+    auto larger = [data = std::array<std::byte, 64>{}] {
+        return data.size();
+    };
+
+    static_assert(sizeof(empty) >= 1);
+    (void)sizeof(one);
+    (void)sizeof(larger);
+}
+```
+
+To test wrapper allocation, intercept allocations only in a controlled test or use a test allocator/instrumented global allocation setup that accounts for startup and unrelated library work. Construct targets on both sides of observed thresholds, include over-aligned and non-trivially movable targets, and repeat for copy, move, and assignment. Do not infer a production guarantee from the result; pin it as a tested property of the selected standard-library build.
 
 ---
 
-## Key Interview Questions
+## Worked reasoning: queued work and handler storage — Core
 
-1. **What is a lambda, precisely?** — An expression creating a unique unnamed closure class with an inline `operator()`, whose members are the captures.
-2. **What can and cannot be captured?** — Only automatic-storage variables of the enclosing function; globals, statics, and `thread_local`s are referenced, not captured, so `[=]` does not make a static safe.
-3. **Does `[=]` copy the object in a member function?** — No: it captures `this` by value, i.e. the pointer. Deprecated in C++20; `[*this]` (C++17) copies the object.
-4. **Why is `operator()` const by default, and what does `mutable` change?** — So value captures are read-only; `mutable` drops the `const`, which is required to modify or move out of a value capture.
-5. **Why is a stateful mutable lambda dangerous as an algorithm predicate?** — Algorithms take predicates by value and may copy them; accumulated state is unspecified. `std::for_each` returns the functor, which is the exception.
-6. **How do you move a `unique_ptr` into a lambda?** — C++14 init-capture `[p = std::move(p)]`, plus `mutable` if you modify it; the closure becomes move-only and no longer fits `std::function`.
-7. **Which lambdas convert to function pointers, and why the restriction?** — Captureless only; a function pointer has no room for state. Use the trampoline pattern with `void* user_data` for C APIs.
-8. **What does `+[]{}` do?** — Forces conversion to a function pointer, e.g. to give two lambdas in a ternary a common type or to defeat closure-type deduction.
-9. **What changed about closure types in C++20?** — Captureless closures became default-constructible and copy-assignable, and lambdas became usable in unevaluated contexts — so `std::set<int, decltype([](…){…})>` works.
-10. **Why prefer a lambda comparator over `std::function` in a `std::map`?** — A captureless closure is an empty class, costing zero bytes via EBO and inlining fully; `std::function` costs 32 bytes and an unpredictable indirect call per comparison.
-11. **How do you write a recursive lambda?** — C++23 `[](this auto&& self, int n){ … }` (deducing this); previously a `std::function` (allocating) or a Y-combinator.
-12. **What do explicit template parameter lists on lambdas buy over `auto` parameters?** — A name for the type, the ability to force two parameters to the same type, deduction of array extents/NTTPs, pack naming, and direct concept constraints.
-13. **When is a lambda `constexpr`?** — Implicitly since C++17 whenever `operator()` meets constexpr-function requirements; `constexpr` on the *object* additionally requires literal-type captures.
-14. **What is the IILE pattern and why use it?** — An immediately-invoked lambda initializing a `constexpr`/`const` value with imperative code, moving table construction to compile time and eliminating static-init-order issues.
-15. **Give four ways a lambda capture dangles.** — Reference capture escaping the frame; implicit `this` in an async callback; init-capture of a temporary (lifetime extension does *not* apply); reference to a container element that is later invalidated.
-16. **What is the correct capture for an async callback on a `shared_ptr`-owned object?** — `[self = shared_from_this()]` to keep it alive, or `[weak = weak_from_this()]` plus a `lock()` check to make the callback a cancellable no-op.
-17. **How big can a lambda be before `std::function` allocates?** — Unspecified by the standard; ~16 bytes in libstdc++/libc++ and only for nothrow-movable types, ~40 in MSVC. Practically: two pointers' worth.
-18. **What does invoking through `std::function` cost?** — A null check, an indirect call that the optimizer cannot inline through, BTB pressure, and a possible extra cache miss for heap-stored state.
-19. **When would you use `function_ref` instead of `std::function`?** — For a callback that is only invoked during the call: non-owning, never allocates, two registers, trivially copyable — at the price of view semantics and dangling risk if stored.
-20. **What does `std::move_only_function` (C++23) solve?** — Holding move-only closures (e.g. `unique_ptr` or promise captures) in a task queue, and supporting cv/ref/`noexcept`-qualified call signatures that `std::function` cannot express.
+Consider a feed callback that parses a packet in a ring slot and queues strategy work:
+
+```cpp
+#include <string_view>
+#include <utility>
+
+struct PacketView {
+    int sequence() const;
+    std::string_view symbol() const;
+};
+
+struct StrategyRef {
+    void on_update(int, std::string_view);
+};
+
+struct QueueRef {
+    template <class F>
+    void push(F&&) {} // stand-in for a queue that stores the callable
+};
+
+extern StrategyRef strategy;
+extern QueueRef queue;
+
+void on_packet(PacketView packet) {
+    int sequence = packet.sequence();
+    queue.push([&] {
+        strategy.on_update(sequence, packet.symbol());
+    });
+}
+```
+
+Assume `queue.push` stores the closure and returns before a worker invokes it. The code has two distinct dangling paths:
+
+1. `sequence` belongs to the callback frame and dies on return.
+2. `packet` is a view of the ring slot. Even if the view object were copied, its backing bytes can be reused for the next packet.
+
+Changing the queue's slot from `std::function` to a fixed-capacity wrapper would remove possible wrapper allocation but preserve both bugs. The capture contract must be repaired first.
+
+### Step 1: decide what crosses the boundary
+
+`sequence` is small and immutable, so copy it. If the strategy needs only a resolved instrument ID, resolve synchronously and copy the ID rather than retaining symbol text. If text must cross the queue, copy it into bounded owned storage or retain ownership of the packet block.
+
+```text
+receive thread                     worker thread
+──────────────                     ─────────────
+ring slot owns packet bytes
+parse sequence ──value copy────────────► task.sequence
+resolve symbol ──integer ID─────────────► task.instrument
+return / reuse ring slot
+                                      invoke task using owned values
+```
+
+A value-only task can be expressed as a closure without hidden borrowing:
+
+```cpp
+#include <cstdint>
+#include <functional>
+
+struct Strategy {
+    void on_update(std::uint64_t sequence, std::uint32_t instrument);
+};
+
+std::function<void()> make_task(
+    Strategy& strategy,
+    std::uint64_t sequence,
+    std::uint32_t instrument)
+{
+    return [&strategy, sequence, instrument] {
+        strategy.on_update(sequence, instrument);
+    };
+}
+```
+
+This is still correct only if `strategy` outlives every queued task. That may be a valid architectural invariant—for example, workers are joined and the queue drained before strategies are destroyed—but it must be stated and enforced. If dynamic strategy removal is allowed, capture a strong owner, a weak handle with a check, or an immutable strategy ID resolved by the worker.
+
+### Step 2: choose the lifetime policy for `this`
+
+For a `shared_ptr`-managed strategy, a weak capture gives cancellation semantics:
+
+```cpp
+#include <cstdint>
+#include <functional>
+#include <memory>
+
+class Strategy : public std::enable_shared_from_this<Strategy> {
+public:
+    std::function<void()> task(std::uint64_t sequence) {
+        return [weak = weak_from_this(), sequence] {
+            if (auto self = weak.lock()) {
+                self->on_sequence(sequence);
+            }
+        };
+    }
+
+private:
+    void on_sequence(std::uint64_t);
+};
+```
+
+The weak policy prevents a task from extending strategy lifetime, but `lock()` performs shared-ownership synchronization and adds a branch per invocation. A strong capture avoids cancellation while extending lifetime and changing destruction timing. A raw `this` capture avoids ownership traffic but requires a quiescence protocol. Choose semantics first, then measure their mechanisms.
+
+| Policy | When object dies | Per-call mechanism | Operational requirement |
+|---|---|---|---|
+| `[this]` | External owner decides | Pointer dereference | Unregister, drain, and join before destruction |
+| `[self = shared_from_this()]` | After last task/owner releases it | Reference-count operations on task copy/destruction | Cycles must be prevented |
+| `[weak = weak_from_this()]` | Independent of queued tasks | `lock()` plus branch and temporary strong count | Expired callback policy |
+| `[snapshot = *this]` | Snapshot dies with task | Object copy/move | Snapshot semantics must be correct; transitive pointers audited |
+| `[id]` and registry lookup | Registry policy | Lookup plus missing-ID branch | Stable identity and concurrency-safe registry |
+
+### Step 3: choose callable storage
+
+Now suppose a dispatcher stores heterogeneous handlers registered during startup:
+
+```cpp
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <utility>
+#include <vector>
+
+struct BookEvent {
+    std::uint32_t instrument{};
+};
+
+using Handler = std::function<void(const BookEvent&)>;
+
+class Dispatcher {
+    std::vector<Handler> handlers_;
+
+public:
+    void reserve(std::size_t count) { handlers_.reserve(count); }
+    void add(Handler handler) {
+        handlers_.push_back(std::move(handler));
+    }
+    void dispatch(const BookEvent& event) {
+        for (auto& handler : handlers_) {
+            handler(event);
+        }
+    }
+};
+```
+
+Registration can allocate in both the vector and individual wrappers. Reserving the vector controls only vector growth, not target storage inside each handler. If registration occurs before latency-sensitive processing and no later mutation is allowed, those allocations may be acceptable; invocation still pays erased dispatch. Replace `std::function` with `std::move_only_function` when handlers need move-only ownership rather than copyability; the storage threshold remains non-portable.
+
+Three alternatives answer different workload facts:
+
+- If the handler set is fixed at compile time, store named function objects in a tuple and dispatch statically. This improves optimizer visibility but instantiates code for each handler/type and complicates runtime reconfiguration.
+- If handlers vary at startup but have a proven size/alignment bound, use a fixed-capacity move-only wrapper with no heap fallback. This keeps runtime heterogeneity and bounds storage while retaining indirect dispatch.
+- If handlers can be arbitrarily large or plugins define them, `move_only_function` provides general ownership. Move allocation and destruction outside the critical phase where possible.
+
+There is no universal ordering among these designs. A statically dispatched bank of many large handlers can harm instruction-cache locality more than one indirect call. Conversely, a call site cycling unpredictably among many erased targets can mispredict. Benchmark the actual number of handlers, target distribution, capture sizes, update frequency, and build configuration.
+
+### Step 4: prove the storage policy
+
+For a strict fixed-capacity wrapper, the acceptance condition should resemble:
+
+```cpp
+#include <cstddef>
+#include <type_traits>
+
+template <class F, std::size_t Capacity,
+          std::size_t Alignment>
+concept InlineStorable =
+    sizeof(F) <= Capacity &&
+    alignof(F) <= Alignment &&
+    std::is_nothrow_move_constructible_v<F>;
+```
+
+The exact policy is a design choice. Requiring nothrow move simplifies exception safety when the wrapper itself moves. A copyable wrapper needs a clone thunk and must decide what copy failures mean. A heap fallback violates a hard no-allocation contract, so reject an oversized callable at compile time instead.
+
+Validate the finished system at two levels:
+
+1. Unit tests exercise destruction, move, empty state, over-aligned rejection, throwing targets, and every lifetime policy.
+2. Workload tests count allocations during registration and steady state, then measure dispatch latency and binary/code-cache effects with the production handler mix.
 
 ---
 
-## Common Traps
+## 18.7 `constexpr` lambdas — Deep dive
 
-- **`[=]` in a member function believed to copy the object** — it copies the `this` pointer; the closure dangles when the object dies.
-- **`[&]` or `[=]` in a stored, queued, or cross-thread closure** — the top lifetime bug class.
-- **Init-capture of a temporary** — lifetime extension does not apply through a capture.
-- **Capturing a `static` or global and expecting per-closure state** — they are not captured at all.
-- **Forgetting `mutable`** when modifying or moving out of a value capture; the error message names constness, not the capture.
-- **A `const` lambda object with a `mutable` `operator()`** — cannot be invoked.
-- **Stateful mutable predicates in `remove_if`/`sort`** — the algorithm may copy the functor; results are unspecified and differ between libstdc++ and libc++.
-- **Assuming closures of identical text share a type** — every lambda expression yields a distinct type.
-- **Lambdas as default template arguments in headers** — distinct types per TU, an ODR hazard.
-- **Expecting a capturing lambda to convert to a function pointer** — it cannot.
-- **Converting to a function pointer on a hot path** — loses inlining, becomes an indirect branch.
-- **`std::function` assignment in a per-message path** — that is where the heap allocation happens.
-- **Assuming `std::function` never allocates for "small" lambdas** — the buffer is unspecified and libstdc++ additionally requires nothrow-movability.
-- **Storing a `function_ref`** — it is a non-owning view.
-- **Trying to put a move-only closure in `std::function`** — needs `std::move_only_function` (C++23).
-- **`std::thread t([&]{ … })` in a returning function** — a race even before the frame dies.
-- **A lambda coroutine with captures** — the closure is destroyed at the first suspension; pass state as parameters instead.
-- **Believing lambda `mutable` relates to the `mutable` member specifier** — unrelated.
-- **Non-exhaustive `overloaded` visitor with an `auto&&` fallback** — silently swallows new variant alternatives.
+A lambda's call operator is implicitly `constexpr` when it satisfies the requirements of a constexpr function. Writing `constexpr` explicitly makes failure to meet those requirements a compile-time error.
+
+```cpp
+constexpr auto square = [](int n) { return n * n; };
+static_assert(square(4) == 16);
+
+constexpr auto cube =
+    [](int n) constexpr { return n * n * n; };
+static_assert(cube(3) == 27);
+```
+
+Three separate declarations are easy to conflate:
+
+| Placement | Meaning |
+|---|---|
+| `constexpr auto f = [] { … };` | The closure object is a constant expression |
+| `[]() constexpr { … }` | The call operator is eligible for constant evaluation |
+| `[]() consteval { … }` | Every potentially evaluated call is immediate and must produce a constant expression |
+
+For a captured closure object to be a constant expression, its captured subobjects and initializers must satisfy constant-expression rules. Capturing a runtime local by value remains legal for runtime use; it does not turn that value into a compile-time constant.
+
+An immediately invoked lambda can build a table with ordinary control flow:
+
+```cpp
+#include <array>
+#include <cstdint>
+
+constexpr auto kLut = [] {
+    std::array<std::uint8_t, 256> table{};
+    for (std::size_t i = 0; i < table.size(); ++i) {
+        table[i] = static_cast<std::uint8_t>(i);
+    }
+    return table;
+}();
+
+static_assert(kLut[42] == 42);
+```
+
+Constant evaluation establishes the table without dynamic initialization. Whether the emitted program places bytes in read-only data, folds accesses into instructions, or emits no storage is an implementation decision.
 
 ---
 
-## Compact Recall Summary
+## Recall card — Core
 
-**Captures.** A lambda is a unique unnamed class whose captures are members. Only automatic locals are captured; globals/statics/`thread_local`s are merely referenced. `[=]`/`[&]` capture only odr-used variables; value captures snapshot at *creation*. **`[=]` in a member function captures `this`, not the object** — deprecated in C++20 in favour of `[=, this]`, with `[*this]` (C++17) for a real copy and `[m = member]` for the minimal capture. Init-capture (C++14) enables move-capture, expression capture, renaming, and — with C++20 pack expansion — variadic capture; before C++20 the tuple + `std::apply` workaround served.
+1. Each lambda expression creates a unique closure type. Copy captures store values; reference-capture representation is unspecified but its lifetime risk is real.
+2. `operator()` is `const` unless `mutable`; mutability does not repair lifetime, synchronization, or ownership.
+3. `[this]` stores a pointer. `[*this]` stores a snapshot; transitive raw pointers inside that snapshot can still dangle.
+4. Immediate callbacks may borrow only under a completion guarantee. Stored, returned, queued, and cross-thread callbacks need explicit lifetime policy per capture.
+5. A lambda expression itself does not allocate. Captured types and owning wrappers can allocate during closure construction or storage.
+6. An empty capture list enables conversion to a matching function pointer; a `void*` context carries state across a C callback boundary.
+7. Algorithms can copy function objects. Do not use an original mutable predicate as a reliable record of accumulated calls.
+8. `std::function` owns a copyable target; `move_only_function` owns movable targets. Both erase type and may use dynamic storage for ordinary lambdas.
+9. A template preserves concrete type and optimizer visibility but may multiply code. Erasure centralizes code and runtime storage but adds indirect dispatch.
+10. Fixed-capacity wrappers need explicit size, alignment, move/copy, overflow, empty-state, and exception policies.
 
-**Closure type.** Public inline `operator()`, `const` unless `mutable`, defaulted copy/move if the captures allow, deleted default construction and copy assignment **except for captureless closures in C++20**, unspecified member layout, `sizeof ≥ 1` but empty (hence zero-cost via EBO) when captureless. Captureless closures convert to a plain function pointer — the basis of the `void* user_data` trampoline for C APIs; `+[]{}` forces that conversion. Distinct types for every lambda expression, so heterogeneous storage needs erasure and header lambdas carry ODR risk.
+## Questions — Core
 
-**Qualifiers.** `mutable` drops the `const` on `operator()` and only affects value captures; algorithms may copy predicates, so stateful mutable predicates are unspecified outside `for_each`. `operator()` is implicitly `constexpr` since C++17 when eligible; a `constexpr` closure *object* additionally needs literal-type captures; C++20 permits lambdas in unevaluated and constant-expression contexts, and the constexpr IILE is the idiomatic compile-time table builder.
+1. For `[id, &book, p = std::move(owner)]`, classify each stored relationship and state the proof required before queued invocation.
+2. Why does `[=]` inside a member function not copy the object, and how do `[this]`, `[*this]`, and `[value = member]` differ?
+3. A live object is captured by pointer and used on another thread. Why is lifetime proof insufficient for correctness?
+4. When can a mutable algorithm predicate produce misleading accumulated state even though every input result is correct?
+5. Why does `[] {}` convert to a function pointer while `[=] {}` does not, even if the second closure captures no entity?
+6. A C API stores both callback and `void*`. Which object must own the context, and which operations can invalidate its address?
+7. Compare a template parameter, borrowed callable view, fixed-capacity wrapper, and `std::function` for a call-scoped callback and a stored callback.
+8. Why is `sizeof(lambda) <= N` alone insufficient to prove acceptance by a fixed-capacity wrapper?
+9. Under what shutdown protocol can a queued `[this]` capture be safer and cheaper than a `shared_ptr` capture?
+10. Which measurements distinguish template code-size cost from erased-dispatch and wrapper-allocation cost?
 
-**Genericity.** `auto` parameters (C++14) make `operator()` a template — forward with `std::forward<decltype(x)>(x)`. Explicit template parameter lists (C++20) recover the type name, same-type enforcement, NTTP/extent deduction, pack naming, and concept constraints. `overloaded : Fs... { using Fs::operator()...; }` plus generic lambdas is the standard `std::visit` visitor; `if constexpr` inside a generic lambda is the inline type switch. Deducing this (C++23) gives allocation-free recursive lambdas.
+## Common traps — Core
 
-**Lifetime.** No tracking exists: captures are raw references. `[&]`/`[=]` are correct for immediately-consumed closures (algorithm predicates, scope guards) and wrong for anything stored, queued, or crossing a thread. Use `[self = shared_from_this()]` to extend, `[weak = weak_from_this()]` to cancel, values otherwise. ASan with `detect_stack_use_after_return`, `-Wdangling`, and `-Wdeprecated-this-capture` are the tooling.
+| Trap | Failed reasoning | Repair |
+|---|---|---|
+| `[=]` means self-contained | Member access captures the `this` pointer | Capture selected member values, an object snapshot, or an ownership handle |
+| Copying a view capture owns bytes | The closure copies only pointer/count metadata | Copy required payload or retain its owner |
+| Queue owns the closure, so captures are safe | Outer storage ownership does not extend borrowed inner objects | Audit every capture independently |
+| `mutable` makes a captured object non-const | It removes const from `operator()`, not from referenced objects or a const `*this` snapshot | Reason about each captured type's own cv-qualification |
+| Small closure guarantees wrapper SBO | Threshold, alignment, and relocation policy are implementation-specific | Measure the chosen library or use a strict fixed-capacity wrapper |
+| Reserving a vector prevents handler allocation | It controls vector storage, not erased target storage | Instrument wrapper construction separately |
+| Captureless function-pointer conversion is direct dispatch | Runtime function-pointer targets are ordinarily indirect | Keep concrete type where static dispatch matters; measure devirtualization |
+| Weak capture is “free safety” | `lock()` and shared-count operations have cost and cancellation semantics | Choose it for semantics, then measure |
+| Generic lambda is one function | Each argument combination can instantiate another specialization | Inspect compile-time traces, symbols, and binary size |
+| Inline buffer aligned as `max_align_t` accepts everything | User types can be over-aligned | Reject excessive alignment or parameterize supported alignment |
 
-**Erasure and cost.** Template parameter → fully inlined, zero cost, the hot-path default. `function_ref` (C++26) → two pointers, never allocates, non-owning, correct for call-scoped callbacks. `std::function` → 32–64 bytes with an unspecified ~16-byte inline buffer (libstdc++ also demands nothrow-movability), heap-allocates above it, requires copyable targets, and invokes via an unpredictable, non-inlinable indirect call. `std::move_only_function` (C++23) and `copyable_function` (C++26) fix the move-only and qualifier gaps. For stored callbacks on a latency-sensitive path, use a fixed-capacity `inplace_function` with a `static_assert`ed size rather than accepting per-assignment allocation.
+## Code-reading puzzle — Core
+
+```cpp
+#include <cstdio>
+#include <utility>
+
+void log(int id) {
+    std::printf("%d\n", id);
+}
+
+template <class F>
+void register_cb(F&& f) {
+    static auto stored = std::forward<F>(f);
+    stored();
+}
+
+void arm(int id) {
+    register_cb([id] { log(id); });
+}
+
+int main() {
+    arm(1);
+    arm(2);
+    arm(3);
+}
+```
+Predict the three lines. Then suppose a second function contains a different lambda expression passed to `register_cb`: explain why it gets another static object yet repeats the same first-registration-wins defect for that closure type. Redesign the registration around one stable context object per active callback.
+
+## Implementation / design exercise — Core
+
+Design a fixed-capacity callable wrapper, `inline_function<Sig, Capacity>`, usable as a member of a hot-path struct with no heap allocation ever:
+
+- Store the callable in an in-place buffer of `Capacity` bytes with a matching alignment; `static_assert` at the call site that a given callable fits.
+- Provide a small function-pointer/thunk table (construct-from, invoke, move, destroy) so the wrapper does not need RTTI or `std::function`'s allocator path.
+- Decide and justify move-only versus copyable, empty-call behavior, supported alignment, nothrow-move requirements, and const/ref-qualified invocation.
+- Reject a target that does not fit at compile time; do not silently add a heap fallback to a hard bounded-storage type.
+- Test move construction and destruction with a non-trivial target, reject an over-aligned target, and use an allocation counter to confirm no wrapper allocation during construction and invocation.
+- Compare generated size and steady-state invocation against `std::move_only_function` for a representative mixture of targets; do not optimize only an empty lambda.
+
+## Prerequisites for the next chapter — Core
+
+Chapter 19 assumes the value-category and lifetime model from Chapters 4–5, move/copy behavior from Chapter 10, and this chapter's distinction between owning and borrowing closure state. It applies the same lifetime vocabulary to range-for temporaries, explicit object parameters, and coroutine frames.

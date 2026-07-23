@@ -1,12 +1,29 @@
 # Chapter 41 — Assembly, Binaries, and ABI
 
-*Interview-focused revision notes. The theme: the ABI is the contract that lets separately compiled code interoperate — this chapter is that contract stated precisely, plus the ability to read the machine code and the binary container that implement it.*
+An application binary interface (ABI) is the contract that lets separately compiled code interoperate. C++ defines the program; an ISA defines instructions; an ABI defines calls and object-level conventions; an object format and operating system define linking and loading. Keeping those layers separate is the central discipline of this chapter.
 
 ---
 
-## 41.1 Reading x86-64 Assembly
+## The 90-Second Screen — Core
 
-Fluency here is the difference between "the compiler did something" and "the compiler hoisted the load, kept `n` in `ecx`, and emitted a `cmov`". You do not need to write assembly; you need to read it at the speed you read C++.
+When handed a disassembly or crash address:
+
+1. Name the context: ISA, syntax, object format, OS, ABI, compiler, and build flags. A SysV AMD64 register rule is not a C++ guarantee and is not the Windows x64 rule.
+2. Find the function boundary, arguments, returns, calls, backward branches, and memory operands. Correlate addresses with source and samples before optimizing.
+3. At a call boundary, distinguish caller-saved from callee-saved registers, check stack alignment, and recognize hidden aggregate-return or indirect-parameter conventions.
+4. A reliable stack trace needs either an intact frame-pointer chain or correct unwind metadata. Inlining and tail calls change the logical call stack.
+5. In ELF, sections are primarily the linker's view; program segments are the loader's view. Symbols name entities; relocations describe address fixups.
+6. PIC usually reaches internal data PC-relatively and preemptible data through a GOT. Imported calls may use a PLT and lazy or eager binding.
+7. Debug information maps machine addresses back to source. Preserve build IDs and matching symbols for the exact deployed binary.
+8. Diagnose from evidence: source → compiler output → object symbols/relocations → linked image → loader decisions → sampled instruction.
+
+Chapter 1 covers translation units, linkage, the ODR, and `extern "C"`. This chapter follows those language concepts across the binary boundary.
+
+---
+
+## 41.1 Reading Machine Code and x86-64 Assembly — Core
+
+Machine code is bytes interpreted by an ISA. Assembly is a textual representation chosen by a disassembler; labels and symbol names may not exist in a stripped binary. The goal is not to memorize an instruction catalog, but to follow values, control flow, and memory traffic.
 
 **First: know which syntax you are looking at.**
 
@@ -22,15 +39,35 @@ Use `objdump -d -M intel` or `gcc -S -masm=intel` if Intel syntax is easier for 
 
 **The reading procedure**, applied to a function:
 
-1. **Find the prologue and frame size.** `push rbp; mov rbp, rsp; sub rsp, N` (frame pointer) or just `sub rsp, N` (omitted frame pointer, §41.16). The `N` is your stack-frame size — a large `N` in a hot function means spills or big locals.
+1. **Find the entry and stack adjustment.** `push rbp; mov rbp, rsp; sub rsp, N` is one possible frame-pointer prologue; optimized functions may omit it. `N` covers some mixture of locals, spills, alignment, and outgoing-call space.
 2. **Map arguments to registers** by the SysV order (§41.5): `rdi, rsi, rdx, rcx, r8, r9` for integers/pointers, `xmm0–7` for floating point.
 3. **Identify the loop.** Look for a backward jump to a label above it. The instructions between the label and the jump are the loop body; count them.
 4. **Classify memory traffic.** `mov reg, [mem]` is a load, `mov [mem], reg` a store. Loads from `[rsp+N]` or `[rbp-N]` inside a loop are **spills** — a red flag.
-5. **Find the calls.** `call` to a named symbol means the function was not inlined. `call [rax]` or `jmp rax` means indirect dispatch (virtual call or function pointer). No calls in a hot loop is what you want.
-6. **Check for SIMD.** `xmm`/`ymm`/`zmm` registers and `v`-prefixed mnemonics (`vaddps`, `vfmadd231pd`) mean vectorization happened; `addss`/`addsd` (single element, `s` = scalar) means it did not.
+5. **Find the calls.** A surviving `call` is a real call in this binary. An indirect `call [rax]` or `blr xN` may be virtual dispatch, a function pointer, or a linkage stub; inspect how its target was produced.
+6. **Check data width.** Vector registers do not by themselves prove loop vectorization, and a scalar instruction does not prove that the entire loop is scalar. Read the loop body and lane width.
+
+### Worked reading: one loop
+
+```cpp
+#include <cstddef>
+
+extern "C" int sum(const int* a, std::size_t n) {
+    int result = 0;
+    for (std::size_t i = 0; i < n; ++i) result += a[i];
+    return result;
+}
+```
+
+One reproducible way to keep this teaching output scalar is:
+
+```bash
+clang++ -std=c++23 -O1 -fno-vectorize -fno-slp-vectorize \
+  -fno-unroll-loops -S -masm=intel sum.cpp -o sum.s
+```
+
+A representative SysV AMD64 body is:
 
 ```asm
-; int sum(const int* a, size_t n)
 sum:
         xor     eax, eax          ; result = 0     (xor is the idiomatic zero)
         test    rsi, rsi          ; n == 0 ?
@@ -45,23 +82,27 @@ sum:
         ret
 ```
 
+Map `a → rdi`, `n → rsi`, and the integer result → `eax`. `rcx` is the induction variable. `[rdi+rcx*4]` is the only source-array load, `cmp`/`jb` forms the unsigned loop condition, and no stack adjustment means the function needs no local frame. A different compiler version may use `jne`, pointer induction, unrolling, or SIMD while preserving the same C++ behavior.
+
 **Reading tips that save time:**
 
-- Compilers put the **hot path as the fall-through** and jump forward to cold code (§40.6). If you see `jne .L_cold` and the target is after the `ret`, you are looking at an error path.
-- `nop` and multi-byte `nopw 0x0(%rax,%rax,1)` sequences are **alignment padding**, not code — ignore them.
-- Instructions ending in `s` (scalar) vs `p` (packed): `addss` = add one float; `addps` = add four.
+- Compilers commonly make the predicted or profiled hot path the fall-through, but this is a heuristic rather than an ABI rule (Ch. 40 §40.4).
+- `nop` and multi-byte NOP sequences often provide alignment or patching space.
+  They can still execute on a fall-through path, so confirm control flow rather
+  than assuming every NOP is irrelevant.
+- In legacy SSE names, `addss` operates on one scalar float and `addps` on packed floats. AVX/AVX-512 forms and element counts depend on operand width.
 - `%rip`-relative addressing (`lea rax, [rip+0x2f31]`) is how PIC references globals (§41.12).
 - Sizes: register name tells you the width — `rax` (64), `eax` (32), `ax` (16), `al` (8).
 
-**Tools:** `objdump -d`, `gcc -S`, `perf annotate` (assembly with per-instruction sample counts — the single most useful view for optimization work), and Compiler Explorer (Ch. 40 §40.21) with source↔asm color mapping.
+**Tools:** `objdump -d`, `gcc -S`, `perf annotate` (assembly with per-instruction sample counts), and Compiler Explorer (Ch. 44 §44.3) with source↔asm color mapping. Match the tool to the question and validate on the shipped target.
 
 ---
 
-## 41.2 x86-64 Registers, Flags, and Addressing
+## 41.2 x86-64 Registers, Flags, and Addressing — Core
 
 ### General-purpose registers
 
-16 of them, each addressable at four widths:
+The base x86-64 ISA exposes 16 general-purpose registers. The table uses SysV AMD64 conventional roles; Windows x64 assigns arguments and preservation differently.
 
 | 64 | 32 | 16 | 8 (low) | Conventional use (SysV) |
 |---|---|---|---|---|
@@ -76,11 +117,11 @@ sum:
 | `r8`–`r11` | `r8d`… | `r8w`… | `r8b`… | `r8`,`r9` = 5th/6th args; all caller-saved |
 | `r12`–`r15` | `r12d`… | | | **Callee-saved** |
 
-**The 32-bit zero-extension rule is the most-asked register detail:** writing to a 32-bit register **zeroes the upper 32 bits** of the 64-bit register. Writing to a 16- or 8-bit register does *not* — it merges, creating a false dependency on the previous value (Ch. 42 §42.11). Consequences:
+**The 32-bit zero-extension rule is the most-asked register detail:** writing to a 32-bit register **zeroes the upper 32 bits** of the 64-bit register. Writing to a 16- or 8-bit register does *not* — it merges, creating a possible target-dependent false dependency on the previous value (Ch. 42 §42.9). Consequences:
 
-- `xor eax, eax` is the idiomatic 64-bit zero (2 bytes, and recognized by the renamer as a dependency-breaking idiom costing zero execution ports).
+- `xor eax, eax` is a compact zeroing idiom and is recognized specially by many x86 microarchitectures.
 - `mov eax, edi` is a legitimate zero-extending 32→64 move; `movzx`/`movsx` are needed for narrower widths.
-- Partial-register writes (`mov al, 1`) cause merge micro-ops and stalls on some cores. Prefer `movzx eax, byte ptr [..]`.
+- Partial-register writes (`mov al, 1`) followed by wider reads can create merge work or false dependencies on some cores. Prefer a full-width-producing instruction such as `movzx eax, byte ptr [..]` when it expresses the intended value.
 
 **Vector registers:** `xmm0–15` (128-bit, SSE), extended to `ymm0–15` (256-bit, AVX) and `zmm0–31` (512-bit, AVX-512, which also adds `xmm16–31` and the mask registers `k0–k7`). `xmm0` returns floating-point values; `xmm0–7` pass FP arguments.
 
@@ -95,15 +136,15 @@ Set by arithmetic/logic and consumed by conditional jumps, `setcc`, and `cmov`:
 | CF | Carry / unsigned overflow-borrow | `jb`/`jae` (**unsigned** comparisons) |
 | OF | Signed overflow | `jo`, and `jl`/`jge` (**signed** comparisons) |
 | PF | Parity of low byte | rarely used |
-| AF | BCD adjust | never |
+| AF | Auxiliary carry | mainly legacy/BCD uses; rarely relevant in compiler output |
 
-**Unsigned vs signed jumps are a reliable reading cue:** `jb`/`ja`/`jbe`/`jae` (below/above) mean the C-level comparison was **unsigned**; `jl`/`jg`/`jle`/`jge` (less/greater) mean **signed**. Spotting a `jb` where you expected a signed compare tells you an implicit conversion happened (Ch. 2 §2.3).
+**Unsigned vs signed jumps are a reliable reading cue:** `jb`/`ja`/`jbe`/`jae` (below/above) implement **unsigned** conditions; `jl`/`jg`/`jle`/`jge` (less/greater) implement **signed** conditions. Spotting a `jb` where you expected a signed compare is evidence to inspect conversions (Ch. 2 §§2.15–2.18), not a unique reconstruction of the source.
 
 Note `test rax, rax` is the idiomatic "is it zero/null" (cheaper encoding than `cmp rax, 0`), and `cmp` is a `sub` that discards its result.
 
 ### Addressing modes
 
-One instruction can compute `[base + index*scale + disp]` with scale ∈ {1,2,4,8} — this is exactly C's `array[i]` for element sizes 1/2/4/8, which is why those sizes are fast.
+One memory operand can compute `[base + index*scale + disp]` with scale ∈ {1,2,4,8}. This directly represents many array indexes, but element size alone does not determine loop speed.
 
 ```asm
 mov  rax, [rdi]                ; *p
@@ -114,19 +155,19 @@ lea  rax, [rdi + rdi*2]        ; rax = rdi*3  — arithmetic abuse of LEA
 mov  eax, [rip + 0x2f31]       ; RIP-relative global access (PIC)
 ```
 
-**`lea` is the instruction to recognize.** It performs the address computation without touching memory, so compilers use it as a three-operand add/shift that does not clobber flags. Seeing `lea` chains means the compiler strength-reduced a multiply (Ch. 40 §40.13).
+**`lea` is the instruction to recognize.** It performs the address computation without touching memory, so compilers use it as a three-operand add/shift that does not clobber flags. An `lea` chain may implement address arithmetic or a constant multiply (Ch. 40 §40.3).
 
-An element size that is not 1/2/4/8 (e.g. a 24-byte struct) forces an explicit `imul` before the load — one concrete reason power-of-two struct sizes matter in hot arrays (Ch. 3 §3.3).
+Scales are limited to 1, 2, 4, and 8, but a compiler can use `lea`, shifts, additions, or pointer induction for other strides. Do not infer an expensive multiply from the C++ element size alone.
 
 ---
 
-## 41.3 Common Compiler Assembly Idioms
+## 41.3 Common Compiler Assembly Idioms — Core
 
-Recognizing these on sight is what makes disassembly reading fast.
+These are representative x86-64 patterns from common compilers. None is a unique source-level decoding: confirm operands, surrounding control flow, target ABI, and compiler output.
 
 | Idiom | Assembly | Meaning |
 |---|---|---|
-| Zero a register | `xor eax, eax` | `= 0`; dependency-breaking, zero ports |
+| Zero a register | `xor eax, eax` | `= 0`; commonly dependency-breaking |
 | Null/zero test | `test rax, rax; je` | `if (!p)` |
 | Sign-extend 32→64 | `movsxd rax, edi` / `cdqe` | `(int64_t)someInt` |
 | Zero-extend 8/16→32 | `movzx eax, byte ptr [rdi]` | `(int)someChar` avoiding partial-register stalls |
@@ -134,32 +175,32 @@ Recognizing these on sight is what makes disassembly reading fast.
 | **Divide by constant** | `mov rax, 0x51EB851EB851EB85; mul rsi; shr rdx, 5` | `/ 100` via magic reciprocal — *not* a crypto constant |
 | Modulo by power of 2 | `and eax, 63` | `% 64` on unsigned |
 | Signed `/2` | `mov eax,edi; shr eax,31; add eax,edi; sar eax,1` | Rounding-toward-zero correction — signed division is more expensive than unsigned |
-| Branchless select | `test/cmp ...; cmov ge rax, rcx` | ternary or `std::max` compiled branchlessly (Ch. 42 §42.4) |
+| Branchless select | `test/cmp ...; cmovge rax, rcx` | ternary or `std::max` compiled branchlessly (Ch. 42 §42.6) |
 | Boolean materialize | `setne al; movzx eax, al` | `bool b = (x != y)` |
 | Memory clear | `rep stosq` or `vpxor`+`vmovdqu` loops | `memset`/value-init |
 | Bulk copy | `rep movsb` (ERMSB) or SIMD loop | `memcpy`/struct copy |
-| Vtable call | `mov rax,[rdi]; call [rax+16]` | virtual dispatch: load vptr, call slot 2 |
-| Bounds-check pair | `cmp rsi, [rdi+8]; jae .throw` | `vector::at` / `span` check |
+| Possible vtable call | `mov rax,[rdi]; call [rax+16]` | load a table pointer and call an indirect slot under a compatible C++ ABI |
+| Bounds-check pair | `cmp rsi, [rdi+8]; jae .throw` | checked container access or an explicit span bounds guard |
 | PIC global | `mov rax, [rip+0x1234]` | position-independent data access |
-| External call via PLT | `call foo@PLT` | dynamic symbol, first call goes through the resolver (§41.12) |
-| Stack protector | `mov rax, fs:0x28; ... xor rax, fs:0x28; jne __stack_chk_fail` | `-fstack-protector` canary |
-| TLS access | `mov rax, fs:[0xfffffff8]` or `__tls_get_addr` | `thread_local` (Ch. 24 §24.3) — initial-exec vs general-dynamic model |
-| Atomic RMW | `lock xadd [rdi], eax` | `fetch_add`; `lock` prefix = ~20 cycles uncontended (Ch. 29 §29.16) |
-| Full fence | `mfence` or `lock or [rsp], 0` | `seq_cst` fence; compilers prefer the `lock` form as it is faster |
-| Timestamp | `rdtsc` / `rdtscp` / `lfence; rdtsc` | Ch. 43 §43.12 |
-| Alignment padding | `nopw 0x0(%rax,%rax,1)` | not executed on the hot path |
+| External call via PLT | `call foo@PLT` | dynamic symbol; lazy mode may resolve it on first call (§41.12) |
+| Stack protector | `mov rax, fs:0x28; ... xor rax, fs:0x28; jne __stack_chk_fail` | one Linux/glibc x86-64 `-fstack-protector` pattern |
+| TLS access | `mov rax, fs:[0xfffffff8]` or `__tls_get_addr` | `thread_local` (Ch. 24 §24.9) — initial-exec vs general-dynamic model |
+| Atomic RMW | `lock xadd [rdi], eax` | one common `fetch_add` mapping (Ch. 25) |
+| Ordering instruction | `mfence` or a locked operation | possible mapping; inspect compiler and context |
+| Timestamp | `rdtsc` / `rdtscp` / `lfence; rdtsc` | Ch. 43 §43.3 |
+| Possible alignment padding | `nopw 0x0(%rax,%rax,1)` | often padding; verify whether control flow executes it |
 
 **Two worth expanding:**
 
-**Division by a constant.** The compiler replaces `x / d` with a multiply-high by `⌈2^k/d⌉` plus shifts, because `div` is 20–40+ cycles and never pipelined while `mul` is 3 cycles. If you see a large hex constant followed by `mul`/`imul` and a `shr`, it is a division. Conversely, **division by a runtime value cannot be optimized** — a `div` in a hot loop is often the single largest cost, and hoisting to a reciprocal multiply (or restructuring so the divisor is a compile-time constant, e.g. via a template parameter) is a real optimization.
+**Division by a constant.** Compilers often replace integer division by a known constant with a multiply-high and shifts. A large constant followed by `mul`/`imul` and a shift is therefore often reciprocal division, but confirm against the source. Runtime divisors may still be simplified through value propagation or specialized versions. Ch. 40 covers the transformation; Ch. 42 covers when the resulting dependency chain matters.
 
-**The `lock` prefix.** `lock xadd`, `lock cmpxchg`, `lock add` are your atomics. Any `lock`-prefixed instruction in a hot loop is a serialization point and a cache-line ownership request (Ch. 29 §29.16). Counting `lock` instructions in a disassembled hot path is a fast audit for accidental atomics — e.g. a `shared_ptr` copy hiding in a "cheap" function shows up as a `lock xadd` pair (Ch. 9 §9.11).
+**The `lock` prefix.** Locked instructions are common implementations of atomic RMWs on x86. They request exclusive cache-line ownership and can become expensive under contention (Chs. 25 and 29). A `lock` instruction in a sampled hot loop is evidence to trace back to its source; a reference-count operation is one possible origin (Ch. 9).
 
 ---
 
-## 41.4 AArch64 Assembly Fundamentals
+## 41.4 AArch64 Assembly Fundamentals — Core
 
-ARM64 matters for Apple Silicon development machines, Graviton/Ampere servers, and because contrasting the two ISAs is a common way to test whether you understand *why* x86 code looks the way it does.
+AArch64 provides a useful contrast with x86-64. The examples below describe the base ISA and AAPCS64; Apple, Windows, and platform extensions add ABI details.
 
 **Registers:** 31 general-purpose, `x0–x30` (64-bit) / `w0–w30` (32-bit, zero-extending on write, like x86's 32-bit rule). `x31` is context-dependent: `sp` (stack pointer) or `xzr`/`wzr` (the **zero register**, which reads as 0 and discards writes). `x30` = `lr`, the **link register**. 32 vector registers `v0–v31` (128-bit NEON, or SVE's scalable `z0–z31`).
 
@@ -169,12 +210,12 @@ ARM64 matters for Apple Silicon development machines, Graviton/Ampere servers, a
 |---|---|---|
 | Type | CISC, variable length (1–15 bytes) | RISC, fixed 4-byte instructions |
 | Memory operands | Most instructions can access memory | **Load/store only** — arithmetic is register-to-register |
-| Registers | 16 GP | 31 GP (far fewer spills) |
-| Flags | Almost every ALU op sets flags | Only `S`-suffixed forms (`adds`, `subs`, `cmp`) set flags |
-| Return address | Pushed on stack by `call` | Placed in `lr` (`x30`) by `bl`; leaf functions never touch the stack |
-| Memory model | **TSO** — strong (Ch. 29 §29.13) | **Weakly ordered** — needs explicit barriers (Ch. 29 §29.14) |
-| Atomics | `lock` prefix, or `cmpxchg` | `ldxr`/`stxr` LL-SC pairs, or LSE (`ldadd`, `casal`) since ARMv8.1 |
-| Unaligned access | Allowed (penalty on line/page straddle) | Allowed for normal memory, **faults** for device memory and exclusives |
+| Registers | 16 GP | 31 GP |
+| Flags | Many integer ALU operations set flags implicitly | Most integer ALU forms do not; `S`-suffixed and compare/test forms do |
+| Return address | Pushed on stack by `call` | Placed in `lr` (`x30`) by `bl`; a simple leaf may avoid saving it |
+| Memory ordering | x86-TSO model (Ch. 29 §29.9) | weaker architectural model (Ch. 29 §29.9) |
+| Atomics | locked instructions or `cmpxchg` sequences | exclusive pairs or optional atomic extensions selected by target |
+| Unaligned access | ISA and memory-type rules apply | ISA, memory-type, and instruction rules apply |
 | Zero register | None | `xzr`/`wzr` |
 
 ```asm
@@ -194,18 +235,17 @@ sum:
         ret                        // returns to address in lr (x30)
 ```
 
-**Points that appear in interviews:**
+**AAPCS64 points:**
 
-- **The weak memory model is the practical difference.** Code with a missing `std::atomic` or a wrong memory order that works on x86 (where TSO gives you acquire/release almost for free) breaks on ARM. Porting to Graviton is a classic way latent memory-model bugs surface (Ch. 25 §25.19).
-- **`stp`/`ldp`** (store/load pair) move two registers at once and dominate prologues/epilogues: `stp x29, x30, [sp, #-16]!` pushes the frame pointer and link register with pre-decrement.
-- **AAPCS64 calling convention:** `x0–x7` for the first 8 integer args, `v0–v7` for FP/SIMD, return in `x0`/`v0`, callee-saved `x19–x28` and `v8–v15` (low 64 bits only). Stack must be **16-byte aligned at all times**, not just at calls — stricter than SysV. **No red zone** in AAPCS64 (Apple's ABI variants differ in other details, notably variadic argument passing).
-- **Apple Silicon specifics:** 128-byte cache lines (vs 64 on x86) matter for `alignas` and false-sharing padding (Ch. 3 §3.3); and Rosetta 2's ability to run x86 binaries relies on hardware TSO-emulation support.
+- A program with a C++ data race is already undefined on either ISA. For race-free code using weak atomics, a language-permitted outcome may be easier to observe on a weaker hardware mapping. Ch. 25 supplies the language proof.
+- **`stp`/`ldp`** (store/load pair) move two registers and are common in prologues/epilogues: `stp x29, x30, [sp, #-16]!` stores the frame pointer and link register while pre-decrementing `sp`.
+- **AAPCS64 calling convention:** `x0–x7` carry the first integer/pointer argument slots and `v0–v7` carry FP/SIMD arguments under the ABI's classification rules. Results commonly use `x0` or `v0`; `x19–x29` (with `x29` conventionally the frame pointer), `sp`, and the low 64 bits of `v8–v15` are callee-saved. Register `x18` is platform-specific and should be avoided by portable hand-written assembly. The stack pointer is 16-byte aligned when used for memory access and at public interfaces, and the base procedure-call standard permits no below-`sp` red zone. Platform variants, especially variadic rules, must be checked separately.
 
 ---
 
-## 41.5 System V AMD64 Calling Convention
+## 41.5 Calling Conventions and System V AMD64 — Core
 
-The **System V AMD64 ABI** governs Linux, macOS, and the BSDs (Windows x64 differs — see the table below). This is the most likely single thing to be asked in detail.
+A calling convention answers where arguments and results live, which registers survive a call, how the stack is aligned, and how exceptional control flow unwinds. The following details are the **System V AMD64 psABI**, used by ELF systems such as Linux and the BSDs. Darwin's x86-64 convention is closely related but belongs to the Mach-O/Darwin ABI; Windows x64 differs substantially.
 
 ### Argument passing
 
@@ -215,7 +255,7 @@ Arguments are classified by type into classes, then assigned to registers in ord
 |---|---|
 | INTEGER (integers, pointers, `bool`, enums) | `rdi, rsi, rdx, rcx, r8, r9` |
 | SSE (`float`, `double`, small vectors) | `xmm0, xmm1, ..., xmm7` |
-| MEMORY (anything too large or unsuitable) | Pushed on the stack, right to left |
+| MEMORY (anything too large or unsuitable) | Passed in memory according to the ABI; an indirect reference may itself use a register |
 
 The two sequences are **independent counters**: in `void f(int a, double b, int c, double d)`, `a`→`rdi`, `c`→`rsi`, `b`→`xmm0`, `d`→`xmm1`. Mixing does not consume the other class's slots. This trips people up constantly.
 
@@ -223,7 +263,7 @@ Once the six INTEGER registers are exhausted, remaining INTEGER arguments go on 
 
 ```cpp
 void f(int a, long b, void* c, char d, int e, int f, int g, double h);
-// a→edi  b→rsi  c→rdx  d→ecx  e→r8d  f→r9d  g→[rsp]  h→xmm0
+// At callee entry: a→edi ... f→r9d, g→[rsp+8], h→xmm0.
 ```
 
 ### Return values
@@ -231,17 +271,20 @@ void f(int a, long b, void* c, char d, int e, int f, int g, double h);
 | Return type | Location |
 |---|---|
 | Integer/pointer ≤ 64 bits | `rax` |
-| Integer 65–128 bits (e.g. `__int128`, small struct of two words) | `rax:rdx` |
+| Integer or two INTEGER-class eightbytes totaling 65–128 bits (for example, `__int128`) | `rax:rdx` |
 | `float`/`double` | `xmm0` |
 | Two FP values (e.g. `struct {double,double}`) | `xmm0:xmm1` |
-| Large or non-trivial types | **Hidden pointer**: caller allocates space, passes its address as an *implicit first argument* in `rdi` (shifting all real arguments right by one), and the callee returns that same pointer in `rax` (§41.8) |
+| Many MEMORY-class or non-trivial types | **Hidden pointer**: caller allocates space, passes its address as an *implicit first argument* in `rdi` (shifting all real arguments right by one), and the callee returns that same pointer in `rax` (§41.8) |
 
 ### Other rules
 
 - **`this` is passed as the first INTEGER argument** (`rdi`) for non-static member functions, before all declared arguments. With a hidden return pointer, the order is: hidden pointer in `rdi`, `this` in `rsi`.
-- **Variadic functions** require `al` to hold *the number of SSE registers used* (0–8) — this is why calling a varargs function through a wrong prototype (e.g. `printf` without `<cstdio>`'s declaration) can crash: the callee saves `xmm0–7` to its register save area only if `al` says to.
+- **Variadic functions** require `al` to hold an upper bound on the number of
+  vector registers used for arguments (0–8); it need not be exact. Calling
+  through an incompatible prototype is undefined behavior and can break this
+  and other ABI requirements.
 - **Direction flag (DF)** must be clear on entry and exit.
-- **The x87 stack** must be empty on entry/exit; `mxcsr` and the x87 control word are callee-saved (which is one reason `-ffast-math`'s FTZ/DAZ setting is global and sticky).
+- The x87 control word is callee-saved. For `mxcsr`, control bits are preserved while status bits are not. Code that changes floating-point environment state must follow the ABI and language-library contract.
 
 ### SysV vs Windows x64
 
@@ -253,17 +296,17 @@ void f(int a, long b, void* c, char d, int e, int f, int g, double h);
 | Shadow space | None | Caller reserves **32 bytes** for the callee to spill the 4 register args |
 | Red zone | **128 bytes** | None |
 | Callee-saved | `rbx, rbp, r12–r15` | `rbx, rbp, rdi, rsi, r12–r15, xmm6–15` |
-| Struct return | By value in registers if ≤16 B and classifiable | By hidden pointer unless 1/2/4/8 bytes |
+| Aggregate return | In registers if its eightbytes classify suitably; otherwise indirect | Qualifying small aggregates may use integer registers; larger, non-qualifying, and non-trivial cases are commonly indirect, with separate vector rules |
 
-The register-count difference is a real performance difference: SysV passes 6 integer arguments in registers to Windows' 4, and Windows must reserve shadow space on every call.
+These are interoperability rules, not a portable ranking of performance. Optimizers can inline calls, allocate values differently within a function, and specialize internal conventions when no external boundary remains.
 
 ---
 
-## 41.6 Stack Alignment and the Red Zone
+## 41.6 Stack Alignment and the Red Zone — Core
 
 ### The 16-byte alignment rule
 
-**At the point of a `call` instruction, `rsp` must be 16-byte aligned.** The `call` then pushes an 8-byte return address, so **on entry to the callee `rsp ≡ 8 (mod 16)`**. This is the precise statement; getting the off-by-8 right is the mark of someone who has actually debugged it.
+Under SysV AMD64, `rsp` is 16-byte aligned at a normal call site. Because `call` pushes an 8-byte return address, a normally entered callee begins with `rsp ≡ 8 (mod 16)`.
 
 ```
                  rsp % 16 == 0     ← required before `call`
@@ -271,11 +314,11 @@ call pushes RIP: rsp % 16 == 8     ← state at callee entry
 push rbp:        rsp % 16 == 0     ← standard prologue restores alignment
 ```
 
-**Why it exists:** so that 16-byte-aligned SIMD spills (`movaps [rsp+N], xmm0`) are legal without dynamic realignment. `movaps` on a misaligned address **faults with SIGSEGV** (Ch. 3 §3.3).
+The rule lets a callee establish aligned local storage predictably. Some aligned-move instructions require aligned addresses and can fault when used on misaligned memory; the observed OS signal is platform-specific (Ch. 3 §3.3).
 
-**How it breaks in practice:** hand-written assembly or a JIT that calls into C code without aligning; a signal handler on a misaligned stack; an odd number of pushes before a call. The signature is a **crash inside `memcpy`, `printf`, or any libc routine that uses SSE**, at an instruction like `movaps`, with a fault address that is 8 mod 16. Nearly every "crash inside memcpy" that is not a buffer overrun is a stack-alignment bug.
+It breaks most often in hand-written assembly, JIT code, foreign-function interfaces, or mismatched conventions. A fault on an aligned stack move inside a callee is evidence to inspect the caller's stack alignment; it is not proof, because memory corruption and invalid pointers remain common causes.
 
-`-mpreferred-stack-boundary=N` and `-mstackrealign` exist for interop with code that violates the rule; `alignas(32)` locals force the compiler to emit a dynamic realignment sequence (`and rsp, -32`) plus a frame pointer.
+`-mpreferred-stack-boundary=N` and `-mstackrealign` are target-specific controls for stack alignment and interoperation. A used over-aligned local may require dynamic realignment (for example, an `and rsp, -32` sequence) and extra frame bookkeeping; inspect the generated code rather than assuming one prologue.
 
 ### The red zone
 
@@ -293,7 +336,7 @@ The **red zone** is the **128 bytes below `rsp`** that a function may use as scr
       lower addresses
 ```
 
-**Why it matters:** a **leaf function** (one that makes no calls) can use up to 128 bytes of locals with no prologue and no epilogue at all — no `sub rsp, N` / `add rsp, N`. Two instructions saved on every call to a small leaf function, which for accessors and hot helpers is meaningful.
+It allows a leaf function to use limited scratch storage without changing `rsp`. Whether a compiler does so depends on flags, instrumentation, and its frame layout.
 
 ```asm
 ; leaf using the red zone — note the absence of any rsp adjustment
@@ -305,16 +348,16 @@ f:      mov     QWORD PTR [rsp-8], rdi
 
 **Where the red zone does not exist or must be disabled:**
 
-- **Kernel code.** Interrupts push onto the current stack, clobbering the red zone. The Linux kernel is built with `-mno-red-zone` — a classic interview question ("why does the kernel disable the red zone?").
+- **Kernel code.** Interrupts may use the current stack and clobber space below `rsp`; x86-64 Linux kernel code is built without the user-space red-zone convention.
 - **Signal handlers** in user space are safe, because the kernel's signal delivery explicitly skips 128 bytes below `rsp` when building the signal frame. That skip *is* the red zone guarantee.
 - **Windows x64** has no red zone.
-- **Interrupt/exception handler attributes** (`__attribute__((interrupt))`) imply `-mno-red-zone`.
+- **Interrupt/exception handlers and similarly privileged code** must follow their platform's stack rules and are commonly built with `-mno-red-zone`; do not infer safety from a source attribute alone.
 
-A related trap: **inline assembly that writes below `rsp`** without accounting for the red zone corrupts the compiler's scratch data, producing corruption that only appears in optimized builds where the compiler chose to use the red zone.
+A related trap: **inline assembly that writes below `rsp`** without coordinating with the compiler's frame model can corrupt red-zone scratch data, producing failures that appear only in optimized builds where the compiler chose to use that space.
 
 ---
 
-## 41.7 Caller-Saved and Callee-Saved Registers
+## 41.7 Caller-Saved and Callee-Saved Registers — Core
 
 The register-preservation contract, which determines what a function may assume survives a call.
 
@@ -324,13 +367,13 @@ The register-preservation contract, which determines what a function may assume 
 | **Caller-saved** (volatile / scratch) | `rax, rcx, rdx, rsi, rdi, r8–r11`, **all `xmm`/`ymm`/`zmm`** | The callee may destroy them. The caller must spill anything it needs across a call. |
 | Special | `rsp` (restored by convention), `rbp` (callee-saved, frame pointer if used) | |
 
-**The fact people miss: on SysV, *all* vector registers are caller-saved.** Any function call in the middle of a vectorized loop forces the compiler to spill up to 16 `ymm` registers (512 bytes) to the stack and reload them. This is a large part of why a non-inlined call inside a hot loop is so damaging (Ch. 40 §40.16) — it is not just the call, it is the register-file evacuation. On Windows x64, `xmm6–xmm15` are callee-saved, which shifts the cost but does not remove it.
+Under SysV AMD64, vector registers are caller-saved. A call can therefore cause live vector values to be spilled, but the allocator may also rematerialize values, shorten live ranges, or use other registers. Windows x64 preserves part of the vector-register set, subject to its exact ABI rules.
 
 **Consequences for code generation:**
 
-- A **leaf function** using ≤6 values can run entirely in caller-saved registers with no push/pop at all.
-- A function with a loop and a call inside it will push `rbx`/`r12`–`r15` in the prologue so it has stable registers across the call — you can read the number of pushes as "how many values this function needs to keep live across calls".
-- **Register pressure** is why aggressive inlining can backfire (Ch. 40 §40.4): with only 16 GP registers, inlining several functions into one body exhausts them and the allocator spills.
+- A leaf function with modest register pressure may need no save/restore sequence.
+- A function with values live across a call may keep some in callee-saved registers and save those registers in its prologue. Other values can spill, be recomputed, or have shorter live ranges.
+- **Register pressure** is why aggressive inlining can backfire (Ch. 40 §40.4): combining more live values into one body can exhaust the allocatable registers and force spills.
 
 ```asm
 ; a function that keeps two values across a call
@@ -352,43 +395,41 @@ Note the `sub rsp, 8` for alignment — reading a prologue's push count plus the
 **Inline assembly must declare clobbers correctly**, or the compiler will assume its values survived:
 
 ```cpp
-asm volatile("rdtsc" : "=a"(lo), "=d"(hi));            // declares rax, rdx written
-asm volatile("cpuid" : : "a"(0) : "rbx","rcx","rdx");  // cpuid clobbers rbx — MUST declare
+asm volatile("rdtsc" : "=a"(lo), "=d"(hi));  // declares rax, rdx written
+unsigned eax = 0, ebx, ecx, edx;
+asm volatile("cpuid"
+             : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
 asm volatile("" ::: "memory");                          // compiler barrier only (Ch. 25 §25.16)
 ```
-Omitting a clobber produces miscompilation that appears only under optimization — the compiler keeps a value in `rbx` across your asm and reads garbage.
+Omitting a clobber can produce optimization-dependent miscompilation: the compiler may keep a live value in a register that the assembly silently destroys.
 
 ---
 
-## 41.8 Structure Parameter and Return ABI
+## 41.8 Aggregate Parameters, Returns, and Tail Calls — Core
 
-How aggregates are passed is where the ABI meets C++ class design, and it produces one of the best interview answers in the language (Ch. 3 §3.5).
+Aggregate rules are ABI rules, not consequences of `sizeof` alone. The summary below targets the current SysV AMD64 psABI; verify examples with the named compiler and target whenever an interface depends on them.
 
 ### The SysV classification algorithm
 
-1. If the aggregate is **larger than 16 bytes**, or contains unaligned fields, it is class **MEMORY**.
-2. If it has a **non-trivial copy constructor, move constructor, or destructor**, it is class **MEMORY** — regardless of size.
-3. Otherwise, split it into two 8-byte "eightbytes" and classify each: all-float ⇒ SSE, anything integer/pointer ⇒ INTEGER.
-4. Pass each eightbyte in the next register of its class, or the whole thing in MEMORY if registers run out.
+1. The ABI recursively classifies an aggregate into one or more eightbytes.
+2. Objects larger than the register-class limit, objects with unaligned fields, and certain non-trivial C++ types use memory/indirect conventions.
+3. Simplified common cases classify integer/pointer content as INTEGER and floating/vector content as SSE.
+4. If the required register classes are unavailable, the argument is passed in memory. Exact cleanup, homogeneous-vector, `long double`, and platform-extension rules require the psABI.
 
 ```cpp
 struct A { int x, y; };                  // 8 B, INTEGER      → one register (rdi)
 struct B { double x, y; };               // 16 B, SSE,SSE     → xmm0, xmm1
 struct C { long x; double y; };          // 16 B, INTEGER,SSE → rdi, xmm0
-struct D { long a, b, c; };              // 24 B > 16         → MEMORY (stack)
-struct E { long x; ~E(); };              // 8 B but non-trivial dtor → MEMORY
-struct F { std::unique_ptr<int> p; };    // 8 B, non-trivial  → MEMORY
+struct D { long a, b, c; };              // LP64: 24 B         → MEMORY
+struct E { long x; ~E(); };              // non-trivial ABI handling
+struct F { std::unique_ptr<int> p; };    // non-trivial ABI handling
 ```
 
-**Rule 2 is the money detail.** `struct E` and `struct F` are pointer-sized but must be passed **in memory** — the caller allocates a slot, copies the value there, and passes its address. The canonical statement:
-
-> **`std::unique_ptr<T>` is not zero-overhead at ABI boundaries.** It is exactly one pointer, but because it has a non-trivial destructor it is passed on the stack, while a raw `T*` is passed in a register. Across a non-inlined call this is a real, measurable difference.
-
-The same argument covers `std::optional<T>` with non-trivial `T`, `std::string`, and any RAII wrapper. Inside a TU, inlining makes this vanish — the cost is at **non-inlined boundaries**, which is exactly what LTO (Ch. 40 §40.3) reduces.
+A small non-trivial wrapper can use an **invisible reference**: the caller materializes the object and passes its address. That address may occupy an argument register; “class MEMORY” does not mean the object bytes are always pushed onto the stack. A `unique_ptr<T>` can therefore have the same stored size as `T*` while differing at a non-inlined ABI boundary. This is an observation about a named ABI, not a general claim that RAII has runtime overhead. Inlining and whole-program optimization can erase the boundary (Ch. 40 §40.3).
 
 ### Return values
 
-- ≤16 bytes and trivially copyable ⇒ returned in `rax:rdx` and/or `xmm0:xmm1` by the same classification.
+- Suitable small, trivial aggregates are returned in `rax:rdx` and/or `xmm0:xmm1` according to classification.
 - Otherwise ⇒ **hidden return pointer (sret)**: the caller allocates the storage, passes its address as an implicit first argument in `rdi`, and the callee returns that pointer in `rax`.
 
 ```asm
@@ -396,18 +437,18 @@ The same argument covers `std::optional<T>` with non-trivial `T`, `std::string`,
 call    make_big     ; rdi = &result_storage in the caller's frame
 ```
 
-This is why **NRVO and guaranteed copy elision** are so effective (Ch. 10 §10.1): with the hidden pointer, the callee constructs *directly into the caller's storage*, so there is genuinely no copy or move — it is an ABI-level property, not an optimization the compiler chooses. When NRVO fails (multiple return objects, returning a parameter), you get a real move into `*hidden`.
+The hidden destination is how many implementations realize direct construction into caller-provided storage. The C++ guarantee comes from the language's prvalue/copy-elision rules (Ch. 10 §10.1); the hidden pointer is one ABI implementation technique. NRVO remains optional where the standard does not mandate elision.
 
 ### ABI-visible design rules
 
-- Keep small value types **trivially copyable** if they cross non-inlined boundaries; a destructor costs you register passing.
-- Keep hot aggregates **≤16 bytes** with 8-byte-classifiable halves.
+- If call-boundary traffic matters, inspect how the actual target passes the type before redesigning it.
+- Size, alignment, triviality, field classes, and register availability can all affect an aggregate.
 - Beware mixed classes: `struct { float a; int b; }` is 8 bytes but classifies as INTEGER (an eightbyte with any integer member is INTEGER), so it travels in a GP register and needs moves to get into an FP register.
 - **Bit-fields, `[[no_unique_address]]`, and empty bases** all participate in classification and have caused real cross-compiler ABI bugs. GCC and Clang have shipped mutually incompatible `[[no_unique_address]]` and empty-struct-in-C classifications; `-Wpsabi` warns about the ones GCC knows it changed.
 
 ---
 
-## 41.9 Tail Calls
+### Tail calls
 
 A **tail call** is a call in tail position — its result is immediately returned, with no work after it. The compiler can replace `call f; ret` with `jmp f`, reusing the current stack frame.
 
@@ -422,38 +463,60 @@ f:      add     edi, 1
 
 **Benefits:**
 
-- Saves the `call`/`ret` pair (~2 cycles) and, more importantly, saves a stack frame — so **tail recursion becomes O(1) stack** instead of O(n), eliminating stack overflow on deep recursion.
-- Reduces stack traffic and improves I-cache locality in dispatch chains.
-- It is the enabling transformation for **continuation-passing dispatch** in interpreters and protocol state machines: each handler `jmp`s to the next, so the CPU's return-stack-buffer is not thrashed and there is no frame growth. Some high-performance parsers (and the "computed goto"/tail-call interpreter loop pattern) rely on it heavily.
+- Reuses the current frame, so an implementation that performs tail-recursion elimination can avoid linear stack growth.
+- Can reduce call/return stack traffic; instruction-fetch and prediction effects remain workload- and microarchitecture-dependent.
+- Enables **continuation-passing dispatch** patterns in which handlers jump to the next state without accumulating frames. This changes return-stack and branch-prediction behavior, so it must be measured on the target.
 
-**What defeats tail-call optimization** — this is the interview content:
+**What can defeat tail-call optimization:**
 
 | Blocker | Why |
 |---|---|
 | A local whose address escapes into the callee | The frame cannot be destroyed before the callee runs |
-| Any non-trivially-destructible local | The destructor must run *after* the call returns, so the call isn't in tail position |
+| A non-trivially-destructible local still alive across the call | Its destructor must run *after* the call returns, so the call isn't in tail position |
 | A `try`/`catch` or any active cleanup scope | Unwinding state must survive |
 | The callee returns a different type / needs a hidden sret pointer mismatch | Frame layouts incompatible |
-| Variadic callee, or caller with stack arguments smaller than the callee's | The argument area cannot be reused |
-| `-O0` | No such transformation |
+| Outgoing arguments or hidden ABI state cannot be made compatible | The current argument area or calling sequence cannot be safely reused |
+| Low-optimization/debug-oriented builds | Transformation is commonly absent |
 | Sanitizers, `-fno-optimize-sibling-calls` | Explicitly disabled to preserve stack traces |
 
 The **destructor blocker is the C++-specific one and the most commonly missed**:
 
 ```cpp
 int f(int x) { std::string s = make(); return g(x); }   // NOT a tail call: ~s runs after g
-int f(int x) { { std::string s = make(); use(s); } return g(x); }  // IS one: scope closed first
+int f(int x) { { std::string s = make(); use(s); } return g(x); }  // eligible: scope closed first
 ```
 
-**Flags and attributes:** `-foptimize-sibling-calls` (on at `-O2`), `[[clang::musttail]] return f(args);` which is a *guaranteed* tail call — a compile error if impossible — and is the tool for writing interpreter dispatch loops that must not grow the stack. GCC has no `musttail` equivalent as of GCC 14.
+Compiler flags and extensions control sibling calls. Clang's `[[clang::musttail]]` extension requires a tail call or diagnoses the statement; support and restrictions are compiler-version facts, not C++23 guarantees.
 
-**Cost:** tail calls **destroy stack traces**. The intermediate frame is gone, so `perf`, gdb, and your crash handler show `g` called directly from `f`'s caller (Ch. 58 §58.5). Debug builds and profiling builds commonly use `-fno-optimize-sibling-calls` for this reason. Also note that a `jmp` to a PLT stub interacts with the return-stack-buffer predictor: a `call`/`ret` imbalance from mixing tail calls and normal calls can cause RSB mispredictions (Ch. 27 §27.9).
+**Diagnostic cost:** a tail-called intermediate function has no physical frame, so a debugger or profiler may show the callee reached from an earlier caller (Ch. 58 §58.5). Debug- or profiling-oriented builds sometimes disable sibling-call optimization for clearer stacks. Prediction effects are microarchitecture- and call-sequence-dependent (Ch. 27 §27.6).
 
 ---
 
-## 41.10 ELF Sections and Segments
+## 41.9 Stack Unwinding at the Call Boundary — Core
 
-**ELF** (Executable and Linkable Format) is the container on Linux. The single most important idea: **sections are for the linker; segments are for the loader.** The same bytes are described twice.
+Unwinding reconstructs caller state from the current program counter and registers. Two common sources are:
+
+- a compiler-maintained frame-pointer chain, when the build preserves one and every traversed frame obeys it;
+- unwind metadata such as DWARF CFI, which describes how to recover the caller at each instruction range.
+
+Neither mechanism recreates a frame removed by inlining or a tail call. Hand-written assembly needs correct unwind directives if exceptions or profilers may cross it. A production crash record should preserve raw addresses, module load addresses, and build IDs so symbolization can occur against the exact binaries. §41.16 covers the tradeoffs in depth.
+
+```
+current PC/registers
+        │ frame pointer or CFI rule
+        ▼
+caller's CFA ──► saved return address ──► caller PC
+        │
+        └──── repeat until the root or an invalid frame
+```
+
+This completes the call-boundary path: arguments and returns (§41.5), stack and preservation (§§41.6–41.7), aggregates and tail calls (§41.8), then unwinding. The next sections follow code from relocatable object to loaded image.
+
+---
+
+## 41.10 ELF Sections and Segments — Role-specific
+
+**ELF** (Executable and Linkable Format) is used by Linux and many Unix-like systems. Mach-O and PE/COFF are different containers. The essential distinction is: **sections organize linking and analysis; program segments describe runtime mapping.** Some bytes appear in both views, and a stripped executable can run without a section-header table.
 
 ```
 ELF header
@@ -475,27 +538,27 @@ ELF header
 | `.text` | Executable code |
 | `.rodata` | Read-only constants, string literals, jump tables |
 | `.data` | Initialized writable globals — occupies file space |
-| `.bss` | Zero-initialized globals — **occupies no file space**, mapped from `/dev/zero`. This is why a 1 GB static array does not make a 1 GB binary. |
+| `.bss` | Zero-initialized storage represented as `SHT_NOBITS`; it contributes memory size but normally no payload bytes in the file |
 | `.rodata.cst*`, `.rodata.str1.*` | Mergeable constant/string pools (dedup via `SHF_MERGE`) |
-| `.init_array` / `.fini_array` | Pointers to static constructors/destructors, run by the runtime before `main` (Ch. 5 §5.9) |
+| `.init_array` / `.fini_array` | Initialization/finalization callbacks; constructors normally run before `main`, while finalizers run during normal process termination (Ch. 5 §5.9) |
 | `.plt`, `.got`, `.got.plt` | Dynamic-linking indirection (§41.12) |
 | `.dynamic`, `.dynsym`, `.dynstr` | Dynamic linking metadata and the exported/imported symbol table |
-| `.symtab`, `.strtab` | Full static symbol table — **removed by `strip`** |
+| `.symtab`, `.strtab` | Full static symbol and string tables; commonly removed by a full strip and not required to load the image |
 | `.rela.dyn`, `.rela.plt` | Relocations applied at load time |
-| `.eh_frame`, `.eh_frame_hdr` | DWARF CFI unwind tables (§41.16) — **not** removed by `strip`, because exceptions need them |
+| `.eh_frame`, `.eh_frame_hdr` | Runtime unwind tables (§41.16); stripping policies normally preserve required allocated unwind data |
 | `.gcc_except_table` | Landing-pad and action tables for `catch` clauses |
 | `.tdata`, `.tbss` | TLS initialization images |
 | `.debug_*` | DWARF debug info (§41.15) |
 | `.note.gnu.build-id` | The build ID used to match binaries to symbol files |
 | `.comment` | Compiler version strings |
 
-**RELRO** is worth understanding: `GNU_RELRO` marks a region (typically `.init_array`, `.dynamic`, `.got`, and `.data.rel.ro`) that the dynamic linker makes **read-only after relocations are applied**, hardening against GOT-overwrite attacks. **Full RELRO** (`-Wl,-z,relro,-z,now`) additionally resolves all PLT entries eagerly at load so `.got.plt` can be made read-only too — at the cost of slower startup for large symbol tables. **This is also a latency decision**: `-z now` (BIND_NOW) eliminates lazy first-call resolution jitter (§41.13).
+`GNU_RELRO` marks a region the ELF loader can make read-only after relocation, hardening writable control data. “Full RELRO” commonly combines `-z relro` and eager binding (`-z now`) so relevant PLT/GOT entries can also become read-only. It moves binding work toward startup and avoids lazy first-call resolution; exact defaults and layout vary by linker and distribution (§41.13).
 
 **Practical numbers:** `size -A ./app` gives per-section sizes; `readelf -lW ./app` shows segments and their section mapping; `readelf -SW ./app` shows sections with flags (`A`=alloc, `X`=exec, `W`=write, `M`=merge).
 
 ---
 
-## 41.11 ELF Symbols and Relocations
+## 41.11 ELF Symbols, Relocations, and a Link Diagnosis — Role-specific
 
 ### Symbols
 
@@ -503,26 +566,30 @@ A **symbol** binds a name to an address (or a request for one). Each has a **bin
 
 | Binding | Meaning |
 |---|---|
-| `GLOBAL` | Visible across objects; duplicate definitions are an error |
+| `GLOBAL` | Externally bound; multiple strong definitions in one static link are generally an error, while dynamic lookup has additional scope/preemption rules |
 | `LOCAL` | Internal to the object (`static`, anonymous namespace) |
-| `WEAK` | Global, but may be overridden; unresolved weak references become 0 rather than an error (Ch. 1 §1.12) |
+| `WEAK` | Global, but may be overridden; unresolved weak references become 0 rather than an error (Ch. 1 §1.14) |
 
 | Type | Meaning |
 |---|---|
 | `FUNC`, `OBJECT` | Code, data |
-| `NOTYPE` | Undefined reference (`U` in `nm`) |
+| `NOTYPE` | No more specific symbol type is recorded; undefinedness is instead represented by section index `SHN_UNDEF` |
 | `TLS` | Thread-local |
-| `GNU_IFUNC` | Resolved by running a resolver function at load time (used for CPU dispatch, §40.2) |
+| `GNU_IFUNC` | Resolved by running a resolver function at load time; commonly used for target-dependent dispatch |
 
 | Visibility | Meaning |
 |---|---|
-| `DEFAULT` | Exported from a shared library; **interposable** by `LD_PRELOAD` |
+| `DEFAULT` | Eligible for external visibility/preemption when present in the dynamic symbol table; actual export and interposition depend on link/loader policy |
 | `HIDDEN` | Not exported; internal to the library. `-fvisibility=hidden` makes this the default. |
 | `PROTECTED` | Exported but not interposable |
 
-Hidden visibility is both a correctness and a performance tool: it shrinks the dynamic symbol table (faster load, fewer relocations), removes interposition so calls can be inlined and direct (Ch. 40 §40.3), and prevents accidental ABI exposure of internals.
+Hidden visibility prevents external preemption of a definition and reduces accidental ABI exposure. It can shrink dynamic metadata and permit more direct references; inlining still depends on whether the compiler or linker can see the body (Ch. 40 §40.3).
 
-**Weak symbols in practice:** `__attribute__((weak))` for optional dependencies (`if (&pthread_create) ...`), and the ODR mechanism — inline functions and template instantiations are emitted as `WEAK` in COMDAT groups (`.text._Z3fooi` with `SHF_GROUP`), so the linker keeps one copy and discards duplicates. That is how `inline` actually works at link level (Ch. 1 §1.9).
+**Weak/COMDAT symbols in practice:** ELF compilers may use weak definitions,
+COMDAT groups, or both for inline functions and template instantiations so a
+linker can retain one equivalent copy. This is a common Itanium-C++-ABI
+implementation of ODR entities, not a C++ requirement. Explicit weak references
+are another ELF extension (Ch. 1 §§1.9 and 1.14).
 
 ### Relocations
 
@@ -533,14 +600,14 @@ A **relocation** is an instruction to the linker or loader: "patch the value at 
 | `R_X86_64_PC32` | 32-bit PC-relative — normal intra-module calls and RIP-relative data |
 | `R_X86_64_PLT32` | Call routed through the PLT |
 | `R_X86_64_GOTPCREL` | Load the address from the GOT, RIP-relative |
-| `R_X86_64_64` | Absolute 64-bit address — requires a load-time write |
+| `R_X86_64_64` | Absolute 64-bit address; whether the static linker or dynamic loader applies it depends on the output artifact |
 | `R_X86_64_GLOB_DAT` | Fill a GOT entry with a symbol's address |
 | `R_X86_64_JUMP_SLOT` | Fill a PLT's GOT entry (lazily, or eagerly with BIND_NOW) |
 | `R_X86_64_RELATIVE` | Add the load base — the cheap, symbol-less relocation for internal pointers in PIE |
 | `R_X86_64_COPY` | Copy a data object from a library into the executable (legacy, ABI-fragile) |
-| `R_X86_64_TPOFF64`, `TLSGD` | TLS offsets |
+| `R_X86_64_TPOFF64`, `R_X86_64_TLSGD` | TLS offsets/models |
 
-**`R_X86_64_RELATIVE` count is a startup-latency metric.** A PIE binary with many vtables and pointer-containing globals accumulates hundreds of thousands of these, and the dynamic linker must apply every one at startup — the reason large C++ binaries can take hundreds of milliseconds to load. `DT_RELR` (relative relocation compression, glibc 2.36+/lld) encodes them as a bitmap and cuts both size and startup time substantially. For a trading process this is a real cold-start consideration (Ch. 60 §60.7).
+The number and kind of dynamic relocations are inputs to startup cost, alongside symbol lookup, constructors, page faults, and loader policy. Some ELF toolchains support compact relative-relocation encodings such as RELR; availability depends on linker, loader, target, and the deployment's loader baseline (Ch. 60).
 
 ```bash
 readelf -rW ./app | head          # relocations
@@ -549,32 +616,62 @@ nm -C --defined-only ./app        # defined symbols, demangled
 nm -CD ./libfoo.so                # dynamic symbol table only
 ```
 
-**Relocation errors you will meet:** *"relocation R_X86_64_32S against `.rodata` can not be used when making a PIE object; recompile with -fPIE"* — a non-PIC object linked into a PIE/shared library. *"undefined reference to `foo(int)`"* with a demangled C++ name means a declaration without a definition; the same with a C name usually means a missing `extern "C"` (Ch. 1 §1.10).
+### Worked diagnosis: declaration, symbol, relocation, link
+
+```cpp
+// api.hpp
+int price(int);
+
+// main.cpp
+#include "api.hpp"
+int main() { return price(7); }
+```
+
+```bash
+c++ -std=c++23 -c main.cpp -o main.o
+nm -C main.o
+readelf -rW main.o
+c++ main.o -o app
+```
+
+`nm -C` shows `U price(int)`: the object requests a definition. `readelf -rW` shows a relocation at the call site naming the mangled symbol. The final link reports an undefined reference because no input defines it. This is a link-time failure, not a runtime loader failure.
+
+```
+undefined symbol
+  ├─ expected C++ name → missing object/library, wrong signature, or archive order
+  ├─ expected C name but got mangled C++ → mismatched `extern "C"` (Ch. 1)
+  ├─ definition exists but is local/hidden → visibility mistake
+  └─ non-PIC relocation in a shared object → rebuild or change the target/code model
+```
+
+Use `nm -C`, `readelf -Ws`, and link-map or trace options rather than guessing from the source declaration. An error naming `R_X86_64_32` or `R_X86_64_32S` while building a PIE/shared object often indicates a non-PIC input, but the exact remedy depends on relocation, code model, and target.
 
 ---
 
-## 41.12 PLT, GOT, and Position-Independent Code
+## 41.12 PLT, GOT, and Position-Independent Code — Role-specific
 
-**Position-independent code** can execute at any load address, which is required for shared libraries and for **ASLR** on executables (PIE). The mechanism is indirection through two tables.
+**Position-independent code** can execute at any load address, which is required for shared libraries and for **ASLR** on executables (PIE). PC-relative addressing and, where necessary, linkage tables avoid fixed absolute addresses.
 
-- **GOT (Global Offset Table)** — an array of addresses in the data segment, filled in by the dynamic linker. Code loads an address from the GOT instead of embedding it.
-- **PLT (Procedure Linkage Table)** — small code stubs, one per imported function, that jump through the GOT.
+- **GOT (Global Offset Table)** — linker-created address slots. Some are fixed by static linking; others receive load-time relocations or dynamic resolutions. Code can load an address from a GOT slot instead of embedding it.
+- **PLT (Procedure Linkage Table)** — linker-created call stubs that may route imported calls through GOT slots. Linker relaxation, `-fno-plt`, eager binding, and platform hardening can change or remove this path.
 
 ### Data access
 
 ```asm
-; non-PIC absolute:
-mov  eax, [0x601040]          ; requires a load-time relocation, breaks sharing
+; fixed absolute address:
+mov  eax, [0x601040]          ; unsuitable as-is for freely relocated PIE/shared code
 ; PIC, module-internal (hidden visibility or static):
-mov  eax, [rip + 0x2f31]      ; RIP-relative, zero relocations at load, FREE
+mov  eax, [rip + 0x2f31]      ; direct RIP-relative reference after linking
 ; PIC, possibly-interposed global:
 mov  rax, [rip + got_offset]  ; load address from GOT (one extra load)
 mov  eax, [rax]               ; then dereference
 ```
 
-RIP-relative addressing (new in x86-64) makes PIC *nearly free for internal references* — which is why PIE is the default on modern Linux with little measured cost, unlike on 32-bit x86 where PIC cost a dedicated register (`ebx`) and a `call/pop` to discover the PC.
+RIP-relative addressing makes many internal x86-64 PIC references direct. That does not make PIE universally free: symbol preemption, code model, register pressure, linker relaxation, and target all affect the result.
 
 ### Function calls and lazy binding
+
+The following is the classic x86-64 ELF lazy-PLT shape used for explanation; exact stub instructions and resolver protocol are linker-, loader-, and hardening-specific.
 
 ```
 call foo@PLT
@@ -587,61 +684,75 @@ PLT[n]:  jmp  [GOT[n]]          ; first call: GOT[n] points back to PLT[n]+6
 PLT[n]:  jmp  [GOT[n]]          ; now jumps straight to foo
 ```
 
-**Cost model:** first call ~microseconds (symbol lookup by hash across all loaded objects); subsequent calls one extra indirect jump — an extra load and a branch predicted by the BTB, so typically ~1–2 cycles when hot.
+With lazy binding, the first call performs loader resolution and later calls use the resolved GOT entry. The latency depends on loaded objects, lookup scope, cache state, hardening, and loader version; measure it rather than assigning a universal cycle count.
 
-**For low-latency systems the lazy-binding jitter is unacceptable**: a rarely-used error path resolving a symbol during a market event costs microseconds at exactly the wrong moment. The fixes, in order of preference:
+When first-call latency is undesirable, available choices include:
 
-1. **`-Wl,-z,now`** (BIND_NOW) — resolve everything at load; combined with `-Wl,-z,relro` gives full RELRO and a read-only GOT. Equivalently `LD_BIND_NOW=1` at runtime.
-2. **Static linking** — no PLT, no GOT for functions, no dynamic linker at all.
-3. **`-fvisibility=hidden` plus `-fno-semantic-interposition`** — internal calls become direct `call` with no PLT and become inlinable (Ch. 40 §40.3).
-4. **Prefault/warm the hot paths at startup** so any remaining resolution happens before trading (Ch. 60 §60.7).
+1. **`-Wl,-z,now`** (BIND_NOW) — request eager dynamic binding; combined with `-Wl,-z,relro` this commonly provides full RELRO for eligible GOT data. Loaders such as glibc's also support `LD_BIND_NOW=1`.
+2. **Static linking where the deployment and libc/plugin requirements permit it** — removes ordinary dynamic symbol binding but has compatibility tradeoffs.
+3. **Visibility and semantic-interposition controls** such as
+   `-fvisibility=hidden` and, where appropriate,
+   `-fno-semantic-interposition`—these can enable direct internal references and
+   optimization, subject to actual visibility and link decisions (Ch. 40).
+4. **Startup warm-up** so expected lazy work occurs before the measured service phase (Ch. 60 §60.5).
 
-**`-fPIC` vs `-fPIE`:** `-fPIC` is for shared libraries (must assume any global may be interposed); `-fPIE` is for executables (can assume symbols defined in the executable are not interposed, so it generates better code — direct RIP-relative access instead of GOT loads). `-fno-pie -no-pie` disables PIE entirely, giving marginally better code density and losing ASLR; some HFT shops do this deliberately for determinism and for stable addresses in flight recorders.
+**`-fPIC` vs `-fPIE`:** on GCC/Clang ELF targets, `-fPIC` prepares code for shared objects and `-fPIE` for position-independent executables. Their optimization assumptions and supported code models are toolchain-specific. Disabling PIE loses an ASLR defense and should be a security/deployment decision, not a folklore performance tweak.
 
-**Verification:** `objdump -d --section=.plt`, `readelf -r` for `JUMP_SLOT` entries, `LD_DEBUG=bindings ./app` to trace every symbol resolution, and `checksec --file=./app` for a quick RELRO/PIE/BIND_NOW summary.
+**Verification:** `objdump -d --section=.plt`, `readelf -r` for `JUMP_SLOT` entries, glibc's `LD_DEBUG=bindings ./app` to trace dynamic-loader bindings, and `checksec --file=./app` for a quick RELRO/PIE/BIND_NOW summary.
 
 ---
 
-## 41.13 Dynamic Linking
+## 41.13 Dynamic Linking and Loading — Role-specific
 
-The **dynamic linker** (`/lib64/ld-linux-x86-64.so.2`, named in the `PT_INTERP` program header) runs before `main` and is responsible for loading dependencies, applying relocations, and running initializers.
+On a typical glibc x86-64 ELF system, the interpreter named by `PT_INTERP` loads dependencies, applies dynamic relocations, and participates in initialization before `main`. Its pathname and behavior vary across OSes, architectures, libcs, and container formats.
 
 **The startup sequence:**
 
 1. Kernel maps the executable's `PT_LOAD` segments and the interpreter, then jumps to the interpreter.
-2. `ld.so` reads `DT_NEEDED` entries and loads each library, recursively, honoring `DT_RPATH`/`DT_RUNPATH`, `LD_LIBRARY_PATH`, `/etc/ld.so.cache`, then default paths.
-3. Relocations are applied per object (`R_X86_64_RELATIVE` first, then symbol-based ones).
+2. The loader follows `DT_NEEDED` entries and its platform-specific search rules. `RPATH`, `RUNPATH`, environment variables, caches, secure-execution mode, and transitive dependencies interact in ways that must be checked in the loader documentation.
+3. Relocations are applied per object; loaders commonly process inexpensive relative relocations before symbol-based work, but batching and ordering are implementation details.
 4. RELRO regions are `mprotect`ed read-only.
-5. TLS blocks are set up; `.init_array` entries run in dependency order — this is where your static constructors execute.
+5. TLS blocks are set up; initialization callbacks run in the loader's
+   object/initialization order. Dependencies constrain that order, but cycles,
+   preload/audit objects, and loader policy make “dependency order” alone too
+   simple.
 6. Control passes to `_start` → `__libc_start_main` → `main`.
 
-**Symbol resolution order and interposition.** Lookup proceeds in **breadth-first load order**, and the *first* definition found wins globally. This is why `LD_PRELOAD` works: a preloaded object is placed first in the search order, so its `malloc` displaces libc's. It is also the source of subtle bugs where two libraries define the same symbol and one silently wins.
+**Symbol resolution and interposition.** ELF lookup scopes and preemption rules depend on load groups, visibility, flags such as `RTLD_LOCAL`/`RTLD_DEEPBIND`, namespaces, symbol versions, and loader implementation. `LD_PRELOAD` commonly injects definitions early enough to interpose default-visible symbols, but “first definition globally wins” is too crude for diagnosis. Use loader traces.
 
 **Versioning.** glibc uses symbol versioning (`memcpy@GLIBC_2.14`) so that an ABI change can coexist with the old behavior. Two consequences:
 
-- A binary built against a newer glibc will not run on an older one — the classic *"`version GLIBC_2.34' not found`"*. The reverse (old binary, new glibc) generally works. Build on the oldest supported target, or use a sysroot/container.
-- Your own libraries can use a version script (`-Wl,--version-script=`) to control exports precisely — the professional way to manage a library ABI (Ch. 44 §44.17).
+- A binary requiring a symbol version absent on the deployment system fails to load—the classic `version 'GLIBC_x.y' not found`. Build against a deliberate deployment baseline or sysroot; do not assume every newer/older combination is compatible.
+- Your own libraries can use a version script (`-Wl,--version-script=`) to control exports precisely as part of an ABI policy (Ch. 44 §44.8).
 
-**`dlopen`/`dlsym`** for runtime loading: note that `dlopen`ing a plugin defeats whole-program devirtualization (Ch. 40 §40.18) because a new derived class can appear at runtime; and that symbols reachable only via `dlsym` need `used`/`retain` or they are collected by `--gc-sections` (Ch. 40 §40.20).
+**`dlopen`/`dlsym`** for runtime loading: a possible plugin constrains
+whole-program devirtualization because new implementations can appear at
+runtime. Entry points reached only by string lookup also need an explicit
+export/retention contract so compilation or section GC does not remove them
+(Ch. 40 §§40.4 and 40.9).
 
-**Static vs dynamic for low-latency systems:**
+**Static vs dynamic:**
 
 | | Static | Dynamic |
 |---|---|---|
-| Startup | Fast — no relocation storm, no symbol resolution | Slower; hundreds of ms for large C++ binaries |
-| Call cost | Direct `call`, fully inlinable with LTO | PLT indirection unless hidden/BIND_NOW |
-| Deployment | One self-contained artifact; trivially reproducible | Version skew risk across hosts |
-| Memory | Each process has its own copy | `.text` shared across processes |
-| Updates | Relink and redeploy | Swap a `.so` |
-| Caveats | `getaddrinfo`/NSS and `dlopen` do not work fully statically with glibc; consider musl | — |
+| Startup | Avoids ordinary dynamic binding; constructors and paging still matter | Loader work depends on dependency graph and relocation policy |
+| Call boundary | Can enable direct calls and whole-program work | May be direct, PLT-mediated, or relaxed by the linker |
+| Deployment | Fewer runtime library files; not automatically self-contained or reproducible | Version/search-path skew risk across hosts |
+| Memory | File-backed executable pages can be shared by processes running that artifact | Shared-library pages can be shared across different executables |
+| Updates | Relink and redeploy | Update a `.so` only under compatible ABI and process load/restart policy |
+| Caveats | glibc NSS, locale, plugin, and resolver interactions require target-specific qualification | loader/search/interposition behavior requires qualification |
 
-Trading systems overwhelmingly prefer **static linking** (or minimal dynamic dependencies with `-z now`) for deterministic startup, reproducible artifacts, and full LTO across the whole program (Ch. 60 §60.1).
+Choose from deployment, update, security, licensing, plugin/NSS, memory-sharing, and latency requirements. A minimal dynamic set with eager binding is often a useful compromise; static linking is not automatically self-contained on every libc.
 
-**Diagnostics:** `ldd ./app` (dependencies — note it *executes* the binary's loader, so never run it on untrusted files), `LD_DEBUG=libs,bindings,statistics ./app`, `readelf -d ./app` for `DT_NEEDED`/`RUNPATH`, and `ltrace` for library-call tracing (Ch. 34 §34.6).
+**Diagnostics:** `ldd ./app` can invoke a target interpreter or, in some
+implementations/circumstances, execute the program; never use it on an untrusted
+file. Prefer `readelf -d`/`objdump -p` for static inspection.
+`LD_DEBUG=libs,bindings,statistics` is a glibc-loader diagnostic. Library-call
+tracing belongs with Chapter 34 §34.10.
 
 ---
 
-## 41.14 Binary Inspection Tools
+## 41.14 Binary Inspection Tools — Role-specific Reference
 
 Know what each tool *reveals*; the tool choice is usually the first half of a good answer.
 
@@ -650,10 +761,10 @@ Know what each tool *reveals*; the tool choice is usually the first half of a go
 | **`objdump`** | Disassembly, section contents, relocations, headers | `objdump -d -C -M intel --no-show-raw-insn ./app`<br>`objdump -dS ./app` (source-interleaved, needs `-g`)<br>`objdump -R ./app` (dynamic relocations) |
 | **`readelf`** | Everything ELF, without disassembling | `readelf -hSlWd ./app` (header, sections, segments, dynamic)<br>`readelf -rW`, `readelf -n` (notes/build-id) |
 | **`nm`** | Symbol table with type letters | `nm -C --defined-only --size-sort -S ./app`<br>`nm -CDu ./lib.so` (undefined dynamic symbols) |
-| **`c++filt`** | Demangles Itanium C++ names | `echo _ZNSt6vectorIiSaIiEE9push_backEOi \| c++filt` |
+| **`c++filt`** | Demangles Itanium C++ names | `c++filt _ZNSt6vectorIiSaIiEE9push_backEOi` |
 | **`strings`** | Embedded literals; quick version/config discovery | `strings -n 8 ./app` |
 | **`size`** | Per-section sizes — the metric for `-O3`/ICF/`--gc-sections` effects | `size -A ./app` |
-| **`ldd`** | Shared-library dependency resolution | `ldd ./app` |
+| **`ldd`** | Shared-library dependency resolution for trusted binaries | `ldd ./app` |
 | **`strip`** / `objcopy` | Remove/split debug info | `objcopy --only-keep-debug app app.dbg; strip -g app; objcopy --add-gnu-debuglink=app.dbg app` |
 | **`addr2line`** | Address → file:line, including inline frames | `addr2line -Cfie ./app 0x4011a6` |
 | **`perf`** | Where time goes, at instruction granularity | `perf record -g ./app; perf annotate` |
@@ -663,7 +774,7 @@ Know what each tool *reveals*; the tool choice is usually the first half of a go
 | **`checksec`** | RELRO, PIE, NX, stack canary, BIND_NOW status | `checksec --file=./app` |
 | **`gdb`** | Live disassembly and register state | `disassemble /s`, `info registers`, `x/16i $pc` |
 
-**`nm` symbol letters** worth memorizing: `T` text (global), `t` text (local), `D`/`d` initialized data, `B`/`b` bss, `R`/`r` rodata, `U` undefined, `W`/`w` weak, `V`/`v` weak object, `i` indirect (IFUNC).
+`nm` letters commonly include `T/t` for text, `D/d` for initialized data, `B/b` for BSS, `R/r` for read-only data, `U` for undefined, and `W/w` for weak. Exact letters and options vary between GNU and LLVM tools.
 
 **Common workflows:**
 
@@ -671,7 +782,7 @@ Know what each tool *reveals*; the tool choice is usually the first half of a go
 # Did this function get inlined away?
 nm -C ./app | grep -c 'parse_message'
 
-# What ISA extensions did we actually emit?
+# Which vector-looking mnemonics appear? (not a deployment-baseline proof)
 objdump -d ./app | grep -oE '\bv[a-z0-9]+\b' | sort -u | head
 
 # Why is the binary 400 MB?
@@ -686,215 +797,193 @@ perf record -e cycles:pp ./app && perf annotate --stdio parse_message
 
 ---
 
-## 41.15 Debug Information and Symbolization
+## 41.15 Debug Information and Symbolization — Core
 
-**Symbolization** is turning an address into `function (file:line)`. It requires two independent things: a **symbol table** (address → name) and **DWARF debug info** (address → file, line, inline stack, variable locations).
+**Symbolization** is turning an address into `function (file:line)`. Tools can obtain names from symbol tables and/or debug information; DWARF supplies source lines, inline stacks, types, and variable-location descriptions on the ELF platforms discussed here.
 
-**`-g` levels:**
+**Representative GCC/Clang debug options** (availability and exact contents vary by compiler and version):
 
 | Flag | Contents |
 |---|---|
 | `-g0` | None |
-| `-g1` / `-gmlt` / `-gline-tables-only` | Line tables and function boundaries only — enough for backtraces and AutoFDO, small |
+| `-g1` (GCC) / `-gline-tables-only` (Clang; historically `-gmlt`) | Reduced debug information oriented toward line-level symbolization |
 | `-g` (`-g2`) | Full: types, variables, locations, inline stacks |
 | `-g3` | Plus macro definitions |
 | `-gsplit-dwarf` | Emit `.dwo` files separately; the binary keeps only a skeleton (§ below) |
 | `-gz` | Compress `.debug_*` sections |
 
-**Full `-g` on an optimized build costs nothing at runtime** — DWARF lives in non-`SHF_ALLOC` sections, so it is never loaded into memory at execution. It costs disk and link time only. **`-O2 -g` is the correct production build**, and shipping without debug info is a false economy that makes production crashes unanalyzable.
+Ordinary `.debug_*` sections are non-`SHF_ALLOC`, so the loader does not map them as runtime segments. Debug information still costs storage, link/tool time, distribution bandwidth, and possibly build confidentiality. A common release practice is optimized code plus separate debug data retained by build ID.
 
-**Split DWARF** solves the link-time and size problem: `-gsplit-dwarf` puts debug data in per-object `.dwo` files, so the linker copies far less; combine with `-Wl,--gdb-index` or `gdb-add-index` for fast symbol lookup. The `dwp` tool packages them.
+**Split DWARF** can reduce linked-binary size and debug-data work: `-gsplit-dwarf` puts much of the debug data in per-object `.dwo` files, while the main object keeps a skeleton. Supported toolchains can build an index with linker or debugger utilities; `dwp` can package split data. The exact index and packaging workflow is toolchain-specific.
 
 **The separate-debug-file workflow** (what distributions and serious shops do):
 
 ```bash
 g++ -O2 -g ... -o app
 objcopy --only-keep-debug app app.debug
-strip --strip-debug --strip-unneeded app
+strip --strip-debug app
 objcopy --add-gnu-debuglink=app.debug app
 ```
-Now `app` is small, and gdb finds `app.debug` via the debuglink or via the **build ID** (`readelf -n app` → `.note.gnu.build-id`), which is the robust mechanism: symbol servers index by build ID, so a core dump from any build can be symbolized against the matching debug file (Ch. 58 §58.8). **Store debug files for every deployed build, keyed by build ID** — the single most valuable operational practice in this section.
+Now `app` is smaller, and gdb can find `app.debug` via the debuglink or a **build ID** (`readelf -n app` → `.note.gnu.build-id`). Symbol servers commonly index by build ID so a crash address can be matched to the corresponding debug file (Ch. 58 §58.3). A build ID is an identifier, not an authenticity guarantee. **Store debug files for every deployed build, keyed by build ID** — the single most valuable operational practice in this section.
 
 **Symbolizing optimized code — the hard parts:**
 
-- **Inlining destroys the naive mapping.** One address belongs to several source locations (the inline stack). `addr2line -i` (or `-Cfie`) prints the full stack; `llvm-symbolizer` does the same and is faster. A backtrace that omits inline frames is misleading, and `perf` needs `--inline` to show them.
+- **Inlining destroys the naive mapping.** One address belongs to several source locations (the inline stack). `addr2line -i` (or `-Cfie`) and `llvm-symbolizer` can print the inline stack. A report that omits inline frames can be misleading; use the relevant inline-reporting option in the profiler or symbolizer.
 - **Variables are "optimized out"** because their locations are register-based and change per-instruction. DWARF location lists express this, but gdb will still report values as unavailable in ranges where they are dead.
-- **Line attribution is approximate** — instructions are scheduled across statement boundaries, so a breakpoint may land somewhere surprising. `-Og` mitigates it (Ch. 40 §40.1).
-- **Tail calls remove frames entirely** (§41.9).
-- **BOLT and post-link tools** rewrite addresses; they must update DWARF, and historically did so imperfectly (Ch. 40 §40.11). Validate symbolization on the final shipped artifact, not on the pre-BOLT one.
+- **Line attribution is approximate** — instructions are scheduled across statement boundaries, so a breakpoint may land somewhere surprising. A debug-oriented optimization level changes the artifact and may improve source-level stepping, but production behavior must be checked on the production build (Ch. 40).
+- **Tail calls remove frames entirely** (§41.8).
+- **BOLT and post-link tools** rewrite addresses; supported debug and unwind metadata must be preserved or updated (Ch. 40 §40.8). Validate symbolization and unwinding on the final shipped artifact, not on the pre-rewrite one.
 
-**Runtime symbolization inside your own process** (crash handlers, flight recorders): `backtrace()`/`backtrace_symbols()` from glibc gives only dynamic symbols and allocates; `libunwind` or C++23 `std::stacktrace` is better; the safest production pattern is to record **raw addresses plus the build ID** in the crash log and symbolize offline, because symbolization in a signal handler is not async-signal-safe (Ch. 33 §33.15, Ch. 58 §58.13).
+**Runtime symbolization inside your own process** (crash handlers, flight recorders): facilities such as glibc `backtrace()`/`backtrace_symbols()`, `libunwind`, and C++23 `std::stacktrace` differ in symbol coverage, allocation, locking, and signal-safety properties. A robust crash-handler pattern is to record **raw addresses, module load addresses, and build IDs** and symbolize offline; do not assume general-purpose unwinding or formatting is async-signal-safe (Ch. 33 §33.8, Ch. 58 §58.12).
 
 ---
 
-## 41.16 Stack Unwinding and Frame Pointers
+## 41.16 Deep Dive: Stack Unwinding and Frame Pointers — Deep dive
 
-**Unwinding** is walking the chain of active stack frames. It is needed for exception propagation, backtraces, and profiler call graphs. Two mechanisms exist and they have very different properties.
+**Unwinding** reconstructs caller state while walking active stack frames. It is needed for exception propagation, backtraces, and many profiler call graphs. Common mechanisms include frame chains and unwind metadata; hardware branch records can instead help reconstruct a bounded call history.
 
 ### Frame pointers
 
-With `-fno-omit-frame-pointer`, every function's prologue does `push rbp; mov rbp, rsp`, creating a linked list:
+On x86-64, an eligible function compiled with frame-pointer retention commonly establishes a frame with a sequence such as `push rbp; mov rbp, rsp`, creating a linked list:
 
 ```
    rbp ──► [saved rbp] ──► [saved rbp] ──► ...
            [return addr]   [return addr]
 ```
-Walking it is trivial and fast: two loads per frame, no metadata, works from a signal handler, works even with a corrupted heap.
+When the chain is intact, walking it is simple and does not require per-PC unwind bytecode. A production unwinder still needs bounds checks and fault-safe memory access; “has frame pointers” does not make arbitrary symbolization async-signal-safe.
 
-**Cost:** two instructions per call, plus the loss of `rbp` as a general-purpose register — which on x86-64's 16-register file is roughly a 1–2% penalty (measured; older claims of 5–10% come from 32-bit x86 with 8 registers). The kernel/distro consensus has shifted: Fedora and Ubuntu now build with frame pointers enabled by default precisely because continuous profiling is worth more than 1%.
+Exact prologues vary with ISA, compiler, optimization, leaf-function policy, instrumentation, and attributes. A build flag is not by itself proof that every instruction address in every object participates in one uniform chain; inspect the shipped binary and validate representative stacks.
+
+**Cost:** preserving a frame pointer can add prologue/epilogue work and removes one allocatable register on targets that dedicate it. The workload effect ranges from negligible to material and changes with ISA, compiler, leaf-function policy, and register pressure. Measure the actual build; distribution defaults are versioned policy choices.
 
 ### DWARF CFI (`.eh_frame`)
 
-The compiler emits **Call Frame Information**: a table describing, for every instruction address, how to compute the caller's `rsp` and where each callee-saved register was spilled. This works with `rbp` omitted and is what C++ exceptions use.
+On ELF/DWARF platforms, compilers commonly emit **Call Frame Information**: rules over instruction-address ranges that describe how to compute the caller's stack state and recover saved registers. This can work with the frame pointer omitted and is used by common C++ exception and unwinding implementations. Other object formats and platforms use different unwind metadata.
 
-**Cost:** unwinding requires parsing a table (a binary search in `.eh_frame_hdr` then interpreting a bytecode program per frame) — **orders of magnitude slower** than frame-pointer walking, and it allocates and takes a global lock in some libgcc paths. Fine for exceptions (rare) and offline analysis; problematic for high-frequency sampling.
+Metadata unwinding typically looks up an FDE and interprets CFI rules for each frame. It is usually more work than following an intact frame chain, and library implementations may have locking, allocation, caching, or signal-safety constraints. Check the unwinder actually deployed.
 
-| | Frame pointers | DWARF CFI | ORC (kernel) | LBR / SHADOW_STACK |
+| | Frame pointers | DWARF CFI | ORC (kernel) | LBR |
 |---|---|---|---|---|
-| Runtime cost | ~1–2% always | Zero when not unwinding | Zero | Zero |
-| Unwind speed | Very fast | Slow | Fast | Instant |
-| Depth limit | Unlimited | Unlimited | Unlimited | 16–32 entries (LBR) |
-| Works in signal handler | Yes | Risky (locks, allocation) | N/A | Yes |
-| Works with optimized code | Only if enabled | Yes | Yes | Yes |
+| Runtime cost | build/workload-dependent | metadata size; work when unwinding | platform-specific | hardware/OS-dependent |
+| Unwind work | simple chain walk when intact | FDE lookup plus rule evaluation | kernel implementation-specific | capture mechanism-specific |
+| Depth limit | bounded by valid frames | bounded by metadata/stack | bounded by valid frames | hardware-generation-dependent |
+| Signal-handler use | raw walking may be feasible with care | depends on unwinder implementation | N/A | capture interface-dependent |
+| Optimized-code coverage | only where the chain is preserved | where metadata is complete | within supported kernel code | within capture and reconstruction limits |
 | `perf` flag | `--call-graph fp` | `--call-graph dwarf` | — | `--call-graph lbr` |
 
-`perf --call-graph dwarf` copies a chunk of the stack (default 8 KB) with every sample and unwinds offline — accurate, but it produces enormous `perf.data` files and high sampling overhead. `--call-graph lbr` is nearly free but capped at LBR depth. For a latency-sensitive service being profiled in production, **frame pointers plus `--call-graph fp`** is usually the right tradeoff.
+`perf --call-graph dwarf` can copy stack data with samples for later unwinding; capture size and overhead depend on options and perf version. LBR-based call graphs have hardware depth and availability limits. Choose among frame-pointer, DWARF, and hardware-assisted capture by measuring overhead and validating stack completeness.
 
-**Exception-handling implications** (Ch. 10 §10.7): the "zero-cost" model means no runtime cost on the non-throwing path — the cost is entirely in `.eh_frame`/`.gcc_except_table` size and in the *throwing* path, where unwinding is expensive (microseconds, plus a global mutex in some libstdc++ versions when looking up FDEs in a dynamically-loaded object). This is the concrete basis for "never throw on the hot path" and for `-fno-exceptions` in some trading codebases.
+**Exception-handling implications** (Ch. 10 §10.5): table-based “zero-cost” implementations are designed to avoid per-`try` dynamic bookkeeping on the ordinary path, but code layout and metadata size can still change. Throwing performs search and cleanup work whose cost depends on depth, types, runtime, and loaded objects. Measure before making a build-wide exception-policy decision.
 
-**Diagnostic signature:** broken or truncated stacks in `perf report` (showing only one or two frames) almost always means frame pointers are omitted and you used `--call-graph fp`. Stacks that are correct but sampling that is unbearably slow means `--call-graph dwarf`. Missing intermediate frames with otherwise-good stacks means tail calls or inlining (use `--inline`, or `-fno-optimize-sibling-calls`).
+**Diagnostic signature:** truncated `--call-graph fp` stacks suggest omitted or broken frame chains. High capture overhead with DWARF motivates checking sample rate and stack-dump size. Missing intermediate logical frames can also be caused by inlining or tail calls.
 
 ---
 
-## 41.17 Code Layout and Cold Splitting
+## 41.17 Code Layout and Cold Splitting — Skippable Reference
 
-Instruction fetch is a memory access, so code has cache and TLB behavior exactly as data does — and unlike data, you can rearrange it freely without changing semantics. Front-end stalls are a large fraction of the cost in big C++ services (Ch. 27 §27.15).
+Instruction fetch uses caches, translation structures, and predictors. Linkers and post-link tools may rearrange code while preserving control-flow and metadata contracts, but layout is not “free”: branch ranges, alignment, unwind data, debug information, and profile quality constrain it (Ch. 27 §§27.2 and 27.6).
 
-**The resources being managed:**
-
-| Resource | Typical size | Failure signature |
-|---|---|---|
-| L1 instruction cache | 32 KB, 8-way | `L1-icache-load-misses`, `frontend_bound` |
-| Micro-op cache (DSB) | ~1536 µops, strict per-32B-window limits | `idq.dsb_uops` low vs `idq.mite_uops` |
-| iTLB | 128–256 entries × 4 KB = 0.5–1 MB coverage | `iTLB-load-misses` |
-| Branch target buffer | Thousands of entries | `br_misp_retired.indirect` |
-| Instruction fetch granularity | 16–32 bytes per cycle | Hot loop straddling a 32 B boundary |
-
-A 50 MB binary with a hot path scattered across dozens of translation units touches far more instruction pages than necessary; each cold function interleaved with hot code wastes most of a 64-byte line and a whole TLB entry.
-
-**The layout transformations, in order of leverage:**
-
-1. **Hot/cold splitting.** Move cold basic blocks out of hot functions into `.text.unlikely`. Driven by PGO, `[[gnu::cold]]`, `[[unlikely]]`, or `-freorder-blocks-and-partition`. The hot path becomes contiguous, straight-line, taken-branch-free code.
-2. **Basic-block reordering** so the likely successor is the fall-through (Ch. 40 §40.6).
-3. **Function reordering** so callers and callees are adjacent — `hfsort+` in BOLT, `-Wl,--symbol-ordering-file=` in lld, or `[[gnu::section("...")]]` by hand.
-4. **Huge pages for `.text`.** Backing the hot code region with 2 MB pages collapses hundreds of iTLB entries into one. BOLT's `-hugify`, or manual `madvise(MADV_HUGEPAGE)` remapping of the text segment at startup. Worth several percent on large binaries (Ch. 32 §32.10).
-5. **Loop alignment** — `-falign-loops=32`, and `-mbranches-within-32B-boundaries` for the Skylake JCC erratum (Ch. 40 §40.15).
+Code layout affects instruction-cache, iTLB, branch-prediction, and fetch behavior, but the relevant capacities and counters are microarchitecture-specific. Profile-guided block placement, hot/cold splitting, and post-link reordering can improve locality without changing source semantics. Ch. 40 covers the compiler and BOLT transformations; Chs. 42–43 cover CPU effects and measurement.
 
 **The manual C++ pattern**, which you should be able to write from memory:
 
 ```cpp
-// Cold slow path: separate function, never inlined, marked cold, so the
-// compiler emits it into .text.unlikely and predicts the branch not-taken.
+// GNU attributes request an out-of-line cold slow path.
 [[gnu::noinline, gnu::cold]]
 void handle_sequence_gap(Session&, Seq expected, Seq got);
 
-inline void on_message(Session& s, const Msg& m) noexcept {
+inline void on_message(Session& s, const Msg& m) {
     if (m.seq != s.expected) [[unlikely]] {         // layout hint
-        handle_sequence_gap(s, s.expected, m.seq);  // out-of-line, out-of-cache
+        handle_sequence_gap(s, s.expected, m.seq);
         return;
     }
-    apply(s, m);            // hot path: contiguous, no calls, no taken branches
+    apply(s, m);            // intended common path
     ++s.expected;
 }
 ```
 
-Everything here is deliberate: `noinline` keeps the hot function small; `cold` moves the body to a distant section *and* propagates "unlikely" to callers; `[[unlikely]]` makes the hot path the fall-through; `noexcept` avoids landing-pad edges that constrain code motion; `inline` on the hot function lets it fold into the caller's straight-line region.
+These GNU attributes and the standard `[[unlikely]]` hint influence, but do not mandate, placement. `noexcept` is a semantic promise and must not be added merely as a layout hint. Confirm section placement and samples in the final linked binary.
 
 **Measuring whether layout is your problem:**
+
+For example, on a supported Intel Linux PMU:
 
 ```bash
 perf stat -e cycles,instructions,L1-icache-load-misses,iTLB-load-misses,\
 idq.dsb_uops,idq.mite_uops ./app
 perf stat --topdown ./app        # is 'frontend bound' significant?
 ```
-If `frontend_bound` is low and iTLB/icache misses are low, layout work will do nothing — spend the effort elsewhere (Ch. 43 §43.19). If it is 20–40%, the ordered fix list is: PGO → BOLT → huge-page text → manual hot/cold annotation.
+Interpret counters using the target PMU documentation and a controlled experiment. Low front-end pressure makes layout an unlikely priority; high pressure motivates a measured PGO or post-link trial rather than a universal sequence of fixes.
 
 ---
 
-## Key Interview Questions
+## 41.18 Recall and Practice — Core
 
-1. **Give the SysV AMD64 integer argument registers in order.** — `rdi, rsi, rdx, rcx, r8, r9`; then the stack. FP args use `xmm0–7` on an *independent* counter. `this` is the first integer argument.
-2. **Where is the return value?** — `rax` (integer ≤64), `rax:rdx` (up to 128), `xmm0`/`xmm0:xmm1` (FP), or via a hidden `sret` pointer in `rdi` for large/non-trivial types, returned again in `rax`.
-3. **Which registers are callee-saved?** — `rbx, rbp, r12–r15` (plus `rsp` by convention). Everything else, **including all vector registers**, is caller-saved — which is why a non-inlined call inside a vectorized loop forces a mass spill.
-4. **What is the stack-alignment rule, exactly?** — `rsp` is 16-byte aligned *at the `call` instruction*, so on function entry `rsp % 16 == 8` after the pushed return address. Violations crash in libc's `movaps`.
-5. **What is the red zone, and why does the kernel disable it?** — 128 bytes below `rsp` usable by leaf functions without adjusting `rsp`; interrupts push onto the current kernel stack and would clobber it, hence `-mno-red-zone`.
-6. **Why is `std::unique_ptr` not zero-overhead across an ABI boundary?** — A non-trivial destructor forces class MEMORY, so it is passed on the stack, whereas a raw pointer goes in a register. Inlining or LTO removes the difference; a non-inlined boundary does not.
-7. **When is a struct returned in registers?** — ≤16 bytes, trivially copyable, and classifiable into two eightbytes; otherwise a hidden return pointer, which is exactly what makes NRVO/guaranteed elision free.
-8. **What is a tail call and what prevents it in C++?** — Replacing `call; ret` with `jmp`, reusing the frame. Blocked by non-trivial destructors of locals, escaping local addresses, active cleanup scopes, and `-fno-optimize-sibling-calls`. `[[clang::musttail]]` makes it mandatory.
-9. **You see `mov rax, 0x51EB851EB851EB85; mul; shr` — what is it?** — Division by a constant via magic-reciprocal multiply-high, because `div` is 20–40 cycles.
-10. **How do you tell signed from unsigned comparison in disassembly?** — `jb/ja/jae/jbe` (below/above) are unsigned; `jl/jg/jle/jge` (less/greater) are signed.
-11. **What does writing to `eax` do to `rax`?** — Zeroes the upper 32 bits. Writing to `ax`/`al` merges instead, creating a false dependency.
-12. **What is `lea` for?** — Address computation without memory access; used as a three-operand add/shift that does not set flags, and it is the signature of strength-reduced multiplication.
-13. **Sections vs segments in ELF?** — Sections are link-time views (`.text`, `.rodata`, `.bss`); segments (`PT_LOAD`) are the loader's view. `.bss` occupies no file space.
-14. **Explain the PLT/GOT call path and its cost.** — First call jumps through the PLT stub to `_dl_runtime_resolve`, which writes the resolved address into the GOT; later calls are one indirect jump. Eliminate the first-call jitter with `-Wl,-z,now` or static linking.
-15. **Why is PIC nearly free on x86-64 but expensive on 32-bit x86?** — RIP-relative addressing gives PC-relative data access in one instruction; 32-bit x86 needed a dedicated GOT base register and a `call/pop` to obtain the PC.
-16. **What does `-fvisibility=hidden` buy you?** — Smaller dynamic symbol tables and faster load, no interposition (so calls become direct and inlinable), and no accidental ABI exposure. Pair with `-fno-semantic-interposition`.
-17. **Difference between weak symbols and hidden visibility?** — Weak is a *binding* (overridable, may resolve to 0); hidden is a *visibility* (not exported at all). Inline functions and template instantiations are weak in COMDAT groups.
-18. **What are `R_X86_64_RELATIVE` relocations and why do they matter for startup?** — Load-base additions for internal pointers in PIE binaries; large C++ binaries accumulate hundreds of thousands, dominating startup. `DT_RELR` compresses them.
-19. **Frame pointers vs DWARF unwinding — which and why?** — Frame pointers cost ~1–2% but make unwinding two loads per frame and signal-safe; DWARF `.eh_frame` is free at runtime but slow to unwind and awkward under sampling. For production profiling, keep frame pointers.
-20. **Why does `-O2 -g` cost nothing at runtime?** — DWARF sections are not `SHF_ALLOC`, so they are never mapped into memory during execution. Always ship with debug info (split, keyed by build ID).
-21. **A backtrace is missing frames — why?** — Inlining (use `addr2line -i` / `perf --inline`), tail calls (the frame no longer exists), or omitted frame pointers with `--call-graph fp`.
-22. **How would you make a big binary's hot path faster without changing the code?** — PGO, then BOLT for whole-binary block/function layout and hot/cold splitting, then huge-page-backed `.text`; verify with `perf stat --topdown` that you were front-end bound in the first place.
-23. **Name the key AArch64 differences from x86-64.** — Fixed 4-byte RISC encoding, load/store architecture, 31 GP registers, link register instead of a pushed return address, a zero register, **weak memory ordering** (so x86-TSO-dependent bugs surface), LL-SC or LSE atomics, and 16-byte stack alignment at all times with no red zone.
-24. **What crashes inside `memcpy` for no apparent reason?** — Usually stack misalignment: a `movaps` on an address that is 8 mod 16, caused by hand-written assembly, a JIT, or a mismatched calling convention.
+**Recall card**
 
----
+- Always label the layer: C++ semantics, ISA, ABI, object format, OS loader, or a particular compiler/tool version.
+- On SysV AMD64, integer arguments normally begin in `rdi, rsi, rdx, rcx, r8, r9`; FP/SIMD classification uses a separate register sequence. Windows x64 and AAPCS64 differ.
+- A normal SysV call site aligns `rsp` to 16 bytes; entry is 8 modulo 16 after the return address. The 128-byte red zone is a SysV user-space provision, not a universal x86 feature.
+- Caller-saved means the caller must preserve a live value across a call; callee-saved means the callee restores it.
+- Aggregate passing depends on ABI classification and C++ triviality. “MEMORY” may mean an invisible reference whose pointer is passed in a register, not necessarily object bytes pushed on the stack.
+- Frame pointers and CFI are different unwind mechanisms. Neither recreates inlined or tail-called frames.
+- ELF sections organize linking; program segments organize mapping. Symbols identify entities; relocations tell a linker or loader how to form addresses.
+- GOT/PLT behavior, lazy binding, visibility, and symbol versions are ELF toolchain/loader rules. Inspect the final artifact.
+- Retain raw addresses, module bases, build IDs, and matching debug files for production symbolization.
 
-## Common Traps
+**Questions**
 
-- **Confusing SysV and Windows x64 argument registers** — `rdi,rsi,...` vs `rcx,rdx,r8,r9`, and Windows' positional int/FP slots plus 32-byte shadow space.
-- **Thinking integer and FP arguments share a counter on SysV.** They do not.
-- **Getting the alignment rule off by 8** — it is 16-byte aligned *before* the `call`, so `rsp % 16 == 8` on entry.
-- **Writing below `rsp` in inline assembly** without accounting for the red zone.
-- **Forgetting `-mno-red-zone` in kernel or interrupt-context code.**
-- **Omitting clobbers in inline asm** (`cpuid` clobbers `rbx`) — miscompiles that appear only with optimization.
-- **Assuming a pointer-sized RAII type is passed in a register** — a non-trivial destructor forces MEMORY class.
-- **Assuming writing `al` or `ax` zeroes the upper bits.** Only 32-bit writes do.
-- **Reading `perf` stacks with omitted frame pointers** and believing the truncated result.
-- **Expecting a tail call when a local with a destructor is in scope.**
-- **Relying on tail calls for correctness without `[[clang::musttail]]`** — a debug build or a sanitizer disables them and the stack overflows.
-- **Shipping stripped binaries with no archived debug info** — production crashes become unanalyzable.
-- **Symbolizing without `-i`/`--inline`** and misattributing cost to the wrong function.
-- **Leaving lazy PLT binding enabled** in a latency-critical process — first-call resolution jitter at the worst moment.
-- **Letting `--gc-sections` collect `dlsym`-only symbols** (mark them `used`/`retain`).
-- **Building against a newer glibc than the deployment target** — `version GLIBC_2.34 not found`.
-- **Running `ldd` on an untrusted binary** — it invokes the binary's loader.
-- **Assuming x86-TSO semantics carry to AArch64** — missing atomics and wrong memory orders surface on ARM.
-- **Assuming 64-byte cache lines everywhere** — Apple Silicon uses 128, which changes `alignas` padding.
-- **Deploying a BOLTed binary without re-validating symbolization and unwinding.**
+1. Given an assembly listing, which seven context labels must you establish before applying a register or layout rule?
+2. Walk the annotated `sum` loop in §41.1: where are its two arguments, result, index, load, compare, and back edge?
+3. Contrast SysV AMD64, Windows x64, and AAPCS64 argument passing, stack provisions, and preserved registers without treating any as C++ semantics.
+4. Why can a pointer-sized non-trivial wrapper cross a SysV boundary indirectly, and why is “passed on the stack” an imprecise description?
+5. Draw both unwind paths—frame-pointer chain and CFI—and list three reasons a logical source frame may be absent.
+6. Distinguish an ELF section, segment, symbol, and relocation using one sentence each.
+7. Trace a typical lazy ELF function call through PLT and GOT, then state what eager binding changes.
+8. Which commands distinguish a compile failure, undefined link symbol, runtime loader failure, and bad production symbolization?
 
----
+**Code-reading puzzle**
 
-## Compact Recall Summary
+Assume Intel syntax and the SysV AMD64 ABI:
 
-**Reading asm.** Identify syntax (AT&T `mov src,dst` vs Intel `mov dst,src`), find the prologue and frame size, map arguments to `rdi,rsi,rdx,rcx,r8,r9`/`xmm0–7`, find the backward jump that marks the loop, flag `[rsp±N]` traffic in loops as spills, treat `call` as failed inlining and `call [rax]` as indirect dispatch, and read `v`-prefixed/`ymm` mnemonics as successful vectorization.
+```asm
+quote_value:
+        mov     eax, edi
+        imul    eax, esi
+        add     eax, edx
+        ret
+```
 
-**Registers and flags.** 16 GP registers at four widths; 32-bit writes zero-extend, narrower writes merge and create false dependencies. `xor eax,eax` zeroes; `test rax,rax` is the null check; `lea` computes addresses (and strength-reduced multiplies) without touching memory; `[base+index*scale+disp]` is native for element sizes 1/2/4/8. `jb/ja` = unsigned, `jl/jg` = signed.
+Reconstruct a plausible C++ signature and expression. Then answer: why does the function need no stack frame, what does writing `eax` imply about the upper half of `rax`, and which answers would change under Windows x64? Confirm by compiling a small candidate with `-O2 -S -masm=intel`; do not expect identical instruction selection across compiler versions.
 
-**Idioms.** Magic-reciprocal `mul`+`shr` = constant division; `cmov` = branchless select; `mov rax,[rdi]; call [rax+N]` = virtual dispatch; `lock xadd` = atomic RMW (and an audit target for hidden `shared_ptr` traffic); `fs:` = TLS; `call foo@PLT` = dynamic symbol.
+**Binary exercise**
 
-**AArch64.** Fixed-width RISC, load/store architecture, 31 GP registers plus a zero register, return address in `lr`/`x30`, `stp`/`ldp` pairs in prologues, `x0–x7`/`v0–v7` for arguments, callee-saved `x19–x28`, 16-byte alignment always and no red zone, LL-SC (`ldxr`/`stxr`) or LSE atomics, and a **weak** memory model that exposes latent ordering bugs that x86 TSO hides.
+Build the `price(int)` example in §41.11 twice: once with no definition and once with `int price(int x) { return x * 100; }` in a second translation unit.
 
-**SysV ABI.** Integer args `rdi,rsi,rdx,rcx,r8,r9`; FP args `xmm0–7`, independent counters; `this` first; `al` = SSE-register count for varargs. Returns in `rax`/`rax:rdx`/`xmm0(:xmm1)`, or a hidden `sret` pointer. Callee-saved: `rbx,rbp,r12–r15` only — *all* vector registers are caller-saved. `rsp % 16 == 0` at the `call`, `== 8` on entry; 128-byte red zone below `rsp` for leaf functions, absent in kernel code and on Windows.
+```bash
+c++ -std=c++23 -O2 -g -c main.cpp price.cpp
+nm -C main.o price.o
+readelf -rW main.o
+c++ main.o price.o -Wl,-Map=app.map -o app
+objdump -d -C app
+readelf -lSWd app
+```
 
-**Aggregates.** >16 bytes or non-trivial copy/move/destructor ⇒ class MEMORY ⇒ passed on the stack; otherwise split into two eightbytes classified INTEGER or SSE. This is why `unique_ptr` is not free at ABI boundaries, and why the hidden return pointer makes NRVO and guaranteed elision genuinely zero-cost. Tail calls turn `call;ret` into `jmp`, are blocked by any non-trivially-destructible local or escaping address, destroy stack frames for debugging, and are guaranteed only by `[[clang::musttail]]`.
+Record how the undefined symbol and call relocation in `main.o` become a resolved address in `app`. Locate `main`, `price(int)`, the loadable segments, build ID, dynamic dependencies, and unwind section. If the host uses Mach-O or PE/COFF, perform the equivalent experiment with that platform's tools and explicitly note which ELF commands do not apply.
 
-**ELF.** Sections are for the linker, segments (`PT_LOAD`) for the loader; `.bss` costs no file space; `.eh_frame` survives `strip` because exceptions need it; RELRO plus `-z now` makes the GOT read-only and removes lazy-binding jitter. Symbols carry binding (global/local/**weak** — how `inline` and templates work via COMDAT), type, and visibility (**hidden** shrinks the dynamic table, kills interposition, enables direct inlinable calls). `R_X86_64_RELATIVE` counts drive PIE startup time; `DT_RELR` compresses them.
+**Traps**
 
-**Dynamic linking.** PLT stub → GOT → `_dl_runtime_resolve` on first call, direct thereafter; kill the jitter with `-z now`, hidden visibility, or static linking. Resolution is breadth-first with first-definition-wins, which is why `LD_PRELOAD` works. glibc symbol versioning means build on the oldest supported target. Trading systems prefer static linking for deterministic startup, reproducible artifacts, and whole-program LTO.
+- Mixing SysV, Windows x64, Darwin, and AAPCS64 register or stack rules.
+- Treating compiler-generated assembly as a C++ guarantee or one compiler version's layout as stable ABI.
+- Assuming every `[rsp+N]` access is a spill, every vector register proves vectorization, or every indirect call is virtual.
+- Calling a MEMORY-class aggregate “pushed on the stack” without checking invisible-reference rules.
+- Writing hand assembly without correct stack alignment, clobber declarations, or unwind directives.
+- Believing a truncated profiler stack without checking frame-pointer policy, CFI capture, inlining, and tail calls.
+- Confusing an undefined link symbol with a runtime-loader lookup failure.
+- Running `ldd` or a target loader on an untrusted executable; prefer static inspection.
+- Stripping the deployed binary before archiving matching debug data and build IDs.
+- Applying ELF/PLT/GOT advice to Mach-O or PE/COFF without translating the platform model.
 
-**Tools.** `objdump` (disassembly), `readelf` (ELF structure), `nm` (symbols and sizes), `size`/`bloaty` (where the bytes went), `addr2line -Cfie`/`llvm-symbolizer` (addresses with inline stacks), `ldd`/`LD_DEBUG` (linking), `checksec` (RELRO/PIE/BIND_NOW), `perf annotate` (cost per instruction), `llvm-mca` (static port pressure), `pahole` (layout).
+**Prerequisite for the next chapters**
 
-**Debug and unwind.** `-O2 -g` costs nothing at runtime because DWARF is not `SHF_ALLOC`; split debug files keyed by build ID and archive them for every deployment. Inlining and tail calls remove frames, so symbolize with `-i`. Frame pointers cost ~1–2% and give fast, signal-safe unwinding; DWARF CFI is free until you unwind and then slow; use `--call-graph fp` for production sampling and `lbr` where depth allows.
-
-**Layout.** Instruction fetch is memory access: 32 KB L1i, ~1536-µop DSB, 128–256 iTLB entries. Split cold code into `.text.unlikely` (`[[gnu::cold]]` + `noinline` + `[[unlikely]]`), reorder blocks and functions by profile (PGO then BOLT `hfsort+`), and back hot `.text` with 2 MB pages. Confirm with `perf stat --topdown` that you are front-end bound before spending effort here.
+You should be able to correlate one source function with its sampled instructions, explain one call boundary and unwind path, and trace one external reference from object-file relocation through the linked and loaded image. Chapter 42 uses that evidence for CPU-conscious optimization; Chapters 43–44 use it for measurement and tooling.

@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Single-node atomicity is a durability problem solved by one WAL fsync as the commit point. Across nodes there is no shared log or fate and each node fails independently, turning atomicity into an agreement problem among several independent logs.",
-      "sourceAnchor": "731-the-problem-atomicity-across-independent-failures",
+      "sourceAnchor": "733-core--partitioning-creates-the-coordination-boundary",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Consensus lets a majority impose any proposed value. Atomic commitment requires unanimity to commit and gives every participant a veto: one abort vote, one dead cohort, or one constraint violation forces a global abort.",
-      "sourceAnchor": "732-atomic-commitment-is-not-consensus-but-is-related",
+      "sourceAnchor": "734-core--atomic-commitment-goals-and-invariants",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The Skeen and Stonebraker result is the atomic-commitment analogue of FLP: under asynchrony a single crash can leave the protocol unable to terminate. This is why classic 2PC blocks and why non-blocking commit requires consensus backing.",
-      "sourceAnchor": "732-atomic-commitment-is-not-consensus-but-is-related",
+      "sourceAnchor": "734-core--atomic-commitment-goals-and-invariants",
       "difficulty": "recall"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Uniformity means even a participant that decides commit, acknowledges a client, and then crashes has bound the outcome; on recovery it must decide commit. This is why every node force-logs its vote and the decision before acting on them.",
-      "sourceAnchor": "733-making-operations-appear-atomic-the-problem-statement",
+      "sourceAnchor": "734-core--atomic-commitment-goals-and-invariants",
       "difficulty": "application"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Preparing means guaranteeing the ability to commit: hold locks, force-log the prepared record and changes, then vote yes. Having voted yes the cohort surrenders autonomy and is in-doubt, waiting for the coordinator's verdict.",
-      "sourceAnchor": "734-two-phase-commit-the-protocol",
+      "sourceAnchor": "735-core--two-phase-commit-as-state-machines",
       "difficulty": "recall"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Once the coordinator fsyncs its commit record, the transaction is committed and every cohort will eventually commit no matter how many crashes follow. Before that write the transaction is still abortable; the point is singular and unambiguous.",
-      "sourceAnchor": "734-two-phase-commit-the-protocol",
+      "sourceAnchor": "735-core--two-phase-commit-as-state-machines",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Each cohort fsyncs twice (prepared, then commit) and the coordinator fsyncs its commit, giving about 2(N+1) forced flushes across two round trips. Locks are held for the whole window, which is why 2PC hurts throughput and tail latency.",
-      "sourceAnchor": "735-2pc-the-happy-path",
+      "sourceAnchor": "735-core--two-phase-commit-as-state-machines",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Log-then-send is what makes 2PC recoverable. A cohort that voted yes but crashed before logging prepared could wrongly abort a committed transaction; a coordinator that decided but crashed before logging commit would lose the only record of the outcome.",
-      "sourceAnchor": "736-the-log-records-and-recovery",
+      "sourceAnchor": "737-core--replicating-recovery-and-choosing-a-commit-design",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A prepared-but-undecided transaction is in-doubt: the cohort promised yes so cannot abort, and never heard the verdict so cannot commit. It runs the recovery protocol to obtain the outcome, holding locks until it gets an answer.",
-      "sourceAnchor": "736-the-log-records-and-recovery",
+      "sourceAnchor": "737-core--replicating-recovery-and-choosing-a-commit-design",
       "difficulty": "recall"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "In phase one a missing vote is treated as a no vote, so a timeout drives a safe global abort with nothing committed. The benign nature comes from abort being the default when information is missing before the decision.",
-      "sourceAnchor": "737-failure-analysis-cohort-failures",
+      "sourceAnchor": "736-core--failure-windows-and-the-blocking-state",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "In-doubt cohorts cannot commit (some cohort might have voted no) nor abort (some cohort might already have committed), so they wait holding locks until the coordinator returns. This stalls every conflicting transaction and is inherent, not a bug.",
-      "sourceAnchor": "738-coordinator-failure-and-the-blocking-problem",
+      "sourceAnchor": "736-core--failure-windows-and-the-blocking-state",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Peer cooperation resolves the case where some peer knows the outcome or has not voted yes, but when every reachable cohort is in-doubt none can tell whether the coordinator flushed commit before dying. It narrows the window without closing it.",
-      "sourceAnchor": "738-coordinator-failure-and-the-blocking-problem",
+      "sourceAnchor": "736-core--failure-windows-and-the-blocking-state",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Under partition, in-doubt cohorts block and refuse service on the affected rows to avoid a split-brain outcome, preserving consistency at the cost of availability. The blocking is unbounded and cascades to every conflicting transaction.",
-      "sourceAnchor": "7310-why-2pc-is-not-partition-tolerant",
+      "sourceAnchor": "733-core--partitioning-creates-the-coordination-boundary",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "PREPARE TRANSACTION is 2PC phase one: Postgres writes the transaction state to pg_twophase, fsyncs, keeps all locks, and dissociates it from the session so COMMIT PREPARED or ROLLBACK PREPARED can complete it later, even after a restart.",
-      "sourceAnchor": "7311-postgresql-2pc-prepare-transaction-and-commit-prepared",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "recall"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The parameter sizes the shared-memory slot array for prepared transactions and defaults to zero, meaning two-phase commit is disabled out of the box. Distributed-Postgres systems such as Citus require it be set above zero on workers.",
-      "sourceAnchor": "7311-postgresql-2pc-prepare-transaction-and-commit-prepared",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "recall"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Postgres holds a prepared transaction's locks forever until someone issues phase two, and its live xmin holds back cleanup. A crashed external coordinator leaves such orphans, which must be found via pg_prepared_xacts and resolved by hand.",
-      "sourceAnchor": "7311-postgresql-2pc-prepare-transaction-and-commit-prepared",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The middle state certifies unanimous yes votes. If any survivor reached pre-commit, all voted yes so survivors commit; if none did, they abort. That inference removes the ambiguity that blocks 2PC, under a synchronous fail-stop model.",
-      "sourceAnchor": "7312-three-phase-commit-3pc",
+      "sourceAnchor": "735-core--two-phase-commit-as-state-machines",
       "difficulty": "recall"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "3PC is non-blocking only under a synchronous, partition-free model. A real partition lets each side apply its termination rule correctly yet reach opposite outcomes, trading 2PC's safe blocking for an unsafe disagreement, which is why it is unused.",
-      "sourceAnchor": "7313-why-3pc-fails-under-real-asynchrony",
+      "sourceAnchor": "736-core--failure-windows-and-the-blocking-state",
       "difficulty": "trap"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The single fragile coordinator is replaced by majority-replicated state: votes live in per-cohort consensus instances and the decision is decided by a consensus group. A new leader recovers the outcome from the log, restoring liveness without breaking safety.",
-      "sourceAnchor": "7314-paxos-commit-consensus-backed-2pc",
+      "sourceAnchor": "737-core--replicating-recovery-and-choosing-a-commit-design",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Real distributed SQL systems keep the shape of 2PC but back every role with a consensus group, so no single node's failure can strand the decision. The right cure for blocking is more replication, not more phases.",
-      "sourceAnchor": "7315-2pc-vs-3pc-vs-paxos-commit",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "recall"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "2PC's failure mode under partition is a liveness failure: it blocks but never produces a split decision. 3PC's cure can turn into a safety failure, with partitioned sides reaching opposite outcomes, which is a strictly worse bargain for a database.",
-      "sourceAnchor": "7315-2pc-vs-3pc-vs-paxos-commit",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Calvin front-loads ordering rather than outcome: once all replicas process the same ordered log with the same deterministic logic they reach the same state, so there is no per-transaction vote, no coordinator, and no in-doubt state.",
-      "sourceAnchor": "7316-deterministic-transactions-with-calvin",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "recall"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Determinism requires knowing which keys a transaction touches before it runs so locks can be granted in the global order. Transactions whose access set depends on values read mid-execution need a reconnaissance pre-run, so open-ended interactive transactions fit poorly.",
-      "sourceAnchor": "7316-deterministic-transactions-with-calvin",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "TrueTime returns an interval containing the true absolute time with bounded uncertainty epsilon, kept small via GPS and atomic clocks. Correctness comes from respecting the advertised uncertainty rather than pretending clocks are perfectly synchronized.",
-      "sourceAnchor": "7317-spanner-truetime-and-commit-wait",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "recall"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "By blocking until TrueTime's earliest bound passes the chosen commit timestamp, Spanner ensures any later transaction gets a larger timestamp, yielding external consistency. The price is about 2 epsilon of added latency, which better clocks reduce.",
-      "sourceAnchor": "7317-spanner-truetime-and-commit-wait",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because timestamps are globally meaningful, a snapshot read at a timestamp is consistent across splits and needs no coordination. A follower just waits until it has applied all writes up to that timestamp, so reads are lock-free and locally servable.",
-      "sourceAnchor": "7318-spanner-2pc-over-paxos-and-mvcc-reads",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Hashing spreads load uniformly and avoids hotspots, but it scatters adjacent keys, so ordered range scans must query all partitions. Range partitioning keeps order for cheap scans but is the one prone to sequential-key hotspots and split-point management.",
-      "sourceAnchor": "7319-database-partitioning-and-sharding",
+      "sourceAnchor": "733-core--partitioning-creates-the-coordination-boundary",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With mod N, changing N remaps almost every key. On the hash ring, a membership change only reassigns the arc between the changed node and its neighbor, so roughly one node's share (1/N) moves. That elasticity is the entire point of consistent hashing.",
-      "sourceAnchor": "7320-consistent-hashing",
+      "sourceAnchor": "733-core--partitioning-creates-the-coordination-boundary",
       "difficulty": "recall"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Giving each physical node many random tokens smooths arc sizes by the law of large numbers, parallelizes rebalancing since a node's many small arcs are absorbed by many successors, and lets heterogeneous machines carry proportional shares.",
-      "sourceAnchor": "7320-consistent-hashing",
+      "sourceAnchor": "733-core--partitioning-creates-the-coordination-boundary",
       "difficulty": "recall"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Percolator designates one written row as primary; committing means atomically replacing its lock with a write record using Bigtable's single-row atomicity. That one operation decides the whole transaction, and secondaries are rolled forward lazily afterward.",
-      "sourceAnchor": "7321-percolator-snapshot-isolation-on-bigtable",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The outcome is embodied in the primary lock's state, so cleanup is lazy and on-read: whoever stumbles on a leftover lock checks the primary and either commits the secondary or removes the lock. No dedicated coordinator process is needed.",
-      "sourceAnchor": "7321-percolator-snapshot-isolation-on-bigtable",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "CockroachDB reuses the 2PC-over-Raft plus MVCC design but has no TrueTime hardware, so it uses HLCs with a configured max clock offset and reacts to uncertainty with read restarts. It is serializable but gives weaker real-time guarantees than Spanner.",
-      "sourceAnchor": "7322-cockroachdb-and-yugabytedb",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "recall"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "I-confluence is the precise dividing line: if merging invariant-satisfying states preserves the invariant, replicas can diverge and reconcile without coordination. Uniqueness and non-negative-balance under concurrent decrement are not I-confluent and do need coordination.",
-      "sourceAnchor": "7323-coordination-avoidance-i-confluence-crdts-ramp",
+      "sourceAnchor": "733-core--partitioning-creates-the-coordination-boundary",
       "difficulty": "recall"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Uniqueness is not I-confluent: independent replicas can each pick the same username and the merge breaks the constraint, so coordination is unavoidable. Set-append and grow-only counters are I-confluent and merge cleanly, which is what CRDTs exploit.",
-      "sourceAnchor": "7323-coordination-avoidance-i-confluence-crdts-ramp",
+      "sourceAnchor": "733-core--partitioning-creates-the-coordination-boundary",
       "difficulty": "trap"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Citus uses Postgres's cohort-side 2PC on the workers, driven by its coordinator, which tracks prepared transactions in pg_dist_transaction and runs a recovery daemon to resolve orphans after a crash. Co-located rows keep most transactions local and 2PC-free.",
-      "sourceAnchor": "7324-distributed-postgresql-citus-and-fdw-based-2pc",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "application"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Snapshot isolation gives each transaction a consistent read snapshot but allows write skew, where concurrent transactions read overlapping data and write disjoint keys that jointly break a constraint that serializability would prevent. Percolator inherits this weakness.",
-      "sourceAnchor": "7321-percolator-snapshot-isolation-on-bigtable",
+      "sourceAnchor": "7311-skippable-reference--selected-protocols-and-systems",
       "difficulty": "trap"
     }
   ]

@@ -1,586 +1,864 @@
 # Chapter 15 — Vocabulary and Utility Types
 
-*Interview-focused revision notes. The theme: the standard's small composable types — the ones that appear in every interface — each buy a specific abstraction with a specific representational cost, and the interview is about knowing which ones are free, which allocate, and which have a discriminant you're paying for.*
+## Why this matters — Core
+
+A vocabulary type makes an interface's possible states visible in its type. `std::optional<Price>` says that a price may be absent. `std::variant<Add, Cancel>` says that exactly one member of a closed alternative set is active. `std::chrono::nanoseconds` says both that a value is a duration and what its unit is. These types prevent callers from inventing meanings for null pointers, integer sentinels, untagged unions, or unitless counters.
+
+The type does not remove the need for a contract. An empty optional must have a defined meaning. A variant visitor must account for every alternative and for any possible valueless state. A `reference_wrapper` does not extend an object's lifetime. A time point is meaningful only with its clock and epoch. Correct use therefore starts with semantics and lifetime, then considers representation and cost.
+
+This chapter's Core covers products, nullable values, closed sums, and clocks. Error-policy selection belongs to Chapter 10, non-owning string and range views to Chapter 13, and callable/type-erasure machinery to Chapter 18. The later sections on `any`, reference wrappers, bits, randomness, calendars, time zones, and SIMD are independent Role-specific modules.
+
+The language and library baseline is C++23. In particular, C++23 does **not** contain `std::simd` or `std::optional<T&>`; later-standard facilities are not presented as available here.
 
 ---
 
-## 15.1 Pair and Tuple
+## 90-second screen — Core
 
-`std::pair<T, U>` is a two-member aggregate-like struct with named members `first` and `second`; `std::tuple<Ts...>` generalizes it to N heterogeneous members accessed positionally by `std::get<I>` or (since C++14, when unambiguous) by type with `std::get<T>`.
+1. `pair` and `tuple` are **products**: all component objects exist. `optional<T>` is nullable: either one `T` exists or none does. `variant<Ts...>` is a **closed sum**: one listed alternative normally exists. These are lifetime statements, not byte-layout promises.
+2. Never serialize the object representation of `tuple`, `optional`, `variant`, `any`, or `bitset`. Their padding, discriminants, element arrangement, and small-object choices are not portable formats.
+3. `optional` means “value or absence.” It cannot explain the absence. Use `expected<T, E>` when a caller needs an error value, and keep the full error-policy decision in Chapter 10.
+4. `optional::value()` and `get<T>(variant)` throw on the wrong state; unchecked `*optional`/`optional->` require engagement; `get_if` reports variant mismatch with a null pointer.
+5. Moving an `optional` does not disengage the source. A variant can become `valueless_by_exception` during a throwing state transition. Design and test those states explicitly.
+6. `variant` is for a closed set known at compile time; `any` is for an open set discovered at run time. `any` may allocate and provides no operations beyond type query/cast.
+7. Use `steady_clock` for intervals and deadlines, `system_clock` for civil/wall timestamps. `high_resolution_clock` has implementation-defined identity and monotonicity; its name is not a selection criterion.
 
-```cpp
-std::pair<int, double> p{1, 2.0};
-std::tuple<int, double, std::string> t{1, 2.0, "x"};
-auto& d = std::get<1>(t);          // by index
-auto& s = std::get<std::string>(t); // by type — ill-formed if the type appears twice
-static_assert(std::tuple_size_v<decltype(t)> == 3);
-using Second = std::tuple_element_t<1, decltype(t)>;
-```
+Two decisions to defend:
 
-### Layout and cost
-
-`std::tuple` is **not** required to store elements in declaration order, and libstdc++ implements it by **recursive inheritance in reverse**, so `get<0>` lives at the highest address:
-
-```
-libstdc++ tuple<A,B,C>:  _Tuple_impl<0,A,B,C> : _Tuple_impl<1,B,C> : _Tuple_impl<2,C>
-                          → memory order is roughly C, B, A
-MSVC: also reverse.  libc++: uses a flat multiple-inheritance of indexed bases, declaration order.
-```
-
-Consequences: **a tuple is not layout-compatible with a struct of the same members** (Ch. 3 §3.11), you cannot `memcpy` a tuple into a wire format, `offsetof` is meaningless, and the padding may differ from the equivalent struct (though empty-base optimization means empty members cost nothing — a tuple of stateless functors is empty). `std::pair` *is* a plain struct in declaration order, but is still not guaranteed standard-layout in general.
-
-A tuple is trivially copyable iff all its elements are, and small tuples of scalars do get passed in registers — but the SysV rules (Ch. 3 §3.5) cap that at 16 bytes for the general case.
-
-### Where tuples are the right tool
-
-- **Multiple return values** — though a named struct is usually better: `auto [ok, value] = f()` from a struct gives you names and documentation for free, and structured bindings (Ch. 19) work on both.
-- **Comparison keys** — `std::tie(a.x, a.y) < std::tie(b.x, b.y)` gives lexicographic multi-key ordering with correct strict-weak-ordering semantics (Ch. 14 §14.8). `tuple`'s `operator<=>` (C++20) is lexicographic member-by-member.
-- **Template metaprogramming** — a type list with storage.
-- **Forwarding argument packs** into deferred calls (`std::apply`, §15.2), which is how `std::thread`, `std::bind`, and coroutine promise machinery store arguments.
-
-### Traps
-
-- **`std::pair`'s constructor is not `explicit` when both types are implicitly convertible** but *is* conditionally explicit otherwise (C++17 P0510-adjacent tidy-up); the conditional-explicit dance is a common source of confusing overload errors.
-- **`std::tuple`'s converting constructors are greedy**, and pre-C++17 a `tuple<T>` could hijack copy construction. Fixed by conditional explicitness, but tuple error messages remain notorious.
-- **`std::get<T>` is ill-formed with duplicate types**, which makes type-based access fragile under refactoring.
-- **`std::make_pair`/`make_tuple` decay their arguments** (array-to-pointer, reference-stripping) and unwrap `reference_wrapper` into a real reference — subtle and deliberate. With CTAD (C++17), `std::pair p{a, b}` is usually preferable, but note **CTAD does not decay `reference_wrapper`**, so the two are not equivalent.
-- **`std::tuple` compiles slowly.** Deep recursive instantiation costs real build time (Ch. 17 §17.22); libc++'s flat design is measurably faster to compile than libstdc++'s recursive one.
+- Prefer a named result struct over a long tuple once component names are part of the contract.
+- Prefer the narrowest state model that is honest: plain `T`, then `optional<T>`, then `expected<T,E>` or `variant<...>` according to whether the alternatives are errors or domain states.
 
 ---
 
-## 15.2 `std::apply` and `std::tie`
+## 15.1 The state model: product, nullable, sum, and erasure — Core
 
-`std::apply(f, tuple)` (C++17) invokes `f` with the tuple's elements as separate arguments — the "unpack" operation. Internally it is `std::invoke(f, std::get<Is>(std::forward<Tuple>(t))...)` with `Is` from a `std::index_sequence`, which is *the* canonical pack-expansion idiom (Ch. 17 §17.15).
+The important distinction is not syntax; it is which objects are alive:
 
-```cpp
-auto t = std::make_tuple(1, 2.5, 'c');
-std::apply([](int a, double b, char c){ /* ... */ }, t);
+```text
+pair<A, B> / tuple<A, B, C>
+    [ A alive ][ B alive ][ C alive ]       product: all components
 
-// Generic: call any function with a stored argument pack
-template <class F, class... Args>
-struct DeferredCall {
-    F f; std::tuple<Args...> args;
-    decltype(auto) operator()() { return std::apply(f, args); }
-};
+optional<T>
+    disengaged | [ T alive ]                nullable: zero or one T
+
+variant<A, B, C>
+    tag A + [ A alive ]
+    tag B + [ B alive ]                     closed sum: one listed type
+    tag C + [ C alive ]
+    possibly valueless after an exception
+
+any
+    empty | [ run-time type identity + value ]  open erased set
 ```
 
-`std::apply` is how `std::thread` and `std::async` (Ch. 20) invoke your callable with the arguments they stored at construction, and how `std::make_from_tuple<T>(t)` (C++17) constructs a `T` from tuple elements — the standard's answer to piecewise construction, and the mechanism behind `std::map::emplace(std::piecewise_construct, ...)`.
+An implementation needs enough storage and state to provide these semantics, but the standard generally does not prescribe a struct layout. “Enough storage for the largest variant alternative plus a tag” is a useful cost model, not permission to calculate the tag's offset.
 
-`std::tie(a, b, c)` creates a `std::tuple<T&, U&, V&>` — a tuple of **lvalue references**. Two uses:
+### Match the semantic role
+
+| Interface meaning | Type | What the caller must handle |
+|---|---|---|
+| Two or more values always returned | Named struct, `pair`, or `tuple` | Every component |
+| Value may legitimately be absent | `optional<T>` | Engaged and disengaged |
+| Value or explained failure | `expected<T, E>` | Success and error; Chapter 10 |
+| Exactly one of a known set of domain alternatives | `variant<Ts...>` | Every alternative, plus exception state if reachable |
+| Heterogeneous value from an open extension set | `any` | Run-time type mismatch and possible allocation |
+| Non-owning, copyable alias to an object | `reference_wrapper<T>` | Referent lifetime |
+| Elapsed quantity with a unit | `chrono::duration` | Conversion and rounding |
+| Reading from a particular clock | `chrono::time_point` | Clock identity and epoch |
+
+Do not use a richer state type merely to avoid writing a contract. `optional<bool>` has three states—absent, false, true—which is correct only when the domain has three meanings. A `variant` containing semantically overlapping alternatives can be harder to reason about than a named enum plus payload.
+
+### Cost follows the state model
+
+For a concrete implementation and target, inspect:
+
+- `sizeof` and `alignof` of the complete vocabulary type;
+- whether copying or moving invokes component operations;
+- whether construction or transition can throw;
+- whether dispatch is inlined or branched indirectly;
+- whether the held type itself allocates;
+- object density when stored in a large sequence.
+
+The contained value of an optional or variant is nested within the wrapper rather than separately heap-allocated by the wrapper. A contained `std::string`, however, may allocate. `bitset` has a fixed extent, but its exact storage representation is unspecified. Saying “variant never allocates” without separating wrapper machinery from alternative behavior hides the cost that matters.
+
+### Contract checklist
+
+Before selecting a wrapper, complete these sentences:
+
+- **State:** empty means ___; each variant alternative means ___.
+- **Ownership:** the returned object owns ___ and borrows ___.
+- **Lifetime:** a retained pointer/reference remains valid until ___.
+- **Failure:** callers observe absence, mismatch, or error by ___.
+- **Exception:** if construction or transition throws, the wrapper is left ___.
+- **Cost boundary:** allocation, dispatch, clock access, or conversion may occur at ___.
+
+If any blank is ambiguous, changing `T*` to `optional<T>` or a union to `variant` has not completed the API design. The wrapper can enforce which states exist, but only the contract assigns domain meaning and establishes who keeps referenced objects alive.
+
+For low-latency interfaces, also state whether the uncommon state is permitted on the critical path. “Usually engaged” does not make `value()` non-throwing, and “the variant normally holds `Add`” does not bound a throwing transition. Either arrange the phase so the exceptional state cannot arise, or include it in measurement and recovery.
+
+---
+
+## 15.2 Products: `std::pair`, `std::tuple`, `apply`, and `tie` — Core
+
+`std::pair<T, U>` stores two components named `first` and `second`. `std::tuple<Ts...>` generalizes the product to any fixed number of heterogeneous components. Access is positional through `std::get<I>` or, when a type occurs exactly once, through `std::get<T>`.
 
 ```cpp
-// 1. Unpacking (the pre-C++17 idiom, now superseded by structured bindings)
-int id; double px;
-std::tie(id, px) = parse();
-std::tie(std::ignore, px) = parse();   // std::ignore discards a component
+#include <cassert>
+#include <string>
+#include <tuple>
+#include <utility>
 
-// 2. Lexicographic comparison — still the best pre-C++20 idiom, and fine after
-bool operator<(const K& a, const K& b) {
-    return std::tie(a.x, a.y, a.z) < std::tie(b.x, b.y, b.z);
+int main() {
+    std::pair<int, std::string> venue{7, "XSGX"};
+    std::tuple<int, int, double> quote{101, 12, 101.5};
+
+    auto& price = std::get<2>(quote);
+    auto [id, name] = venue;
+
+    assert(price == 101.5);
+    assert(id == 7 && name == "XSGX");
+    static_assert(std::tuple_size_v<decltype(quote)> == 3);
 }
 ```
 
-`std::ignore` is an object whose `operator=` does nothing; it exists solely for `tie` and was reused for `[[maybe_unused]]`-style discards.
+`std::get<I>` is compile-time indexed; an out-of-range index is ill-formed, not a run-time exception. Type-based `get<T>` is also ill-formed when `T` is absent or occurs more than once. Index access is often more robust for repeated scalar types, while named structs are more robust than either form when meanings matter.
 
-### `tie` vs structured bindings vs `forward_as_tuple`
+### Representation and type traits are not inferred
 
-| Tool | Produces | Requires pre-declared variables | Can bind to rvalues |
-|---|---|---|---|
-| `std::tie(a,b)` | `tuple<A&,B&>` | Yes | No (lvalues only) |
-| Structured bindings (C++17) | Declares new names | No | Yes |
-| `std::forward_as_tuple(a,b)` | `tuple<A&&,B&&>` preserving value category | No | Yes |
+The standard does not require tuple elements to appear in template-argument order in memory. It does not make a tuple layout-compatible with a struct containing the same types. Empty-component optimization, padding, and trivial copyability can vary with implementation and component properties.
 
-**Structured bindings replace `tie` for unpacking** and are strictly better: no pre-declaration, no default-construct-then-assign, and they work on structs and arrays too. `tie` survives for comparison chains and for assigning into *existing* variables (a structured binding always declares new ones).
+`std::pair` exposes actual members in declaration order, but padding and standard-layout/triviality still depend on its specification, implementation, and component types. Neither pair nor tuple is a wire format. If a program requires a trait, ask for it:
 
-`std::forward_as_tuple` is the perfect-forwarding variant, used to pass argument packs through layers without copies. **Its result must not outlive the full expression** — it holds references to (possibly temporary) arguments, so storing it dangles. That is the classic `forward_as_tuple` bug.
+```cpp
+#include <type_traits>
 
-A performance note: `std::apply`, `tie`, and structured bindings are all pure compile-time constructs. After inlining they generate nothing — no runtime cost whatsoever. The cost is in compile time and diagnostics.
+struct MyRecord {
+    int id;
+    double value;
+};
+
+static_assert(std::is_trivially_copyable_v<MyRecord>);
+```
+
+Do not replace `MyRecord` with `tuple<int, double>` and assume the result inherits every representation property of `int` and `double`. Chapter 3 owns object representation and serialization.
+
+Construction helpers also affect types. `make_pair` and `make_tuple` decay most arguments, so arrays become pointers and top-level references/cv-qualification are removed; `reference_wrapper` is deliberately unwrapped into a reference element. Class template argument deduction for direct `pair`/`tuple` construction is not a spelling-only replacement in every such case. Inspect the deduced type when references or arrays are involved.
+
+Pair and tuple comparisons are lexicographic. They compare the first unequal component rather than combining hashes or comparing raw bytes. This makes `std::tie(lhs.price, lhs.sequence) < std::tie(rhs.price, rhs.sequence)` a concise strict ordering when those fields already have suitable comparison semantics. If comparison order is part of a public invariant, a named comparator can make that order harder to change accidentally.
+
+### Tuple or named struct?
+
+Use a short product type when the roles are local and conventional:
+
+- an iterator and a success flag;
+- a key and value;
+- a temporary lexicographic comparison key;
+- a short argument pack consumed generically.
+
+Use a named struct when the result crosses an API boundary, gains invariants, or has several same-typed fields:
+
+```cpp
+struct FillSummary {
+    int filled_quantity;
+    int remaining_quantity;
+    double average_price;
+};
+```
+
+`tuple<int, int, double>` cannot communicate which integer is filled and which is remaining. Structured bindings still work with a suitably accessible aggregate, so naming the type does not sacrifice concise unpacking.
+
+### `std::apply`: expand a product into arguments
+
+`std::apply(f, product)` invokes a callable with the product's elements as arguments. C++23 supports the standard tuple-like product types. Callable ownership, captures, and `std::invoke` belong to Chapter 18; the relevant fact here is how element value categories and lifetimes reach that call.
+
+```cpp
+#include <cassert>
+#include <tuple>
+
+int main() {
+    auto operands = std::tuple{4, 7, 3};
+    int result = std::apply(
+        [](int a, int b, int c) { return a + b * c; },
+        operands);
+    assert(result == 25);
+}
+```
+
+Passing an lvalue tuple exposes lvalue elements; passing `std::move(tuple)` can expose rvalue elements. That distinction matters when the callable consumes move-only components.
+
+### `std::tie` and reference-bearing tuples
+
+`std::tie(a, b)` creates `tuple<A&, B&>`. It is useful for assignment into existing variables and concise lexicographic comparison:
+
+```cpp
+// Context: parse_header and the record types are application-defined.
+std::tie(order_id, quantity) = parse_header();
+return std::tie(lhs.symbol, lhs.sequence)
+     < std::tie(rhs.symbol, rhs.sequence);
+```
+
+`std::ignore` discards a component during tuple assignment. Structured bindings are usually clearer for declaring new variables; `tie` remains useful when variables already exist.
+
+`std::forward_as_tuple` is different. It preserves argument value categories and can therefore store rvalue references to temporaries. Those temporaries die at the end of the full expression:
+
+```cpp
+// Incorrect: the temporary string dies at the semicolon.
+auto refs = std::forward_as_tuple(std::string{"temporary"});
+// refs contains a dangling reference on the next statement.
+```
+
+That snippet is intentionally incorrect. A tuple containing references is non-owning; the tuple's lifetime does not extend any referent. Storing deferred arguments safely requires owning values or a separately proven lifetime, not merely a different tuple helper.
+
+`std::make_tuple` normally decays arguments and recognizes `reference_wrapper`. This can deliberately produce a reference element with `std::make_tuple(std::ref(x))`; it can also surprise code that expected an independent value. State ownership at the declaration.
+
+`tuple_cat` concatenates tuple-like products, preserving or constructing element types according to its arguments. It is not a lifetime escape hatch: concatenating reference-bearing tuples produces another product whose references need valid referents. It can also move or copy owning components, so do not treat a chain of tuple helpers as guaranteed run-time no-ops without checking the instantiated types and generated code.
 
 ---
 
-## 15.3 `std::optional`
+## 15.3 Nullable values: `std::optional` — Core
 
-`std::optional<T>` (C++17) is a **discriminated union of `T` and nothing**: aligned storage for a `T` plus a `bool`. It models "a value that may be absent" *without* allocation and without a sentinel.
+`std::optional<T>` contains either a live `T` or no `T`. It does not use a caller-visible sentinel and does not independently allocate storage for its state. `T` must be an object type that satisfies the optional requirements; C++23 does not permit `optional<T&>`.
 
-```cpp
-std::optional<Order> find(OrderId id);
-if (auto o = find(id)) { use(*o); }          // operator bool + operator*
-int q = o.value_or(0);                         // no throw
-int r = o->qty;                                // UB if empty — no check
-int v = o.value();                             // throws std::bad_optional_access if empty
-o.reset(); o = std::nullopt;                   // disengage
-o.emplace(args...);                            // construct in place, no move
-std::optional<Big> b{std::in_place, a, b, c};  // in-place construction at the call site
-```
+### Access defines the failure contract
 
-### Representation and cost
-
-```
-sizeof(optional<T>) == sizeof(T) rounded up to alignof(T), plus one bool, rounded to alignof(T)
-optional<int>    → 8 bytes   (4 value + 1 bool + 3 padding)
-optional<double> → 16 bytes
-optional<int*>   → 16 bytes  — the bool cannot be folded into the pointer's invalid values
-```
-
-**There is no niche optimization.** Unlike Rust's `Option<&T>`, `std::optional<T*>` is 16 bytes, not 8. This is a legitimate criticism and the reason hot data structures use a sentinel (`price == INT64_MIN`) or a domain-specific optional. C++26's `std::optional<T&>` (P2988) finally adds reference specialization, which *is* pointer-sized — but note it has **rebinding** assignment semantics (assigning rebinds the reference rather than assigning through it), which was the controversy that delayed it for a decade.
-
-`optional` is **trivially copyable iff `T` is** (the implementations specialize on triviality), trivially destructible iff `T` is, and `constexpr`-usable throughout since C++17 (with full `constexpr` for non-trivial `T` arriving with C++20's constexpr-dynamic-allocation rules).
-
-### Monadic operations (C++23)
-
-```cpp
-auto result = find(id)
-            .and_then([](const Order& o) -> std::optional<Price> { return o.limit; })
-            .transform([](Price p) { return p * 100; })
-            .or_else([]{ return std::optional<Price>{default_px}; });
-```
-`and_then` (flatMap), `transform` (map), `or_else` (fallback). These eliminate nested `if (o)` pyramids and compose with `std::expected`'s identically-named members (Ch. 10).
-
-### Design guidance and traps
-
-- **`optional<bool>` is a three-state type** and almost always confusing. So is `optional<optional<T>>`.
-- **`operator*` and `operator->` do not check.** Dereferencing a disengaged optional is UB, not an exception. `value()` throws; `value_or` doesn't. People assume `*` checks.
-- **`value_or` always evaluates its argument** and always constructs a `T` — expensive if the fallback is costly. C++23's `or_else` is lazy.
-- **`optional<T&>` did not exist before C++26.** Use `T*` for "optional reference" in older code; a raw pointer *is* the idiomatic optional reference.
-- **Comparison with `nullopt` and with `T` is defined**, so `o == 5` works and a disengaged optional compares less than any value — occasionally surprising in sorts.
-- **`optional` is not a replacement for error reporting.** It says "absent", not "why". Use `std::expected<T,E>` (C++23, Ch. 10) when the caller needs a reason.
-- On the hot path, `optional<T>` for a large `T` costs a branch on every access plus the storage; for a POD result, returning a struct with an explicit status field often generates better code because the compiler can keep both in registers.
-
----
-
-## 15.4 `std::variant` and Visitation
-
-`std::variant<Ts...>` (C++17) is a **type-safe tagged union**: storage for the largest alternative plus an index, with lifetime management the raw union (Ch. 5) doesn't give you.
-
-```cpp
-std::variant<Add, Cancel, Execute> ev = Cancel{id};
-std::size_t i = ev.index();
-if (auto* c = std::get_if<Cancel>(&ev)) { ... }     // pointer, no throw
-Cancel& c2 = std::get<Cancel>(ev);                   // throws std::bad_variant_access
-std::visit([](auto&& e){ handle(e); }, ev);          // exhaustive dispatch
-
-// The overload idiom (C++17 CTAD + inherited operator())
-template <class... Fs> struct overloaded : Fs... { using Fs::operator()...; };
-template <class... Fs> overloaded(Fs...) -> overloaded<Fs...>;   // unneeded in C++20
-std::visit(overloaded{
-    [](const Add& a)     { ... },
-    [](const Cancel& c)  { ... },
-    [](const Execute& x) { ... },
-}, ev);
-```
-
-### Representation
-
-`sizeof(variant<Ts...>)` ≈ `max(sizeof(Ts)...)` rounded to `max(alignof(Ts)...)`, plus the index (typically `unsigned int`, though implementations shrink it to `unsigned char` when there are few alternatives). No heap allocation, ever — which is the whole point versus a `unique_ptr<Base>` hierarchy.
-
-### The valueless-by-exception state
-
-If an alternative's move/copy constructor throws *during assignment*, the variant can end up holding nothing: `valueless_by_exception() == true`, `index() == variant_npos`, and any `get`/`visit` throws. This exists because the standard refused to require heap fallback or double buffering. Implementations avoid it entirely when all alternatives are nothrow-move-constructible — so **making every alternative `noexcept`-movable eliminates the state**, and every `visit` then skips the valueless check. That check is a real branch in generated code; removing it is a measurable win in dispatch-heavy code.
-
-### `visit` dispatch cost
-
-`std::visit` on a single variant compiles to a **jump table** (an array of function pointers indexed by `index()`), plus the valueless check. That is:
-
-- an indirect call — **not inlinable**, and subject to indirect-branch misprediction (~15–20 cycles when wrong, Ch. 27);
-- for N variants visited together, an N-dimensional table of size ∏|Ts|, which explodes in both code size and compile time. Two 5-alternative variants is a 25-entry table; three is 125.
-
-Alternatives when dispatch is hot:
-- **`if constexpr` chains on `get_if`** for ≤3–4 alternatives — the compiler emits predictable compare-and-branch and can inline each arm.
-- **A hand-rolled tagged union with a `switch`** — the compiler generates a jump table it *can* inline into, unlike `visit`'s function-pointer table. This is the standard low-latency answer, and it is often faster than both `visit` and virtual dispatch.
-- **Sorting/batching events by type** so the branch predictor sees runs of the same tag.
-
-### Variant vs the alternatives
-
-| | `variant` | Virtual base + `unique_ptr` | Raw tagged union |
-|---|---|---|---|
-| Allocation | None | One per object | None |
-| Dispatch | Jump table, indirect call, valueless check | vtable indirect call | `switch`, inlinable |
-| Adding a type | Edit the variant + every visitor (**compile error** — exhaustiveness) | Add a class, no visitor edits | Edit the enum + every switch |
-| Adding an operation | Add a visitor, no type edits | Edit every class | Add a function |
-| Cache | Contiguous, sized to the largest | Pointer chase per element | Contiguous |
-
-This is the **expression problem**: `variant` makes adding operations cheap and adding types expensive; inheritance is the reverse. Say that sentence in an interview. For a closed set of message types in a feed handler — which is exactly a closed set — `variant` or a hand-rolled union is right, and the contiguity (no pointer chase, no allocation) is worth more than the dispatch difference.
-
-Other details: `std::monostate` is the empty alternative you add to make a variant default-constructible when the first alternative isn't; `std::holds_alternative<T>` is the type-check; duplicate alternative types make type-based `get`/`holds_alternative` ill-formed; and converting-construction uses overload resolution, which historically did surprising things (`variant<string,bool> v = "x"` selected `bool` before P0608 fixed it in C++17's DR).
-
----
-
-## 15.5 `std::any`
-
-`std::any` (C++17) holds a value of **any** copy-constructible type, with type recovery via `std::any_cast`. It is type-erasure (Ch. 6) with no interface at all.
-
-```cpp
-std::any a = 42;
-a = std::string("hello");
-int i = std::any_cast<int>(a);            // throws std::bad_any_cast — wrong type now
-auto* p = std::any_cast<std::string>(&a); // pointer form, returns nullptr on mismatch
-const std::type_info& t = a.type();        // requires RTTI
-a.reset(); bool e = a.has_value();
-```
-
-### Cost
-
-- **Small-object optimization is permitted but not required**, and its threshold is implementation-defined (libstdc++ and libc++ both inline types up to roughly 16 bytes that are nothrow-move-constructible). Anything larger **allocates**.
-- `type()` requires **RTTI**; `-fno-rtti` builds cannot use `std::any` at all. `any_cast` compares `type_info`, which across shared-library boundaries can compare *addresses* of type_info objects and fail if symbols aren't merged (`-fvisibility=default` / `RTLD_GLOBAL`, Ch. 1 §1.12) — a genuinely nasty production failure.
-- `any_cast` is a runtime type check plus a possible allocation on copy.
-
-### When to use it (rarely)
-
-`any` is right for genuinely heterogeneous, open-ended storage: plugin registries, property bags, configuration values, message-passing infrastructure that must forward unknown payloads. It is wrong whenever the set of types is closed — that's `variant` — and wrong whenever the operations are known — that's an interface or a concept.
-
-| | `variant<A,B,C>` | `any` |
+| Operation | Empty behavior | Use when |
 |---|---|---|
-| Type set | Closed, compile-time | Open, runtime |
-| Allocation | Never | When above the SOO threshold |
-| Retrieval | `visit` (exhaustive, checked at compile time) | `any_cast<T>` (you must guess T) |
-| RTTI | Not required | **Required** |
-| Exhaustiveness | Compiler-enforced | None |
-
-On a low-latency path, `std::any` is essentially never appropriate: an allocation, an RTTI comparison, and no inlining. It's a configuration-layer tool.
-
----
-
-## 15.6 `std::bitset`
-
-`std::bitset<N>` is a fixed-size sequence of N bits with a compile-time N, stored as an array of `unsigned long` words: `sizeof(bitset<N>) == ceil(N/64)*8` on LP64 (so `bitset<1>` is 8 bytes, `bitset<65>` is 16).
+| `has_value()` / contextual `bool` | Reports false | Branching explicitly |
+| `operator*`, `operator->` | Precondition violated; behavior undefined | Engagement already proved |
+| `value()` | Throws `bad_optional_access` | Throwing access is part of API |
+| `value_or(fallback)` | Returns converted fallback | Fallback expression is cheap/eager |
+| `and_then`, `transform`, `or_else` | Propagate or handle absence | Composing C++23 operations |
 
 ```cpp
-std::bitset<64> b;
-b.set(3); b.reset(3); b.flip(); b.test(3);   // test() throws out_of_range; operator[] doesn't
-b.count();      // popcount — compiles to POPCNT with -mpopcnt/-march=haswell
-b.any(); b.none(); b.all();
-b <<= 1; b |= other;                          // whole-word ops
-unsigned long v = b.to_ulong();               // throws overflow_error if it doesn't fit
-std::string s = b.to_string();                // allocates
+#include <cassert>
+#include <optional>
+
+std::optional<int> top_quantity(bool book_has_level) {
+    if (!book_has_level) {
+        return std::nullopt;
+    }
+    return 17;
+}
+
+int main() {
+    auto doubled = top_quantity(true)
+        .transform([](int quantity) { return quantity * 2; });
+
+    assert(doubled && *doubled == 34);
+    assert(top_quantity(false).value_or(0) == 0);
+}
 ```
 
-`operator[]` returns a **proxy reference** (`bitset<N>::reference`) for the mutable case — the same design as `vector<bool>` and the same consequence: `auto x = b[3];` captures a proxy, not a `bool`, and using it after `b` dies is a dangling reference. Write `bool x = b[3];`.
+`value_or(expr)` is a normal function call, so `expr` is evaluated before `value_or` begins—even when the optional is engaged. The conversion from the fallback to `T` is used only on the empty path, but an expensive function call used to produce that argument has already happened. C++23 `or_else` takes a callable and is lazy:
 
-### Choosing among the bit containers
+```cpp
+// Context: lookup and load_fallback return compatible optionals.
+auto value = lookup(id).or_else([] {
+    return load_fallback();
+});
+```
 
-| | `std::bitset<N>` | `std::vector<bool>` | `uint64_t` | `std::array<uint64_t, K>` |
-|---|---|---|---|---|
-| Size | Compile-time | Runtime | 64 | Compile-time |
-| Storage | Inline, no allocation | Heap | Register | Inline |
-| Interface | Rich (`count`, `any`, shifts) | Container-ish, proxy refs, **not a real container** | Manual | Manual |
-| Bulk ops | Word-at-a-time, often vectorized | Word-at-a-time internally, but API-hostile | — | Whatever you write |
-| Hot path | Fine | Avoid | Best | Best for large fixed sets |
+`and_then` expects a callable returning another optional-like result of the required form and flattens it. `transform` wraps the callable's result. These members improve local composition; the decision between absence, error values, and exceptions remains Chapter 10's responsibility.
 
-`bitset` is a good default for flag sets and fixed-size membership tests: no allocation, dense, and `count()`/`any()` compile to `POPCNT`/`OR`-reduce. Its weaknesses are that N must be a compile-time constant, `to_string`/`operator<<` allocate, and there's no way to iterate set bits efficiently — for that you want the `x & -x` / `countr_zero` loop (§15.7) over raw words.
+### State transitions and lifetime
 
-`std::vector<bool>` remains the standard's acknowledged design mistake: it is a bit-packed specialization that isn't a container (no `data()`, proxy references, `&v[0]` doesn't give you a `bool*`), breaking generic code. Use `std::vector<char>`, `std::vector<uint8_t>`, or `bitset` instead. C++26 discussions around deprecating it continue; the ship has not sailed.
+An optional's contained `T` begins its lifetime when the optional becomes engaged and ends when it is reset, destroyed, assigned to `nullopt`, or replaced as required by an operation.
+
+Important consequences:
+
+- `reset()` destroys the contained object if present.
+- `emplace(args...)` destroys any old value and constructs a new one in place. If construction throws, the optional is disengaged.
+- Copying an engaged optional copies its value; copying an empty optional produces an empty optional.
+- Moving an engaged optional move-constructs or move-assigns the destination value but does **not** require the source optional to become empty. The source remains engaged with a valid but possibly moved-from `T`.
+- A reference or pointer to the contained `T` becomes invalid when that `T` is destroyed or replaced.
+
+```cpp
+#include <cassert>
+#include <optional>
+#include <string>
+#include <utility>
+
+int main() {
+    std::optional<std::string> source{"ABC"};
+    std::optional<std::string> destination{std::move(source)};
+
+    assert(destination.has_value());
+    assert(source.has_value());  // its string is valid but moved-from
+}
+```
+
+The last assertion is often missed. “Move transfers engagement” is not optional's contract.
+
+### Representation-neutral cost model
+
+The standard specifies state and operations, not a separate `bool`, a pointer-niche optimization, or an exact `sizeof(optional<T>)`. An implementation may use padding or another representation so long as behavior is correct. Portable code can rely on:
+
+- the contained object being nested within the optional object;
+- no independent dynamic allocation by optional itself;
+- conditional triviality guarantees for relevant special members when `T` meets their conditions;
+- the address of a contained value remaining stable until an operation destroys or replaces it.
+
+Measure `sizeof`, alignment, generated branches, and copy/move behavior on the actual type. Do not claim that `optional<T*>` has a universal size or that an engaged flag always occupies a separate byte. Do not serialize optional's raw bytes.
+
+In a large array, padding can make optional storage amplification material. A separate bitmap plus dense values can be better when presence is sparse or scanned independently. That is a data-layout transformation with more complex indexing, not a reason to hide absence behind an unexplained sentinel.
+
+Optional comparisons treat disengagement as a state. Two disengaged optionals compare equal, and a disengaged optional orders before an engaged one in the ordinary relational ordering. Sorting optionals can therefore move missing values to the front even if the domain wanted “unknown last.” Supply the domain comparator instead of inheriting a library state order accidentally.
+
+Nested nullable state deserves suspicion. `optional<bool>` distinguishes absent, false, and true; `optional<optional<T>>` distinguishes an outer absence from an inner absence. Both are valid when all states have stable names in the domain. Otherwise an enum, variant, or named state structure is clearer.
+
+### What optional should mean
+
+Good uses include “lookup found no element,” “message omitted an optional field,” and “configuration has no override.” If absence violates a precondition, returning optional may merely defer a bug. If callers need to distinguish malformed input, unavailable data, and permission denial, `expected<T,E>` or another explicit result belongs at the boundary.
+
+An optional reference in C++23 is normally represented by `T*` with a non-owning contract, or by `optional<reference_wrapper<T>>` when optional-style operations are useful. Both forms can dangle; Section 15.8 makes that lifetime explicit.
 
 ---
 
-## 15.7 Standard Bit-Manipulation Utilities
+## 15.4 Closed alternatives: `std::variant` and visitation — Core
 
-`<bit>` (C++20) standardized what everyone was doing with compiler intrinsics, with correct edge-case semantics and `constexpr` evaluation.
+`std::variant<Ts...>` manages the lifetime of one alternative from a compile-time list. It is the standard closed-sum type: adding a new alternative changes the type and forces code that requires exhaustive invocability to account for it.
+
+### Access and exhaustive dispatch
+
+```cpp
+#include <cassert>
+#include <string>
+#include <variant>
+
+struct Add {
+    int quantity;
+};
+struct Cancel {
+    int order_id;
+};
+struct Reject {
+    std::string reason;
+};
+
+template <class... Fs>
+struct overloaded : Fs... {
+    using Fs::operator()...;
+};
+
+int main() {
+    using Event = std::variant<Add, Cancel, Reject>;
+    Event event = Cancel{42};
+
+    int code = std::visit(overloaded{
+        [](const Add& add) { return add.quantity; },
+        [](const Cancel& cancel) { return cancel.order_id; },
+        [](const Reject&) { return -1; }
+    }, event);
+
+    assert(code == 42);
+    assert(std::holds_alternative<Cancel>(event));
+}
+```
+
+`std::get<T>(v)` returns the active `T` or throws `std::bad_variant_access`. `std::get_if<T>(&v)` returns a pointer or null and is the natural non-throwing probe. Index-based access handles duplicate alternative types; type-based access is ill-formed unless the type occurs exactly once.
+
+`std::visit` requires its callable to be invocable for every possible alternative combination and to satisfy its return-type rules. The specific overload set above is exhaustive. A generic fallback such as `[](const auto&) { ... }` deliberately makes future alternatives compile, so it trades compile-time exhaustiveness for a default policy.
+
+`std::monostate` is an empty, regular alternative often placed first when a meaningful alternative is not default-constructible or when an explicit “none” domain state is required. `variant<monostate, T>` resembles optional structurally, but optional communicates nullable intent more directly.
+
+A default-constructed variant default-constructs its first alternative, so alternative order affects more than the numeric result of `index()`. Reordering alternatives can change default behavior and every index. Never persist or transmit `index()` without a separate versioned protocol mapping. Prefer type-based access in source where alternative types are unique, while still treating the variant declaration as an ordered type.
+
+Every `visit` invocation must produce a valid call for each active-type combination, and the deduced overload requires compatible result types and value categories. A visitor whose arms return unrelated types can fail even though every alternative has a syntactically plausible handler. Give `visit<R>` an explicit result in C++20-and-later code when a deliberate common conversion is part of the contract.
+
+### State transitions and `valueless_by_exception`
+
+Changing alternatives can require destroying the old object and constructing a new one. If construction or movement throws after the old alternative can no longer be retained, the variant may become `valueless_by_exception()`:
+
+- `index()` returns `variant_npos`;
+- `get` and `visit` cannot produce an alternative and throw `bad_variant_access`;
+- assignment or emplacement can later give it a value again.
+
+Do not describe the variant as “always exactly one alternative” without this qualification. Nothrow moves and constructions reduce the transitions that can produce a valueless state, but an `emplace` of an alternative with a throwing constructor still deserves analysis. Either handle `valueless_by_exception`, constrain alternatives and operations so it is unreachable in the relevant path, or treat it as a fatal invariant violation explicitly.
+
+### Representation and dispatch are implementation concerns
+
+A useful capacity estimate is:
+
+```text
+storage ≳ max(sizeof(each alternative)), aligned for the strictest alternative
+       + state needed to identify the active alternative
+```
+
+Exact size, padding, tag type, and tag position are unspecified. One very large alternative makes every variant object large; if that alternative is rare, indirection for that alternative or a different event representation may improve object density at the cost of allocation/ownership complexity.
+
+The standard specifies `visit` behavior and complexity requirements, not a mandatory function-pointer table or switch. Implementations and optimizers can use branches, tables, inlining, or other equivalent lowering. Multi-variant visitation must instantiate valid calls for combinations of alternatives, so compile time and code size can grow combinatorially even when run-time dispatch remains efficient.
+
+For a hot event loop, measure:
+
+- alternative frequency and transition pattern;
+- generated code with the production optimizer and LTO settings;
+- instruction footprint and branch behavior;
+- object size and cache density;
+- cost of alternative constructors/destructors.
+
+A hand-written tag and union can expose a switch more directly, but then the application owns lifetime, exception, and exhaustive-state correctness. Use it only when measurement justifies that responsibility. General callable and virtual-dispatch trade-offs stay in Chapters 6 and 18.
+
+### Closed set versus open hierarchy
+
+Choose variant when producers and consumers share a finite domain set such as feed events or parser tokens. Adding an alternative should trigger coordinated rebuilds and visitor updates. Choose a virtual interface or other erased abstraction when third parties add types independently and operations are stable. This is an extensibility decision before it is a dispatch benchmark.
+
+---
+
+## 15.5 Durations, time points, and clocks — Core
+
+`std::chrono::duration<Rep, Period>` stores a count whose unit is encoded by a compile-time ratio. A `time_point<Clock, Duration>` is a duration since a clock's epoch and carries the clock type. Units and clock domains therefore participate in type checking.
+
+### Conversion and rounding
+
+```cpp
+#include <cassert>
+#include <chrono>
+
+int main() {
+    using namespace std::chrono;
+    using namespace std::chrono_literals;
+
+    nanoseconds fine = 1500us;                 // exact conversion
+    microseconds truncated =
+        duration_cast<microseconds>(1500500ns);
+
+    assert(fine == 1'500'000ns);
+    assert(truncated == 1500us);
+    assert(round<milliseconds>(1500us) == 2ms);
+    assert(floor<milliseconds>(-1500us) == -2ms);
+}
+```
+
+Conversion to a duration that can represent every source tick without loss can be implicit when representation conversions allow it. Potentially lossy period conversion requires `duration_cast`. For integral representations, `duration_cast` truncates toward zero. `floor`, `ceil`, and `round` express other boundary policies; `round` resolves exact halves toward the even result.
+
+The rounding policy changes bucket assignment in latency histograms and deadline calculations. State it rather than relying on an incidental integer conversion.
+
+The representation type still obeys ordinary arithmetic rules. A `duration<std::int64_t, std::nano>` gives unit safety, not saturation; signed overflow remains undefined behavior. Converting a floating duration containing an out-of-range or non-finite value to an integral representation has undefined behavior. Validate untrusted values before casting, and compute long deadlines in a representation whose range is sufficient.
+
+Two time points from the same clock can be subtracted to produce a duration. A duration can be added to a time point. Adding two time points is meaningless and ill-formed. Time points from different clocks do not mix merely because their duration representations match; conversion needs a defined relationship between the clocks.
+
+### Choose clocks by semantics
+
+| Need | Standard clock/type | Reason |
+|---|---|---|
+| Measure elapsed time | `steady_clock` | Monotonic; `is_steady` is true |
+| Express a timeout deadline | `steady_clock::time_point` | Wall-clock adjustment does not move the deadline |
+| Record civil/wall time | `system_clock` | Represents system-wide real time; calendar conversion support |
+| Interoperate with `time_t` | `system_clock` | Standard conversion functions |
+| “Highest resolution” | Inspect chosen clock's `period` and measured implementation | `high_resolution_clock` identity is implementation-defined |
+
+`high_resolution_clock` may be an alias for another clock or a distinct implementation clock. It does not portably promise monotonicity, useful accuracy, or lower call overhead. Select `steady_clock` or `system_clock` from semantics, then inspect resolution and implementation on the target.
+
+A clock's `period` describes its tick period as a type-level ratio. It does not guarantee that successive `now()` calls change by one tick, that readings are accurate to that period, or that call overhead is smaller than the period. Measure effective resolution and overhead separately.
+
+Since C++20, `system_clock` time points measure Unix time: time since 1970-01-01 00:00:00 UTC, excluding leap seconds. The clock can still be adjusted, so subtracting two system-clock readings is not the robust way to time work.
+
+### `now()` is an observable cost
+
+Duration arithmetic is ordinary arithmetic after unit conversions are resolved. Calling `Clock::now()` reaches an implementation and operating-system clock source whose mechanism and cost are outside the C++ abstract machine. It might use a user-space fast path, a system call, hardware counter conversion, or another platform facility.
+
+For low-latency measurement:
+
+1. use `steady_clock` unless a calibrated platform counter is an explicit requirement;
+2. measure `now()` overhead and resolution on the deployed platform;
+3. avoid placing two clock reads around work shorter than the measurement noise without batching;
+4. keep wall-time formatting and zone conversion outside the critical interval;
+5. report the clock, units, aggregation, and percentile method with results.
+
+Chapter 35 owns clock-source synchronization and NTP/PTP behavior. The portable conclusion here is narrower: clock selection preserves semantic correctness, while clock-call cost must be measured.
+
+---
+
+## 15.6 Worked choice and diagnosis — Core
+
+### Choose the vocabulary type
+
+Consider five interfaces:
+
+| Requirement | Choice | Rejected alternative and reason |
+|---|---|---|
+| Return bid price and quantity, always together | Named `TopOfBook` struct | Tuple hides component meaning at API boundary |
+| Find an order; “not present” is normal and needs no reason | `optional<Order>` or non-owning handle according to ownership | Sentinel order ID mixes domain value with state |
+| Parse a message; caller needs offset and error category | `expected<Message, ParseError>` | Optional loses the reason; details remain Chapter 10 |
+| Process one of `Add`, `Cancel`, `Trade` known at build time | `variant<Add, Cancel, Trade>` | `any` discards compile-time exhaustiveness |
+| Plugin attaches an arbitrary copyable metadata value | `any`, outside critical path | Variant would require central enumeration of plugin types |
+
+The table is incomplete without lifetime:
+
+- Returning `optional<Order>` owns/moves or copies an order.
+- Returning `optional<reference_wrapper<const Order>>` borrows an order and can dangle.
+- Returning a stable order handle can decouple identity from storage but needs a validation contract.
+
+Chapter 9 owns general ownership handles; Chapter 13 owns non-owning views.
+
+### Diagnose eager fallback work
+
+```cpp
+// Context: cache_lookup returns optional<string>.
+std::optional<std::string> name = cache_lookup(id);
+return name.value_or(fetch_default_name());
+```
+
+Even when `name` is engaged, `fetch_default_name()` is evaluated before `value_or` is called. The defect is not optional's storage or branch; it is ordinary argument evaluation. In C++23:
+
+```cpp
+// Context: fetch_default_name returns a compatible optional.
+return cache_lookup(id)
+    .or_else([] { return fetch_default_name(); })
+    .value();
+```
+
+Here `fetch_default_name` must return a compatible optional. A direct `if` is often clearer and can avoid the throwing final `value()`:
+
+```cpp
+// Context: fetch_default_name_value returns string.
+if (auto name = cache_lookup(id)) {
+    return std::move(*name);
+}
+return fetch_default_name_value();
+```
+
+The correct choice depends on the actual return types and error contract, not a preference for one-liners.
+
+### Predict a moved optional and a throwing variant
+
+```cpp
+// Context: a and b are examined after this state transition.
+std::optional<std::string> a{"live"};
+auto b = std::move(a);
+```
+
+Afterward, both `a` and `b` are engaged. `b` contains the transferred value; `*a` is a valid but unspecified moved-from string state.
+
+For:
+
+```cpp
+// Context: event is a variant with LargeEvent as an alternative.
+event.emplace<LargeEvent>(source);
+```
+
+if constructing `LargeEvent` throws, do not assume the previous alternative survives. Inspect the specified operation and design for a possible valueless variant. This prediction is about object lifetime and exception ordering, not representation.
+
+---
+
+## 15.7 Open erased values: `std::any` — Role-specific
+
+`std::any` holds either no value or one value of a run-time-selected copy-constructible type. It is useful when the set of types is genuinely open and no shared operation belongs in the container abstraction.
+
+```cpp
+#include <any>
+#include <cassert>
+#include <string>
+
+int main() {
+    std::any value = 7;
+    assert(std::any_cast<int>(value) == 7);
+
+    value = std::string{"metadata"};
+    auto* text = std::any_cast<std::string>(&value);
+    assert(text && *text == "metadata");
+    assert(std::any_cast<int>(&value) == nullptr);
+}
+```
+
+The value form of `any_cast<T>` throws `bad_any_cast` on a mismatch. The pointer form returns null and is preferable when mismatch is expected. `type()` returns the held type's `type_info`, or `typeid(void)` when empty. Build modes that disable or alter RTTI are compiler extensions; whether `any` remains usable there is a toolchain question, not an alternate standard guarantee.
+
+Implementations may keep some suitably small values inside the `any` object and allocate for others, but the threshold and eligibility are unspecified. Code cannot use `sizeof(T)` alone to predict allocation. Measure the exact library/type combination or use an explicit allocator-aware erased design if allocation policy is contractual.
+
+`any` cannot directly hold a move-only value such as `unique_ptr<T>` because its contained type must be copy-constructible. Wrapping ownership to make it copyable changes semantics and should be deliberate.
+
+Good uses include plugin property bags and control-plane metadata. It is usually a poor hot-path event representation: run-time type checks replace exhaustive static handling, possible allocation affects tail latency, and consumers still need an out-of-band agreement about allowed types.
+
+---
+
+## 15.8 Reference wrappers — Role-specific
+
+`std::reference_wrapper<T>` is a copyable, assignable object that refers to an existing `T`. `std::ref(x)` and `std::cref(x)` construct wrappers. The wrapper is guaranteed trivially copyable and can be stored where a raw C++ reference cannot, including containers and optional.
+
+```cpp
+#include <cassert>
+#include <functional>
+#include <optional>
+#include <vector>
+
+int main() {
+    int bid = 100;
+    int ask = 102;
+
+    std::vector<std::reference_wrapper<int>> prices{bid, ask};
+    prices[0].get() += 1;
+
+    std::optional<std::reference_wrapper<int>> maybe_bid{std::ref(bid)};
+    maybe_bid->get() += 1;
+
+    assert(bid == 102);
+}
+```
+
+Conversion to `T&` and `get()` access the referent. Assigning one wrapper to another **rebinds** the wrapper; it does not assign through to the old referent. Use `.get() = value` to assign through.
+
+The wrapper owns nothing and does not extend lifetime. `std::ref` rejects direct binding to a temporary, which prevents one common error, but it cannot detect a wrapper returned from a function after a local referent dies or retained after a container relocates its elements.
+
+For optional borrowing in C++23:
+
+- `T*` is compact and conventional when null means absent;
+- `optional<reference_wrapper<T>>` provides optional operations and a visibly non-owning component;
+- an index/generation handle is better when storage can relocate or reuse slots.
+
+Choose based on lifetime and identity, not surface syntax.
+
+---
+
+## 15.9 Fixed bits and `<bit>` utilities — Role-specific
+
+### `std::bitset<N>`
+
+`std::bitset<N>` is a fixed-size sequence of bits whose extent is part of the type. The standard specifies bit operations, conversions, and observable values—not a word-array representation, machine word size, or serialization order.
 
 ```cpp
 #include <bit>
-std::bit_cast<uint32_t>(3.14f);       // Ch. 3 §3.8 — the legal type pun
-std::has_single_bit(x);                // is a power of two
-std::bit_ceil(x); std::bit_floor(x);   // round to power of two (bit_ceil UB if result overflows)
-std::bit_width(x);                     // 1 + floor(log2(x)); 0 for x==0
-std::rotl(x, n); std::rotr(x, n);      // real rotates — n may be negative or > width
-std::countl_zero(x); std::countl_one(x);
-std::countr_zero(x); std::countr_one(x);
-std::popcount(x);
-std::endian::native;                   // Ch. 3 §3.9
+#include <bitset>
+#include <cassert>
+#include <cstdint>
+#include <limits>
+
+int main() {
+    std::bitset<16> flags;
+    flags.set(3);
+    flags.flip(5);
+    assert(flags.test(3));
+    assert(flags.count() == 2);
+
+    std::uint32_t mask = 0b10110000u;
+    assert(std::popcount(mask) == 3);
+    assert(std::countr_zero(mask) == 4);
+    assert(std::countl_zero(std::uint32_t{0})
+           == std::numeric_limits<std::uint32_t>::digits);
+}
 ```
 
-All take **unsigned integer types only** (`unsigned char` through `unsigned long long` and extended types) — passing a signed value is ill-formed, deliberately, because shifts and counts on signed types are where UB lives.
+`test(pos)` checks its index and throws `out_of_range`; unchecked subscript access requires a valid position. Mutable `operator[]` returns a proxy because a bit is not a separately addressable C++ object. Capturing that proxy with `auto` can retain a reference into the bitset; use `bool bit = flags[i]` when a value is intended.
 
-| Function | Instruction (x86-64) | Note |
+`to_ulong` and `to_ullong` throw `overflow_error` if set bits do not fit the destination. `to_string` returns an owning string and may allocate. For a fixed flag set, bitset provides dense storage and whole-set Boolean operations. It has no portable raw-word API, so specialized set-bit iteration may be better expressed with explicit unsigned words.
+
+### Defined bit operations
+
+C++20 `<bit>` includes:
+
+- `popcount`, `countl_zero`, `countl_one`, `countr_zero`, `countr_one`;
+- `rotl` and `rotr`;
+- `has_single_bit`, `bit_width`, `bit_floor`, and `bit_ceil`;
+- `bit_cast`, `endian`, and C++23 `byteswap`.
+
+Most counting and power-of-two functions accept unsigned integer types. The zero cases are specified: for an unsigned type with `W` value bits, `countl_zero(0)` and `countr_zero(0)` return `W`. This differs from several older compiler intrinsics whose zero input had no defined result. `bit_ceil(x)` requires its result to be representable in the return type; exceeding that boundary is undefined behavior.
+
+On x86, optimized code may use `POPCNT`, `LZCNT`, or `TZCNT` when the target enables the relevant feature. The names are not interchangeable: `POPCNT` has its own advertised feature, `LZCNT` is associated with AMD's ABM nomenclature, and `TZCNT` belongs to BMI1. Without those features, compilers use other instruction sequences. Source semantics remain those of `<bit>`, including zero handling.
+
+Set-bit iteration over an unsigned word:
+
+```cpp
+// Context: mask is an unsigned integer and consume accepts an index.
+while (mask != 0) {
+    const unsigned index = std::countr_zero(mask);
+    consume(index);
+    mask &= mask - 1;  // clear the lowest set bit
+}
+```
+
+This performs work proportional to the number of set bits. The snippet is contextual because `mask` and `consume` belong to the caller. Chapter 22 owns larger bitmap algorithms; Chapter 3 owns `bit_cast`, byte order, and object representation.
+
+---
+
+## 15.10 Random engines and distributions — Role-specific
+
+The random library separates:
+
+1. a source of seed material;
+2. an engine that deterministically generates unsigned values from state;
+3. a distribution that maps engine output to a requested statistical distribution.
+
+```cpp
+#include <cassert>
+#include <random>
+
+int main() {
+    std::mt19937 engine{12345};  // fixed seed: reproducible test
+    std::uniform_int_distribution<int> side{0, 1};
+
+    const int first = side(engine);
+    assert(first == 0 || first == 1);
+}
+```
+
+Named standard engines specify their algorithms and sequences, but distribution algorithms are not required to produce the same exact sequence across standard-library implementations. A portable test can assert the range or statistical properties as above. A project requiring bit-for-bit cross-platform output needs to own or pin the mapping from engine words to results.
+
+`default_random_engine` is implementation-defined and should not anchor reproducibility. A fixed seed is valuable for repeatable tests and simulation replay. For independent streams, record the full seeding scheme, engine type, and library assumptions.
+
+`std::random_device` is intended to provide nondeterministic values when the implementation has such a source, but it may use a pseudo-random engine and reports implementation-defined quality through `entropy()`. It is not a standard cryptographic API. Construct and seed engines during initialization rather than repeatedly on a critical path.
+
+Distributions can have state, and some sampling algorithms use rejection, producing variable work per result. That variability matters for tail latency even when average cost is acceptable. Benchmark the chosen engine-distribution pair with the production parameter range. Never use `engine() % n` as a general replacement for `uniform_int_distribution`; modulo reduction is biased unless the engine range aligns appropriately with `n`.
+
+Standard engines prioritize reproducibility and statistical roles, not cryptographic unpredictability or universally minimal state. Security-sensitive randomness requires a security-reviewed platform/library facility outside `<random>`.
+
+---
+
+## 15.11 Calendars and time zones — Role-specific
+
+C++20 calendar types express civil dates without collapsing them immediately into strings or untyped integers:
+
+```cpp
+#include <cassert>
+#include <chrono>
+
+int main() {
+    using namespace std::chrono;
+
+    year_month_day date{year{2028}, February, day{29}};
+    assert(date.ok());
+    assert(date.year().is_leap());
+
+    sys_days midnight = date;
+    year_month_day round_trip{midnight};
+    assert(round_trip == date);
+}
+```
+
+`year_month_day` can represent an invalid combination, so call `ok()` when components come from input. `sys_days` is a system-clock time point with day precision. Calendar arithmetic distinguishes adding months/years from adding fixed-duration days; month-end policy must be explicit.
+
+The C++20 time-zone interface includes the time-zone database, `locate_zone`, `zoned_time`, `sys_info`, and `local_info`. Its central distinction is:
+
+- `sys_time<Duration>` identifies a system timeline instant;
+- `local_time<Duration>` is a local-clock reading without a zone;
+- a time zone maps between them and exposes ambiguous/nonexistent local times around offset transitions.
+
+Converting a local reading during a repeated interval can be ambiguous; converting one in a skipped interval can be nonexistent. APIs let callers choose a policy or report the condition rather than silently guessing.
+
+Time-zone support depends on the standard-library implementation and access to time-zone database data. Deployment images need the relevant data, and library support must be tested on every target. Zone lookup, transition search, and formatting are control-plane/reporting work, not operations to insert into a measured hot loop.
+
+Store the timeline representation required by the system contract, retain enough information to interpret it, and convert to a civil zone at boundaries. Chapter 35 owns synchronization, leap-second operational policy, and exchange clock discipline; Chapter 16 owns formatting.
+
+---
+
+## 15.12 SIMD status in C++23 — Role-specific reference
+
+There is no `std::simd` facility in the C++23 standard library. Code using `<simd>` as a standard header targets a later standard/library. `std::experimental::simd` belongs to a Parallelism Technical Specification and is non-standard; availability, namespace, ABI, and API depend on the implementation.
+
+For C++23 production code, explicit SIMD intent is expressed through one of:
+
+- compiler-specific vector types or intrinsics;
+- a vetted third-party SIMD library;
+- scalar code designed for auto-vectorization and verified in generated code.
+
+These choices trade portability, control, tail handling, alignment requirements, numerical reproducibility, and code size. A vector API does not itself guarantee a particular instruction, and auto-vectorization does not guarantee that a loop remains vectorized after a source change.
+
+Chapter 42 owns SIMD instruction sets, intrinsics, alignment, masks, tails, and frequency effects. The C++23 boundary is simple: a draft or later `std::simd` API is not a C++23 standard facility.
+
+---
+
+## 15.13 Low-latency measurement checklist — Role-specific
+
+Vocabulary types often look costless because their syntax is compact. Test the mechanisms:
+
+| Type/facility | Measure or inspect | Tail-risk question |
 |---|---|---|
-| `popcount` | `POPCNT` | Requires SSE4.2 (`-mpopcnt`); otherwise a ~12-op SWAR fallback |
-| `countr_zero` | `TZCNT` / `BSF` | `BSF` is **undefined for 0**; `TZCNT` returns the width. `std::countr_zero(0)` is defined as the width. |
-| `countl_zero` | `LZCNT` / `BSR` | Same 0-handling story; BMI1 for `LZCNT` |
-| `rotl`/`rotr` | `ROL`/`ROR` | Hand-written `(x<<n)|(x>>(64-n))` is **UB when n==0** (shift by 64); `std::rotl` is not |
-| `bit_width` | `BSR`-derived | |
-| `bit_ceil` | `LZCNT` + shift | UB if the result isn't representable — a real trap |
+| `tuple`/named struct | Size, padding, copies, generated ABI passing | Did a refactor change layout or copying? |
+| `optional` | Size amplification, engagement branch, contained operations | Does fallback execute eagerly? |
+| `variant` | Largest alternative, dispatch code, constructor/destructor paths | Can a transition throw or instruction footprint grow? |
+| `any` | Allocation by held type, casts, copies | Does a rare metadata type escape small storage? |
+| `bitset`/`<bit>` | Generated instructions for target feature set | Is conversion/formatting entering the path? |
+| `<random>` | Engine state locality, distribution iterations | Does rejection produce a long tail? |
+| `chrono` | `now()` overhead/resolution, conversion placement | Can clock adjustment or formatting contaminate timing? |
 
-The zero-input cases are the whole reason these functions exist: `__builtin_ctz(0)` is UB, `BSF` leaves the destination unmodified, and the shift-based rotate is UB at n==0 or n==width. `<bit>` defines all of them.
+Use the production compiler, standard library, flags, and representative type distribution. A benchmark containing only the smallest variant alternative or only engaged optionals does not test the actual branch and object-density behavior. Report high percentiles as well as throughput, and retain a correctness test for every state.
 
-### Idioms worth having memorized
+---
+
+## Recall card — Core
+
+- **Product:** pair/tuple/named struct; every component is alive.
+- **Nullable:** optional; zero or one `T`. Absence has one meaning and no error detail.
+- **Closed sum:** variant; listed alternatives plus a possible valueless-by-exception state.
+- **Open erased value:** any; run-time type, copyable payload, possible implementation-dependent allocation.
+- **Representation:** do not infer tuple order, optional flags, variant tags, any small storage, or bitset words.
+- **Access:** optional `value()` and variant `get` throw; `*optional` requires engagement; `get_if` reports mismatch.
+- **Move:** moving optional leaves the source engaged; the contained `T` may be moved-from.
+- **Lifetime:** tuple references and `reference_wrapper` borrow; neither extends referent lifetime.
+- **Time:** duration carries unit; time point carries clock. `steady_clock` for intervals, `system_clock` for wall time.
+- **C++23 boundary:** no standard `optional<T&>` and no standard `std::simd`.
+
+---
+
+## Common traps — Core
+
+- Returning a tuple of several same-typed fields where a named result is part of the API contract.
+- Assuming tuple is trivially copyable whenever every element is, or assuming its memory order.
+- Storing a `forward_as_tuple` result that refers to a temporary.
+- Forgetting that `make_tuple(std::ref(x))` stores a reference rather than an independent copy.
+- Dereferencing an empty optional because `operator*` looks checked.
+- Calling an expensive function as `value_or`'s argument and expecting lazy evaluation.
+- Assuming moving an optional disengages the source.
+- Using optional when callers need a failure reason.
+- Ignoring `variant::valueless_by_exception` while allowing throwing state transitions.
+- Adding a generic visitor fallback and still claiming compile-time exhaustiveness for new alternatives.
+- Assuming `visit` must lower to a non-inlinable function-pointer table.
+- Using `any` for a closed event set or expecting it to hold a move-only type directly.
+- Keeping a `reference_wrapper` after its referent dies or relocates.
+- Serializing bitset's raw object bytes.
+- Treating `high_resolution_clock` as necessarily steady or cheaper.
+- Timing very small work without accounting for the two `now()` calls.
+- Expecting a standard distribution to reproduce identical values across libraries.
+- Presenting `std::simd` as a C++23 facility.
+
+---
+
+## Reasoning questions
+
+1. A result has three integer fields with distinct meanings. When is a tuple adequate, and what change in scope should trigger a named struct?
+2. Why can `value_or(expensive())` perform expensive work when the optional is engaged, and which two rewrites make the laziness explicit?
+3. After moving `optional<string>`, what can be said about source engagement and source contents?
+4. What operations can leave a variant valueless, and how would an API either handle or rule out that state?
+5. Why does a specific-lambda visitor help detect a new variant alternative while a generic `auto` fallback does not?
+6. A plugin metadata system uses `variant` with 40 alternatives maintained centrally. What evidence would justify changing it to `any` or an interface?
+7. Why is `reference_wrapper` safer than a raw reference for storage but no safer for lifetime?
+8. Which clock should represent a five-second timeout deadline, and why can `system_clock` produce the wrong wait?
+9. A simulation must replay bit-for-bit on three standard libraries. Which parts of `<random>` can it rely on, and which mapping may need project ownership?
+10. Why is “bitset is an array of machine words” an unsafe serialization and ABI assumption even when every tested implementation currently behaves that way?
+
+---
+
+## Code-reading puzzle
 
 ```cpp
-x & (x - 1)        // clear lowest set bit
-x & -x             // isolate lowest set bit  (== x & (~x + 1))
-x | (x + 1)        // set lowest clear bit
-(x & (x-1)) == 0   // power of two (plus x != 0) — or std::has_single_bit
-// Iterate set bits:
-while (mask) { int i = std::countr_zero(mask); use(i); mask &= mask - 1; }
+using Event = std::variant<Add, Cancel, Trade>;
+
+void handle(const Event& event) {
+    std::visit(overloaded{
+        [](const Add& add) { process(add); },
+        [](const Cancel& cancel) { process(cancel); },
+        [](const auto& other) { log_unknown(other); }
+    }, event);
+}
 ```
 
-That set-bit iteration loop is the canonical fast path for a bitmap-based order book level index or a ready-set in an event loop: one `TZCNT` and one `BLSR` per set bit, no branching over empty slots.
-
-**Low-latency relevance:** bit tricks turn branches into data dependencies (Ch. 42). A bitmap of occupied price levels lets `countr_zero` find the best bid in one instruction instead of a loop. BMI2's `PDEP`/`PEXT` are extremely useful for bit-field packing but were **microcoded and catastrophically slow on AMD Zen 1–2** (~18–300 cycles vs 3 on Intel), fixed in Zen 3 — a classic "know your target microarchitecture" detail.
-
-C++23 adds `std::byteswap` (Ch. 3 §3.9); C++26 adds saturating arithmetic (`add_sat`, `sub_sat`, `mul_sat`, `div_sat`, Ch. 23) and `std::bit_cast`-adjacent utilities.
+The team adds `Amend` to `Event`, and this function still compiles. Why did the intended exhaustiveness check fail? Rewrite the visitor so adding a new alternative fails compilation until its policy is explicit. Then decide whether an intentional catch-all should log, reject, or be impossible for this domain.
 
 ---
 
-## 15.8 `std::simd`
+## Design exercise
 
-`std::simd` (C++26, from the Parallelism TS v2, formerly `std::experimental::simd`) is a **data-parallel vector type** with explicit width and element type, giving portable SIMD without intrinsics.
+Design signatures for these five operations and defend the state and lifetime contract of each:
 
-```cpp
-#include <simd>                      // C++26
-namespace stdx = std;
-using V = std::simd<float>;           // native width for float on this target
-V a = ..., b = ...;
-V c = a * b + a;                       // elementwise; maps to MULPS/FMA
-auto m = a < b;                        // std::simd_mask<float>
-V d = std::simd_select(m, a, b);       // blend
-float s = std::reduce(a);              // horizontal sum
-```
+1. Return a venue's mandatory numeric ID and display name.
+2. Look up an immutable order that remains owned by a stable repository and may be absent.
+3. Parse a packet and return either a message or a structured error with byte offset.
+4. Queue one of four closed market-data event types for single-threaded processing.
+5. Attach extension-defined diagnostic metadata outside the critical path.
 
-Key pieces: `std::simd<T, Abi>` where the ABI tag selects `native` (widest efficient), `fixed_size<N>`, or `scalar`; `std::simd_mask<T, Abi>` for lane predicates; loads/stores with alignment flags; `simd_select` for branchless blending; and horizontal reductions.
+Use at least one named struct, one optional or optional reference-wrapper, one `expected`, one `variant`, and one `any`. For each, state whether it owns its payload, how the failure/empty state is observed, what can allocate, and which operation can invalidate a retained reference.
 
-### Why it matters and what it replaces
-
-| Approach | Portability | Control | Pitfalls |
-|---|---|---|---|
-| Auto-vectorization | Total | None | Silently disabled by aliasing, non-unit stride, reductions on floats, unknown trip counts (Ch. 40) |
-| `std::simd` | Across ISAs | Explicit width and ops | Width is target-dependent; tail handling is manual |
-| Intrinsics (`_mm256_*`) | Per-ISA | Total | Rewritten per ISA; AVX/SSE transition penalties (Ch. 42) |
-| Inline asm | None | Total | Blocks the optimizer |
-
-The value proposition is **guaranteed vectorization**: auto-vectorization is a best-effort optimization that vanishes when you change an unrelated line, and `-fopt-info-vec-missed` exists because the failures are silent. `std::simd` makes the vector width part of the type system, so a regression is a compile error rather than a 4× slowdown.
-
-### Practical points
-
-- **Element order and reductions.** Horizontal reductions of floats reassociate, so results differ from a sequential sum (Ch. 23) — the same determinism concern as `std::reduce` (Ch. 14 §14.5).
-- **Alignment.** Aligned loads/stores need the buffer aligned to `simd<T>::size() * sizeof(T)`; use `alignas` or `std::assume_aligned` (Ch. 3 §3.10). Misaligned vector loads that straddle cache lines cost extra, and older ISAs fault.
-- **Tail handling** is yours: N elements rarely divide by the vector width. Masked loads (AVX-512, SVE) or a scalar remainder loop.
-- **Frequency downclocking**: heavy AVX-512 use drops the core (and historically the package) clock on Skylake-SP-era Intel parts, which can make a "faster" kernel slow down the *rest* of the thread (Ch. 42). This is a real reason low-latency shops restrict AVX-512.
-- **`simd_mask` is not `bool`.** Branching on it requires `any_of`/`all_of`/`none_of`; the whole point is to avoid branching via `simd_select`.
-
-Availability: the Parallelism TS version has shipped in libstdc++ as `std::experimental::simd` since GCC 11; the C++26 `<simd>` header is landing now. In production, most shops use intrinsics, Highway, xsimd, or EVE today, and `std::simd` is the direction of travel.
+Finally add a fifth event alternative and compile the visitor. The exercise is complete only when the old visitor fails for the new type without relying on a run-time “unknown” branch.
 
 ---
 
-## 15.9 Random Engines and Distributions
+## Prerequisite for Chapter 16
 
-`<random>` (C++11) deliberately separates three things: a **seed source**, an **engine** (a deterministic PRNG producing raw bits), and a **distribution** (a shaping function mapping engine output to a target distribution).
-
-```cpp
-std::random_device rd;                       // non-deterministic seed source (see caveats)
-std::mt19937_64 eng{rd()};                   // engine: deterministic given the seed
-std::uniform_int_distribution<int> d{1, 6};
-int roll = d(eng);
-```
-
-| Engine | Period | State | Speed | Quality |
-|---|---|---|---|---|
-| `minstd_rand` (LCG) | 2³¹−1 | 4 B | Very fast | Poor — fails statistical tests, low-bit correlation |
-| `mt19937` / `mt19937_64` | 2¹⁹⁹³⁷−1 | **2.5 KB** | Moderate | Good but fails BigCrush's linear-complexity tests |
-| `ranlux48` | Huge | Large | **Very slow** | Excellent |
-| `xoshiro256++` / PCG (non-standard) | 2²⁵⁶ / 2⁶⁴ | 32 B / 16 B | Fastest | Excellent |
-
-**The 2.5 KB state of `mt19937` is the low-latency headline**: it doesn't fit in L1 alongside your working set, and it's 312 `uint64_t`s regenerated in a batch every 312 draws — a periodic latency spike. For simulation on a hot path, a 16–32 byte PCG or xoshiro engine is both faster and cache-friendly. The standard has no such engine; C++26 adds `std::philox_engine` (a counter-based, vectorizable, parallel-friendly engine).
-
-### Traps
-
-- **`std::random_device` is not guaranteed non-deterministic.** libstdc++ on some targets and older MinGW returned a *fixed sequence*. Check `entropy()` (which itself may lie, returning 0 on libc++ even when it's real). For anything security-relevant use the OS directly.
-- **Distributions are stateful.** `std::normal_distribution` generates pairs (Box–Muller/Marsaglia polar) and caches one; copying or `reset()`ing changes the sequence. Never assume a distribution object is a pure function.
-- **Distributions are not portable.** The standard specifies the *distribution*, not the algorithm, so `uniform_int_distribution` gives different values across libstdc++/libc++/MSVC for the same engine and seed. **Engines are fully specified and portable; distributions are not.** For reproducible simulations across platforms (a testing requirement, Ch. 57), implement the distribution yourself or use a fixed-algorithm library.
-- **`rand() % n` is biased** and low-quality; the modern equivalent trap is `eng() % n`, which is biased whenever `n` doesn't divide the engine range. `uniform_int_distribution` does rejection sampling correctly; Lemire's multiply-shift method is the fast unbiased alternative.
-- **Seeding `mt19937` with a 32-bit value** explores only 2³² of its 2¹⁹⁹³⁷ states. Use `std::seed_seq` with multiple words for real seeding.
-- **Determinism is a feature.** In backtesting and deterministic simulation (Ch. 57), you *want* a fixed seed logged with the run so failures are reproducible.
-
----
-
-## 15.10 `std::chrono` Durations and Time Points
-
-`<chrono>` (C++11, hugely extended in C++20) is a compile-time-dimensioned time library: the unit is part of the type, so unit-mismatch bugs are compile errors and conversions are constant-folded.
-
-```cpp
-using namespace std::chrono;
-duration<int64_t, std::nano>  ns{5};       // duration<Rep, Period> — Period is a std::ratio
-nanoseconds  a = 5ns;                       // literals: ns us ms s min h (C++14)
-microseconds b = 3us;
-auto sum = a + b;                            // common type = nanoseconds; NO conversion error
-milliseconds m = duration_cast<milliseconds>(sum);   // truncating: EXPLICIT required
-auto exact = duration_cast<seconds>(1500ms); // 1 — truncates toward zero
-auto rounded = round<seconds>(1500ms);       // 2 — C++17 floor/ceil/round<> exist too
-```
-
-### The type system
-
-- **`duration<Rep, Period>`** — a count (`Rep`) of a unit (`Period`, a `std::ratio` like `std::milli`). Implicit conversion is allowed only when it is **exact** (no truncation): `ns = ms` is implicit, `ms = ns` needs `duration_cast`. That asymmetry catches an entire class of unit bugs at compile time.
-- **`time_point<Clock, Duration>`** — a duration since a clock's epoch, tagged with the clock type. **Time points from different clocks do not mix**, which prevents subtracting a `steady_clock` reading from a `system_clock` reading — a bug that used to be common and silent.
-- Arithmetic: `time_point − time_point = duration`; `time_point ± duration = time_point`; `time_point + time_point` is **ill-formed**, correctly.
-
-### Cost
-
-All conversions between durations are compile-time ratio arithmetic — a multiply and/or divide by a constant, usually folded into a shift or a magic-number multiply. `duration_cast` generates **zero runtime overhead beyond the arithmetic**; there is no allocation, no virtual dispatch, no locale. `chrono` types are trivially copyable and pass in registers. Using `int64_t` nanoseconds internally (the default `Rep` for `nanoseconds`) gives ±292 years of range.
-
-The one cost is `now()` itself (§15.11).
-
-### Practice
-
-- **Store durations, not raw integers.** `nanoseconds latency` is self-documenting and unit-safe; `int64_t latency_ns` is a comment.
-- **Use `double`-based durations for averages** (`duration<double, std::milli>`) to avoid truncation, but never for timestamps — `double` has 53 bits of mantissa, so nanosecond timestamps since 1970 lose precision.
-- **`duration_cast` truncates toward zero**; `floor`, `ceil`, `round` (C++17) do what they say. Latency histograms bucketed with `duration_cast` are systematically biased downward.
-- C++20 added `<chrono>` formatting: `std::format("{:%H:%M:%S}", tp)`, plus `hh_mm_ss`.
-
----
-
-## 15.11 Standard Clocks
-
-Three clocks in C++11, several more in C++20, each with a different guarantee:
-
-| Clock | Monotonic | Adjustable | Epoch | Use for |
-|---|---|---|---|---|
-| `steady_clock` | **Yes** | No | Unspecified (often boot) | **Measuring intervals** |
-| `system_clock` | No | Yes (NTP, admin, DST-irrelevant) | Unix epoch (guaranteed since C++20) | Wall-clock timestamps, converting to/from `time_t` |
-| `high_resolution_clock` | Implementation-defined | — | — | **Nothing — it's an alias** |
-| `utc_clock` (C++20) | No | Yes | Unix epoch, **counts leap seconds** | Leap-second-correct arithmetic |
-| `tai_clock`, `gps_clock` (C++20) | Yes | No | TAI/GPS epochs | Scientific/finance timing standards |
-| `file_clock` (C++20) | — | — | Filesystem-specific | `std::filesystem` timestamps |
-
-**`high_resolution_clock` is a trap.** It is an alias for `steady_clock` on libstdc++ and libc++, and for `steady_clock` on modern MSVC — but the standard permits it to alias `system_clock`, which means your interval measurement can go *backwards* when NTP steps the clock. Never use it. The correct answer to "how do you time a code section?" is `steady_clock`, and saying `high_resolution_clock` is a mild red flag.
-
-**`system_clock` non-monotonicity is a production hazard**: an NTP step (or a `settimeofday`) can move it backwards by seconds, making a computed duration negative. NTP *slewing* (gradual rate adjustment) is gentler but still makes `system_clock` intervals wrong by up to 500 ppm (Ch. 35).
-
-### The cost of `now()`
-
-```
-steady_clock::now()  →  clock_gettime(CLOCK_MONOTONIC)  →  vDSO  →  RDTSC + scaling
-```
-On Linux with a TSC clocksource, `clock_gettime` is served from the **vDSO** (Ch. 34) — no syscall, no mode switch, roughly **20–30 ns**. If the clocksource is `hpet` or `acpi_pm` (check `/sys/devices/system/clocksource/*/current_clocksource`), it becomes a real syscall at **hundreds of nanoseconds to microseconds**, and a hot loop calling `now()` collapses. This is a classic production surprise on VMs.
-
-For sub-20 ns timestamping, use **`RDTSC`/`RDTSCP`** directly (Ch. 43): ~15–20 cycles, no ordering guarantee for `RDTSC` (it's not a serializing instruction, so out-of-order execution can move it; `RDTSCP` and `LFENCE;RDTSC` constrain it). Requirements: `constant_tsc` and `nonstop_tsc` in `/proc/cpuinfo` (invariant TSC — the counter runs at a fixed rate regardless of P-states and C-states), plus TSC synchronization across cores, plus a calibration to convert cycles to nanoseconds. Modern x86 has invariant TSC; older or virtualized systems may not.
-
-**The measurement rule:** timestamp with `RDTSC` (or the vDSO `steady_clock`) on the hot path, convert to human time offline, and never call `system_clock::now()` inside a latency measurement.
-
----
-
-## 15.12 Calendar and Timezone Library
-
-C++20 absorbed Howard Hinnant's `date` library, giving `<chrono>` a full civil-calendar and IANA-timezone layer with no `<ctime>`, no `struct tm`, and no thread-safety hazards.
-
-```cpp
-using namespace std::chrono;
-year_month_day ymd{2026y, July, 19d};              // calendar literals and types
-sys_days sd = ymd;                                  // days since the Unix epoch
-year_month_day back{sd};                            // round trip
-bool leap = ymd.year().is_leap();
-auto last = year_month_day_last{2026y/February/last};   // Feb 28/29 correctly
-
-// Timezones (needs the IANA tzdb)
-auto now = system_clock::now();
-zoned_time zt{"America/New_York", now};
-std::cout << std::format("{:%F %T %Z}", zt);
-auto local = zt.get_local_time();                   // local_time<T> is a DISTINCT type
-
-// Weekday arithmetic
-weekday wd = weekday{sd};
-auto third_friday = 2026y/March/Friday[3];          // options expiry, natively
-```
-
-### The type-safety design
-
-`sys_time<D>` (a `system_clock` time point, UTC), `local_time<D>` (a wall-clock reading **with no timezone attached**), and `zoned_time` (a `time_zone*` plus a `sys_time`) are distinct types. This makes the classic timezone bug — treating a local reading as UTC, or vice versa — a compile error. `local_time` deliberately has no epoch meaning until you pair it with a zone.
-
-Conversions that are genuinely ambiguous are surfaced rather than guessed: converting a `local_time` that falls in a DST gap throws `nonexistent_local_time`, and one in a DST overlap throws `ambiguous_local_time` unless you pass a `choose::earliest` / `choose::latest` policy. That is exactly the case that silently corrupts data in most other date libraries.
-
-### Leap seconds
-
-`utc_clock` counts leap seconds; `system_clock` does not (it follows Unix time, which repeats or smears the leap second). `clock_cast<utc_clock>(sys_time)` does the conversion using the tzdb's leap-second table, and `get_leap_second_info` reports whether a given point is inside one. For financial timestamping this matters: a UTC-labelled exchange timestamp during a leap second is genuinely ambiguous under Unix time. Google-style **leap smearing** (spreading the second over 24 hours) is what most infrastructure actually does, and it means your clock is up to 11.6 ppm off for a day (Ch. 35).
-
-### Practical caveats
-
-- **The tzdb is a runtime dependency.** libstdc++ needs the system `tzdata` (GCC 13+ for full support); libc++ shipped tz support in LLVM 19/20; MSVC uses ICU. In a container, forgetting `tzdata` gives a runtime exception, not a compile error. `std::chrono::get_tzdb()` loads and caches it; `reload_tzdb()` picks up updates.
-- **Zone lookup is not free.** `zoned_time` construction does a string lookup and a binary search over transitions. Cache the `const time_zone*`; never do zone conversion on a hot path.
-- **Formatting allocates.** `std::format` with chrono specifiers builds a string; use `format_to` into a fixed buffer (Ch. 16) for logging.
-- All of this is `constexpr`-friendly for the calendar parts (not the tzdb), so `static_assert(2026y/February/last == 2026y/February/28d)` works.
-
-The low-latency posture: keep everything internally as `int64_t` nanoseconds since epoch (or raw TSC), and convert to calendar/zoned representations only at the logging and reporting boundary.
-
----
-
-## Key Interview Questions
-
-1. **Is `std::tuple` laid out in declaration order?** — No. libstdc++ and MSVC store it in reverse via recursive inheritance; it is not layout-compatible with the equivalent struct and must never be `memcpy`'d to a wire format.
-2. **`std::tie` vs structured bindings vs `forward_as_tuple`?** — `tie` makes a tuple of lvalue references (assign into existing variables, or compare lexicographically); structured bindings declare new names and work on structs and arrays; `forward_as_tuple` preserves value category and must not outlive the full expression.
-3. **What does `std::apply` do and how is it implemented?** — Calls `f` with a tuple's elements as arguments, via `std::invoke` and an `index_sequence` pack expansion. It's how `std::thread` invokes with stored arguments.
-4. **What is `sizeof(std::optional<int*>)`, and why?** — 16, not 8: the standard requires a separate `bool`, with no niche optimization into the pointer's invalid values.
-5. **Does `*opt` check for emptiness?** — No; that's UB. `value()` throws `bad_optional_access`; `value_or` doesn't throw but always evaluates and constructs its fallback.
-6. **What are `and_then`/`transform`/`or_else`?** — C++23 monadic operations on `optional` (and `expected`): flatMap, map, and lazy fallback.
-7. **What is `valueless_by_exception`, and how do you eliminate it?** — A variant left holding nothing when an alternative's move/copy throws during assignment. Make every alternative nothrow-move-constructible; implementations then never enter the state and `visit` skips the check.
-8. **How does `std::visit` dispatch, and what does it cost?** — A jump table of function pointers indexed by `index()`, plus a valueless check: an indirect, non-inlinable call subject to misprediction, and an N-dimensional table for multi-visit.
-9. **`variant` vs virtual inheritance — when do you pick which?** — The expression problem: `variant` makes adding *operations* cheap and adding *types* expensive (and gives compile-time exhaustiveness plus no allocation and contiguity); inheritance is the reverse.
-10. **When is `std::any` appropriate?** — Open-ended heterogeneous storage (plugin/property bags) only. It needs RTTI, may allocate above the SOO threshold, and `any_cast` across shared libraries can fail on `type_info` identity.
-11. **Why is `std::vector<bool>` a problem, and what do you use instead?** — It's a bit-packed specialization that isn't a container (proxy references, no `data()`), breaking generic code; use `vector<char>`, `vector<uint8_t>`, or `bitset<N>`.
-12. **Why does `<bit>` exist when compilers already had intrinsics?** — Defined behavior for the edge cases: `countr_zero(0)`, `rotl(x, 0)`, and `rotl` with n ≥ width are all UB in the hand-rolled/intrinsic forms and defined in `<bit>`. Plus `constexpr` and portability.
-13. **How do you iterate the set bits of a mask efficiently?** — `while (m) { i = countr_zero(m); use(i); m &= m - 1; }` — one `TZCNT` and one `BLSR` per set bit, no branch per empty slot.
-14. **What does `std::simd` give you over auto-vectorization?** — A guarantee. Auto-vectorization silently disappears under aliasing, non-unit stride, float reduction reassociation, or unknown trip counts; `std::simd` puts the width in the type system.
-15. **Why is `mt19937` a poor choice on a latency-sensitive path?** — 2.5 KB of state (cache-hostile) and a batch regeneration every 312 draws (a periodic spike). Use a 16–32 byte PCG/xoshiro, or C++26's `philox_engine`.
-16. **Are `<random>` results reproducible across platforms?** — Engines are fully specified and portable; **distributions are not** — the standard specifies the distribution, not the algorithm. Roll your own for cross-platform reproducibility.
-17. **Why should you never use `high_resolution_clock`?** — It may alias `system_clock`, which is non-monotonic; an NTP step makes your measured interval negative. Use `steady_clock`.
-18. **What does `duration_cast` cost, and what does it do at boundaries?** — Compile-time ratio arithmetic (no runtime overhead beyond a multiply/shift); it **truncates toward zero**, so use `round`/`floor`/`ceil` for histograms.
-19. **Why can't you add two `time_point`s or mix clocks?** — Time points are tagged with their clock, and a point plus a point is meaningless; the type system enforces both, eliminating a whole bug class.
-20. **How much does `steady_clock::now()` cost, and when does that change?** — ~20–30 ns via the vDSO when the clocksource is TSC; hundreds of ns to microseconds when it's HPET/ACPI-PM (common on VMs), because it becomes a real syscall.
-21. **When would you use `RDTSC` instead?** — Sub-20-ns timestamping on the hot path, given invariant TSC (`constant_tsc`/`nonstop_tsc`), cross-core sync, and calibration. `RDTSC` isn't serializing — use `RDTSCP` or `LFENCE` to bound reordering.
-22. **How does C++20 chrono prevent timezone bugs?** — `sys_time`, `local_time`, and `zoned_time` are distinct types; DST gaps and overlaps throw `nonexistent_local_time`/`ambiguous_local_time` instead of guessing.
-23. **What's the difference between `system_clock` and `utc_clock`?** — `system_clock` follows Unix time and ignores leap seconds; `utc_clock` counts them, and `clock_cast` converts using the tzdb's leap table.
-
----
-
-## Common Traps
-
-- **Assuming `tuple` element order matches declaration order** — it usually doesn't; never serialize a tuple.
-- **`std::get<T>` on a tuple with duplicate types** — ill-formed, and fragile under refactoring.
-- **Storing the result of `std::forward_as_tuple`** — it holds references to temporaries.
-- **`auto x = b[3]` on a `bitset` or `vector<bool>`** — captures a proxy reference, not a `bool`.
-- **Dereferencing a disengaged `optional` with `*` or `->`** — UB; only `value()` throws.
-- **`value_or(expensive())`** — always evaluated; use C++23 `or_else`.
-- **Expecting `optional<T*>` or `optional<T&>` to be pointer-sized** — no niche optimization; `optional<T&>` only exists in C++26 and rebinds on assignment.
-- **Ignoring `valueless_by_exception`** — reachable whenever an alternative has a throwing move.
-- **`std::visit` on a hot dispatch path** — an indirect call that can't inline; a `switch` on a hand-rolled tag often wins.
-- **Multi-visit over several variants** — combinatorial table size and compile time.
-- **`std::any` with `-fno-rtti`, or `any_cast` across shared-library boundaries** — `type_info` identity depends on symbol visibility.
-- **`__builtin_ctz(0)`, `x >> 64`, or `(x<<n)|(x>>(64-n))` with n==0** — all UB; `<bit>` defines them.
-- **`std::bit_ceil` overflowing** — UB when the result isn't representable.
-- **BMI2 `PDEP`/`PEXT` on AMD Zen 1–2** — microcoded, up to 300 cycles.
-- **AVX-512 frequency downclocking** slowing down the surrounding non-vector code.
-- **Trusting `std::random_device`** for entropy — it may be a fixed sequence, and `entropy()` may lie.
-- **Assuming `<random>` distributions are portable** — only the engines are specified.
-- **`eng() % n`** — modulo bias; use `uniform_int_distribution` or Lemire's method.
-- **`high_resolution_clock` for measurement** — may be non-monotonic.
-- **Using `system_clock` deltas across an NTP step** — negative durations.
-- **`duration_cast` for latency histograms** — truncation biases every bucket downward.
-- **Calling `clock_gettime` in a hot loop on a VM with an HPET clocksource** — a syscall per call.
-- **Constructing `zoned_time` on a hot path** — string lookup plus a transition search; cache the `time_zone*`.
-- **Missing `tzdata` in a container** — a runtime exception from `get_tzdb()`.
-
----
-
-## Compact Recall Summary
-
-**Pair/tuple.** Heterogeneous fixed-size aggregates. Tuple layout is implementation-defined and usually reversed — not layout-compatible with a struct, never serialize it. Trivially copyable iff the elements are; empty elements cost nothing via EBO. Best uses: multi-key comparison via `tie`/`<=>`, argument-pack storage, metaprogramming. `make_pair` decays and unwraps `reference_wrapper`; CTAD doesn't.
-
-**apply/tie.** `apply` unpacks a tuple into a call via `invoke` + `index_sequence` — how `thread`/`async` invoke stored arguments; `make_from_tuple` constructs. `tie` builds a tuple of lvalue references for assignment and lexicographic comparison; structured bindings supersede it for unpacking; `forward_as_tuple` preserves value category and must die with the full expression. All zero runtime cost.
-
-**optional.** `T` + `bool`, no allocation, no niche optimization (so `optional<T*>` is 16 bytes). `*`/`->` don't check, `value()` throws, `value_or` is eager. Monadic `and_then`/`transform`/`or_else` in C++23; `optional<T&>` with rebinding assignment in C++26. Says "absent", not "why" — that's `expected`.
-
-**variant.** Tagged union, size = largest alternative + index, never allocates. `valueless_by_exception` is eliminated by nothrow-movable alternatives. `visit` is a function-pointer jump table plus a valueless check — an indirect, non-inlinable call; multi-visit is combinatorial. The expression problem: variant favors adding operations, inheritance favors adding types. For a closed message set, variant or a hand-rolled `switch` union wins on contiguity and inlining.
-
-**any.** Open type set, RTTI-dependent, allocates above an implementation-defined SOO threshold, `any_cast` compares `type_info` (fragile across shared libraries). Configuration-layer only.
-
-**bitset.** Fixed-size, inline, word-backed; `count()` → `POPCNT`, `any()`/`all()` are word reductions. `operator[]` returns a proxy. `vector<bool>` is the standard's acknowledged mistake — not a container.
-
-**`<bit>`.** `bit_cast`, `popcount`, `countl/countr_zero/one`, `rotl/rotr`, `bit_width/ceil/floor`, `has_single_bit`, `endian`. Unsigned only, `constexpr`, and defined at the edges where intrinsics and hand-rolled shifts are UB. Set-bit iteration is `countr_zero` + `m &= m-1`. Know `PDEP`/`PEXT`'s Zen 1–2 penalty.
-
-**simd.** C++26 portable data-parallel type: `simd<T,Abi>`, `simd_mask`, `simd_select`, reductions. Buys a *guarantee* where auto-vectorization is best-effort. Watch alignment, tail handling, reduction reassociation, and AVX-512 downclocking.
-
-**random.** Seed source → engine → distribution. `mt19937`'s 2.5 KB state and batch refill make it wrong for hot paths; prefer PCG/xoshiro or C++26 `philox_engine`. `random_device` may be deterministic; engines are portable but **distributions are not**; distributions are stateful; `% n` is biased.
-
-**chrono durations.** `duration<Rep, Period>` puts the unit in the type: exact conversions implicit, lossy ones require `duration_cast` (which truncates toward zero — use `round`/`floor`/`ceil`). Time points are clock-tagged and can't be mixed or added. All conversions are constant-folded ratio arithmetic.
-
-**Clocks.** `steady_clock` for intervals, `system_clock` for wall time (Unix epoch guaranteed in C++20, non-monotonic), `high_resolution_clock` never. `now()` is ~20–30 ns through the vDSO with a TSC clocksource, and orders of magnitude worse on HPET/ACPI-PM. `RDTSC`/`RDTSCP` for sub-20-ns timestamps given invariant TSC, sync, and calibration.
-
-**Calendar/tz.** `sys_time` / `local_time` / `zoned_time` are distinct types, so the UTC-vs-local bug is a compile error; DST gaps and overlaps throw rather than guess. `utc_clock` counts leap seconds, `system_clock` doesn't. The tzdb is a runtime dependency (`tzdata`) and zone lookup is not free — cache the `time_zone*` and keep the hot path on integer nanoseconds, converting only at the logging boundary.
+Chapter 16 assumes that durations and time points retain their units and clock domains until formatting; calendar/time-zone conversion happens at an I/O boundary; and a vocabulary wrapper's compact syntax does not prove that its contained value, erased storage, conversion, or formatting path is allocation-free. Formatting, buffering, and logging failure policy belong there.

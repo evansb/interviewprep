@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The FPGA parses Ethernet/IP/UDP headers (42 bytes, roughly 34 ns of 10 GbE wire time) as they stream past, so a comparator can be loaded before the payload finishes arriving; the CPU cannot start until the whole frame is received and DMA'd because the NIC only signals completion at end-of-frame. The 'higher clock frequency' answer is backwards — FPGA fabric runs far slower than a Xeon (a 10 GbE datapath is 156.25 MHz); the win is architectural, not clock speed.",
-      "sourceAnchor": "481-fpga-based-nics",
+      "sourceAnchor": "484-acceleration-boundaries-fixed-function-smartnic-and-fpga",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The chapter's point is that determinism is the underrated half of the FPGA argument: the same path takes the same cycle count every time, so removing the tail is often worth more than removing the mean. The 'tune the CPU below the FPGA floor' answer inverts the figures — the bypass CPU path is 1-5 microseconds against 20-100 ns, so no amount of tuning closes two orders of magnitude.",
-      "sourceAnchor": "481-fpga-based-nics",
+      "sourceAnchor": "484-acceleration-boundaries-fixed-function-smartnic-and-fpga",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The whole genius of the split is that strategy, risk, message construction, sequence numbers and checksums are done ahead of time on the CPU, reducing the FPGA's task to 'stream these N bytes when this predicate fires'. Building the checksum at fire time is the tempting near-miss: checksums are precomputed, and an FPGA only does incremental one's-complement adjustment (RFC 1624) if it patches a field.",
-      "sourceAnchor": "482-fpga-order-entry",
+      "sourceAnchor": "484-acceleration-boundaries-fixed-function-smartnic-and-fpga",
       "difficulty": "recall"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The signature is diagnostic: two identical orders separated by the A/B feed skew (typically 5-200 microseconds) on exactly the trigger event means the FPGA saw the same market data twice from redundant feeds. The chapter is explicit that the fix is sequence-number-based duplicate suppression, not a timestamp window. The arm-ordering answer describes a real bug but its signature is a hybrid order with mismatched fields, not two identical ones.",
-      "sourceAnchor": "482-fpga-order-entry",
+      "sourceAnchor": "484-acceleration-boundaries-fixed-function-smartnic-and-fpga",
       "difficulty": "trap"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Quantity, notional and price-collar checks go into the fabric precisely because the market access rule requires pre-trade controls on every order and the CPU is not in the path. The 'CPU still arms every slot' answer is the trap: arming happens microseconds-to-seconds ahead of the fire, so the CPU's check reflects stale conditions and does not gate the individual order that is actually transmitted.",
-      "sourceAnchor": "482-fpga-order-entry",
+      "sourceAnchor": "484-acceleration-boundaries-fixed-function-smartnic-and-fpga",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The frequently-missed point is that moving packet processing onto DPU cores raises per-packet latency; their value is removing infrastructure work from the host, not accelerating hot-path logic. The 'faster because it skips PCIe' answer sounds compelling but the crossing is not the bottleneck — the slower core with smaller caches is, and an in-line DPU actually adds a 1-3 microsecond store-and-forward hop for anything that must still reach the host.",
-      "sourceAnchor": "483-smartnics",
+      "sourceAnchor": "484-acceleration-boundaries-fixed-function-smartnic-and-fpga",
       "difficulty": "recall"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "PCIe bandwidth and DDIO cache footprint are real constraints at high message rates, and filtering removes an entire host-side stage rather than merely relocating it — that is the test the chapter applies to any offload. The 'DPU parses faster' answer fails on the chapter's central SmartNIC fact: DPU cores are slower per packet than host cores, so relocating parsing onto them is the bad kind of offload.",
-      "sourceAnchor": "483-smartnics",
+      "sourceAnchor": "484-acceleration-boundaries-fixed-function-smartnic-and-fpga",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The stamp is taken at the MAC/PHY into the PHC domain and includes nothing downstream, which is precisely why hardware-minus-application gives you host stack latency. The 'PHY latency subtracted' answer is the tempting one: PHY latency (100-300 ns for 10GBASE-SR, about 2 microseconds for 10GBASE-T) is not subtracted and is not always constant — you must calibrate the ingress/egress asymmetry yourself.",
-      "sourceAnchor": "484-nic-hardware-timestamping",
+      "sourceAnchor": "483-timestamp-placement-and-clock-domains",
       "difficulty": "recall"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Transmit timestamps do not come back from `send`; they arrive later on the socket error queue and must be read with `recvmsg(fd, &msg, MSG_ERRQUEUE)`. Forgetting to drain it leaks buffers and eventually stalls TX timestamping — exactly this signature. The PTP-only filter is a real gotcha but it would suppress stamps from the very first packet rather than after N of them.",
-      "sourceAnchor": "484-nic-hardware-timestamping",
+      "sourceAnchor": "483-timestamp-placement-and-clock-domains",
       "difficulty": "trap"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The chapter states it directly: precision is not accuracy, and a 1 ns resolution counter disciplined to a grandmaster with 200 ns of error gives you 200 ns of accuracy. The 'halve the error' answer borrows the divide-by-two from PTP's offset formula, which applies to converting round-trip path delay into offset — not to the residual servo error the grandmaster already holds.",
-      "sourceAnchor": "484-nic-hardware-timestamping",
+      "sourceAnchor": "483-timestamp-placement-and-clock-domains",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The formula halves the total round trip, so any asymmetry delta between directions lands as delta/2 of unremovable error — and no amount of averaging detects it. The 'unequal message sizes' answer is plausible-sounding because serialization time is real, but PTP messages are small and fixed-form; the dominant asymmetry sources named are different fibre lengths per direction and non-PTP-aware switch queueing.",
-      "sourceAnchor": "485-ptp-grandmaster-clocks",
+      "sourceAnchor": "483-timestamp-placement-and-clock-domains",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The BC/TC discriminator is that a boundary clock terminates PTP and each hop's servo error compounds, whereas a transparent clock measures its own residence time in hardware and explicitly corrects for queueing. The 'terminates and re-masters' description is actually the boundary clock's behaviour, attached to the wrong name — and one-step versus two-step is a separate axis that has nothing to do with TC versus BC.",
-      "sourceAnchor": "485-ptp-grandmaster-clocks",
+      "sourceAnchor": "483-timestamp-placement-and-clock-domains",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The chapter is explicit that compliance time and measurement time are different problems: 100 microseconds is thousands of times looser than the sub-microsecond accuracy latency work requires. The 'sufficient for one-way delay in the rack' answer fails on scale — intra-rack one-way delays are measured in hundreds of nanoseconds to a few microseconds, so a 100 microsecond error bar swamps the measurement entirely.",
-      "sourceAnchor": "485-ptp-grandmaster-clocks",
+      "sourceAnchor": "483-timestamp-placement-and-clock-domains",
       "difficulty": "trap"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The invariant is budget arithmetic: the FPGA's whole wire-to-wire path is roughly 40 ns, so a 1-2 microsecond host round trip is an order of magnitude over budget — the FPGA either decides alone or does not decide. The 'host cannot read FPGA memory' answer is simply false; PCIe supports host reads of device BARs, they are just slow.",
-      "sourceAnchor": "486-fpga-and-kernel-bypass-hybrids",
+      "sourceAnchor": "484-acceleration-boundaries-fixed-function-smartnic-and-fpga",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Slot updates must be atomic from the FPGA's perspective, so the payload is published before the arm word (a release-style publication) and the FPGA reads the arm word first; the generation counter ensures a late disarm cannot resurrect an old arm. The 'disarm, wait for completion, re-arm' answer is the tempting careful-looking option, but it violates the invariant that the fast path must never depend on a host round trip.",
-      "sourceAnchor": "486-fpga-and-kernel-bypass-hybrids",
+      "sourceAnchor": "484-acceleration-boundaries-fixed-function-smartnic-and-fpga",
       "difficulty": "trap"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Sub-5 ns physical-layer fanout beats any switch by two orders of magnitude and is the standard way to drive both an FPGA and a capture appliance from one wire. The cut-through switch answer is the closest competitor and its premise is true — cut-through switching really is fast — but it still parses headers and costs hundreds of nanoseconds, which is measurable against a 40 ns FPGA path.",
-      "sourceAnchor": "486-fpga-and-kernel-bypass-hybrids",
+      "sourceAnchor": "484-acceleration-boundaries-fixed-function-smartnic-and-fpga",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "tcpdump taps inside the kernel via AF_PACKET, after the driver has run, so receive offloads have already merged frames; `ethtool -K eth0 gro off lro off tso off gso off` restores wire fidelity. The jumbo-frame answer is the plausible misread — but a jumbo MTU tops out around 9000 bytes and would require both ends configured for it, whereas GRO routinely produces these on an ordinary 1500-byte link.",
-      "sourceAnchor": "487-tcpdump-and-wireshark",
+      "sourceAnchor": "486-capture-tcpdump-wireshark-and-libpcap",
       "difficulty": "recall"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Onload, DPDK, ef_vi and VMA all intercept the packet ahead of the kernel stack, so a kernel-resident tap has nothing to observe; the mitigations are the stack's own capture tool (`onload_tcpdump`, DPDK `pdump`) or an external tap. The timestamp-source answer misapplies a real flag — `-j adapter_unsynced` changes which clock stamps captured packets, it does not make invisible packets visible.",
-      "sourceAnchor": "487-tcpdump-and-wireshark",
+      "sourceAnchor": "486-capture-tcpdump-wireshark-and-libpcap",
       "difficulty": "application"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The chapter treats nonzero `dropped by kernel` as invalidating: the drops cluster during microbursts, so the capture is systematically blind to the events that matter — the same coordinated-omission failure that makes a clean tail untrustworthy. The 'captured packets remain representative' answer is the seductive one, and it fails precisely because the missing samples are not random but concentrated in the slow region.",
-      "sourceAnchor": "487-tcpdump-and-wireshark",
+      "sourceAnchor": "486-capture-tcpdump-wireshark-and-libpcap",
       "difficulty": "trap"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "libpcap opens an AF_PACKET socket and maps a shared ring with PACKET_MMAP, so the reader walks memory rather than syscalling per packet. The BPF answer describes a real and important part of the mechanism — the compiled filter discards unwanted packets in the kernel before any copy — but filtering reduces how much is copied, not how many syscalls the copies cost.",
-      "sourceAnchor": "488-packet-capture-with-libpcap",
+      "sourceAnchor": "486-capture-tcpdump-wireshark-and-libpcap",
       "difficulty": "recall"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`ADAPTER_UNSYNCED` is the free-running NIC hardware clock in its own domain, giving the tightest deltas between packets on the same card at the cost of needing your own translation to wall clock — exactly right when you only care about relative timing. The `HOST_HIPREC` answer inverts a key fact: every host-clock source is taken by the kernel and therefore includes driver and IRQ delay.",
-      "sourceAnchor": "488-packet-capture-with-libpcap",
+      "sourceAnchor": "486-capture-tcpdump-wireshark-and-libpcap",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The chapter separates the two counters precisely: `ps_drop` is kernel ring overflow, while `ps_ifdrop` (corroborated by `ethtool -S | grep -i drop`) means the packet never reached the ring at all, making ring sizing the correct remedy. The 'bigger capture buffer' answer is the standard reflex and it addresses `ps_drop` — which is zero here, so it would change nothing.",
-      "sourceAnchor": "488-packet-capture-with-libpcap",
+      "sourceAnchor": "486-capture-tcpdump-wireshark-and-libpcap",
       "difficulty": "trap"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The hierarchy runs application (plus or minus tens of microseconds, including everything) worst, then kernel software (1-20 microseconds, including DMA and softirq scheduling), then NIC hardware (50-500 ns, limited by PHC sync), then an external tap at 5-20 ns of true wire time, with an FPGA inline stamp at the SFP better still. The ordering that puts NIC hardware ahead of the external tap is the tempting one — but the NIC stamp inherits clock sync error the single-clock tap does not.",
-      "sourceAnchor": "489-software-and-hardware-timestamp-selection",
+      "sourceAnchor": "483-timestamp-placement-and-clock-domains",
       "difficulty": "recall"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The kernel software stamp is taken in `netif_receive_skb` in NAPI softirq context, after the interrupt is serviced, so with `rx-usecs=50` it can be up to 50 microseconds late — and the lateness is inversely correlated with load, producing exactly this signature. Cache warming and frequency scaling are real effects and genuinely do help under load, but they operate at the tens-of-nanoseconds scale, far too small to invert a profile shaped by microseconds of coalescing delay.",
-      "sourceAnchor": "489-software-and-hardware-timestamp-selection",
+      "sourceAnchor": "483-timestamp-placement-and-clock-domains",
       "difficulty": "trap"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A timestamp records when the stamping stage saw the packet, so hardware-minus-application on one host spans exactly the DMA, interrupt, softirq, scheduler and app loop — your stack latency. The kernel-software-minus-hardware pairing is close and genuinely useful, but it stops at NAPI softirq and therefore excludes scheduler and app-loop delivery jitter, so it under-reports the full stack.",
-      "sourceAnchor": "489-software-and-hardware-timestamp-selection",
+      "sourceAnchor": "483-timestamp-placement-and-clock-domains",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Tapping the inbound feed fibre and the outbound order fibre into the same appliance means T_out minus T_in is computed within one clock domain, so the measurement is exact to the appliance's few-nanosecond precision with no sync error at all. The averaging answer is the classic error the chapter attacks separately: averaging reduces jitter but does nothing for a systematic offset.",
-      "sourceAnchor": "4810-one-way-versus-round-trip-latency",
+      "sourceAnchor": "485-define-endpoints-and-the-error-model",
       "difficulty": "recall"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "When ticks arrive densely and your response is slow, the nearest preceding tick is not the causing tick but a later one, so the computed interval is too short — and the bias is invisible unless you look for it. The 'symmetric noise' answer is the intuitive statistical read, but the error is one-directional by construction: the nearest preceding event can only be later than the true trigger, never earlier. Embedding the trigger's sequence identifier in the client order ID makes correlation exact.",
-      "sourceAnchor": "4810-one-way-versus-round-trip-latency",
+      "sourceAnchor": "485-define-endpoints-and-the-error-model",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "RTT/2 equals one-way delay only if the path is symmetric and remote turnaround is zero, and in a trading network neither holds — the market-data egress path and the order-entry ingress path are physically different, and remote processing is often exactly what you want to isolate. The clock-offset objection is the trap: RTT is measured with a single clock precisely so that sync error does not enter, so it is the one problem RTT does not have.",
-      "sourceAnchor": "4810-one-way-versus-round-trip-latency",
+      "sourceAnchor": "485-define-endpoints-and-the-error-model",
       "difficulty": "trap"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Clock offset is correlated and slowly varying, so it survives any amount of averaging; only the random jitter component shrinks with sample count. The 'too few samples' answer concedes the premise and argues about magnitude, which is exactly the misunderstanding — no sample count fixes a systematic bias, and path asymmetry in particular contributes delta/2 that no statistic detects.",
-      "sourceAnchor": "4811-clock-synchronization-error",
+      "sourceAnchor": "485-define-endpoints-and-the-error-model",
       "difficulty": "recall"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The loopback sanity test uses one clock at both ends, so the measured delay should equal the cable's propagation (about 5 ns per metre) plus PHY latency — anything else is your measurement error, exposed with no clock sync involved. The servo-restart test is real and worth monitoring, but it characterizes reconvergence transients rather than isolating the measurement floor, and it still depends on the sync path being present.",
-      "sourceAnchor": "4811-clock-synchronization-error",
+      "sourceAnchor": "485-define-endpoints-and-the-error-model",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "50 ppm is 50 microseconds per second, which is 180 milliseconds over 3600 seconds; holdover oscillators close the gap by three to four orders of magnitude (OCXO about 0.01 ppm, rubidium about 0.001 ppm). The 180 microsecond answer is the arithmetic slip to watch for — it is the one-second figure quoted as if it were the hourly one.",
-      "sourceAnchor": "4811-clock-synchronization-error",
+      "sourceAnchor": "485-define-endpoints-and-the-error-model",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The layered decision tree is the expected answer: sequence gaps with clean NIC and kernel counters localize the loss before your NIC, whereas gaps accompanied by `rx_no_buffer` mean you dropped it yourself. The socket-queue answer is the most tempting because `SO_RXQ_OVFL` genuinely must be enabled to see per-socket drops — but socket overflow also shows up in `/proc/net/snmp` UDP receive buffer errors, which are clean here.",
-      "sourceAnchor": "4812-packet-loss-and-jitter-measurement",
+      "sourceAnchor": "487-loss-and-jitter-are-layered",
       "difficulty": "application"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The minimum observed delay is propagation plus serialization plus fixed processing, so everything above it is queueing and contention — making p99.9 minus min far more actionable than 'jitter = 3 us'. RFC 3550 interarrival jitter is the plausible-looking choice because it is a real standard, but the chapter flags its heavy smoothing as hiding exactly the tails that matter here.",
-      "sourceAnchor": "4812-packet-loss-and-jitter-measurement",
+      "sourceAnchor": "487-loss-and-jitter-are-layered",
       "difficulty": "application"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "required_entries is peak_pps times max_service_gap, so 1.5 Mpps times 200 us is 300 entries; the mature point is that a larger ring adds bufferbloat, worsens cache and DDIO footprint, and masks a too-slow consumer. The 'bigger is strictly safer' answer shares the correct arithmetic but draws the wrong conclusion — for market data a packet that sat 500 us behind a full ring is stale, and acting on it can be worse than having dropped it.",
-      "sourceAnchor": "4813-nic-ring-sizing",
+      "sourceAnchor": "481-ports-queues-rings-and-ownership",
       "difficulty": "application"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`rx_missed_errors` counts frames the NIC took off the wire and could not place because no free descriptor was available, and `rx_errors` at zero rules out physical-layer damage — so the fault is entirely host-side. The optics-and-fibre answer describes the complementary signature: `rx_crc_errors` or `rx_length_errors` rising is what points at the physical layer.",
-      "sourceAnchor": "4813-nic-ring-sizing",
+      "sourceAnchor": "481-ports-queues-rings-and-ownership",
       "difficulty": "recall"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A minimum frame is 64 bytes plus 8 preamble/SFD and 12 interframe gap, giving 84 bytes or 672 bits, so 10e9/672 is 14,880,952 pps at 67.2 ns each. The 19.53 Mpps figure is what you get by dividing by the 64-byte frame alone and forgetting the preamble and IFG — the most common way to overstate the budget. The 812 kpps figure is the 1500-byte frame rate, not the minimum-frame rate.",
-      "sourceAnchor": "4814-packets-per-second-limits",
+      "sourceAnchor": "489-capacity-and-saturation",
       "difficulty": "recall"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The bottleneck is transactions, not bytes — the NIC ASIC's pps budget and PCIe's per-packet descriptor/data/completion cost bind well before the bit rate does, which is why market data's small ITCH-sized messages live in the worst region of the curve. The interframe-gap answer has a true premise (small frames really do lose a larger fraction to preamble and IFG) but that overhead is only about 24%, nowhere near the 70% shortfall observed.",
-      "sourceAnchor": "4814-packets-per-second-limits",
+      "sourceAnchor": "489-capacity-and-saturation",
       "difficulty": "application"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Processing 32 packets per poll spreads the per-batch cost, raising throughput dramatically at the price of up to a batch-time of latency for the first packet — and a busy-poll loop degenerates to batch-size-1 under light traffic, which is why busy polling is lowest-latency but not highest-throughput. The 'holds packets until the batch fills' answer describes a timeout-driven batcher; a busy-poll loop takes whatever is present and returns immediately.",
-      "sourceAnchor": "4814-packets-per-second-limits",
+      "sourceAnchor": "489-capacity-and-saturation",
       "difficulty": "application"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 0,
       "explanation": "40 payload plus 8 UDP, 20 IP, 14 Ethernet and 4 FCS is 86 bytes, plus 8 preamble and 12 IFG gives 106 on the wire, so 40/106 is 37.7%; ten messages packed give 400/466, about 86%. The jumbo-MTU answer is the tempting one because a bigger MTU sounds like the same fix, but a larger MTU does nothing when each datagram still carries a single 40-byte message — the win comes from aggregation, which is what every real exchange feed does.",
-      "sourceAnchor": "4815-offered-load-and-goodput",
+      "sourceAnchor": "489-capacity-and-saturation",
       "difficulty": "application"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is coordinated omission in generator form: a closed-loop generator's send rate is coupled to the system's response rate, so as the system degrades the offered load drops with it and the queueing never appears. The description that attributes fixed-rate sending to the closed-loop generator has the definitions exactly swapped — fixed rate regardless of responses is what makes a generator open-loop, and that is precisely why it exposes queueing.",
-      "sourceAnchor": "4815-offered-load-and-goodput",
+      "sourceAnchor": "489-capacity-and-saturation",
       "difficulty": "trap"
     }
   ]

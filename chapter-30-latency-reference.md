@@ -1,379 +1,522 @@
 # Chapter 30 — Latency Reference
 
-*Interview-focused revision notes. The theme: every number in this chapter is the visible output of a mechanism described in Ch. 27–29 — you should be able to derive it, not recite it, and you should know which hardware or kernel decision moves it.*
+**Why this matters.** Latency folklore ages badly. “A cache miss costs 100 ns” may have been a useful estimate on one host, for one working set, at one load, using one statistic. It is not a property of C++, Linux, x86, Arm, or “modern hardware.” This chapter is the book’s home for reference values so that later chapters can cite one qualified source instead of repeating incompatible constants.
+
+The durable skill is not memorizing a table. It is learning to classify a number, reconstruct an estimate, identify the critical path, predict where queueing begins, and replace the estimate with a measurement from the target system.
+
+**90-second screen.**
+
+Five facts:
+
+1. Keep the scale straight: \(1\text{ s}=10^3\text{ ms}=10^6\text{ µs}=10^9\text{ ns}\). At a stated 3.2 GHz, one cycle is 0.3125 ns; at another frequency, recalculate.
+2. A latency number needs a boundary, platform, workload, load, statistic, and provenance. “80 ns” alone is not evidence.
+3. Latency, throughput, and bandwidth are different. Add serial critical-path stages; for genuinely overlapping work, follow the longest dependency.
+4. Queueing can dominate service time near capacity. A low-load median neither predicts a loaded tail nor combines arithmetically with component percentiles.
+5. The C++ standard specifies semantics, not nanoseconds. Architecture, OS, vendor, measured, derived, and illustrative values have different scopes.
+
+Two decisions:
+
+- Use a qualified reference range to reject an impossible claim or size an experiment, never as a production service-level objective.
+- Make a design decision from an end-to-end measurement on a production-like target, then use component measurements to explain it.
 
 ---
 
-## Conventions used throughout
+## 30.1 A Number Is a Claim — Core
 
-Unless stated otherwise, figures are **typical modern x86-64 Linux server** values: an Intel Skylake-SP-through-Sapphire-Rapids or AMD Zen 3/4 core at a **~3 GHz sustained all-core clock**, 64-byte cache lines, DDR4-3200 or DDR5-4800 memory, a recent (5.x/6.x) kernel with default Spectre/Meltdown mitigations enabled. At 3 GHz, **1 cycle ≈ 0.33 ns** and **1 ns ≈ 3 cycles** — that conversion is the single most useful thing to have memorized, because hardware documentation quotes cycles and latency budgets are quoted in nanoseconds.
+Attach one of these labels whenever a number enters a design document:
 
-Two units matter and they degrade differently:
-
-- **Cycles** are the right unit for anything inside the core (ALU latency, branch mispredict, L1/L2 hit). These are nearly frequency-invariant: the pipeline depth doesn't change when the clock changes.
-- **Nanoseconds** are the right unit for anything off-core (DRAM, interconnect, PCIe, network). These are nearly *cycle*-variant: DRAM latency is set by the DIMM and the memory controller, so raising the clock raises the *cycle* cost of a memory access without changing the nanosecond cost.
-
-That asymmetry is why "L3 miss costs 200 cycles" and "L3 miss costs 70 ns" are both correct and neither is portable across frequencies. State which unit you're using.
-
----
-
-## 30.1 CPU and Memory Latency Numbers
-
-### The core hierarchy
-
-| Operation | Cycles | ns @3 GHz | Mechanism (Ch.) |
-|---|---|---|---|
-| Register-to-register ALU op (add, and, shift) | 1 | 0.33 | Ch. 27 §27.13 |
-| Simple ALU with 3-4 ops in flight | 0.25 (throughput) | 0.08 | 4-wide superscalar |
-| L1d hit, simple addressing | 4 | 1.3 | Ch. 28 §28.1 |
-| L1d hit, complex/indexed addressing | 5–6 | ~1.7 | AGU penalty |
-| L2 hit | 12–16 | 4–5 | |
-| L3 hit, same-socket (server mesh/CCX) | 40–75 | 15–25 | Higher on mesh than on client ring |
-| DRAM, local socket, unloaded | 200–260 | 70–90 | Ch. 29 §29.5 |
-| DRAM, local socket, ~80% loaded | 400–900 | 130–300 | Queueing, not physics |
-| DRAM, remote NUMA socket | 320–450 | 110–150 | 1.4–2.0× local |
-| Cache line from another core's L1/L2, same socket (HITM) | 120–220 | 40–75 | Coherence transfer, Ch. 28 §28.7 |
-| Cache line from another socket (HITM cross-socket) | 550–900 | 180–300 | UPI/xGMI hop |
-
-**Deriving DRAM latency instead of memorizing it.** A local DRAM read is roughly: L1+L2+L3 lookup miss chain (~20 ns) + memory controller queue + DRAM device timing. On a row-buffer *hit* the DRAM device contributes tCL only (~14 ns at DDR4-3200 CL22 → 13.75 ns); a row *miss* costs tRP+tRCD+tCL (~42 ns); a row-buffer *conflict* on a busy bank costs more. Add the on-die mesh traversal to the home agent and back (~15–25 ns) and you land at 70–90 ns. This is why DRAM latency has barely improved in fifteen years while bandwidth has grown 10× — the bank timings are electrically bound, only the channel count scales.
-
-### Control flow, arithmetic, and address translation
-
-| Operation | Cycles | ns | Notes |
-|---|---|---|---|
-| Correctly predicted, not-taken branch | 0 (extra) | 0 | Free; folded in the front end |
-| Correctly predicted taken branch | 1–2 | ~0.5 | BTB hit |
-| **Branch misprediction** | **15–20** | **5–7** | Pipeline flush + refill; Ch. 27 §27.11 |
-| Mispredict with cold I-cache refill | 30–60 | 10–20 | Front-end starvation dominates |
-| Integer multiply (64-bit) | 3 | 1 | Fully pipelined |
-| Integer divide (32-bit) | 12–26 | 4–9 | Not pipelined; Ice Lake+ ~12–18 |
-| Integer divide (64-bit) | 18–90 | 6–30 | Pre-Ice-Lake 64-bit `div` is a disaster |
-| FP add / multiply / FMA | 4 | 1.3 | 2/cycle throughput |
-| FP divide (`divsd`) | 13–20 | 4–7 | Poorly pipelined |
-| `sqrtsd` | 15–20 | 5–7 | |
-| `rsqrtps` approximation | 4 | 1.3 | 12-bit accuracy |
-| L1 dTLB hit | 0 (extra) | 0 | Parallel with L1 tag lookup |
-| STLB (L2 TLB) hit | 7–9 | 2–3 | |
-| Page walk, PTEs in L1/L2 | 20–40 | 7–14 | Ch. 32 §32.8 |
-| Page walk, PTEs in DRAM | 300–600 | 100–200 | Up to 4 dependent DRAM reads |
-
-**The mispredict number is derivable.** Pipeline depth from fetch to branch resolution is ~15–19 stages on Skylake/Golden Cove; a mispredict discards everything younger than the branch and restarts fetch. That's why the penalty tracks pipeline depth and why it did *not* grow with core width. Note the "up to 30–60" row: the raw flush is 16 cycles, but if the correct path isn't in the µop cache or L1i you also pay a front-end refill, and a modern profile will attribute that to `frontend_bound`, not `bad_speculation`.
-
-### Memory-system throughput (Little's Law)
-
-Latency alone is misleading for streaming code. **Little's Law**: `outstanding_bytes = bandwidth × latency`. A single core supports ~10–16 outstanding line fills (line-fill buffers / miss-status registers), so single-core streaming bandwidth ≈ `12 × 64 B / 80 ns ≈ 9.6 GB/s` from DRAM, even though the socket can do 200+ GB/s. Hardware prefetch raises the effective concurrency; that is the mechanism by which prefetching helps sequential code, not "hiding latency" in the abstract.
-
-| Bandwidth figure | Value |
-|---|---|
-| L1d load bandwidth | 2× 32 B/cycle ≈ 190 GB/s |
-| L2 → L1 | 64 B/cycle ≈ 190 GB/s |
-| L3 → L2 | ~32 B/cycle ≈ 100 GB/s |
-| DRAM per socket, DDR4-3200 ×8 channels | 204 GB/s peak, ~150 GB/s achieved |
-| DRAM per socket, DDR5-4800 ×8 | 307 GB/s peak, ~230 GB/s achieved |
-| **Single core from DRAM** | **8–15 GB/s** (concurrency-bound, not bandwidth-bound) |
-| UPI/xGMI cross-socket link | 30–60 GB/s per direction |
-
-### Data-structure consequences
-
-| Access pattern | Effective per-element cost |
-|---|---|
-| Sequential array scan, prefetcher engaged | 0.2–1 ns/element (bandwidth-bound) |
-| Random access within L1 (32 KB) | ~1.3 ns |
-| Random access within L2 (1–2 MB) | ~4 ns |
-| Random access within L3 (32–128 MB) | ~20 ns |
-| Random access in a 10 GB working set | 80–120 ns + likely TLB miss = 150–250 ns |
-| Pointer-chasing linked list, 100 M nodes | 150–300 ns/node (no MLP; dependent loads serialize) |
-| Binary search over 1 M `int64` (8 MB) | ~7 dependent misses × ~25 ns ≈ 175 ns |
-| Hash lookup, open addressing, 1 probe | 1 miss ≈ 80–100 ns |
-
-**Pointer chasing is the worst case not because a miss is expensive but because dependent misses cannot overlap.** Memory-level parallelism goes to 1. Indexed/flat structures (Ch. 12 §12.7, Ch. 21) win precisely by restoring MLP.
-
-### ARM differences
-
-Neoverse N1/V1/V2 (Graviton 2/3/4), at ~2.6–3.0 GHz: L1d 4 cycles, L2 11–14 cycles, system-level cache ~30 ns, DRAM 90–110 ns — broadly the same shape, slightly worse DRAM latency on Graviton 2, comparable on V2. Branch mispredict is ~11–13 cycles (shallower pipeline). Cache line is 64 B on Neoverse but **128 B on Apple M-series**, which changes false-sharing padding (Ch. 26 §26.16). Integer divide is much better than pre-Ice-Lake x86. The big architectural difference is not latency but ordering: ARM is weakly ordered (Ch. 29 §29.14), so barriers appear where x86 needed none, and `ldar`/`stlr` cost ~5–20 cycles where x86 acquire/release loads and stores are free.
-
----
-
-## 30.2 Synchronization and Syscall Latency Numbers
-
-### Atomics and fences
-
-| Operation | Cycles | ns | Condition |
-|---|---|---|---|
-| Relaxed atomic load (x86 plain `mov`) | 4 | 1.3 | Identical to a normal load |
-| Acquire load / release store (x86) | 4 / 1 | ~1 | Free — TSO gives them for nothing |
-| `seq_cst` store (`xchg` or `mov`+`mfence`) | 20–35 | 7–12 | Full barrier |
-| `lock xadd` / `lock cmpxchg`, line in L1 Modified, uncontended | 18–25 | 6–9 | |
-| `lock` op, line in another core's cache, same socket | 100–250 | 35–85 | RFO + HITM |
-| `lock` op, heavily contended, 8 threads | 500–2000 | 170–700 | Serialized queue |
-| `lock` op, cross-socket contention | 1500–4000 | 500–1300 | |
-| `mfence` | 20–35 | 7–12 | Drains the store buffer |
-| `pause` (spin hint) | 5 (pre-Skylake) / ~40 (Skylake+) | 1.5 / 13 | Deliberately lengthened |
-| Split-lock atomic (straddles a cache line) | — | **1000–5000** | Bus lock; stalls **every** core |
-| ARM `ldaxr`/`stlxr` LL-SC pair, uncontended | ~20–40 | 8–15 | Can livelock |
-| ARM LSE `casal`/`ldadd`, uncontended | ~10–20 | 4–8 | Far-atomic capable |
-
-**The single most important number here:** an uncontended atomic RMW on a line you already own is ~20 cycles; a contended one is 10–100× worse. Lock-free code doesn't fail because atomics are slow, it fails because *shared* atomics are slow. Per-core sharded counters (Ch. 59 §59.3) exist entirely to move the operation from row 4 to row 3 of that table.
-
-### Locks and thread coordination
-
-| Operation | Typical | Notes |
+| Label | Kind of claim | What it can legitimately establish |
 |---|---|---|
-| `std::mutex` lock+unlock, uncontended | 15–25 ns | Two atomics, no syscall — glibc futex fast path |
-| `std::mutex`, contended, spin phase succeeds | 50–500 ns | Adaptive spin before parking |
-| `std::mutex`, contended, futex park + wake | **2–8 µs** | Two syscalls + a context switch |
-| `std::shared_mutex` read lock, uncontended | 20–40 ns | Still a shared atomic — readers contend with readers |
-| `condition_variable::notify_one` → waiter runs | 3–10 µs | `FUTEX_WAKE` + wakeup latency |
-| `std::atomic::wait`/`notify` (C++20) | Same as futex | Spins first, then parks |
-| Thread creation (`pthread_create`) | 15–40 µs | `clone` + stack mmap + TLS setup |
-| Thread join | 5–15 µs | |
-| Voluntary context switch (same core, warm) | 1–3 µs | Direct cost only |
-| Involuntary context switch, cross-core | 3–10 µs | Plus cold-cache recovery |
-| **Cache/TLB "recovery" after a switch** | **10–100 µs** | The indirect cost, usually the dominant one |
-| Thread migration to another NUMA node | 50–500 µs of degraded work | Working set is now remote |
-| SPSC ring-buffer handoff, cores on same socket | 40–80 ns | One cache-line transfer (Ch. 26 §26.3) |
-| SPSC handoff, cross-socket | 200–400 ns | |
-| Futex wake-to-run under `SCHED_OTHER`, loaded box | 10 µs – 10 ms | Tail depends entirely on run-queue depth |
+| **S — standard** | ISO C++ semantics or complexity | What a program may rely on; normally no wall-clock latency |
+| **A — architecture** | ISA or architectural specification | Required behavior of an architecture; usually not a microarchitectural cost |
+| **O — OS/interface** | Kernel or API contract and configuration | Boundaries, states, and guarantees; not a portable runtime |
+| **V — vendor** | Published data for a named processor, NIC, switch, or drive | A part-specific figure under the vendor’s stated conditions |
+| **M — measured** | A benchmark record with raw samples and metadata | What happened on that system, with that workload and statistic |
+| **D — derived** | Arithmetic from stated inputs | What follows from the model, such as serialization or propagation |
+| **I — illustrative** | A teaching assumption | How to calculate; never evidence about a target |
 
-The **indirect** cost of a context switch is the interview point. The direct cost (save/restore registers, switch `CR3`, run the scheduler) is ~1–3 µs. The real cost is that the incoming thread finds its L1/L2 evicted and its TLB entries flushed, and spends tens of microseconds re-warming. On a busy-polling hot path a *single* involuntary preemption can create a 50 µs latency outlier that no amount of code optimization removes — which is the whole justification for core isolation (Ch. 31 §31.19).
+These labels do not rank truthfulness. A **V** value can be precise and useful. It simply cannot be silently promoted into an **A** guarantee or a universal constant. Likewise, a correct **M** result does not automatically transfer from one machine to the next.
 
-### System calls
+Every usable latency claim answers six questions:
 
-| Operation | No mitigations | With KPTI + IBRS/retpoline (default) |
-|---|---|---|
-| `SYSCALL`/`SYSRET` mode switch, no work | 40–60 ns | 100–200 ns |
-| `getpid()` (cheapest real syscall) | ~60 ns | 200–350 ns |
-| `clock_gettime()` **via vDSO** | 15–25 ns | 15–25 ns (no mode switch at all) |
-| `clock_gettime()` forced through syscall | ~80 ns | 300–500 ns |
-| `rdtsc` / `rdtscp` | 6–10 ns / 10–12 ns | unchanged |
-| `read()`/`write()` on a ready socket, small | 1–3 µs | Includes stack traversal, not just entry |
-| `sendto()` UDP, 100 B | 1.5–3 µs | |
-| `epoll_wait()` returning immediately | 1–2 µs | |
-| `io_uring` SQE submit, `SQPOLL` mode | **0 syscalls**, ~100–300 ns | Ch. 34 §34.21 |
-| `mmap()` / `munmap()` | 1–5 µs | `munmap` also triggers TLB shootdown |
-| Minor page fault | 0.5–2 µs | Ch. 32 §32.4 |
-| Copy-on-write fault (4 KB) | 1.5–3 µs | Fault + page copy |
-| Major page fault, NVMe backing | 30–150 µs | |
-| Major page fault, spinning disk | 3–10 ms | |
-| TLB shootdown IPI, 2 cores | 2–5 µs | |
-| TLB shootdown, 64 cores | 10–50 µs | Scales with participating CPUs |
-| `fork()` of a 1 GB-RSS process | 300 µs – 2 ms | Page-table copy is O(mapped pages) |
-| `signal` delivery to a running thread | 2–5 µs | |
+1. **Boundary:** from what event to what event? `send()` entry to return, application timestamp to application timestamp, first bit at ingress to first bit at egress, or durable media commit?
+2. **Platform:** which processor stepping, sockets, memory, device, firmware, kernel, mitigations, and power settings?
+3. **Workload:** what size, dependency pattern, working set, queue depth, contention, and locality?
+4. **Load:** idle, steady-state utilization, or burst?
+5. **Statistic:** minimum, median, mean, p99, p99.9, or maximum over a stated interval?
+6. **Provenance:** **S**, **A**, **O**, **V**, **M**, **D**, or **I**?
 
-**Why mitigations cost what they cost.** KPTI (Meltdown) swaps `CR3` on every kernel entry and exit; without PCID that flushes the entire TLB, and with PCID it still costs two `mov %cr3` (~200–300 cycles combined) plus lost TLB reach. IBRS/eIBRS and retpoline add indirect-branch serialization inside the kernel. Measure your own box: `cat /sys/devices/system/cpu/vulnerabilities/*` tells you which are active, and a `getpid()` loop tells you the price. Turning them off (`mitigations=off`) is a common, deliberate, security-accepting choice on an air-gapped trading host and typically restores 2–3× on syscall-heavy paths.
+A seventh question—*when?*—matters for changing firmware, kernels, compilers, and cloud hosts. Record the date.
 
-**The rule that falls out:** at 200 ns of pure entry overhead plus 1–3 µs of real work, a syscall in a hot loop that runs 1 M times/second consumes 1–3 full cores of overhead. That is the arithmetic behind kernel bypass (Ch. 47), `io_uring` (Ch. 34 §34.13), and vDSO.
+### Units and conversions
+
+Frequency in GHz is cycles per nanosecond:
+
+\[
+t_{\text{ns}}=\frac{\text{cycles}}{f_{\text{GHz}}}
+\qquad
+\text{cycles}=t_{\text{ns}} f_{\text{GHz}}
+\]
+
+Thus 160 cycles at a *stated* 3.2 GHz is 50 ns. This is a conversion, not a prediction: turbo, throttling, heterogeneous cores, and invariant timestamp counters can make “the frequency” ambiguous. Record the effective frequency during the run.
+
+Rates require equal care:
+
+\[
+\text{operations/s}=\frac{1}{\text{seconds/operation}},\qquad
+\text{bandwidth}=\text{operations/s}\times\text{bytes/operation}
+\]
+
+The inverse of single-operation latency is a throughput ceiling only when operations cannot overlap. Chapters 27–29 explain why modern cores overlap independent instructions and memory misses.
 
 ---
 
-## 30.3 Network Latency and Serialization Numbers
+## 30.2 The Logarithmic Ladder — Core
 
-### Propagation and serialization — the two irreducible components
+The following is an **orientation sheet**, not a benchmark result. Its scope is commodity server-class systems commonly encountered in the first half of the 2020s. The bands are intentionally wide, mix x86-64 and Arm implementations, assume warmed steady-state execution unless stated, and are rounded to orders of magnitude. They help choose a measurement method and catch a missing unit. They must not be copied into a service-level objective.
 
-**Propagation delay** is distance ÷ signal velocity. In single-mode fiber the refractive index is ~1.47, so light travels at ~204,000 km/s:
+| Approximate scale | Representative operation class | Conditions that can move it | Claim |
+|---:|---|---|---|
+| \(10^0\) ns | Simple dependent core operation or private-cache hit | instruction, core model, dependency, frequency | **I**, informed by named-part **V** manuals |
+| \(10^1\) ns | Last-level-cache access or an ownership transfer with favorable topology | cache slice, hop count, coherence state, contention | **I** |
+| \(10^2\) ns | Idle local DRAM access; a very small kernel crossing may also land on this scale | memory clocks, NUMA node, mitigations, timer boundary | **I** |
+| \(10^3\) ns = 1 µs | Park/wake, minor fault, or host-network software path can begin on this scale | scheduler, kernel, device path, load | **I** |
+| \(10^4\) ns = 10 µs | Fast storage or a longer host/network path can begin on this scale | device, queue depth, block size, interrupt policy | **I** |
+| \(10^5\) ns = 100 µs | Many device completions and loaded software paths | firmware, queues, filesystem, coalescing | **I** |
+| \(10^6\) ns = 1 ms and above | WAN paths, storage tails, scheduler delay, overload | distance, retry, reclaim, preemption, queueing | **I** |
 
-```
-fiber:      ~4.9 µs per km   (≈ 5 µs/km — memorize this)
-copper:     ~5.0 ns per metre
-free space / microwave: ~3.34 µs per km  (≈ 1.5× faster than fiber)
+This is a logarithmic ladder: each row is ten times the previous one. It deliberately avoids claims such as “L1 is exactly four cycles” or “a syscall is exactly 200 ns.” For instruction and cache details, consult the optimization manual for the *named* CPU and verify with a dependency-chain benchmark. For kernel, device, and network paths, measure the boundary the application actually cares about.
+
+A compact picture is often more useful than another table:
+
+```text
+time ───────────────────────────────────────────────────────────────►
+      core      cache/coherence     DRAM/kernel     device/network
+      ns             10 ns            100 ns          µs … ms
+
+      └──────── machine-local mechanisms ────────┘
+                                      └──── queues, scheduling,
+                                            firmware, and distance ────┘
 ```
 
-**Serialization delay** is frame bits ÷ link rate. Ethernet adds 8 B preamble/SFD and a 12 B interframe gap to every frame, so a 64 B frame occupies 84 B on the wire:
+The categories overlap. That is the point: mechanism and boundary classify a result better than a memorized decimal.
 
-| Frame | 1 GbE | 10 GbE | 25 GbE | 100 GbE |
-|---|---|---|---|---|
-| 64 B (84 B on wire) | 672 ns | 67.2 ns | 26.9 ns | 6.7 ns |
-| 256 B | 2.2 µs | 220 ns | 88 ns | 22 ns |
-| 1500 B MTU | 12.2 µs | 1.22 µs | 488 ns | 122 ns |
-| 9000 B jumbo | 72.5 µs | 7.25 µs | 2.9 µs | 725 ns |
+### First-pass planning bands
 
-Serialization is why **store-and-forward switching costs a full frame time per hop** and cut-through does not (Ch. 39 §39.1–§39.2). It is also why jumbo frames are a *throughput* optimization and a *latency* pessimization.
+For interview estimation, the scale rows can be expanded into the following deliberately broad bands. This table is an editorial synthesis for experiment sizing, not a shared benchmark dataset. Its claim label is therefore **I**, even where named-part vendor manuals and reproducible measurements motivate the order of magnitude. Scope: server-class systems from roughly 2020–2025, warmed steady state, low offered load, bare metal, and favorable local placement unless the row says otherwise. A machine outside that scope—or a tail statistic—may fall outside a band.
 
-### Switches, NICs, and stacks
+| Operation class | First-pass band | Boundary and caveat | Claim |
+|---|---:|---|---|
+| Dependent simple integer operation | 1–a few cycles | result available to a dependent instruction; instruction and core specific | **I** |
+| Private L1 data-cache load | roughly 3–6 cycles | aligned scalar dependent load, hot line; not store or scan throughput | **I** |
+| Private or mid-level cache load | roughly 10–30 cycles | dependent load; cache organization varies substantially | **I** |
+| Shared last-level-cache load | roughly 30–150 cycles | hit in shared cache; slice, hop, contention, and topology matter | **I** |
+| Local DRAM load | roughly 60–200 ns | unloaded dependent pointer chase, local NUMA allocation, beyond LLC | **I** |
+| Cache-line ownership transfer | roughly 30–300 ns | favorable same-host topology; coherence state and contention dominate | **I** |
+| Uncontended user-space lock path | roughly 10–100 ns | lock already available; no park or kernel wait | **I** |
+| Park-to-wake synchronization | roughly 1–30 µs | lightly loaded host; excludes an unbounded run-queue wait | **I** |
+| Small real syscall | roughly 0.1–2 µs | actual kernel entry with little work; kernel and mitigations matter | **I** |
+| Minor page fault | roughly 1–20 µs | resident backing, no storage I/O; allocator and kernel paths vary | **I** |
+| Small host-network path | roughly 2–50 µs | low load; boundary may be NIC-to-application or application round trip | **I** |
+| NVMe read at queue depth one | roughly 10–500 µs | small block, device completion; model, firmware, and thermal state matter | **I** |
+| Durable small write | roughly 0.1 ms to many ms | requested persistence boundary; device/filesystem/cache policy dominate | **I** |
 
-| Element | One-way latency |
+These bands are order-of-magnitude envelopes, not means or percentiles. Do not average the endpoints or quote the midpoint as “the latency.” Choose the row, tighten its boundary and platform assumptions, and then replace **I** with a dated **M** record. If a result lands outside the band, first check units and boundaries; then investigate rather than deleting the sample.
+
+### Compute and memory
+
+Instruction latency is the delay along a dependency chain. Reciprocal throughput is the rate for independent operations after the execution machinery is full. A vendor may publish both for a named microarchitecture; confusing them can produce a several-fold error.
+
+Cache latency also needs a definition. A pointer chase makes each address depend on the preceding load, exposing load-to-use latency. An array scan lets prefetchers and memory-level parallelism overlap requests, so it measures throughput more than isolated latency. Neither benchmark is “the cache speed.”
+
+Memory results additionally depend on:
+
+- cache state and working-set size;
+- access order and prefetching;
+- page size and translation state;
+- local versus remote NUMA placement;
+- read/write mix and memory-controller utilization;
+- the number of outstanding misses; and
+- coherence ownership, including whether another core has modified the line.
+
+An unloaded pointer chase and a saturated bandwidth test answer different questions. Keep both. Chapter 29 develops the topology and memory mechanisms.
+
+### Synchronization and system calls
+
+“Atomic latency” is not one value. A load from a line already present locally, a read-modify-write that must acquire ownership, and an operation fought over by many sockets exercise different paths. Similarly, an uncontended mutex may remain entirely in user space; a contended mutex may spin, enter the kernel, sleep, wait in a run queue, wake on another core, and reload cold state.
+
+The C++ standard label **S** can tell us that an atomic operation has a particular ordering effect. It does not tell us how many cycles that effect costs. An x86 or Arm architecture label **A** constrains permitted behavior, but timing remains implementation-specific. Vendor guidance is **V**; the result from the target is **M**.
+
+A syscall number also needs an OS boundary. A vDSO-assisted clock read may not enter the kernel at all. A ready-file `read`, a blocking socket `read`, and a storage-backed `read` share a spelling but not a path. Speculation mitigations, tracing, security modules, virtualization, and kernel configuration can all change the result.
+
+### Storage
+
+Separate at least three boundaries:
+
+- **page-cache access:** data is already in memory;
+- **device completion:** the device reports completion to the host;
+- **durable completion:** the required persistence domain has committed the data.
+
+Then state operation size, access pattern, queue depth, read/write mix, filesystem and mount options, device model, firmware, and cache/flush policy. Queue depth one exposes something like a request’s service path. A high queue depth may maximize throughput while increasing individual response time. A surprisingly fast durability result is a reason to inspect the persistence boundary, not a reason to celebrate.
+
+---
+
+## 30.3 Latency, Throughput, and the Critical Path — Core
+
+Suppose a four-stage pipeline has an **illustrative** 100 ns service time at each stage. With no overlap, one item takes 400 ns and the maximum rate is 2.5 million items/s. If different stages can process different items concurrently, latency is still 400 ns, but after filling, the pipeline may complete one item every 100 ns: 10 million items/s. Throughput improved; the latency of an individual item did not.
+
+For one request, draw dependencies:
+
+```text
+receive ──► decode ──► decide ──► encode ──► transmit
+                         │
+                         └──► asynchronous log
+```
+
+If the log is truly asynchronous and never creates backpressure, it is not on the request’s critical path. If the logging queue fills and the producer waits, it rejoins the path. “Asynchronous” is therefore a normal operating condition to verify, not a permanent property.
+
+For serial stages,
+
+\[
+T_{\text{critical}}=\sum_i T_i
+\]
+
+For independent work that completely overlaps,
+
+\[
+T_{\text{critical}}=\max_i T_i
+\]
+
+Real systems lie between these extremes. DMA may overlap compute but still contend for memory bandwidth. Two nominally parallel branches may serialize on a lock or cache line. Use a trace to discover the dependency graph; do not infer it from thread count.
+
+Bandwidth is rate times size. A path transferring 64-byte cache lines at 100 million lines/s carries 6.4 GB/s of payload. That says nothing by itself about whether an individual miss takes 10 ns or 200 ns; many requests may be in flight. Little’s Law supplies the connection.
+
+---
+
+## 30.4 Queueing, Load, and Tails — Core
+
+For a stable system in steady state, Little’s Law is:
+
+\[
+L=\lambda W
+\]
+
+where \(L\) is the average number of requests in the system, \(\lambda\) is the average completion rate, and \(W\) is average time in the system. If a memory path completes 100 million requests/s and the average request spends 80 ns in flight, it needs eight requests in flight on average. Those inputs are **illustrative**; the relationship is general when its steady-state assumptions hold.
+
+Utilization is
+
+\[
+\rho=\lambda S
+\]
+
+for arrival rate \(\lambda\) and mean service time \(S\) at one server. Capacity planning must leave \(\rho<1\), but merely being below one is not enough for low tails.
+
+For an **illustrative M/M/1 model only**—Poisson arrivals, exponential service times, one server, unlimited queue—the mean response time is:
+
+\[
+W=\frac{S}{1-\rho}
+\]
+
+At \(\rho=0.5\), this model gives \(W=2S\); at 0.9, \(10S\); at 0.99, \(100S\). Those multipliers are consequences of this model, not predictions for a trading system, NIC, mutex, or SSD. Bursty arrivals, bounded queues, batching, correlated service times, priorities, and multiple servers change the distribution. The model’s lesson survives: waiting becomes nonlinear near saturation.
+
+### Tails are not a lookup table
+
+There is no universal rule that p50 “belongs to caches” while p99.9 “belongs to the kernel.” Any mechanism can dominate any percentile if it occurs often enough. Typical tail contributors include:
+
+- cache and TLB misses;
+- lock or cache-line contention;
+- run-queue delay and preemption;
+- interrupts, deferred work, and timer activity;
+- allocator, page-fault, reclaim, migration, and writeback paths;
+- device firmware, retries, and queueing;
+- power-state and frequency transitions; and
+- virtualization pauses or noisy neighbors.
+
+Measure a histogram and preserve raw samples. State the observation interval because a maximum over ten seconds is not comparable with a maximum over ten days.
+
+Component percentiles do not normally add:
+
+\[
+p99(A+B)\ne p99(A)+p99(B)
+\]
+
+The slow samples may be correlated, anticorrelated, or occur on different requests. Measure end to end, then use per-stage traces to attribute the result. Summing stage p99s can be a conservative planning exercise only if it is explicitly presented as such, not as the predicted end-to-end p99.
+
+Open-loop load generation also matters. A benchmark that waits for each response before sending the next request stops creating work during a stall and can under-report the latency that scheduled arrivals would have experienced. Chapter 43 treats this coordinated-omission failure in depth.
+
+---
+
+## 30.5 Network Numbers You Can Derive — Core
+
+Two network floors are arithmetic rather than folklore.
+
+### Serialization
+
+For \(B\) transmitted bytes on a link of \(R\) bits/s:
+
+\[
+T_{\text{serialization}}=\frac{8B}{R}
+\]
+
+An Ethernet example must state what \(B\) includes. A 64-byte MAC frame plus an 8-byte preamble/start delimiter spans 72 transmitted byte-times. The mandatory interpacket gap sends no bits, but reserves another 12 byte-times before the next frame; the complete transmission opportunity is therefore 84 byte-times for packet-rate calculations. These counts exclude physical-layer coding and forward-error-correction delay.
+
+At a stated 10 Gb/s:
+
+- the 72-byte-time minimum-frame span serializes in \(72\times8/10^{10}=57.6\) ns (**D**), while its 84-byte-time transmission opportunity consumes 67.2 ns;
+- an untagged 1,518-byte MAC frame carrying a 1,500-byte payload spans 1,526 byte-times including preamble, or 1.2208 µs (**D**); including the following gap, its 1,538-byte-time transmission opportunity consumes 1.2304 µs.
+
+A store-and-forward switch must receive the complete frame before forwarding it, so a frame-span term can recur at hops. Output-port spacing can add gap time as well. A cut-through switch may begin earlier, but it still has implementation delay and can queue at an output. Chapter 36 owns the Ethernet byte accounting, Chapter 38 develops transport queueing, and Chapter 39 owns switch forwarding and queueing.
+
+### Propagation
+
+The SI fixes vacuum light speed at exactly 299,792,458 m/s. A 1 km vacuum path therefore has a one-way propagation floor of about 3.336 µs (**D**). For an **illustrative** fibre refractive index of 1.468:
+
+\[
+T_{\text{fibre/km}}
+=\frac{1000\times1.468}{299\,792\,458}
+\approx4.897\text{ µs}
+\]
+
+The index is an assumption, not a value for every cable and wavelength. Real routes exceed map distance and add transceivers, repeaters, switches, coding, packetization, host processing, and queues. Round-trip time is not one-way time, and dividing by two is justified only when path and processing asymmetry are acceptable.
+
+### Host and device paths
+
+“Network latency” may mean any of these:
+
+```text
+application ─ kernel/bypass ─ driver ─ NIC ─ wire ─ switch ─ wire ─ NIC ─ application
+     ▲                                                           ▲
+ software timestamp                                      hardware timestamp
+```
+
+A vendor’s port-to-port switch result (**V**) cannot be compared directly with an application round trip (**M**). A producer-side enqueue duration excludes consumer observation. Interrupt coalescing, busy polling, batching, offloads, PCIe topology, IOMMU settings, NUMA locality, frame size, offered load, and timestamp position all need to be recorded. Chapter 48 develops the measurement boundary.
+
+---
+
+## 30.6 Worked Latency Budget — Core
+
+Consider a feed handler. Every number in this example is **I**—an assumption for arithmetic, not a claim about a product.
+
+**Boundary:** first inbound preamble bit enters a local 100 m fibre segment to the last outbound FCS bit leaving a second 100 m segment.
+
+**Assumptions:**
+
+- both links are 10 Gb/s;
+- each isolated minimum frame spans 72 transmitted byte-times per direction; the following interpacket gap affects capacity but lies outside this first-bit-to-last-bit boundary;
+- both fibre segments use the illustrative refractive index 1.468;
+- receive processing takes 650 ns;
+- decode, decision, and encode take 900, 700, and 500 dependent cycles;
+- effective core frequency is fixed at 3.2 GHz for the conversion;
+- transmit processing takes 550 ns; and
+- initially there is no queueing and no overlap.
+
+The derived pieces are:
+
+\[
+\begin{aligned}
+T_{\text{serialization, one link}} &= 57.6\text{ ns}\\
+T_{\text{propagation, 100 m}} &\approx489.7\text{ ns}\\
+T_{\text{CPU}} &= (900+700+500)/3.2=656.25\text{ ns}
+\end{aligned}
+\]
+
+The serial critical path is:
+
+\[
+\begin{aligned}
+T_{\text{total}}
+&=57.6+489.7+650+656.25+550+57.6+489.7\\
+&\approx2,951\text{ ns}=2.95\text{ µs}
+\end{aligned}
+\]
+
+This result is only as valid as the boundary and assumptions. If the published boundary is NIC ingress to NIC egress, both external propagation terms may disappear. If receive DMA overlaps inbound serialization, the sum is pessimistic. If a cache miss, interrupt, or queue occurs, it is optimistic. The right next step is a trace with matching timestamps, not an extra significant digit.
+
+Now treat only the 656.25 ns CPU handler as one server. Its no-overlap service capacity is:
+
+\[
+\mu=1/S\approx1.524\text{ million requests/s}
+\]
+
+At an **illustrative** arrival rate of 500,000 requests/s, \(\rho=0.328125\). If—and only if—the M/M/1 assumptions were reasonable:
+
+\[
+W=\frac{656.25}{1-0.328125}\approx976.7\text{ ns}
+\]
+
+The model adds about 320 ns of mean queueing to the CPU stage, making the illustrative mean end-to-end budget about 3.27 µs. This is not a tail prediction. A bursty feed and variable service times require measured arrival and service distributions, a realistic load generator, and an explicit overflow policy.
+
+The following C++23 calculator reproduces the unit conversions. It is deliberately not a benchmark:
+
+```cpp
+#include <cassert>
+#include <iostream>
+
+constexpr double cycles_to_ns(double cycles, double ghz) {
+    return cycles / ghz;                 // GHz == cycles/ns
+}
+
+constexpr double serialization_ns(double wire_bytes, double gbps) {
+    return wire_bytes * 8.0 / gbps;      // Gb/s == bits/ns
+}
+
+constexpr double propagation_ns(double metres, double refractive_index) {
+    constexpr double c_m_per_s = 299'792'458.0;
+    return metres * refractive_index / c_m_per_s * 1.0e9;
+}
+
+constexpr double mm1_response_ns(double service_ns,
+                                 double arrivals_per_second) {
+    const double rho = arrivals_per_second * service_ns / 1.0e9;
+    return service_ns / (1.0 - rho);
+}
+
+int main() {
+    constexpr double serial = serialization_ns(72.0, 10.0);
+    constexpr double fibre = propagation_ns(100.0, 1.468);
+    constexpr double cpu = cycles_to_ns(900.0 + 700.0 + 500.0, 3.2);
+    constexpr double total =
+        serial + fibre + 650.0 + cpu + 550.0 + serial + fibre;
+    constexpr double cpu_response = mm1_response_ns(cpu, 500'000.0);
+
+    static_assert(serial > 57.5 && serial < 57.7);
+    static_assert(cpu > 656.2 && cpu < 656.3);
+    static_assert(cpu_response > 976.6 && cpu_response < 976.8);
+    assert(total > 2950.0 && total < 2952.0);
+    std::cout << "serial critical path: " << total << " ns\n"
+              << "M/M/1 CPU response: " << cpu_response << " ns\n";
+}
+```
+
+The constants are visible so that nobody mistakes the output for discovery.
+
+---
+
+## 30.7 Replacing the Reference with Measurements — Core
+
+A measurement is authoritative only for its recorded scope. Keep a machine-readable record beside the raw samples:
+
+| Field | Minimum record |
 |---|---|
-| Cut-through switch (Arista 7130/Exablaze class) | 40–130 ns |
-| Cut-through switch, general datacenter (Tomahawk/Trident) | 400–800 ns |
-| Store-and-forward switch, 1500 B @10G | 1.3–2 µs |
-| Switch under output-port contention (microburst) | +1 µs to +1 ms (queueing) |
-| Optical layer-1 tap / passive splitter | ~5 ns |
-| NIC RX: wire → DMA into host memory | 300–800 ns |
-| PCIe Gen3/4 round trip (doorbell → completion) | 500 ns – 1 µs |
-| Intel DDIO (DMA lands in L3, not DRAM) | saves ~70–100 ns per line |
-| **Kernel UDP RX, wire → `recvfrom` returns** | **3–6 µs** |
-| **Kernel TCP RX, wire → `read` returns** | **4–8 µs** |
-| Kernel TX, `send()` → wire | 2–5 µs |
-| Kernel path with `SO_BUSY_POLL` | 2–4 µs (removes interrupt+wakeup) |
-| Interrupt-driven wakeup (no busy poll) | +5–30 µs, and it is the jitter source |
-| Interrupt coalescing at default settings | +20–200 µs of added tail |
-| **Kernel bypass (OpenOnload/VMA), UDP** | **1.2–2 µs** |
-| **ef_vi / DPDK raw, wire-to-wire** | **700 ns – 1.5 µs** |
-| **FPGA NIC, tick-to-trade** | **30–120 ns** |
-| RDMA one-sided read, RoCE | 1.5–3 µs |
-| TCP loopback RTT (`lo`) | 15–40 µs |
-| UNIX-domain socket RTT | 8–20 µs |
-| Shared-memory SPSC queue, cross-process | 100–300 ns |
+| Claim and boundary | Exact start event, end event, units, direction, and clock domain |
+| Hardware | CPU model/stepping, sockets and topology, memory, NIC/device model, firmware |
+| Software | OS and kernel, mitigations, drivers, compiler and flags, executable revision |
+| Placement | CPU affinity, NUMA allocation, IRQ placement, SMT sibling, device locality |
+| Workload | Operation and message size, working set, access order, queue depth, contention |
+| Environment | Power policy, effective frequency, virtualization, background workload |
+| Sampling | Warm-up, duration, count, timer, timer overhead, load-generation model |
+| Result | Histogram or raw samples plus p50/p90/p99/p99.9 as justified; never only a mean |
+| Reproduction | Command/configuration, raw-data path and checksum, timestamp |
 
-### Application-level and geographic
+### Match the benchmark to the question
 
-| Path | Latency |
-|---|---|
-| Same rack, cut-through, kernel bypass, RTT | 3–6 µs |
-| Cross-connect within a colo hall | 100–500 ns of cable + 1 switch hop |
-| Within one metro (e.g. Secaucus ↔ Carteret, ~30 km) | ~150 µs one-way fiber |
-| Chicago ↔ New York, best commercial **fiber** | ~6.5 ms one-way, ~13 ms RTT |
-| Chicago ↔ New York, **microwave** | ~4.0 ms one-way, ~8.1 ms RTT |
-| London ↔ Frankfurt fiber | ~4.5 ms RTT |
-| New York ↔ London fiber | ~55–60 ms RTT |
-| Trans-Pacific | ~150–200 ms RTT |
+- To measure dependent instruction or cache latency, create a dependency chain. To measure throughput, use independent operations and enough iterations to reach steady state.
+- To expose cache levels, sweep working-set size and defeat unintended prefetching. Verify with counters; do not assume a “random” access pattern succeeded.
+- To measure memory under load, vary offered bandwidth and plot latency against load. An idle point does not locate the queueing knee.
+- To measure synchronization, timestamp the full handoff through consumer observation. Report producer-only enqueue separately if it matters.
+- To measure a syscall, distinguish a real kernel entry from a vDSO fast path and record mitigation state.
+- To measure storage, use direct or buffered I/O intentionally, state queue depth and block size, and verify the durability contract independently.
+- To measure networking, state application, NIC, or switch timestamp positions and whether the clock domains are synchronized.
 
-The Chicago–NY spread is the standard illustration of why microwave networks exist: the great-circle distance is ~1,190 km, so a straight-line vacuum path is 3.97 ms one-way. Fiber loses on both counts — a longer physical route (~1,300 km) and a slower medium (1.47× index) — giving ~6.5 ms. **Microwave cannot beat physics; it beats the refractive index and the routing.**
+On Linux, `perf stat` can collect hardware and software event counts, but event availability and meaning are CPU- and kernel-specific. A useful command shape is:
 
-### Tick-to-trade budgets
+```sh
+perf stat -r 30 -e cycles,instructions,cache-misses,branch-misses -- ./bench
+```
 
-A realistic decomposition for a competitive equities/futures strategy, one way, from the first bit of the market-data packet arriving at your NIC to the first bit of the order leaving it:
+Treat it as **O/V-dependent**, not as a universal command: first list available events, check multiplexing, and record the `perf` and kernel versions. Counters attribute a result; they do not replace timing.
 
-| Stage | Software (bypass) | FPGA |
-|---|---|---|
-| NIC RX to user memory | 400–700 ns | 30–50 ns (on-chip) |
-| Feed decode / book update | 200–800 ns | 10–30 ns |
-| Strategy decision | 100–500 ns | 5–20 ns |
-| Order encode | 100–300 ns | 5–15 ns |
-| NIC TX to wire | 400–700 ns | 20–40 ns |
-| **Total** | **1.2–3 µs** | **70–150 ns** |
+Timer choice is part of the experiment. A language-level monotonic clock is appropriate for many end-to-end intervals but can overwhelm a tiny operation. An architectural counter needs correct ordering and a conversion; its rate need not equal instantaneous core frequency. Measure timer overhead, use a control experiment, inspect generated code, and prevent the optimizer from deleting the work. Chapter 35 covers clocks and ordering; Chapter 43 gives the full benchmarking protocol.
 
-Serialization, encoding, and byte-order work (Ch. 3 §3.9, Ch. 51) sit inside the middle three rows. A `BSWAP` costs 1 cycle; a `std::stringstream` parse costs 500 ns–2 µs and is the reason allocation-free binary parsing exists.
+Finally, run two experiments:
+
+1. a controlled test that isolates the mechanism; and
+2. a production-like test with realistic load, placement, background activity, and duration.
+
+The first explains. The second decides.
 
 ---
 
-## 30.4 Latency Numbers as Estimates, Not Constants
+## 30.8 Reference Notes — Skippable
 
-Every table above is a *distribution summarized by its mode*, quoted for one machine class. Treating any of them as a constant is the most common way engineers reason themselves into wrong designs.
+Use primary, part-specific documents rather than an unattributed latency chart:
 
-### What moves the numbers, and by how much
+- The [Intel 64 and IA-32 Architectures Optimization manuals](https://www.intel.com/content/www/us/en/developer/articles/technical/intel64-and-ia32-architectures-optimization.html) publish optimization guidance and named-microarchitecture throughput/latency material. Treat those figures as **V**, then verify the exact processor.
+- AMD publishes [processor-specific software optimization guides](https://docs.amd.com/r/en-US/57368-uProf-user-guide/Useful-URLs) for several processor families. Again, the label is **V**, not a cross-family guarantee.
+- The [Linux kernel workload-tracing documentation](https://origin.kernel.org/doc/html/latest/admin-guide/workload-tracing.html) describes `perf stat` and `perf bench`. Tool and event behavior remain kernel- and processor-dependent (**O/V**).
+- The [BIPM SI Brochure](https://www.bipm.org/documents/20126/41483022/SI-Brochure-9-EN.pdf/2d2b50bf-f2b4-9661-f402-5f9d66e4b507?t=1671101192839&version=1.11) defines \(c=299\,792\,458\text{ m/s}\) exactly. Propagation results in §30.5 are **D** from that constant and a stated medium assumption.
 
-| Factor | Effect | Typical magnitude |
-|---|---|---|
-| CPU frequency (C-state/P-state, turbo, AVX offset) | Changes cycles↔ns conversion | 0.8–2.5× |
-| Waking from C6 | Adds fixed exit latency | 50–150 µs |
-| Frequency ramp after idle | Runs at base clock briefly | 20–40% slower for ~1 ms |
-| SMT sibling active | Halves front-end and L1 capacity | 1.2–2× worse |
-| NUMA node of memory vs thread | Remote access penalty | 1.4–2.0× |
-| Memory-controller load | Queueing delay | 1× → 4× at saturation |
-| Working-set size crossing a cache level | Discontinuous jump | 4×, 5×, 4× at each boundary |
-| TLB reach exceeded (4 KB vs 2 MB pages) | Adds page walks | 10–40% on random access |
-| Spectre/Meltdown mitigations | Syscall + indirect-branch cost | 2–3× on syscalls |
-| Hypervisor / cloud tenancy | Steal time, vCPU preemption | 10 µs – 10 ms outliers |
-| Kernel version | Scheduler, io_uring, mitigation changes | Occasionally 2× |
-| Compiler and code layout | I-cache and BTB pressure | 5–30% with no source change |
-
-**The hardware-generation caveat, stated precisely.** Between Skylake-SP (2017) and Sapphire Rapids/Genoa (2023): L1/L2 latency in *cycles* barely moved (4/12 → 5/16 — L2 got *slower* in cycles as it got bigger); L3 latency worsened as core counts grew and meshes lengthened; DRAM latency in *nanoseconds* is nearly unchanged; per-socket bandwidth roughly tripled; core width went from 4-wide to 6-wide; branch mispredict penalty is flat. **Latency is stagnant, bandwidth and parallelism are not.** Any design whose performance rests on a latency improvement arriving is a design that will not improve.
-
-### Mean is the wrong statistic
-
-For a low-latency system the mode is irrelevant and the mean is misleading. What matters is p99, p99.9, and max, and those are governed by entirely different mechanisms than the median:
-
-| Percentile | Dominated by |
-|---|---|
-| p50 | Cache hits, correct prediction, hot path |
-| p90 | L3 misses, occasional branch mispredict |
-| p99 | Page faults, TLB misses, lock contention, allocator slow paths |
-| p99.9 | Context switches, IRQ handling, timer ticks, THP compaction |
-| p99.99 / max | C-state exit, NUMA migration, page-cache writeback, GC-like arena reclaim, `mmap` semaphore stalls |
-
-A change that improves p50 by 20 ns and adds a 1-in-10⁵ chance of a 500 µs stall is a loss. This is why Ch. 43 §43.2–§43.5 insists on full histograms and warns about coordinated omission: a load generator that stops sending during a stall never records the stall.
-
-### Measuring rather than assuming
-
-| Question | Tool | Specific counter/knob |
-|---|---|---|
-| Where are the cache misses? | `perf stat` | `LLC-load-misses`, `mem_load_retired.l3_miss` |
-| Is it front-end or back-end bound? | `perf stat --topdown`, `toplev` | Top-down levels 1–3 |
-| Actual DRAM latency on this box | Intel MLC (`mlc --latency_matrix`), `lmbench lat_mem_rd` | Per-NUMA-node matrix |
-| Branch mispredicts | `perf stat` | `branch-misses`, `br_misp_retired.all_branches` |
-| TLB cost | `perf stat` | `dtlb_load_misses.walk_active`, `.walk_pending` |
-| Syscall cost on this kernel | `perf trace`, a `getpid` loop | — |
-| Which mitigations are on | `/sys/devices/system/cpu/vulnerabilities/*` | — |
-| Actual core frequency during the run | `turbostat`, `perf stat` | `cycles` ÷ `ref-cycles` ratio |
-| Context switches and migrations | `perf stat` | `context-switches`, `cpu-migrations` |
-| Off-CPU time and why | `bpftrace` / `offcputime` | Kernel stack at schedule-out |
-| Scheduler latency | `perf sched latency`, `ftrace sched_switch` | Wakeup-to-run delay |
-| Page faults | `perf stat`, `/proc/PID/stat` | `page-faults`, `minflt`/`majflt` |
-| NUMA behaviour | `numastat`, `perf c2c` | Remote access %, HITM sources |
-| Network stack timing | NIC hardware timestamps, `SO_TIMESTAMPING` | Ch. 48 §48.9 |
-
-**`perf c2c` deserves a specific mention**: it attributes cache-line contention to the exact line, offset, and pair of code sites, and is the correct answer to "how would you find false sharing in production?" (Ch. 26 §26.15).
-
-### How to use this chapter in an interview
-
-The expected failure mode is reciting a table. The expected strong answer has three parts:
-
-1. **Order of magnitude and unit.** "An L3 miss is ~80 ns, call it 250 cycles at 3 GHz."
-2. **The mechanism that produces it.** "Because the mesh traversal is ~20 ns and DRAM row activation plus CAS is ~40–50 ns; bandwidth has scaled, timings haven't."
-3. **What would change it here.** "But this is a remote node in a two-socket box, so 130 ns, and if the working set is 10 GB with 4 KB pages I should assume a page walk on top."
-
-The ratios matter more than the absolutes, and the ratios are stable across generations: **L1 : L2 : L3 : DRAM ≈ 1 : 3 : 15 : 60**, and **cache-miss : syscall : context-switch : disk ≈ 1 : 3 : 30 : 1000**. Those two chains reconstruct most of the tables above.
+These links are source routes, not a frozen benchmark dataset. When this chapter is revised, update a measured table only from its raw record; do not “refresh” a number by copying a newer marketing page with a different boundary.
 
 ---
 
-## Key Interview Questions
+## 30.9 Traps, Puzzle, and Exercise — Core
 
-1. **What's the cycles-to-nanoseconds conversion you work in?** — ~3 cycles/ns at 3 GHz; in-core costs quote in cycles (frequency-invariant), off-core in ns (frequency-invariant the other way).
-2. **Give the cache hierarchy latencies.** — L1 ~4 cy (1.3 ns), L2 ~14 cy (4–5 ns), L3 ~50–70 cy (15–25 ns), local DRAM ~80 ns, remote NUMA ~130 ns.
-3. **Why hasn't DRAM latency improved in 15 years?** — It's bounded by DRAM bank timings (tRP/tRCD/tCL), which are electrically constrained; channel count and clock scale bandwidth, not latency.
-4. **What is the branch-misprediction penalty and why that value?** — 15–20 cycles, set by pipeline depth from fetch to branch resolution; add front-end refill if the correct path isn't in the µop cache.
-5. **How fast is an uncontended atomic RMW vs a contended one?** — ~20 cycles if the line is already in Modified state in your L1; 100–250 cycles when another core owns it; 500–2000 under real contention; 10× that cross-socket.
-6. **Why is a split-lock catastrophic?** — An atomic straddling two cache lines can't be done by cache-line locking, so the CPU asserts a bus lock, stalling every core for microseconds. Detect with `split_lock_detect`.
-7. **Cost of a syscall today?** — 40–60 ns of raw entry/exit, but 200–350 ns with KPTI+IBRS enabled; a real syscall like `read` on a ready socket is 1–3 µs including stack work.
-8. **Why is `clock_gettime` cheap?** — vDSO maps kernel timekeeping data into user space and reads the TSC there; no mode switch, 15–25 ns.
-9. **Direct vs indirect cost of a context switch?** — 1–3 µs direct (registers, CR3, scheduler); 10–100 µs indirect from cold L1/L2/TLB. The indirect cost dominates and is what core isolation eliminates.
-10. **Uncontended vs contended mutex?** — 15–25 ns (pure atomics, no syscall) vs 2–8 µs when it parks on a futex, because that's two syscalls plus a context switch.
-11. **How long does 1500 B take to serialize at 10 GbE, and why does it matter?** — 1.22 µs; it is the per-hop cost of store-and-forward switching and the reason jumbo frames hurt latency.
-12. **Fiber propagation delay?** — ~5 µs/km (index ~1.47); microwave ~3.34 µs/km, which is why Chicago–NY is ~4.0 ms one-way by microwave and ~6.5 ms by fiber.
-13. **Kernel network stack vs kernel bypass?** — 3–6 µs one-way for kernel UDP RX vs 700 ns–1.5 µs for ef_vi/DPDK; FPGA tick-to-trade is 30–120 ns.
-14. **What is Little's Law telling you about single-core memory bandwidth?** — With ~12 line-fill buffers and 80 ns latency, one core sustains ~10 GB/s from DRAM regardless of the socket's 200 GB/s; prefetching helps by raising concurrency.
-15. **Why is pointer chasing so much worse than its miss count suggests?** — Dependent loads serialize, collapsing memory-level parallelism to 1, so misses add rather than overlap.
-16. **Which mechanisms dominate p99.9 as opposed to p50?** — Context switches, IRQs, timer ticks, THP compaction, C-state exits, page faults — none of which appear in the median.
-17. **How would you find false sharing in production?** — `perf c2c`, which attributes HITM events to specific cache lines, offsets, and code sites.
-18. **What differs on ARM?** — Similar cache latencies, shallower pipeline (11–13 cycle mispredict), 128 B lines on Apple Silicon, weak ordering so acquire/release cost real instructions, and LSE atomics instead of LL/SC.
-19. **How do you validate any of these numbers on a given machine?** — Intel MLC or lmbench for memory, `perf stat` with specific PMU events, `turbostat` for the actual frequency, `/sys/.../vulnerabilities` for mitigation state.
+### Common traps
 
----
+- **Latency versus throughput:** using reciprocal throughput as dependent latency.
+- **Cycles versus nanoseconds:** converting with nominal frequency while the core boosts, throttles, or uses an invariant counter.
+- **Warm versus cold:** presenting the minimum of a warmed loop as a first-request prediction.
+- **Local versus remote:** omitting NUMA, cache ownership, IRQ, or device placement.
+- **One-way versus round trip:** halving an asymmetric RTT without evidence.
+- **Enqueue versus handoff:** timing the producer call but claiming consumer-visible latency.
+- **Service versus response:** omitting queueing and scheduler delay.
+- **Completion versus durability:** treating a returned write as persisted data.
+- **Median versus tail:** improving a hot path while introducing a rare slow path.
+- **Component percentiles:** adding p99 values and naming the sum “end-to-end p99.”
+- **Coordinated omission:** letting the load generator stop issuing during stalls.
+- **False precision:** writing 83.7 ns when the platform and boundary justify only “order \(10^2\) ns.”
 
-## Common Traps
+### Puzzle: the impossible queue
 
-- **Quoting cycle counts without a frequency**, or nanoseconds without saying which hardware class. Both are meaningless alone.
-- **Assuming the core runs at turbo frequency** — all-core AVX-512 workloads can run 25–40% below the marketing clock.
-- **Using the mean latency.** Low-latency systems are judged on p99.9 and max; the mean hides exactly the events that matter.
-- **Forgetting the indirect cost of a context switch** and quoting only the 1–3 µs direct cost.
-- **Assuming an atomic is "about 20 cycles"** without stating that this requires the line to be uncontended and already in Modified state.
-- **Believing "syscalls are 100 ns"** on a machine with default mitigations — measure; it's usually 2–3× that.
-- **Ignoring interframe gap and preamble** when computing serialization: a 64 B frame is 84 B on the wire.
-- **Confusing propagation with serialization.** Distance sets the first, link rate sets the second; only one of them is fixed by geography.
-- **Treating jumbo frames as a latency win.** They are a throughput/CPU win and a per-hop latency loss.
-- **Comparing cross-machine latencies without hardware timestamping** — software timestamps carry the stack cost you're trying to measure.
-- **Assuming DRAM latency scales with a newer CPU generation.** Bandwidth does; latency doesn't.
-- **Benchmarking on a machine with C-states enabled** and reporting the warm number, then seeing 100 µs outliers in production after idle periods.
-- **Measuring with an SMT sibling active** and attributing the noise to the code.
-- **Extrapolating single-thread numbers to N threads** — memory latency degrades sharply under controller load.
-- **Assuming remote NUMA is "a bit slower".** It's 1.4–2× on latency and drastically worse on contended lines (cross-socket HITM is 500 ns+).
-- **Reciting the table without the mechanism.** The follow-up question is always "why", and the number alone doesn't survive it.
+A report says:
+
+> “Our SPSC queue handoff is 18 ns p99 on every server.”
+
+The benchmark timestamps immediately before and after the producer’s `push`, pre-faults the ring, runs the producer and consumer unpinned, and discards all samples above 100 ns as “scheduler noise.”
+
+Find at least six defects. A strong answer should identify the wrong boundary, explain why unpinned placement changes coherence and scheduling, reject the censored percentile, request platform and load metadata, distinguish producer progress from consumer observation, and challenge “every server.” Then design the smallest experiment that measures publication-to-observation with a sequence number and timestamps at both ends.
+
+### Applied exercise
+
+Create a latency sheet for one real target:
+
+1. Choose one compute/cache operation, one memory operation, one handoff or syscall, one storage operation, and one network boundary.
+2. Write an order-of-magnitude estimate before measuring. Label each input **V**, **D**, or **I**.
+3. Complete every field in the measurement record in §30.7.
+4. Measure an idle distribution and at least three offered-load points, one near the observed knee.
+5. Plot latency percentiles against load. Keep raw samples.
+6. Reconcile estimate and measurement. Identify whether each miss came from a wrong constant, wrong boundary, wrong dependency model, or omitted queue.
+
+The objective is not five impressive numbers. It is five claims another engineer can reproduce.
 
 ---
 
-## Compact Recall Summary
+## 30.10 Recall and Review — Core
 
-**Anchors.** 3 cycles ≈ 1 ns at 3 GHz. L1 4 cy / 1.3 ns; L2 ~14 cy / 4 ns; L3 50–70 cy / 20 ns; local DRAM 80 ns; remote DRAM 130 ns; cross-socket dirty-line transfer 200–300 ns. Ratios **1 : 3 : 15 : 60** across the hierarchy. Branch mispredict 15–20 cy. Page walk 20–40 cy warm, 100–200 ns cold.
+**Recall card.**
 
-**Bandwidth vs concurrency.** Socket DRAM bandwidth is 200–300 GB/s but a single core gets 8–15 GB/s, because Little's Law caps it at `line_fill_buffers × 64 B / latency`. Prefetching raises concurrency; pointer chasing destroys it.
+- \(1\text{ µs}=1{,}000\text{ ns}\); at \(f\) GHz, cycles divided by \(f\) gives ns.
+- Label claims: **S** standard, **A** architecture, **O** OS/interface, **V** vendor, **M** measured, **D** derived, **I** illustrative.
+- Record boundary, platform, workload, load, statistic, provenance, and date.
+- Latency is dependency time; throughput is completion rate; bandwidth is rate times bytes.
+- Sum serial critical-path stages; take the longest only for work that truly overlaps.
+- Little’s Law is \(L=\lambda W\). Queueing rises nonlinearly near capacity.
+- Serialization is \(8B/R\). Propagation is distance divided by signal speed.
+- Percentiles do not add in general. Measure end to end and trace components.
+- A reference range sizes an experiment. A qualified target measurement makes the decision.
 
-**Synchronization.** Uncontended atomic RMW ~20 cy; contended 100–2000 cy; cross-socket worse still; split lock is microseconds of whole-machine stall. Uncontended mutex 15–25 ns, parked mutex 2–8 µs. SPSC handoff 40–80 ns same socket.
+**Questions.**
 
-**Kernel.** Syscall entry 40–60 ns bare, 200–350 ns with KPTI+IBRS. vDSO `clock_gettime` 15–25 ns. Minor fault 0.5–2 µs, COW fault 1.5–3 µs, major fault 30–150 µs on NVMe. Context switch 1–3 µs direct, 10–100 µs of cache recovery. TLB shootdown scales with core count: 2–5 µs at two cores, 10–50 µs at sixty-four.
+1. Why can the C++ standard specify atomic correctness yet say nothing useful about an atomic operation’s nanoseconds?
+2. What metadata is missing from the claim “DRAM takes 90 ns”?
+3. A vendor lists instruction latency as four cycles and reciprocal throughput as 0.5 cycles. What does each number mean?
+4. How can a pipeline improve throughput without improving per-item latency?
+5. When should serial stage costs be summed, and when is taking the maximum defensible?
+6. Derive both the 1,526-byte-time frame span and the 1,538-byte-time transmission opportunity at 25 Gb/s. Why are they different, and which PHY details remain outside both results?
+7. Why is fibre propagation near 4.9 µs/km only a qualified estimate even though vacuum light speed is exact?
+8. In the worked example, which assumptions would make the 2.95 µs sum pessimistic, and which omitted events would make it optimistic?
+9. Why does an M/M/1 calculation teach a useful queueing lesson without predicting a production p99?
+10. Design a benchmark that distinguishes producer-side enqueue time from consumer-visible handoff time.
 
-**Network.** Fiber 5 µs/km, microwave 3.34 µs/km. 1500 B at 10 GbE = 1.22 µs; 64 B = 67 ns (84 B on wire). Cut-through switch 40–130 ns for HFT-grade silicon, 400–800 ns for general datacenter. Kernel UDP one-way 3–6 µs; bypass 0.7–2 µs; FPGA tick-to-trade 30–120 ns. Chicago–NY: 8.1 ms RTT microwave, 13 ms fiber.
-
-**Variance.** Frequency, C-states, SMT, NUMA placement, controller load, page size, mitigations, hypervisor steal, and code layout each move these by 1.2–3×; C6 exit and THP compaction move the tail by orders of magnitude. p50 is cache behaviour; p99.9 is the operating system.
-
-**Method.** Know the order of magnitude, the mechanism that produces it, and the local factor that would change it. Verify with `perf stat` (specific PMU events), `perf c2c`, Intel MLC, `turbostat`, `bpftrace`, and hardware timestamps — never with a remembered table.
+**Prerequisite for Chapter 31.** Be able to separate a thread’s service time from its run-queue wait, and to explain why a microbenchmark on an idle pinned core does not predict wake-to-run latency on a loaded scheduler. Chapter 31 applies those distinctions to processes, threads, scheduling, affinity, preemption, and futexes.

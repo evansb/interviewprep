@@ -1,670 +1,870 @@
 # Chapter 59 — Observability
 
-*Interview-focused revision notes. The theme: every measurement perturbs the thing measured, and in a system whose end-to-end budget is a few microseconds the probe's cost is a first-class design constraint — so observability becomes an exercise in moving work off the hot path rather than in collecting more data.*
+Observability is the ability to answer important production questions correctly and quickly from evidence the system deliberately emits or retains. In a low-latency service, that evidence must not become an unbounded producer of latency, memory, disk, network traffic, or cardinality.
 
----
+The design problem is not “add logs and dashboards.” It is:
 
-## 59.1 Metrics Types and Semantics
+> Define signal semantics and ownership, bound hot-path work and storage, account for telemetry loss, preserve causal context, and make one incident reconstructible without pretending timestamps or sampled data are complete.
 
-A **metric** is a numeric time series describing a system property. Four semantic kinds dominate, and confusing them is the most common conceptual error:
+Chapter 43 owns measurement methodology, statistics, histogram interpretation, and benchmarking. This chapter owns production signals: metrics, structured events, traces, profiles, health/progress signals, watchdogs, alerts, and flight recorders.
 
-| Kind | Semantics | Hot-path cost | Aggregation across instances |
-|---|---|---|---|
-| **Counter** | Monotonically increasing total (orders sent, packets dropped) | one `++` on a thread-local | sum |
-| **Gauge** | Instantaneous value (queue depth, position, free descriptors) | one store | **not summable** in general; last-value or sum depending on meaning |
-| **Histogram** | Distribution of observations (latency) | bucket index + `++` (§59.4) | mergeable if bucket boundaries match |
-| **Summary / quantile** | Pre-computed quantiles at the source | expensive (needs sorted state) | **not mergeable** — averaging p99s is meaningless |
+Label every implementation claim:
 
-The **counter vs gauge** distinction matters because counters are *resettable-safe*: a monotonic counter plus a timestamp lets the collector compute a rate and correctly handle process restarts (a decrease implies a reset). A gauge sampled at 1 Hz simply misses everything that happened between samples, which for a system operating at microsecond scale is essentially all of it. **Anything you care about the tail of must be a counter or a histogram, never a gauge.**
-
-The **summary is the trap.** Prometheus-style summaries compute quantiles in the process, which means (a) you pay the cost in the process, and (b) the resulting numbers cannot be combined. If eight strategy processes each report p99 = 4 µs, the fleet p99 is *not* 4 µs and cannot be derived. Histograms with fixed shared bucket boundaries are mergeable by construction — sum the bucket counts, then interpolate. This is why every serious latency pipeline ships histograms, not quantiles (§59.4).
-
-### Semantics that must be nailed down
-
-- **Unit and scale.** Store nanoseconds as `uint64_t`; never store a pre-divided float. Division loses precision and hides the true distribution. Name the metric with its unit (`order_ack_latency_ns`).
-- **Monotonicity across restart.** Export a `process_start_time` gauge alongside counters so a collector can distinguish "counter reset" from "counter wrapped."
-- **Counter width.** 64-bit. A 32-bit packet counter at 10 Gbps line rate wraps in about five minutes.
-- **Delta vs cumulative.** Cumulative (report the running total, let the collector difference) is robust to lost scrapes; delta (report the increment since last scrape) silently loses data if a scrape fails. Prefer cumulative.
-
-### The cost model
-
-A metric update on the hot path should be a single non-atomic increment to a thread-local or per-core cache line:
-
-```cpp
-struct alignas(64) CoreCounters {          // one line per core, no false sharing (Ch. 3 §3.3)
-    uint64_t orders_sent;
-    uint64_t rejects;
-    uint64_t md_msgs;
-    char pad[64 - 3 * sizeof(uint64_t)];
-};
-inline CoreCounters& my() noexcept;        // thread_local or indexed by core id
-// hot path:
-++my().orders_sent;                        // ~1 cycle, no lock, no atomic, no cache-line contention
-```
-
-A `std::atomic<uint64_t>` increment shared between threads is a locked RMW: ~20 cycles uncontended, and under contention it serializes the cache line across cores at ~100 ns per hop (Ch. 28). A `std::map<std::string, Counter>` lookup on the hot path is a hash or tree traversal plus a possible allocation — three orders of magnitude too expensive. **The metric handle must be resolved at construction time, not at update time**; the hot path holds a pointer or index, never a name. This single point separates candidates who have instrumented a real hot path from those who have used a metrics library.
-
----
-
-## 59.2 High-Cardinality Metrics
-
-**Cardinality** is the number of distinct time series a metric produces: the metric name multiplied by the cross-product of its label values. `order_latency{symbol, venue, strategy, side}` with 8000 symbols, 6 venues, 40 strategies, 2 sides is 3.8 million series — each of which the backend stores, indexes, and retains.
-
-The cost is borne in three places:
-
-| Location | Cost of high cardinality |
+| Label | Example |
 |---|---|
-| **Hot path** | Label lookup becomes a hash of a string tuple; the counter is no longer a fixed address. Allocation on first sight of a new label set. |
-| **Process memory** | One counter/histogram per series. A 200-bucket histogram × 3.8 M series = gigabytes. |
-| **Backend** | Prometheus/InfluxDB index explosion; ingestion falls over. This is the standard way monitoring systems die. |
+| Signal contract | `orders_rejected_total` counts terminal admission rejections |
+| C++ requirement | concurrent non-atomic read/write is a data race |
+| Product/tool fact | a backend’s histogram or tail-sampling behavior |
+| Version/schema fact | log record version 7 and dictionary build ID |
+| Deployment fact | collector CPU, scrape cadence, ring capacity |
+| Measurement | instrumentation cost and telemetry loss under workload B |
 
-### The hot-path structure that makes it survivable
+A sampling rate, buffer size, cache-line width, alert window, or stall timeout is not universal. Derive it from event rate, diagnostic objective, resource budget, failure policy, and measured observer effect.
 
-Never key metrics by string at runtime. Key them by a dense integer id you already have:
+The final test of observability is practical: during a failure, can an owner determine what became unsafe, when, why the evidence is incomplete, and which reversible action follows?
+
+## The 90-second screen — Core
+
+For each production signal, answer:
+
+1. **Question:** What operator or automated decision does it support?
+2. **Semantic owner:** Which component defines and increments/emits it?
+3. **Type/unit:** Counter, gauge, histogram, state transition, event, span, profile, or recorder entry?
+4. **Dimensions:** Which labels are bounded, and what is the maximum series/schema cardinality?
+5. **Hot-path cost:** Copies, atomics, cache lines, timestamp reads, allocation, formatting, syscalls, and branches?
+6. **Buffering:** Capacity in records and bytes, expected coverage horizon, and memory placement?
+7. **Backpressure:** Drop, overwrite, sample, block, spill, or disable—and why is that safe?
+8. **Loss visibility:** Which counter/gap record proves telemetry is incomplete?
+9. **Correlation:** Event/trace/order IDs, per-owner sequence, clock domain, and uncertainty?
+10. **Failure behavior:** What happens when collector, disk, network, clock sync, or decoder fails?
+
+The signal flow should be explicit:
+
+```text
+critical owner
+  | fixed, bounded update/record
+  +-> owner-local counters/histogram
+  +-> bounded event or trace ring
+  +-> overwriting flight recorder
+
+collector / backend (off critical owner)
+  -> aggregate, encode, batch, persist/export
+  -> expose telemetry-loss and collector-health signals
+  -> trigger alerts and incident capture
+```
+
+No arrow has infinite capacity. If an exporter slows, the critical owner follows a predeclared policy rather than inheriting the exporter’s latency.
+
+## 59.1 Goals, signals, and ownership
+
+Production evidence should answer:
+
+- **rate:** what work arrives, completes, rejects, or drops;
+- **errors:** which invariant, protocol, resource, or dependency failed;
+- **saturation:** which queue, thread, pool, session, device, or storage boundary is nearing capacity;
+- **distribution:** how latency, size, batch, and queue age vary;
+- **state:** which mode, health, reference version, session, or failover epoch is active;
+- **causality:** which input and state produced an output;
+- **history:** what happened immediately before a rare failure.
+
+The main signal classes trade detail for cost:
+
+| Signal | Best for | Main cost/risk | Loss behavior to define |
+|---|---|---|---|
+| counter | cumulative occurrences/rates | update and collection coherence | reset/wrap/process restart |
+| gauge | current sampled state | missed between-sample behavior | staleness and scrape gaps |
+| histogram | mergeable distribution with fixed schema | per-observation bucket update, storage | overflow/underflow and dropped samples |
+| structured event/log | discrete explanation and audit context | bytes, queue, formatting/persistence | record drops and gaps |
+| trace/span | causal path and stage timing | context propagation and event volume | sampling and partial traces |
+| profile | where CPU/memory/blocking occurs | sampling/collection overhead | sample bias and unsupported frames |
+| health/progress | automation and operator state | false confidence or flapping | stale/missing signal semantics |
+| flight recorder | detailed recent pre-failure history | fixed memory and dump path | overwritten generations/dump failure |
+
+One signal should have one semantic owner. Multiple components can contribute separate shards, but the aggregation rule must be explicit. A metric called `errors` owned by everyone has no stable meaning.
+
+### Start from incident questions
+
+For a latency incident, operators need more than a percentile:
+
+```text
+Did offered load or event mix change?
+Which stage/queue accumulated age?
+Were inputs healthy and clocks comparable?
+Which event IDs form the tail?
+Did telemetry itself drop or stall?
+What build/config/reference/deployment was active?
+What state transitions or faults preceded it?
+```
+
+Design dashboards, traces, and recorder schemas from these questions. Collecting every available host metric without an investigation path increases cost and cognitive load.
+
+### Signal ownership map
+
+Map each critical architecture boundary to both a correctness signal and a capacity signal:
+
+| Boundary | Correctness/state signal | Rate/saturation signal | Detail source |
+|---|---|---|---|
+| network -> feed | sequence gaps, invalid/recovery transitions | packets/events, ring/backlog drops | packet metadata and feed recorder |
+| feed -> market state | rejected version/event, stale state | apply rate, queue age/high-water | state-transition event |
+| state -> strategy | decision suppressed by quality/version | decision rate and span histogram | sampled causal decision |
+| strategy -> risk | reject/reason, reservation expiry | intent rate and reservation saturation | risk decision record |
+| risk -> gateway | admission without/with valid reservation | intent-queue age, throttle headroom | order audit transition |
+| gateway -> venue | disconnect/ambiguous state, encode/send error | bytes/messages, TX queue age | session recorder |
+| venue -> gateway | duplicate/illegal response, reconciliation state | ack/fill rate and latency | canonical order history |
+
+An application signal does not replace lower-layer evidence. A feed gap can originate on the wire, NIC, kernel, application queue, or decoder. Chapter 46 names those counters. Likewise, a host CPU metric does not reveal which business state became unsafe. Preserve layer boundaries so an incident can identify the first failing stage.
+
+**Profiles** are supporting signals, not continuous truth. A CPU profile can explain where samples landed during a slow interval; it cannot show a missing market-data packet, prove order identity, or replace state transitions. Combine resource evidence with domain evidence.
+
+## 59.2 Cost, boundedness, cardinality, and backpressure
+
+### Instrumentation cost model
+
+For one signal update, inventory:
+
+\[
+C = C_{\text{clock}}+C_{\text{lookup}}+C_{\text{atomic/coherence}}
+  +C_{\text{copy}}+C_{\text{branch}}+C_{\text{queue}}
+\]
+
+Formatting, allocation, syscall, compression, and network/disk I/O should normally be off the critical owner. “Asynchronous logging” is not free: producing a record still evaluates arguments, reads time, copies fields, updates queue state, and may transfer cache lines.
+
+Measure:
+
+- disabled instrumentation;
+- enabled without a collector;
+- enabled with healthy export;
+- exporter slow/unavailable;
+- ring full/drop/overwrite;
+- trigger/dump;
+- realistic event mix and burst load.
+
+Report distributions and correctness outcomes, not one minimum loop number. Chapter 43 defines methodology.
+
+### Bounded cardinality
+
+Metric series count is approximately the cross-product of metric name and label values. Labels such as raw order ID, user string, stack trace, error text, IP, or symbol from an unbounded namespace can create unbounded memory/index/network work.
+
+Before adding a label, write:
+
+```text
+value source
+maximum values per process and fleet
+retention/lifecycle
+aggregation question it answers
+behavior for unknown/new values
+backend product limits and cost
+```
+
+Use bounded categories for metrics: venue/partition from configuration, status enum, error-reason code, latency class, or a deliberately capped top-K/bucket. Put per-order or per-packet detail in a bounded event/trace/recorder channel and link a small number of examples through exemplars or IDs where the product supports it.
+
+Cardinality controls must exist before backend ingestion. A backend rejecting excess series does not refund hot-path allocation or network cost.
+
+Calculate the bound before coding. With 8 owners, 4 configured venues, and 12 reason codes, a fully crossed metric can produce at most:
+
+\[
+8\times4\times12=384
+\]
+
+series per metric name. Adding an `instrument` label with 4,000 values raises that theoretical bound to 1,536,000. Adding raw order ID makes the bound a function of traffic and retention, which is not acceptable for a normal metric.
+
+Cross-products may be sparse, but budgeting the maximum forces an explicit decision. If per-instrument visibility is necessary, alternatives include:
+
+- a fixed array aggregated into configured product/venue groups;
+- capped top-K with an `other` bucket and churn/eviction counters;
+- on-demand temporary diagnostics with authorization and expiry;
+- structured events queried by entity ID;
+- recorder capture triggered for a selected instrument;
+- exemplars linking selected histogram observations to traces.
+
+Top-K is approximate and can churn under changing workloads. Export the algorithm/window/capacity and eviction count. An `other` bucket is part of the truth, not an inconvenience to hide.
+
+### Backpressure table
+
+| Signal | Full/slow policy candidate | Required evidence |
+|---|---|---|
+| owner-local counter | remain local until collector catches up | collector age/staleness |
+| optional debug event | drop/sample | dropped count by reason/source |
+| mandatory audit event | reserved durable path or fail action safely | commit/ack state and failure alarm |
+| trace span | head/tail/adaptive sampling per policy | sampled/dropped/incomplete counts |
+| flight recorder | overwrite oldest | generation/overwrite boundary |
+| recorder dump | rate-limit/coalesce/fail visibly | dump result and suppressed-trigger count |
+
+Audit/compliance records are not ordinary debug logs. Their durability and failure action are business/jurisdiction requirements and may deliberately constrain trading. Chapter 60 owns disk retention and operational lifecycle.
+
+Never let an unbounded logger turn telemetry overload into process memory exhaustion. Never block a critical owner merely because a debug backend is slow. If a mandatory sink must block or fail closed, state that as a safety requirement and capacity-test it.
+
+### Telemetry resource budget
+
+Budget telemetry like any other pipeline:
+
+```text
+per-event producer work
+records/s and bytes/s at normal and burst load
+in-memory bytes and coverage age
+collector CPU and batching
+export/network bytes
+disk/backend ingest and retention
+worst-case time to detect sink failure
+```
+
+For a synthetic 48-byte detailed record at 200,000 events/s, the producer generates 9.6 MB/s before ring headers, alignment, batching, or exporter encoding. At a burst of 1,000,000 events/s it generates 48 MB/s. A 65,536-record queue covers about 328 ms at the first rate and 66 ms at the second if the consumer stops. These numbers are arithmetic examples, not recommended formats or capacities.
+
+The calculation exposes choices: sample detail while retaining aggregate counts, enlarge a fixed memory budget, drain faster off-path, or accept a shorter evidence window with explicit loss. It also reveals when continuous “full detail” cannot meet both hot-path and retention objectives.
+
+Measure bytes as well as records. One exceptional event containing a bounded-but-large payload can dominate. Keep record-size histograms or counters by schema class, and reject/truncate according to a documented diagnostic policy rather than allowing arbitrary text.
+
+### Telemetry failure matrix
+
+| Failure | Hot-owner behavior | Evidence/alert |
+|---|---|---|
+| collector paused/crashed | local bounded signals continue; optional detail eventually drops | collector age, producer drops, restart epoch |
+| exporter/network unavailable | bounded retry/spool/drop per stream | export failure, backlog bytes/age |
+| disk full/slow | optional records drop; mandatory stream follows safety contract | disk error, partial commit, safety transition |
+| backend cardinality/schema reject | producer cardinality remains bounded | rejection count and offending schema/label category |
+| decoder/dictionary mismatch | retain raw bytes; fail decode loudly | build/schema identity and decode error |
+| clock unsynchronized | stop publishing affected cross-domain latency as valid | sync/translation error and invalid observation count |
+| owner process crash | recorder/event tail may be partial | process epoch, incomplete marker, external audit/recovery |
+| observability configuration change | atomic/versioned activation | old/new policy IDs and effective boundary |
+
+Test this matrix under burst load. Healthy-export tests do not reveal whether retry, dumping, or error reporting becomes the new critical path.
+
+## 59.3 Metrics semantics and per-owner aggregation
+
+### Types
+
+A **counter** is cumulative over a declared lifetime and normally increases. A reset can occur at process restart or explicit epoch; export a start/epoch identity. Rates are derived from counter differences and time.
+
+A **gauge** is a current value such as queue depth, live orders, mode, or last completed sequence. It can rise or fall. A scrape observes one instant and may miss intervening peaks, so separately maintain high-water or transition counters where needed.
+
+A **histogram** stores counts in configured buckets or another mergeable schema. Histograms merge only when unit, boundaries/encoding, and semantic population match. Per-instance quantiles cannot be averaged into a fleet quantile.
+
+A **summary/quantile product type** may compute client-side quantiles with product-specific windows/algorithms and often cannot be merged exactly. Treat this as a product contract, not a universal “summary” definition.
+
+Every metric specifies:
+
+```text
+name and unit
+what increments/sets/observes it
+population and exclusions
+labels and cardinality bounds
+lifetime/reset/overflow behavior
+collection consistency
+schema version
+```
+
+Use units in names or metadata consistently. Do not publish a value called `latency` whose unit changes between code paths.
+
+### Per-owner and per-core counters
+
+Owner-local metrics avoid a single contended global update. If a collector concurrently reads fields that the owner writes, ordinary non-atomic C++ objects create a data race. For independent numeric counters, relaxed atomics can provide defined atomic access without claiming ordering of unrelated state.
 
 ```cpp
-// Symbols are already interned to a dense id for the book (Ch. 50 §50.13).
-// Metrics reuse that id — the "label lookup" is an array index.
-struct SymbolMetrics { uint64_t fills; uint64_t rejects; Histogram ack_ns; };
-std::vector<SymbolMetrics> per_symbol;      // sized at startup, index = symbol_id
-per_symbol[sym].fills++;                    // 1 load + 1 add + 1 store
-```
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 
-This turns unbounded cardinality into a bounded, preallocated array, and it makes the hot path allocation-free — the property that actually matters (Ch. 7). Cardinality is then a *memory* problem, not a *latency* problem, and memory problems are tractable.
+struct alignas(64) OwnerMetrics {
+    std::atomic<std::uint64_t> events{0};
+    std::atomic<std::uint64_t> rejects{0};
+    std::atomic<std::uint64_t> telemetry_drops{0};
+};
 
-### Reducing cardinality without losing information
-
-- **Drop the label at export, keep it in the log.** The dimension that matters for post-hoc analysis (order id, client id) belongs in the event stream (§59.5), not in a metric. Metrics answer "is the system healthy"; events answer "what happened to *this* order." Conflating them is the root cause of most cardinality explosions.
-- **Bucket the label.** Replace `symbol` with `liquidity_tier`, replace `client_id` with `client_class`. Three values instead of 40 000.
-- **Top-K with an overflow bucket.** Track the 100 busiest symbols exactly and aggregate the rest into `other`. A Space-Saving / Misra-Gries counter (Ch. 22) does this in fixed memory.
-- **Exemplars.** Keep the aggregate histogram low-cardinality, but attach a handful of full-detail sample records (trace id, symbol, timestamp) to the tail buckets. You get "p99.9 is 40 µs" *and* "here are five specific orders that took 40 µs" for the price of a few slots. This is the single highest-value pattern in latency observability and is worth naming explicitly in an interview.
-
-### The unbounded-label failure mode
-
-**Diagnostic signature:** process RSS grows monotonically and without bound; the growth rate tracks message rate; a heap profile (Ch. 58) shows the allocation site inside the metrics registry; the monitoring backend simultaneously reports rising ingestion lag and index size. The cause is almost always a label derived from an unbounded input — an order id, a timestamp, a client-supplied string, or an error message used as a label value. **Any label whose value comes from the network is a bug.** Validate at registration: assert that the label's value set is drawn from a closed enumeration known at startup.
-
----
-
-## 59.3 Per-Core Metrics Aggregation
-
-Sharding counters per core (or per thread) removes contention but creates a **read-side consistency** problem: aggregating N shards is not atomic, so the sum you read never corresponds to any single instant.
-
-### The layout
-
-```
-core 0: [ orders | rejects | md | pad ...... ] ← 64 B, exclusive-owned line
-core 1: [ orders | rejects | md | pad ...... ]
-...
-reader:  sum over cores  → one shared-read of each line (~100 ns each, cold)
-```
-
-The write side is a plain non-atomic increment because only the owning thread writes. The read side is done by a separate, non-latency-critical collector thread.
-
-### The formal problem: it is a data race
-
-A non-atomic write on core 0 concurrently with a non-atomic read on the collector thread is a data race and therefore UB (Ch. 25). It "works" on x86 because aligned 64-bit loads and stores are atomic in hardware, but the compiler is entitled to tear, duplicate, or invent the load. The correct construction costs nothing on x86:
-
-```cpp
-struct alignas(64) Shard {
-    std::atomic<uint64_t> orders{0};
-    // writer (owner only):
-    void inc() noexcept {
-        orders.store(orders.load(std::memory_order_relaxed) + 1,
-                     std::memory_order_relaxed);   // compiles to a plain inc/add on x86
+template<std::size_t N>
+std::uint64_t total_events(const std::array<OwnerMetrics, N>& shards) {
+    std::uint64_t total = 0;
+    for (const auto& shard : shards) {
+        total += shard.events.load(std::memory_order_relaxed);
     }
-};
+    return total;
+}
 ```
-`relaxed` atomics generate identical code to plain accesses for loads and stores on x86-64 and ARM (no fences, no `lock` prefix) while removing the UB and the tearing risk. **"Use relaxed atomics for per-core counters — same instruction, defined semantics"** is a strong, precise answer.
 
-### Consistency guarantees you can and cannot offer
+`alignas(64)` is an illustrative deployment choice, not a portable claim that every destructive-interference boundary is 64 bytes. Validate type layout and cache behavior on supported targets. `memory_order_relaxed` makes only the counter access atomic; it does not publish the owner’s book, order, or risk state.
 
-| Property | Achievable? |
+Per-core metrics are a deployment specialization of owner-local shards, not a portable thread identity. They are straightforward when each owner is pinned under a stable placement contract. A migratable user-space thread can update several CPU shards, and reading a current-CPU ID before an update can race migration unless the placement or update protocol prevents it. CPU hotplug and topology changes also alter the shard set. Prefer per-owner shards unless the diagnostic question truly concerns CPU placement; if per-core shards are required, bound configured CPU IDs and export placement/epoch changes.
+
+The collector’s sum is not an atomic fleet snapshot. Owners advance while it reads. Cross-counter expressions such as `sent - acked` can appear transiently inconsistent when collected from different shards/instants. Options include:
+
+- accept eventual/approximate semantics and avoid invariants on the scrape;
+- publish an owner-created snapshot;
+- attach per-owner epochs/sequences and retry;
+- collect an event ledger for exact reconciliation.
+
+Choose collection cadence by operational need and measured observer effect. Reading a hot owner’s cache lines too often can create coherence traffic.
+
+For several related values, define whether readers need:
+
+1. **independent eventual counters:** each field is meaningful alone;
+2. **owner-consistent snapshot:** one owner publishes related values together;
+3. **globally consistent cut:** several owners coordinate at an epoch/barrier;
+4. **exact event ledger:** derive state from ordered durable events.
+
+The cost and availability rise down the list. Most dashboards need (1) or (2), while financial reconciliation may need (4). Do not build a global stop-the-world scrape merely to make a graph look tidy.
+
+A safe owner-published snapshot can be copied into a bounded message whose ownership transfers to the collector, or placed in immutable storage with a lifetime protocol. Double buffering alone is insufficient if the owner reuses a buffer while a reader still accesses it. A sequence protocol over non-atomic concurrently modified payload bytes can still be a C++ data race. Use atomic fields, a proven publication/lifetime mechanism, or quiescence.
+
+### Overflow and reset
+
+Unsigned counters wrap modulo their width in C++, but exporters/backends may convert to signed integers or floating point and lose precision. Define realistic maximum rate/lifetime, reset behavior, and export representation. Epoch/start identity distinguishes restart from negative rate. Saturating a counter hides subsequent occurrences; wrapping without detection corrupts rate. Test the chosen policy.
+
+## 59.4 Latency histograms in production
+
+A latency histogram needs:
+
+- start and end event definitions;
+- clock domain(s) and uncertainty;
+- unit and range;
+- bucket/encoding schema and version;
+- event population and exclusion reasons;
+- sample policy and weight;
+- underflow/overflow counters;
+- count and telemetry-drop counters;
+- labels/cardinality limit.
+
+Record end-to-end latency plus selected stage spans for the same causal event. Do not add independently aggregated p99 values. Chapter 43 covers percentiles, coordinated omission, confidence, and comparison.
+
+### Merge and rotation
+
+Bucket histograms merge by summing corresponding bucket counts only when boundaries and semantics match. If a deployment changes buckets, retain schema identity or translate with explicitly accepted information loss. An observation on a histogram boundary follows the library/product’s inclusion convention; tests should pin it.
+
+Maintain interval views by rotating or differencing cumulative data with reset-safe epochs. Rotation across owners is not simultaneous unless coordinated. A fleet view must preserve total sample count and under/overflow counts; otherwise a “better” tail may simply mean missing samples.
+
+### Sampling
+
+**Head sampling** decides before the outcome, so it can be unbiased if selection is independent and weights are handled correctly, but it may miss rare tails. **Tail sampling** retains based on outcome, requiring buffering or later correlation and producing a deliberately biased diagnostic set. **Adaptive sampling** changes with load/state and must export its probability/policy.
+
+There is no universal sampling rate. Suppose a rare class occurs with probability \(p\) and independent head sampling retains fraction \(s\). The chance of retaining at least one instance in \(n\) events is:
+
+\[
+1-(1-ps)^n
+\]
+
+This simplified calculation helps size a policy; independence and stationarity may not hold during correlated incidents. Always preserve unsampled aggregate counts/histograms when using sampled detailed records.
+
+Sampling and telemetry drops are different. A planned sampling decision follows policy; a queue/drop is loss. Count both separately.
+
+### Exemplars and tail investigation
+
+An **exemplar** associates a selected histogram observation or bucket with a trace/event identifier. Product support and storage semantics vary, but the architectural value is stable: aggregate evidence says the distribution moved; the exemplar points to a concrete causal record.
+
+Selection must be bounded. Options include one exemplar per interval/bucket, reservoir within a bounded interval, or first/last/worst under a declared policy. “Worst” requires comparing observations and can overrepresent one repeated cause. Export how the exemplar was chosen and never treat it as a statistically representative sample.
+
+When an observation lacks a valid clock translation, increment a clock-invalid counter and retain diagnostic context separately; do not insert a negative or clamped duration into the ordinary latency histogram. When an operation has no completion, represent timeout/missing outcome in counters or a censored/outcome model rather than silently excluding it.
+
+## 59.5 Structured events, binary logging, and queues
+
+Text formatting is useful for humans but expensive and ambiguous on a hot path. A structured record carries typed fields:
+
+```text
+schema/site ID
+record version and build/dictionary ID
+owner/thread ID and monotonic sequence
+local timestamp plus clock-domain ID
+causal/event/order identifiers
+event kind/reason
+fixed payload or reference to durable owned data
+```
+
+Binary/deferred logging moves formatting and encoding work to a backend. It imposes lifetime rules: never enqueue a pointer/string view into mutable or stack storage unless the ownership protocol guarantees it survives consumption. Copy bounded bytes or intern stable IDs.
+
+Schema evolution must decode old retained data. Ship the dictionary/schema with the artifact and stamp every stream/dump. A decoder mismatch should fail loudly, not produce plausible wrong text.
+
+### Queue choice
+
+Per-owner SPSC rings can avoid multi-producer contention when one backend consumes each ring. MPSC/MPMC designs trade topology simplicity for additional coordination. “Lock-free” says something about progress, not cost, boundedness, correctness, or absence of cache-line transfer.
+
+The queue contract includes:
+
+- fixed record and byte capacity;
+- payload lifetime;
+- producer/consumer memory ordering;
+- behavior at wrap and integer overflow;
+- full policy;
+- record-drop/gap representation;
+- shutdown/drain behavior;
+- backend batching and sink failure.
+
+**Drop accounting.** A debug queue normally drops rather than blocks its owner. The producer increments a drop counter even if it cannot enqueue a gap record. When space returns, the backend can synthesize “records missing” using observed sequence gaps and producer counters. Never make the only loss counter travel through the queue whose loss it measures.
+
+### Reserve, commit, and consume
+
+A bounded ring record commonly has a lifecycle:
+
+```text
+free slot -> producer owns/reserves -> payload complete
+          -> committed/published -> consumer owns/reads -> free
+```
+
+The consumer must not observe a partially initialized payload. The producer must not reuse storage until the consumer has released it, unless overwrite is the declared recorder policy. Memory-order details belong to the chosen queue implementation and Chapter 26; tests should cover wrap, full, producer interruption after reserve, consumer restart, and integer-counter rollover assumptions.
+
+Variable-size records complicate wrap and recovery. A fixed header with total length, schema, sequence, and commit/integrity marker lets an offline decoder reject a truncated tail. Still bound individual record length and total bytes. A corrupt length must not cause the decoder to walk beyond the retained segment.
+
+The backend is a state machine too:
+
+```text
+drain rings -> batch encode -> write/export -> acknowledge local progress
+                        \-> retry/drop/spool/fail according to stream policy
+```
+
+If it retries forever in memory, the queue is effectively unbounded. If it drops a batch, count records/bytes/time range and preserve stream sequence gaps. If it spools, bound disk bytes and define eviction. If mandatory audit persistence fails, invoke the approved safety action rather than silently switching to debug-log semantics.
+
+### Sampling and rate limiting
+
+Sampling strategies include deterministic hashing by trace/order ID, probabilistic head sampling, first-N-per-category, token-bucket rate limits, state-triggered capture, and tail selection. Each biases the retained set differently.
+
+Rate limiting protects resources but can discard the burst operators wanted to inspect. Pair it with aggregate counters and a flight recorder. Use stable hash sampling when all events for one causal ID should be retained together. Never sample mandatory audit facts without an approved alternative source.
+
+Argument evaluation can dominate a disabled/sampled log site. Guard expensive field construction behind the enable/sample decision, while ensuring the decision itself does not depend on data omitted from the sampling policy. Avoid macros that evaluate an expression more than once. Any formatting deferred to another build/process must retain the exact site dictionary and type schema used by the producer.
+
+## 59.6 Traces, correlation, clocks, and profiles
+
+A trace represents causal work using a trace ID and spans/events with parent/link relationships. Distributed tracing products and OpenTelemetry-style specifications define particular context, sampling, and export formats; version and product behavior must be checked. The architecture is general:
+
+```text
+market ingress event
+  trace/event ID
+  -> decode span
+  -> state-update span
+  -> decision span
+  -> risk span
+  -> gateway/send span
+  -> acknowledgment linked by order/session IDs
+```
+
+Not every externally related event is a strict parent/child. An acknowledgment can link to an order and session; a market decision can depend on several market events. Preserve domain IDs rather than forcing causality into one tree.
+
+Span creation has costs: generating/propagating context, reading clocks, storing attributes/events, queueing/export, and retaining partial trace state. Attribute cardinality can be as dangerous as metric labels even when the backend stores traces differently. Bound attribute size and avoid copying payloads merely “for tracing.”
+
+Sampling can create partial traces. A downstream component may receive sampled context when an upstream exporter lost its span, or a tail sampler may time out before late spans arrive. Export incomplete/late/dropped counts and allow incident tools to show gaps. Never infer “component did not run” solely from an absent sampled span.
+
+For a decision depending on several market events, use links or domain dependency records. A trace tree optimized for request/response services may not naturally represent fan-in, multicast, replay, or asynchronous execution reports. Product conventions are not market-causality definitions.
+
+### Correlation fields
+
+Use complementary orderings:
+
+- protocol sequence identifies source order/gaps within its domain;
+- owner-local sequence gives total local emission order;
+- trace/event/order IDs express causality/identity;
+- monotonic timestamps give elapsed ordering within a clock domain;
+- wall/exchange/hardware timestamps provide external anchors with uncertainty.
+
+Timestamps alone do not prove causality or total order. Equal/coarse timestamps need a tie-break. Clocks can step, drift, migrate between domains, or be read at different physical points. Negative duration is a clock/correlation fault unless the defined endpoints legitimately reverse.
+
+For cross-domain duration:
+
+\[
+\hat{L} = t_B - t_A,\qquad
+|\text{error}| \le \epsilon_A+\epsilon_B+\epsilon_{\text{translation}}
+\]
+
+provided the error bounds are valid for that interval. Export clock source, sync state, offset/error estimates, and translation anchors. Chapter 48 covers timestamp mechanics; Chapter 43 covers measurement.
+
+### Profiles
+
+Profiles answer where CPU time, allocation, blocking, faults, or other sampled events occur. Continuous profiling can connect regressions to code paths, but collection, stack unwinding, symbolization, sampling frequency, and unsupported frames have product/platform/version-specific costs and bias.
+
+Keep profiling on bounded controlled settings, measure observer effect, retain build IDs/symbols, and correlate profiles with load/state. A profile says where samples landed, not automatically why latency rose.
+
+## 59.7 Health, heartbeats, watchdogs, and alerts
+
+### Health is progress, not endpoint responsiveness
+
+Separate:
+
+- **liveness:** process/control plane is responding;
+- **readiness:** safe and configured to accept intended work;
+- **domain health:** feeds/session/risk/reference state valid;
+- **progress:** critical owner advances expected counters within a workload-aware interval.
+
+An HTTP health thread returning success does not prove the critical event loop is progressing. Conversely, a quiet market may legitimately leave a message counter unchanged. Use a loop/progress epoch plus input/output expectations and state.
+
+Health collection must not take a lock held by the monitored hot owner or enqueue into its saturated queue. The monitor should be able to report “owner unobservable” separately from “owner unhealthy.”
+
+A heartbeat carries identity and state such as build/config epoch, role/fencing epoch, domain status, and progress sequence. Sending and checking it through the same failed resource can create false health. Timeout and cadence are deployment policies derived from false-positive tolerance and required detection time; test stalls and partitions.
+
+### Watchdogs and stall detectors
+
+A stall detector samples:
+
+```text
+progress counter/sequence
+last progress time in a monotonic domain
+owner state and expected workload
+queue age/depth
+```
+
+Distinguish no input, slow progress, no progress, blocked/uninterruptible state, spinning/livelock, and monitor failure. On trigger, preserve evidence before disruptive action: mark state, request flight-recorder freeze/dump, capture permitted thread/host diagnostics, and notify the safety owner.
+
+Restart, halt, cancel, failover, or alert-only behavior is operational policy, not an observability default. Automated action must respect order/session/risk uncertainty. Chapter 60 owns supervision and recovery.
+
+### Actionable alerts
+
+Alert on a condition an owner can act on:
+
+| Condition | Supporting context |
 |---|---|
-| Each shard's value is a real value that existed | Yes (relaxed atomic load) |
-| The sum equals the true total at some instant | **No** — shards are read at different times |
-| The sum is monotonically non-decreasing across reads | Yes, if every shard is monotonic |
-| Two different counters are mutually consistent (`sent >= acked`) | **No** — you can observe `acked > sent` |
+| error/invariant counter increase | reason, component, build/config, last transitions |
+| queue age/high-water approaching bound | offered rate, consumer progress, drop count |
+| latency objective violations | sample count, load/event mix, stage spans, exemplars |
+| telemetry loss | source/ring/sink drop counters and collector lag |
+| stale/invalid domain state | affected scope, source sequence, recovery status |
+| clock uncertainty | clock source, offset/error, affected latency metrics |
+| disk/export failure | buffered bytes/age, mandatory versus optional streams |
 
-That last row causes real alarm noise: a derived metric like `fill_ratio = fills / orders` can transiently exceed 1.0, or a "leaked orders" gauge computed as `sent - acked` can go negative. Fixes: (a) accept and clamp, (b) read counters in a fixed order that makes the skew's sign harmless (read `sent` before `acked` so `sent - acked` is biased non-negative), or (c) use a **sequence-number snapshot**: the owner bumps an even/odd seqlock around a batch update and the reader retries on a torn read (Ch. 26). The seqlock costs the writer two extra stores and a compiler barrier — usually too much for a per-message counter, appropriate for a per-batch snapshot of a struct.
+Percentile alerts require enough population and stable definitions. Counts of objective violations and error-budget consumption are often easier to reason about, but exact policy belongs to the service objective. Avoid universal thresholds/windows.
 
-### Aggregation cost and cadence
+An alert should link a runbook and automatically preserve a bounded incident bundle. Deduplicate/rate-limit notifications without hiding the underlying condition count.
 
-Reading N shards touches N cache lines that are in **Modified** state in other cores' caches, so each read is a coherence miss costing ~100–300 ns and — crucially — it **downgrades the owner's line to Shared**, so the owner's next increment takes a fresh RFO (Ch. 28). Scraping 64 shards every second is negligible. Scraping every millisecond puts a periodic ~20 µs coherence storm into the hot path's cache. **Scrape cadence is an observer-effect knob**: 1 Hz is normal, 10 Hz is defensible, 1 kHz means the monitoring is now part of the latency distribution. Pin the collector thread to a non-trading core (Ch. 31) and never let it run on an isolated core.
+### Detection and action are separate
 
----
+A detector states evidence:
 
-## 59.4 Latency Histograms in Production
-
-An average latency is nearly useless: the distribution is heavy-tailed and multi-modal (cache-warm vs cache-cold, page-fault, interrupt, GC-equivalent pauses), so the mean sits in a region where no actual sample lives. Production latency measurement means **histograms**, and reporting p50/p99/p99.9/p99.99/max.
-
-### The structure
-
-**HdrHistogram** (High Dynamic Range) is the reference design: it stores counts in buckets whose width grows exponentially while guaranteeing a fixed *relative* precision. Conceptually, the value is split into an exponent (bucket index) and a mantissa (sub-bucket index):
-
-```cpp
-// significant_bits = 3 → 2^3 = 8 sub-buckets per power of two → ≤ ~6% relative error
-inline int index(uint64_t v) noexcept {
-    int e = 63 - __builtin_clzll(v | 1);          // LZCNT: 1 cycle
-    int sub = (v >> (e - 3)) & 7;                 // top 3 bits below the leading one
-    return (e << 3) | sub;
-}
-void record(uint64_t v) noexcept { ++counts[index(v)]; }   // ~4 instructions, no branch, no atomic
+```text
+condition + scope + first/last time + count
++ signal quality/loss + relevant state/load
 ```
 
-Covering 1 ns to 60 s at 3 significant bits needs a few hundred `uint64_t` — a handful of cache lines, comfortably resident. The recording cost is **~2–4 ns**, which is the number to quote.
+An action policy decides page, ticket, capture, reject-new, cancel, failover, restart, or observe. Keeping them separate makes alert logic testable and prevents a changed threshold from silently changing safety behavior.
 
-Alternatives and their trade-offs:
+Test alerts with recorded metric/event sequences and virtual time. Cover rising condition, recovery, missing data, clock jumps where relevant, deployment maintenance, and repeated flapping. Assert notification count plus capture/action requests. A dashboard screenshot is not an alert test.
 
-| Structure | Record cost | Accuracy | Mergeable | Notes |
-|---|---|---|---|---|
-| Linear buckets | ~2 ns | Poor at the tail unless huge | Yes | Fine when the range is known and narrow |
-| **HdrHistogram / log-linear** | 2–4 ns | Fixed relative error | Yes | The default choice |
-| t-digest | ~50 ns+ | Excellent near 0 and 1 | Yes (approximately) | Too expensive for a hot path; good for a collector |
-| Reservoir sampling | ~10 ns | Loses the tail — the tail is rare and sampling drops it | No | **Wrong tool for tail latency** |
-| Store every sample | ~1 ns (ring append) | Exact | Yes | Memory-bounded; the flight recorder pattern (§59.13) |
+Multi-window/error-budget methods can distinguish rapid severe burn from slow degradation, but parameters derive from the service objective and traffic. Low-volume services may need event-count or state-based alerts instead of unstable tail estimates.
 
-### Coordinated omission
+## 59.8 Flight recorders
 
-The subtlest and most interview-relevant trap. If your measurement loop is *"send request, wait for response, record elapsed"*, then a 10 ms stall causes you to send **fewer** requests during the stall. The slow period is under-sampled: one bad sample instead of the thousand requests that *would* have been delayed had you kept to schedule. The reported p99 can be off by orders of magnitude.
+A flight recorder is a fixed-capacity circular history that overwrites old records and is frozen or dumped on a trigger:
 
-The fix is to measure against the **intended** start time, not the actual one:
+```text
+oldest retained -> [event ... event ... event] <- newest committed
+                    ^ overwritten as writer wraps
 
-```cpp
-// Correct: schedule is fixed; latency is measured from when the request SHOULD have gone out.
-for (uint64_t i = 0; ; ++i) {
-    uint64_t due = start + i * interval_ns;
-    busy_wait_until(due);
-    uint64_t t0 = rdtscp();
-    send_and_await();
-    hist.record_corrected(rdtscp() - t0, /*expected_interval=*/interval_ns);
-}
-```
-`record_corrected` backfills synthetic samples at `v - interval`, `v - 2*interval`, … for any observation exceeding the expected interval. HdrHistogram implements this directly. In a live trading system the equivalent is measuring from the **hardware receive timestamp of the market-data packet that triggered the order** (§59.6), not from the moment your code got around to looking at it — that timestamp is schedule-independent and immune to coordinated omission by construction.
-
-### Reporting discipline
-
-- **Never average percentiles across time or instances.** Merge the raw bucket counts, then compute.
-- **Report max alongside p99.99.** For a system doing 10⁶ events/day, p99.99 still hides 100 events; max is the one number a risk officer will ask about.
-- **Reset semantics:** keep both a cumulative histogram (since start) and an interval histogram (since last scrape). Emitting only cumulative makes a recent regression invisible under a day of good data; emitting only interval loses the session view.
-- **Record what the histogram is of.** "Tick-to-trade" must state both endpoints: NIC hardware RX timestamp → NIC hardware TX timestamp is the only definition that is comparable across firms.
-
----
-
-## 59.5 Structured and Binary Logging
-
-Text logging is the single most common hot-path performance bug. `fprintf`-style logging costs, per call: format-string parsing, integer-to-decimal conversion (~20–50 ns per field), a `snprintf` into a buffer, a timestamp syscall or `clock_gettime` (Ch. 35), a mutex, and a `write` (Ch. 34) — **1–10 µs**, with a tail into milliseconds when the disk or the pipe backs up. That is the entire latency budget, spent describing the latency budget.
-
-**Structured logging** means emitting typed key-value records rather than prose, so downstream tools can query without regex. **Binary logging** means deferring the *formatting* entirely: the hot path writes raw argument bytes plus an identifier for the format string, and an offline or off-thread process reconstructs the text.
-
-### The deferred-formatting design
-
-```cpp
-// Compile-time: the format string is interned into a static section; the hot path
-// never touches its characters.
-#define LOG_INFO(fmt, ...)                                            \
-    do {                                                              \
-        static constexpr LogSite site{__FILE__, __LINE__, fmt};       \
-        log_binary(&site, __VA_ARGS__);                               \
-    } while (0)
-
-// Runtime, per record: [ uint32 site_id ][ uint64 tsc ][ packed args ... ]
-template <class... Ts>
-inline void log_binary(const LogSite* s, Ts... args) noexcept {
-    auto* p = ring.claim(sizeof(Header) + (sizeof(Ts) + ...));   // may fail → drop (§59.7)
-    if (!p) { ++dropped; return; }
-    write_pod(p, Header{s->id, rdtsc()});                        // no clock_gettime
-    (write_pod(p, args), ...);                                   // memcpy of trivially-copyable args
-    ring.commit(p);
-}
+trigger -> freeze/swap/snapshot protocol -> bounded dump -> offline decode
 ```
 
-Cost: a TSC read (~15–20 cycles, `rdtsc` unserialized), a ring reservation (one relaxed CAS or, on an SPSC ring, a plain store), and a few `memcpy`s. **Total ~10–30 ns.** Two to three orders of magnitude cheaper than `fprintf`.
+It retains detailed pre-trigger context without continuously persisting every record. Capacity determines coverage:
 
-This is exactly what **NanoLog**, **Quill** (in its macro-based mode), **Binlog**, and most in-house HFT loggers do. NanoLog's published figure is ~7 ns per log call for the staging path; Quill and spdlog's async mode land in the tens to low hundreds of nanoseconds because they still format eagerly or copy strings.
+\[
+\text{expected horizon}\approx
+\frac{\text{record capacity}}{\text{event rate}}
+\]
 
-| Logger design | Hot-path cost | Notes |
-|---|---|---|
-| `printf`/`ostream`, synchronous | 1–10 µs | Formatting + syscall + lock on the critical path |
-| `spdlog` async | ~200 ns–1 µs | Formats on the caller side by default; queue is MPMC |
-| `Quill` | ~20–50 ns | Defers formatting to a backend thread |
-| **NanoLog-style binary** | **~7–20 ns** | Defers formatting *and* string parsing to an offline decompressor |
-| Hand-rolled SPSC binary ring | ~10 ns | Best case; requires per-thread rings (§59.6) |
+Event rate varies during incidents, so measure actual oldest/newest timestamps and overwritten generations rather than promising “the last N seconds.”
 
-### Constraints the design imposes
+For an illustrative 2 MiB buffer with 32-byte fixed records:
 
-- **Arguments must be trivially copyable** (Ch. 3 §3.5). You cannot log a `std::string` by reference — the string may be destroyed before the backend formats it. Options: copy the bytes into the ring (bounded length, costs the copy), or intern the string to an id. Logging a `const char*` pointing to a string literal is safe; logging one pointing to a stack buffer is a use-after-free with a *delayed, non-reproducible* signature.
-- **The decoder needs the exact binary.** The site table lives in the executable (or an extracted sidecar dictionary). If you log with build A and decode with build B, the ids are wrong and you get plausible-looking garbage. **Ship the dictionary with the artifact and stamp both with the same build id** (Ch. 60 §60.1) — this is the single most common operational failure of binary logging.
-- **Timestamps are raw TSC.** Conversion to wall-clock happens at decode time using a captured (TSC, CLOCK_REALTIME) pair plus the measured TSC frequency; see §59.9 for why this is harder than it looks.
-- **Log-level filtering must be a predictable branch.** `if (level < threshold) return;` with the threshold in a hot cache line and the branch trivially predicted costs ~1 cycle. Using `[[unlikely]]` and keeping the argument evaluation *inside* the macro guard is essential — otherwise you pay for computing arguments to messages you discard.
+\[
+\text{capacity}=\frac{2\times1024\times1024}{32}=65{,}536
+\]
 
----
+At 50,000 records/s its average horizon is about 1.31 s; at a 500,000 records/s burst it is about 0.13 s. Neither rate is a default or guarantee. Header/alignment overhead, multiple writers, variable events, and dump/swap behavior change the calculation. Choose capacity from the pre-trigger interval needed at the relevant burst rate and from a tested memory budget.
 
-## 59.6 Lock-Free Logging Queues
+### Record and concurrency design
 
-The queue between the hot path and the log backend determines whether logging can stall a trading thread. The goal is **wait-free on the producer side**: the producer's worst case must be bounded and must never depend on another thread's progress.
+Prefer fixed-size records or a separately bounded payload arena. Include format/build ID, writer/owner, monotonically increasing writer sequence, clock domain, event kind, causal IDs, and payload validity. Preallocate and establish memory residency appropriate to the deployment, then measure record cost.
 
-### SPSC per-thread rings are the right default
+A simple single-writer buffer is safe to write, but a collector concurrently copying non-atomic slots can create a C++ data race. Safe choices include:
 
-```
-thread A ──▶ [ ring A ]  ┐
-thread B ──▶ [ ring B ]  ├──▶ backend thread: poll all rings, merge by TSC, format, write()
-thread C ──▶ [ ring C ]  ┘
-```
+- quiesce the writer before snapshot;
+- swap between buffers through a defined ownership handoff;
+- publish each slot with an atomic fixed-record protocol;
+- keep recorder per owner and have that owner perform a bounded freeze.
 
-An SPSC ring (Ch. 26) needs no atomic RMW at all — the producer does a relaxed load of the consumer's index, writes data, then a `release` store of its own index; the consumer mirrors it. On x86 the release store is a plain `mov`. **Producer cost: ~5–10 ns, wait-free, zero contention.** Contrast with an MPMC queue, where every producer does a `lock xadd` or CAS loop on a shared head — 20 cycles uncontended, unbounded under contention, and it drags a shared cache line across every logging core.
+Do not cite “seqlock” while copying ordinary concurrently modified C++ bytes without addressing the data race. Verify wrap, incomplete record, sequence gap, and crash-mid-write behavior.
 
-Design points that matter:
+A double-buffer ownership protocol can be:
 
-- **Cache-line separate the head and tail indices** (`alignas(64)`), or producer and consumer ping-pong the same line and you have reintroduced the contention you removed (Ch. 3 §3.3).
-- **Cache the opposite index.** The producer keeps a local copy of the last-seen consumer index and only re-reads the shared one when its local copy says the ring is full. This turns a shared-line read per message into one per lap.
-- **Power-of-two capacity** so wraparound is a mask, not a modulo. Use free-running 64-bit indices and mask on access — this removes the full/empty ambiguity without a wasted slot.
-- **Variable-length records** need a claim/commit protocol with a length prefix and a wrap marker (a record that would straddle the end is preceded by a "skip to start" filler). Alternatively use fixed-size slots and pay the internal fragmentation; fixed slots are meaningfully simpler and usually the right call.
-- **Huge pages for the ring** (Ch. 32): a 4 MB ring in 4 KB pages is 1024 TLB entries; in 2 MB pages it is 2. Log records are written to cold parts of the ring by definition, so TLB misses are otherwise routine.
-- **Non-temporal stores** (`_mm_stream_si64`) for the payload avoid pulling ring lines into L1/L2 and evicting the hot path's working set. Real win when the ring is large and never re-read by the producer; measure, because the store buffer behaviour differs across microarchitectures (Ch. 42).
-
-### Backend thread discipline
-
-The backend does the expensive work: format, compress, `write()`. It must be pinned to a housekeeping core, never an isolated trading core, and must not be the same core as an interrupt-handling sibling hyperthread (Ch. 31, Ch. 35). Give it a **batched, timed flush**: drain all rings, sort the batch by TSC, `writev()` once. A per-record `write()` costs a syscall (~1 µs after Spectre/Meltdown mitigations, Ch. 34) and destroys throughput.
-
-**Backpressure is the design decision.** Three options, in order of preference for trading systems:
-
-| Policy | Behaviour when the ring is full | Verdict |
-|---|---|---|
-| **Drop and count** | Producer returns immediately, `++dropped` | **Correct default.** Latency is bounded; loss is measured (§59.7) |
-| Block | Producer spins or sleeps until space | Never on a trading thread — the log backend now owns your tail latency |
-| Grow (allocate) | Producer allocates a new segment | `malloc` on the hot path plus unbounded memory; a page fault here is a 10 µs stall |
-
-**Failure signature of a blocking logger:** the latency histogram grows a distinct secondary mode at exactly the disk/pipe flush interval, and perf (Ch. 43) shows the trading thread in `futex_wait` or spinning in the queue's push. Correlating a p99.9 spike with log volume, not market volume, is the tell.
-
----
-
-## 59.7 Log Sampling and Drop Accounting
-
-Under a burst — a market open, a fat-finger order storm, an error loop — log volume can rise by two orders of magnitude at exactly the moment you most need the data. The system must degrade in a *measured*, not silent, way.
-
-### Drop accounting is mandatory
-
-An unaccounted drop is worse than no logging: it produces a record that looks complete and is not, and every subsequent reconstruction is wrong. The minimum contract:
-
-```cpp
-struct RingStats {
-    uint64_t enqueued;      // records accepted
-    uint64_t dropped;       // records rejected because the ring was full
-    uint64_t bytes_dropped;
-    uint64_t first_drop_tsc, last_drop_tsc;   // the outage window
-};
-// The backend emits a synthetic record whenever dropped changes:
-//   [GAP] 14,203 records dropped between t=... and t=... on thread md-0
+```text
+owner writes A
+trigger request observed by owner
+owner seals A with [first_seq, last_seq, valid_bytes, schema]
+owner publishes A to dump worker and switches to free B
+dump worker exclusively reads A
+after successful/failed bounded dump, A returns to free pool
 ```
 
-That synthetic gap record is the deliverable. It makes the hole visible in the log stream itself, so an analyst reading the file cannot mistake absence for silence. Export `dropped` as a counter (§59.1) and **alert on any non-zero value** — drops in a correctly-sized system are a bug, not a routine condition.
+If no free buffer exists on another trigger, count/coalesce/suppress according to policy; never let the owner wait unexpectedly. The handoff needs a C++-safe publication mechanism, and the dump worker must not return A until all I/O using it is complete. This preserves post-trigger events in B, but doubles recorder memory and still has finite trigger capacity.
 
-### Sampling strategies
+### Dump failure and signal safety
 
-| Strategy | Mechanism | Keeps the tail? | Cost |
+Dumping is I/O and can amplify an incident. Bound dump size/rate, coalesce triggers, count suppressed requests, preflight storage, and report partial/failure status. Decide whether the live service continues recording into a second buffer or loses the post-trigger interval.
+
+Crash/signal handlers have severe restrictions. C++ library facilities, locks, allocation, formatting, and even some atomic operations may not be async-signal-safe/lock-free on every platform. Chapter 58 owns crash-handler constraints. A normal watchdog-triggered dump from a controlled thread has a different safety envelope from a fatal-signal handler.
+
+Kernel, hardware, and tracing products offer snapshot/ring mechanisms, but their modes, overwrite semantics, supported platforms, and overhead are tool/version-specific. Treat them as additional evidence sources and measure them on the deployed system.
+
+## 59.9 Worked telemetry and incident design
+
+Consider a service with two market-data owners, four strategy shards, and one order gateway. The objective is to diagnose order-ack tail spikes without making the gateway depend on telemetry.
+
+### Signal plan
+
+| Owner | Always-on local signals | Bounded detail | Full behavior |
 |---|---|---|---|
-| **Rate limiting (token bucket)** | N records/sec per site; excess dropped | No — drops are burst-correlated, i.e. exactly the interesting period | ~2 ns |
-| **Deterministic 1-in-N** | `if ((++n & (N-1)) == 0)` | Statistically, but each individual event may be lost | ~1 ns |
-| **Log-and-suppress-duplicates** | First occurrence logged, repeats counted | Yes for the first instance | hash lookup |
-| **Tail-biased / conditional** | Always log if latency > threshold, sample otherwise | **Yes, by construction** | one compare |
-| **Head-based trace sampling** | Decide at request entry, propagate the decision | Uniformly, not tail-biased | ~1 ns |
-| **Tail-based trace sampling** | Buffer the whole trace, decide after it completes | Yes | Buffering cost at the collector |
+| feed | packets/events/gaps/recovery counters; queue age histogram | quality-transition events; recorder | drop optional detail; never hide input gap |
+| shard | decisions/rejects; decision latency; intent-queue age | sampled causal decision event; recorder | reject new intent by architecture, not telemetry |
+| gateway | intents/bytes/acks/fills/throttles; live queue gauges; ack histogram | every state transition on mandatory audit path; recorder | debug drops; audit failure follows safety policy |
+| collector | scrape/export/disk errors and lag | incident bundle manifest | never block owners for optional export |
 
-For latency work, the **conditional/tail-biased** policy is dominant and cheap:
+Cardinality is bounded by configured owner/venue/reason codes. Raw order ID appears only in structured/audit/trace records, not as a metric label.
 
-```cpp
-uint64_t elapsed = t_out - t_in;
-if (elapsed > slow_threshold_ns) [[unlikely]] LOG_SLOW(order_id, elapsed, stage_tsc);
-hist.record(elapsed);                                   // always
-```
-You get the full distribution from the histogram and full detail on every outlier, at the cost of one predicted-not-taken branch. Pair it with **exemplars** (§59.2) so the histogram bucket links to the detailed record.
+All event records carry:
 
-The "log first occurrence, count the rest" pattern deserves emphasis because the classic incident is a per-message error log inside a loop that is now firing on every message: the logging itself becomes the outage. A per-site token bucket with a suppression counter (`... [repeated 1,204,331 times]`) bounds the damage and preserves the count.
-
-### Where drops actually happen
-
-There are four independent queues, and each drops differently — an interview favourite because most candidates know only the first:
-
-```
-NIC RX ring ──▶ kernel socket buf ──▶ app ring ──▶ log ring ──▶ file ──▶ collector
-   (ethtool -S       (netstat -s        (RingStats)  (RingStats)   (disk    (ingest
-    rx_dropped)       drops)                                        full)     lag)
-```
-Ch. 46 covers the first two; §59.13 and Ch. 60 §60.13 cover the last. A "missing log lines" report must be triaged against all of them, and each has a distinct counter you should be able to name.
-
----
-
-## 59.8 Sequence and Timestamp Event Correlation
-
-Reconstructing what happened means joining events from multiple threads, processes, and machines into a single ordered narrative. Timestamps alone cannot do this; sequence numbers alone cannot either. You need both.
-
-### Why timestamps are insufficient
-
-- TSC values from different cores are only comparable if the TSC is **invariant and synchronized** (`constant_tsc`, `nonstop_tsc`; Ch. 35). It is, on modern single-socket x86 — but across sockets the sync is firmware-dependent, and after a socket-level C-state transition or a live migration it can jump.
-- Two events genuinely 3 ns apart cannot be ordered by a clock whose read cost is 15 ns and whose resolution is ~0.3 ns but whose *serialization* is not guaranteed. `rdtsc` may be reordered by the CPU; `rdtscp` and `lfence; rdtsc` are the serialized forms and cost more (Ch. 35).
-- Wall-clock (`CLOCK_REALTIME`) is not monotonic — NTP steps and leap seconds move it backwards.
-
-### Why sequence numbers are insufficient
-
-A per-thread sequence number orders that thread's events but says nothing about interleaving. A **global** sequence number is a shared atomic increment: 20+ cycles and a contended cache line, which is precisely the cost you were avoiding.
-
-### The working construction
-
-1. **Per-thread monotonic sequence + per-thread TSC.** Cheap, exact within a thread, and the TSC gives approximate cross-thread ordering.
-2. **Causal identifiers threaded through the flow.** A `trace_id` (128-bit, generated once at ingress from the market-data packet) plus a per-hop `span_id` and `parent_id`. Copying 16 bytes is far cheaper than a global atomic and gives exact causality rather than approximate temporal order.
-3. **The originating packet's hardware timestamp as the anchor** (§59.6, §59.7 of Ch. 48). Every downstream event carries the trigger packet's NIC RX timestamp, so end-to-end latency is computed against a clock that is the *same physical clock* for every machine on the PTP domain.
-
-```cpp
-struct EventHdr {
-    uint64_t trace_id_lo, trace_id_hi;   // set once at ingress from md packet
-    uint64_t trigger_hw_ts;              // NIC RX timestamp of the causing packet
-    uint64_t tsc;                        // local TSC at this event
-    uint32_t seq;                        // per-thread monotonic
-    uint16_t thread_id, site_id;
-};
-```
-32–40 bytes, all trivially copyable, all writable in a couple of stores. This header is what makes a binary log (§59.5) reconstructible into a causal graph rather than a pile of lines.
-
-### Reconstruction and its pitfalls
-
-- **Merge by TSC after converting each host's TSC to the PTP domain** (§59.9), not by arrival order at the collector.
-- **Ties are common** at nanosecond resolution when events are pipelined; break them with (thread_id, seq) so the ordering is total and deterministic.
-- **Exchange sequence numbers are the ground truth for market data.** Gap detection on the exchange's own sequence number (Ch. 37) is what tells you a multicast packet was lost; your internal sequence numbers cannot detect that.
-- **Clock skew shows up as negative durations.** If a reconstructed span has `end < start`, you have a clock-domain bug, not a fast machine. Assert on it and count it; a rising count of negative spans is the cleanest possible signal that PTP has degraded (§59.9).
-
----
-
-## 59.9 Clock-Domain Uncertainty
-
-A **clock domain** is a set of timestamps that are meaningfully comparable to each other. Every end-to-end latency number is a subtraction of two timestamps, and if they come from different domains the result carries the domains' offset error, not just the true latency.
-
-The domains present in one trading host:
-
-| Domain | Source | Resolution | Comparable to |
-|---|---|---|---|
-| **TSC** | CPU counter, per-socket | ~0.3 ns | Other cores on the same socket (if invariant TSC) |
-| **CLOCK_MONOTONIC** | kernel, TSC-derived | ~1 ns | Same host only; unaffected by NTP steps |
-| **CLOCK_REALTIME** | kernel, NTP/PTP-disciplined | ~1 ns | Other hosts, to within sync error; **can step** |
-| **NIC PHC** (PTP hardware clock) | NIC oscillator, PTP-disciplined | ~1–8 ns | Other PHCs in the PTP domain, to tens of ns |
-| **Exchange timestamps** | Exchange's clock | µs typically | Nothing of yours, except via a regulatory sync bound |
-| **Switch timestamps** | Cut-through switch (Ch. 39) | ~1 ns | Its own PTP domain |
-
-### The error budget
-
-End-to-end "wire-to-wire across two hosts" via PHC timestamps carries:
-- **PTP sync error** between the two PHCs: 10–100 ns typical with hardware timestamping and a boundary-clock-capable switch; microseconds with software PTP or a transparent-clock-less path.
-- **PHC-to-TSC translation error** if you cross domains, from the `PTP_SYS_OFFSET_PRECISE` ioctl's own sampling window (tens of ns) plus drift between reads.
-- **Oscillator drift** between disciplining events: a 100 ppb oscillator drifts 100 ns per second.
-
-So a measured 2 µs cross-host latency has an uncertainty of perhaps ±50 ns. **A measured 200 ns cross-host latency is not measurable at all by that method** — the error dominates. This is why serious tick-to-trade measurement uses a **single external instrument**: a passive tap feeding one capture device (Corvil, Exablaze/Cisco Nexus SMARTNIC, Napatech, Solarflare with `sfptpd`) that timestamps *both* the inbound market-data packet and the outbound order with the *same* oscillator. One clock, no domain crossing, no sync error. Naming this trade-off — "if I need sub-100 ns confidence I must measure both endpoints with one clock" — is the mark of someone who has actually built the measurement rig.
-
-### Practical mechanics
-
-```cpp
-// Correlating TSC to PHC once, then extrapolating. Do this off the hot path, periodically.
-struct ClockPair { uint64_t tsc; uint64_t phc_ns; };
-// ioctl(fd, PTP_SYS_OFFSET_PRECISE, &req)  → hardware-assisted, ~tens of ns of window
-// TSC frequency: derived from CPUID leaf 0x15, or measured against CLOCK_MONOTONIC over ≥1 s.
-```
-- **Never derive TSC frequency by a short calibration loop.** A 10 ms calibration has ~100 ppm error, which is 100 µs of drift per second of extrapolation. Use CPUID 0x15 where available, or calibrate over seconds and re-fit continuously (linear regression over a window of pairs) so you track drift.
-- **Re-anchor periodically** and store the anchor pairs *in the log stream* so decoding is reproducible after the fact.
-- **`clock_gettime` via vDSO** is ~20–25 ns and gives CLOCK_MONOTONIC without a syscall (Ch. 35); this is the correct choice when you need a real clock and cannot afford TSC conversion complexity. Verify the vDSO is actually being used — a clocksource of `hpet` or `acpi_pm` instead of `tsc` makes `clock_gettime` a ~1 µs trap, and the diagnostic is `cat /sys/devices/system/clocksource/clocksource0/current_clocksource`.
-
-**Failure signature of clock-domain confusion:** latency distributions with a small number of impossibly small or negative values; a step change in measured latency coinciding with an NTP adjustment or a PTP grandmaster failover; two machines reporting different latencies for the same round trip whose difference is constant rather than noisy (a constant difference is an offset, i.e. a sync error, not a performance difference).
-
----
-
-## 59.10 Health Checks and Heartbeats
-
-A **health check** is a query answered by the process. A **heartbeat** is an unsolicited periodic emission. The distinction matters because they fail differently: a health check can hang (and a hung check is indistinguishable from a hung process only if you time it out), while a missing heartbeat is unambiguous.
-
-### What a health check must not do
-
-- **Must not run on the hot path.** A health-check endpoint served by the trading thread means an external system can inject latency into trading by polling. Serve it from a separate thread on a housekeeping core, reading the same per-core counters the metrics path reads (§59.3).
-- **Must not take the locks the hot path takes.** A health check that acquires the order-book mutex will, at the worst possible moment, be the thing that blocks.
-- **Must not merely return 200.** A check that only proves the HTTP thread is alive proves nothing about the trading loop — this is the classic false-negative. It must assert on evidence *produced by* the critical path: "the market-data sequence number advanced within the last N ms", "the last strategy loop iteration completed less than N ms ago."
-
-```cpp
-// Hot path publishes liveness cheaply; checker reads it.
-std::atomic<uint64_t> last_loop_tsc;                        // one relaxed store per loop, ~1 ns
-// in the loop:
-last_loop_tsc.store(rdtsc(), std::memory_order_relaxed);
-// checker thread:
-bool healthy = tsc_to_ns(rdtsc() - last_loop_tsc.load(std::memory_order_relaxed)) < budget_ns;
+```text
+build/config/reference epoch
+owner ID + owner sequence
+monotonic timestamp + clock-domain ID
+trace/event ID
+order/client/session identifiers where applicable
+event kind/reason and bounded payload
 ```
 
-### Heartbeat design
+### Incident
 
-- **Interval and timeout must differ by a factor.** Heartbeat every 100 ms, declare dead after 3 missed (300 ms). A timeout equal to the interval guarantees false positives from ordinary jitter.
-- **Heartbeats carry state, not just liveness.** Include: sequence numbers consumed, orders live, mode (running/draining/halted), config version (Ch. 60 §60.2), build id. This makes the heartbeat stream a free audit trail and lets you detect a split-brain config mismatch across the fleet immediately.
-- **Send over a path independent of the one being monitored.** A heartbeat sent over the same multicast group whose loss you are trying to detect tells you nothing new. Ideally a separate NIC/VLAN.
-- **Exchange-side heartbeats are protocol-level obligations.** FIX `Heartbeat`/`TestRequest` (Ch. 50) and many binary order-entry protocols will drop your session if you miss them. A session dropped for a missed heartbeat *during* a busy period, because your heartbeat timer was starved by the trading loop, is a real and famous failure mode. Heartbeat generation must be on a thread that cannot be starved, or driven off a timerfd on a non-isolated core.
+At time \(t_0\), the `ack_latency_objective_violations_total` counter rises. A detailed record is sampled because the event exceeded the objective, and a gateway recorder freeze is requested.
 
-### Failure modes and signatures
+The incident bundle shows:
 
-| Failure | Signature |
-|---|---|
-| Health check served by hot thread | p99.9 latency spikes at exactly the monitoring poll interval |
-| Check asserts only on the HTTP thread | Process reports healthy while stalled; only downstream staleness reveals it |
-| Heartbeat timer starved | Session drops correlate with market bursts; heartbeat gaps precede the drop |
-| Timeout == interval | Constant flapping; the ops team disables the alert, and it is off during the real outage |
-| Heartbeat over the monitored path | Correlated failure; no signal when it matters |
-
-The "healthy process, stale data" case is the one to lead with in an interview: **the useful definition of health is progress, not responsiveness.**
-
----
-
-## 59.11 Watchdogs and Stall Detectors
-
-A **watchdog** takes an action (kill, restart, cancel orders, flip to a hot spare) when progress stops. A **stall detector** merely observes and reports. In a trading system the difference is a policy decision with money attached, and conflating them is dangerous.
-
-### Layers, from hardware down to application
-
-| Layer | Mechanism | Reaction time | Action |
-|---|---|---|---|
-| Hardware watchdog | `/dev/watchdog` (IPMI/TCO timer) | 1–60 s | Hard reset the machine |
-| Kernel soft/hard lockup detector | `watchdog_thresh`, NMI-based | 10–20 s | Panic or warn |
-| RCU stall detector | `rcu_cpu_stall_timeout` | ~21 s | Dump stacks |
-| **External process supervisor** | systemd `WatchdogSec` + `sd_notify(WATCHDOG=1)` | 100 ms–10 s | Restart the unit |
-| **In-process stall detector** | Separate thread checks a progress counter | **1–10 ms** | Log, alert, cancel orders |
-| **Peer/session watchdog** | Exchange or peer detects missing heartbeat | seconds | Cancel-on-disconnect |
-
-The in-process detector is the only one operating at a timescale relevant to a trading loop, and it is the one worth designing:
-
-```cpp
-// Stall detector thread, pinned to a housekeeping core, running at ~1 kHz.
-for (;;) {
-    uint64_t now = rdtsc();
-    for (auto& t : threads) {
-        uint64_t last = t.last_progress.load(std::memory_order_relaxed);
-        uint64_t age  = tsc_to_ns(now - last);
-        if (age > t.stall_ns) {                     // e.g. 1 ms for a 5 µs loop
-            record_stall(t, age);                   // to the flight recorder (§59.13)
-            capture_backtrace(t.tid);               // via libunwind or /proc/<pid>/task/<tid>/stack
-            if (age > t.kill_ns) policy_action(t);  // cancel orders / halt trading
-        }
-    }
-    nanosleep_1ms();
-}
+```text
+t0-40 ms  offered intent rate stable
+t0-12 ms  gateway outbound queue age begins rising
+t0-10 ms  gateway progress continues, but completion batch size falls
+t0-8 ms   optional debug-log ring begins dropping; drop counter rises
+t0        ack objective violations rise
+t0+2 ms   flight recorder frozen; one duplicate trigger suppressed
 ```
 
-### Design points
+Correlation by order ID and gateway sequence shows intent admission to send submission became slow; external order-to-ack after egress did not. Feed and strategy spans remained stable. The debug logger’s drops are evidence loss, not automatically the cause: its queue was designed not to block.
 
-- **The progress signal must be a plain relaxed store by the monitored thread** (§59.3). Anything requiring the monitored thread to *do* something (respond to a ping, take a lock) is useless: a stalled thread cannot respond, and a healthy thread pays for the ceremony.
-- **A stall detector cannot distinguish "stuck" from "slow but working"** unless you separate the counters: a monotonically advancing loop counter distinguishes them, a timestamp alone does not (a thread doing one iteration every 900 µs looks alive to a 1 ms timeout while being 200× too slow).
-- **Capture on detection, decide later.** The moment of the stall is the only moment the evidence exists. Snapshot the flight recorder, per-thread backtraces, `/proc/<pid>/stat` (to see if the thread is in `R` or `D` state), and the perf counter deltas. In `D` state the cause is I/O or a page fault (Ch. 32); in `R` state with no progress it is a spin, a livelock, or a preemption by a higher-priority thread (Ch. 31).
-- **Automatic restart during market hours is usually the wrong action.** A restarted trading process has an empty book, a cold cache, no session, and unknown positions. The default automated action should be **cancel and go flat, then halt** — a state a human can reason about — with restart as a deliberate decision (Ch. 60 §60.8).
-- **Watchdog-induced outages are real.** A watchdog with too tight a threshold, triggered by a legitimate 5 ms GC-equivalent pause at market open, will restart every instance in the fleet simultaneously. Stagger thresholds, require N consecutive violations, and rate-limit the action.
+Further deployment counters show the gateway shared a CPU resource with a newly enabled collector task. Disabling that task in a controlled rollback restores outbound queue age and latency. This supports a mechanism: observer interference delayed gateway service. It is stronger than “logging caused it” because the architecture, telemetry-loss behavior, queue age, per-event spans, and reversal agree.
 
-**Diagnostic signature of a false-positive watchdog:** restarts cluster at a fixed time of day (open, auction, settlement message burst) across many hosts at once, and the pre-restart flight recorder shows the loop was running, merely slowly. **Signature of a true stall:** one host, no periodicity, and the captured thread state shows `D` (I/O wait) or a lock held by a descheduled thread.
+### What made diagnosis possible
 
----
+- end-to-end and stage boundaries were distinct;
+- owner-local sequences survived ambiguous timestamps;
+- queue **age**, not only depth, led the alert;
+- tail detail linked a histogram to concrete orders;
+- debug loss was counted, so the timeline was marked incomplete;
+- the flight recorder retained pre-trigger context;
+- build/deployment/config identity was in the bundle;
+- optional telemetry could degrade without backpressuring the gateway.
 
-## 59.12 Tail-Latency Alerting
+### Incident reconstruction procedure
 
-The alerting problem for latency is that the interesting quantity is rare by construction. An alert on the mean will never fire; an alert on max will fire constantly.
+1. **Validate evidence quality.** Check exporter lag, sampling-policy version, observation counts, clock health, ring/event drops, and recorder generation. Mark incomplete intervals.
+2. **Establish scope and chronology.** Use domain/owner sequences for local order, causal IDs for links, and translated timestamps only where uncertainty permits.
+3. **Find the first leading change.** Offered load, input quality, queue age, progress, state transition, resource saturation, or deployment/config event.
+4. **Follow one concrete tail event.** Compare its end-to-end interval with stage spans, order/session transitions, and relevant recorder entries.
+5. **Separate symptom from mechanism.** Log drops can be a consequence; queue age can be a location; a profile can show work. Form a causal hypothesis connecting them.
+6. **Test a reversible prediction.** Roll back/configure one factor or reproduce under controlled load. Require the predicted leading signal and end-to-end outcome to reverse.
+7. **Retain the bundle and gap statement.** Document what evidence was missing and add a bounded signal/test if it blocked diagnosis.
 
-### What to alert on
+Do not sort all records from several hosts by wall timestamp and call that the truth. Construct a partial order from protocol sequence, owner sequence, message causality, and acknowledged clock bounds. Events whose order remains ambiguous should remain ambiguous in the report.
 
-| Signal | Alert form | Why |
-|---|---|---|
-| p99.9 over a 1-min window | Threshold vs SLO | The primary latency SLO signal |
-| **Count of samples above budget** | `sum(bucket[>budget]) > N per minute` | Directly counts SLO violations; scale-free and mergeable |
-| Max | Report, don't page | One outlier is a fact of life; a *trend* in max is signal |
-| Drop counters (§59.7) | Any non-zero | A drop is a defect, not a degradation |
-| Negative/impossible durations | Any non-zero | Clock-domain break (§59.9) |
-| Histogram *shape* change | New mode appears | A bimodal distribution is a different bug than a shifted one |
+## 59.10 Reference: schema and runbook
 
-The **error-budget / burn-rate** formulation is the right framing and the one that avoids alert fatigue: if the SLO is "99.9% of order paths under 5 µs", the budget is 0.1% of events. Alert when the *rate of budget consumption* implies exhaustion within a short horizon — a fast burn (e.g. 14.4× budget rate over 5 minutes) pages immediately, a slow burn (3× over 6 hours) files a ticket. This gives one alert that is both sensitive to acute outages and to chronic degradation without needing two thresholds that fight each other.
+This section is skippable on a first pass.
 
-### Statistical hazards
+### Metric contract example
 
-- **Never alert on a p99 computed by averaging p99s** (§59.1). Merge buckets first.
-- **Small windows make percentiles meaningless.** A p99.9 over 100 samples is the max, with enormous variance. Either lengthen the window or alert on the violation count instead — counts are well-behaved at any sample size.
-- **Percentiles hide multimodality.** A distribution that is 5 µs normally and 400 µs on cache-cold paths can have a fine p99 while every cache-cold order is catastrophically late. Alert per *class* (cold-start, first-message-after-idle, cross-NUMA) if the classes have different physics.
-- **Beware sampling interactions.** If the metrics pipeline drops under load and load correlates with latency, your p99 improves during an incident. Always cross-check the sample count.
-
-### Making the alert actionable
-
-An alert that says "p99.9 exceeded 8 µs" is not actionable. Attach, automatically:
-- the exemplars from the offending buckets (§59.2) — specific trace ids;
-- the per-stage histogram breakdown (parse / decide / encode / send), so the regression localizes to a stage;
-- the concurrent counters: message rate, drop counters, `perf` context switches and page faults for the thread, `softirq` time (Ch. 46), C-state residency (Ch. 35);
-- a flight-recorder dump (§59.13) covering the window.
-
-**The most common false alarm** is a latency regression that is really a *load* change: p99 rose because volume tripled and the batch sizes changed. Always plot latency against concurrent throughput; a latency alert without a throughput panel next to it wastes a page.
-
----
-
-## 59.13 Flight-Recorder Ring Buffers
-
-A **flight recorder** is a fixed-size in-memory ring holding the most recent N events, continuously overwritten, and dumped only when something goes wrong. It inverts the usual logging economics: you record *everything* at full detail because you almost never pay to persist it.
-
-```
-    ┌──────────────────────── 64 MB, huge pages, mlock'd ───────────────────────┐
-    │ ...older... │ e_{n-3} │ e_{n-2} │ e_{n-1} │ e_n │ (free/oldest) │ ...     │
-    └──────────────────────────────▲────────────────────────────────────────────┘
-                                   write cursor (monotonic uint64, masked)
-    Dump triggers: stall detector (§59.11), latency > threshold, exception,
-                   crash handler, risk breach, operator request.
+```yaml
+name: order_ack_latency_seconds
+type: histogram
+owner: gateway_session
+population: terminal new-order acknowledgments
+start: egress hardware timestamp when available
+end: ingress hardware timestamp when available
+clock_domain: nic_phc
+labels:
+  venue: configured_bounded_enum
+  result: [accepted, rejected]
+schema_version: 3
+required_companions:
+  - order_ack_latency_observations_total
+  - order_ack_latency_overflow_total
+  - telemetry_records_dropped_total
 ```
 
-### Why it is the right structure for low latency
+YAML is illustrative configuration, not a standard observability schema. Bucket/encoding and backend mapping belong in the versioned product-specific definition.
 
-- **Write cost is a store to a preallocated slot**: ~5–15 ns, no allocation, no syscall, no I/O, bounded worst case. There is no backpressure path, because it never fills — it overwrites.
-- **You get pre-fault context.** The single hardest thing about a rare latency event is that by the time you know it happened, the evidence is gone. The flight recorder has the preceding 100 ms of every event at full fidelity.
-- **It composes with binary logging** (§59.5): same record format, same decoder; the only difference is that the ring is the destination of record, and the file is the destination of *exception*.
+### Structured event contract
 
-### Implementation details that matter
+```text
+header:
+  magic, schema_version, record_length
+  build_id, config_epoch
+  owner_id, owner_sequence
+  timestamp, clock_domain
+  event_kind, flags
 
-- **Preallocate and `mlock`** the buffer (Ch. 32). A flight recorder that page-faults during a stall adds latency at the worst moment and may fail to record the stall's cause. Huge pages keep the TLB footprint at a handful of entries.
-- **Touch every page at startup** so the first write is not a fault.
-- **Make the dump path allocation-free and signal-safe** if it can be invoked from a crash handler (Ch. 58): `write()` the raw bytes to a preopened fd, decode offline. Formatting inside a signal handler is how a crash handler deadlocks on the malloc lock.
-- **Version and stamp the ring.** Header with build id, TSC anchor pairs (§59.9), record-format version, and the site dictionary id — a dump you cannot decode is worthless (Ch. 60 §60.1).
-- **Dump on a rising edge, and rate-limit.** A dump is I/O; a condition that dumps 64 MB every 10 ms will itself cause the outage. One dump, then a cooldown, then a counter of suppressed dumps.
-- **Consider a second, coarser ring** with a much longer horizon: a 64 MB full-detail ring might cover 200 ms, which is too short to see a slow-building problem. A parallel ring of periodic summaries covers hours in a few megabytes.
+identity:
+  trace_id/event_id
+  domain identifiers (order/session/instrument where applicable)
 
-### Kernel and hardware analogues worth naming
+payload:
+  fixed versioned fields
+  no borrowed pointer
 
-The same pattern exists at every layer and citing it shows breadth: **Intel Processor Trace** (`perf record -e intel_pt//` with a snapshot-mode ring) records every branch executed in a small circular buffer with ~5% overhead and is dumped on trigger — the definitive tool for "what code path ran during that 40 µs"; **`perf record --snapshot`** with `SIGUSR2` triggering; **ftrace's snapshot buffer**; **eBPF ring buffers** (`BPF_MAP_TYPE_RINGBUF`) for kernel-side events with the same overwrite-and-dump discipline; and **`ltt`/LTTng** for full-system tracing. Intel PT in snapshot mode is the strongest single answer to "how would you find out what happened during a rare microsecond-scale stall" — it is the only tool that gives instruction-level history with acceptable steady-state cost.
-
-### The observer-effect summary
-
-Every technique in this chapter sits somewhere on one curve: **cost paid on the hot path vs information retained.**
-
+integrity:
+  framing/length validation
+  optional checksum according to persistence threat model
 ```
-  info
-   ▲   full instruction trace (Intel PT, ~5%) ●
-   │   flight recorder, full detail  ●
-   │   binary log, all events    ●
-   │   binary log, sampled   ●
-   │   histogram            ●
-   │   counters        ●
-   │   nothing    ●
-   └──────────────────────────────────────────▶ hot-path cost
-       ~0      1ns    5ns   15ns   30ns    ~100ns+
+
+### Incident bundle manifest
+
+```text
+trigger reason and objective
+UTC and monotonic/PHC anchors with uncertainty
+service/build/config/reference/deployment identity
+metric histogram/count snapshots with schema IDs
+telemetry loss/sampling/export health
+structured events and trace fragments
+flight-recorder dump with generation boundaries
+host/kernel/NIC signals relevant to hypothesis
+commands/actions taken and rollback result
 ```
-The engineering answer is not a point on this curve but a *split*: cheap always-on aggregate signals (counters, histograms) to know that something is wrong, plus an always-writing/rarely-reading recorder to know what it was. Anything that costs more than ~30 ns per event and runs unconditionally on the critical path is a design error.
 
----
+### Review checklist
 
-## Key Interview Questions
+- Does every alert map to an owner and action?
+- Can series count be computed from configuration?
+- Are metric populations, units, resets, and exclusions documented?
+- Are histograms merge-compatible and under/overflow visible?
+- Are per-owner reads C++ data-race-free?
+- Can collection cadence perturb hot cache lines?
+- Are record payload lifetimes safe?
+- Can optional sink failure block or allocate on a critical owner?
+- Are drops, sampling, sequence gaps, and incomplete traces distinguishable?
+- Can timestamps be compared, and is uncertainty reported?
+- Does health reflect domain state and progress?
+- Can recorder snapshot/dump race with writers?
+- Does the incident bundle survive schema/build changes?
 
-1. **Why are counters preferred over gauges for anything you care about?** — A gauge sampled at 1 Hz misses everything between samples; a cumulative counter plus timestamps lets the collector derive rates and detect resets, losing nothing to scrape gaps.
-2. **Why can't you average p99s across instances?** — Percentiles are not linear; the fleet p99 is not derivable from per-instance p99s. Ship histograms with shared bucket boundaries and merge bucket counts, then compute.
-3. **What does a metric update cost on the hot path, and how do you make it ~1 cycle?** — Resolve the handle at construction, store per-core in a cache-line-padded struct, increment with a relaxed atomic (identical codegen to a plain `++` on x86, but not UB). A name lookup or a shared atomic is 20–1000× worse.
-4. **What is a cardinality explosion and what causes it?** — Series count = name × cross-product of label values; caused by a label derived from unbounded input (order id, error string). Signature: unbounded RSS growth tracking message rate plus backend ingestion lag.
-5. **How do you get per-order detail without high-cardinality metrics?** — Exemplars: low-cardinality histogram plus a few full-detail sample records attached to tail buckets, linking "p99.9 = 40 µs" to specific trace ids.
-6. **Reading per-core counters from a collector thread — what is the correctness issue?** — Non-atomic concurrent read/write is a data race (UB); use relaxed atomics for identical x86 codegen with defined semantics. Also, the sum corresponds to no single instant, so derived metrics can transiently be impossible.
-7. **What is coordinated omission?** — A closed-loop measurement that stops issuing requests while stalled under-samples the slow period, understating the tail by orders of magnitude. Fix: measure from intended start times, or from the hardware timestamp of the triggering packet.
-8. **Why HdrHistogram rather than linear buckets or reservoir sampling?** — Constant relative error across many decades in a few cache lines, ~2–4 ns per record, mergeable. Reservoir sampling structurally discards the tail, which is the only part that matters.
-9. **How does binary logging achieve ~10 ns per record?** — Defer everything: intern the format string to an id at compile time, write raw trivially-copyable argument bytes plus a raw TSC into a preallocated ring, and format offline. No parsing, no conversion, no `clock_gettime`, no syscall, no lock.
-10. **What breaks if you log a `const char*` into a deferred logger?** — If it points to non-static storage, the backend formats freed memory — a use-after-free with a delayed, non-reproducible signature. Only string literals or interned ids are safe.
-11. **Why per-thread SPSC log rings rather than one MPMC queue?** — SPSC needs no atomic RMW: relaxed load, stores, release store — wait-free, ~5–10 ns, zero cross-core contention. MPMC costs a contended `lock`-prefixed RMW per record and drags a shared line across every producing core.
-12. **What should a logger do when its queue is full?** — Drop and count, then emit a synthetic gap record naming the number of records and the time window. Blocking puts the log backend on the trading thread's critical path; growing puts `malloc` and page faults there.
-13. **Which sampling policy preserves the tail?** — Conditional/tail-biased: always log when latency exceeds a threshold, sample otherwise. Rate limiting drops precisely during bursts, i.e. exactly when you need the data.
-14. **Why isn't a timestamp enough to order events across threads and hosts?** — TSC comparability requires invariant/synchronized TSC and breaks across sockets and migrations; wall-clock is not monotonic; and event spacing can be below the clock's read cost. Carry causal ids (trace/span) and per-thread sequence numbers alongside.
-15. **What is a clock domain, and what is the error budget on a cross-host latency measurement?** — A set of mutually comparable timestamps. Cross-host via PTP-disciplined PHCs carries 10–100 ns of sync error plus translation error; sub-100 ns claims require one instrument timestamping both endpoints with one oscillator.
-16. **How do you detect that PTP has degraded, from application data alone?** — A rising count of negative or impossibly small reconstructed durations, and a *constant* (not noisy) difference between two hosts' measurement of the same round trip.
-17. **What makes a health check useful rather than decorative?** — It must assert progress produced by the critical path (sequence advanced, loop iterated within budget), be served off the hot path, and take no lock the hot path takes. A 200 from an HTTP thread proves nothing.
-18. **A stall detector fires — what do you capture, and what action?** — Capture at the moment of detection: flight recorder, per-thread backtraces, thread state (`R` vs `D`), perf counters. Default action during market hours is cancel-and-halt, not restart: a restarted process has no book, no session, and unknown state.
-19. **How would you find out what code ran during a rare 40 µs stall?** — Intel PT in snapshot mode: a circular branch-trace buffer at ~5% overhead, dumped on trigger, giving instruction-level history. Backed by an application flight recorder for semantic events.
+## 59.11 Common traps
 
----
+- A metric with no stable population, unit, lifetime, or owner.
+- Treating a gauge scrape as proof that no intermediate peak occurred.
+- Averaging per-instance or per-window quantiles.
+- Merging histograms with different boundaries, units, or populations.
+- Omitting sample, underflow, overflow, or telemetry-drop counts.
+- Using raw order IDs, symbols, error strings, or stack traces as labels.
+- Enforcing cardinality only after backend ingestion.
+- Looking up metric names or allocating label sets on the hot path.
+- Concurrently reading plain per-owner counters in C++.
+- Assuming relaxed counter reads publish unrelated owner state.
+- Treating an asynchronously collected cross-counter expression as exact.
+- Calling asynchronous/deferred logging free.
+- Enqueueing borrowed strings/pointers whose lifetime ends before decode.
+- A logging queue that blocks or grows without bound.
+- Sending the log-drop counter through the same full log queue.
+- Confusing planned sampling with unplanned loss.
+- Tail sampling without accounting for buffered/partial traces.
+- Reconstructing causality from timestamps alone.
+- Comparing clock domains without offset/error/translation evidence.
+- Health that checks only an HTTP thread, not domain validity/progress.
+- A watchdog whose observation path uses the failed resource.
+- Universal heartbeat/stall/alert thresholds copied across deployments.
+- Alerting on a tail percentile with too few or missing observations.
+- A flight-recorder horizon based on average, not incident event rate.
+- Concurrently copying recorder slots without a C++-safe publication protocol.
+- Unbounded or repeated recorder dumps turning diagnosis into an outage.
+- Claiming a crash-handler dump is signal-safe without platform validation.
+- Product/tool overhead figures presented as architecture constants.
 
-## Common Traps
+## 59.12 Recall card
 
-- **Averaging percentiles** across instances or time windows — mathematically meaningless; merge histogram buckets instead.
-- **Using a summary/quantile metric type** and then being unable to aggregate the fleet.
-- **Looking up a metric by string on the hot path** — hash plus possible allocation, three orders of magnitude over budget.
-- **A label sourced from network input** (order id, symbol string, error text) — unbounded cardinality; RSS grows without limit and the backend index dies.
-- **Per-core counters as plain non-atomic reads from a collector** — formally a data race; use relaxed atomics for the same instructions.
-- **Deriving `sent - acked` from unsynchronized shards** and alerting on the negative value.
-- **Scraping shards at kHz rates** — turns metrics into a coherence storm that invalidates the hot path's cache lines.
-- **Closed-loop latency measurement** — coordinated omission understates the tail catastrophically.
-- **Reservoir sampling for tail latency** — the tail is rare, so sampling deletes it.
-- **`printf`/`ostream` logging on the hot path** — 1–10 µs including format, lock, and syscall.
-- **Logging a pointer to a stack buffer into a deferred logger** — the backend formats freed memory.
-- **Decoding a binary log with a different build than produced it** — the site dictionary ids shift and you get plausible garbage. Stamp both with the build id.
-- **A blocking log queue** — the disk now owns your p99.9; signature is a secondary latency mode at the flush interval.
-- **Silent drops** — an incomplete log that looks complete makes every reconstruction wrong. Always emit a gap record.
-- **Rate-limiting logs during bursts** — drops exactly the interesting period.
-- **Sharing a cache line between a ring's head and tail indices** — reintroduces the contention the lock-free design removed.
-- **Assuming TSC is comparable across sockets or after migration** — it is not guaranteed.
-- **Short TSC frequency calibration** — 10 ms of calibration is ~100 ppm, i.e. 100 µs of drift per second of extrapolation.
-- **A clocksource of `hpet`/`acpi_pm`** — `clock_gettime` silently becomes a ~1 µs syscall instead of a ~20 ns vDSO call.
-- **A health check served by the trading thread** — monitoring becomes an attack surface on your own latency; spikes appear at the poll interval.
-- **Heartbeat timeout equal to the heartbeat interval** — permanent flapping, so the alert gets disabled before the real outage.
-- **Watchdog auto-restart during market hours** — replaces a slow process with a cold, sessionless, position-unknown one; and a fleet-wide threshold restarts everything at once at the open.
-- **A stall detector using only a timestamp** — cannot distinguish "stuck" from "200× too slow but progressing." Use a loop counter too.
-- **A flight recorder that page-faults or allocates on dump** — fails precisely when invoked, and deadlocks if invoked from a signal handler.
-- **Alerting on a percentile over too few samples** — p99.9 of 100 samples is just the max.
-- **A latency alert with no concurrent throughput panel** — most "regressions" are load changes.
+```text
+GOAL
+rates + errors + saturation + distributions + states + causal history
+with bounded observer effect and explicit evidence loss
 
----
+SIGNAL CONTRACT
+question + owner + type/unit/population + bounded dimensions
++ cost + capacity + full policy + loss indicator + version
 
-## Compact Recall Summary
+METRICS
+counter = cumulative lifetime/epoch
+gauge = sampled current value
+histogram = merge only identical schema/population
+quantiles do not merge by averaging
 
-**Metric types.** Counter (monotone, cumulative, resettable-safe), gauge (instantaneous, not summable), histogram (mergeable if buckets match), summary (quantiles computed in-process — **not mergeable**, avoid). Store nanoseconds as `uint64_t`, 64-bit width, cumulative rather than delta. Hot-path update must be a resolved handle plus an increment on a padded per-core line: ~1 cycle. A name lookup or shared atomic is 20–1000× worse.
+PER-OWNER
+owner-local update; concurrent collector uses defined atomic/publication
+relaxed counter != publication of other state
+cross-shard scrape is not one atomic snapshot
 
-**Cardinality.** Series = name × label cross-product. Costs hit the hot path (string hashing, allocation), memory (one histogram per series), and backend index. Key by dense integer ids into preallocated arrays; bucket or top-K high-cardinality labels; push per-entity detail into the *event stream*, not metrics; link them with **exemplars**. Any label sourced from network input is a bug — signature is unbounded RSS tracking message rate.
+CARDINALITY
+bound before ingestion
+metrics carry categories; events/traces carry entity detail
 
-**Per-core aggregation.** Owner-writes/collector-reads with **relaxed atomics** (identical x86 codegen, no UB, no tearing). The sum corresponds to no instant, so cross-counter invariants can be violated transiently; fix by read ordering, clamping, or a seqlock for batch snapshots. Scraping downgrades the owner's line from M to S and forces a fresh RFO — cadence is an observer-effect knob; 1 Hz fine, 1 kHz is a coherence storm.
+LOGGING
+fixed structured record -> bounded queue -> off-path encode/persist
+no borrowed lifetime; schema/build ID; drop/gap accounting
+optional telemetry never silently blocks or allocates
 
-**Histograms.** HdrHistogram: exponent (LZCNT) plus mantissa bits gives fixed relative error over many decades in a few hundred `uint64_t`; ~2–4 ns per record, branchless, mergeable. **Coordinated omission** is the headline trap — closed-loop measurement under-samples stalls; measure from intended start times or from the trigger packet's hardware RX timestamp. Report p50/p99/p99.9/p99.99 **and max**; keep both cumulative and interval histograms; state both endpoints of any "tick-to-trade" figure.
+SAMPLING
+policy decisions != telemetry loss
+export probability/policy/count; retain unsampled aggregates
+no universal sample or rate-limit default
 
-**Logging.** Text logging costs 1–10 µs (parse, convert, lock, syscall). Binary/deferred logging costs ~10–30 ns: intern the format string to an id at compile time, write raw TSC plus trivially-copyable argument bytes into a preallocated ring, format offline. Constraints: no dangling `const char*`, ship the site dictionary with the build id, convert TSC at decode time, and keep argument evaluation inside the level-guard.
+CORRELATION
+protocol sequence + owner sequence + domain IDs + causal ID
++ timestamp/clock domain + uncertainty
+timestamps do not create causality
 
-**Queues.** Per-thread SPSC rings, wait-free producers, cache-line-separated indices, cached opposite index, power-of-two capacity with free-running masked 64-bit indices, huge pages, optional non-temporal stores. Backend on a housekeeping core, batched `writev`. Backpressure policy: **drop and count** — never block (log backend owns your tail) and never allocate (page fault at the worst moment).
+HEALTH
+liveness != readiness != domain validity != progress
+watch independently; preserve evidence before disruptive action
 
-**Sampling and drops.** Account for every drop and emit a synthetic gap record; alert on any non-zero drop counter. Tail-biased conditional logging (`if elapsed > threshold`) is the only cheap policy that preserves outliers; rate limiting drops precisely during bursts. Know the four independent drop points: NIC ring, socket buffer, app ring, log ring — each with its own counter.
+FLIGHT RECORDER
+fixed capacity, overwrite oldest, measured horizon
+safe writer/snapshot ownership; bounded rate-limited dump
 
-**Correlation.** Per-thread sequence + per-thread TSC + a causal `trace_id`/`span_id` propagated from ingress + the trigger packet's hardware timestamp as the anchor. Merge by converted TSC, break ties by (thread, seq), and use exchange sequence numbers as ground truth for market-data gaps. Negative durations mean a clock bug, not speed.
+INCIDENT
+bundle identity + counts/distributions + loss + causal detail
++ recorder + relevant host signals + actions/rollback
+```
 
-**Clock domains.** TSC / CLOCK_MONOTONIC / CLOCK_REALTIME / NIC PHC / exchange / switch are distinct comparability sets. Cross-host PTP sync error is 10–100 ns with hardware timestamping; sub-100 ns claims require one instrument timestamping both endpoints with a single oscillator. Get TSC frequency from CPUID 0x15 or a multi-second continuous fit, re-anchor periodically, log the anchors, and verify the clocksource is `tsc`.
+## 59.13 Questions
 
-**Health, watchdogs.** Health = *progress*, not responsiveness: assert on a counter the critical path advances, served off the hot path, taking no hot-path lock. Heartbeats carry state (config version, build id, mode) and travel a path independent of the monitored one; timeout must be several intervals. Stall detection layers span 1 ms (in-process) to 60 s (hardware watchdog). Capture at the moment of detection (recorder dump, backtraces, `R` vs `D` state); the default in-hours action is cancel-and-halt, not restart.
+1. Design a signal contract for feed gaps, including owner, type, dimensions, reset, loss behavior, and alert.
+2. Why can per-owner relaxed atomics be correct for counters but incorrect for publishing book or order state?
+3. Explain why quantiles cannot be averaged and when histogram counts can be merged.
+4. How would you bound per-order diagnostic detail without creating per-order metric series?
+5. Compare head sampling, tail sampling, rate limiting, and unplanned queue loss. What must each export?
+6. Which fields reconstruct causality when threads, hosts, protocol streams, and clocks differ?
+7. Design health/progress signals that distinguish a quiet service, a stalled owner, and an invalid feed.
+8. Give three C++-safe strategies for snapshotting a flight recorder and the failure behavior of its dump path.
+9. During an ack-latency incident, how do queue age, stage spans, load, telemetry loss, and recorder data narrow the cause?
+10. Which observability costs and settings are architecture contracts, product/version facts, deployment choices, or measurements?
 
-**Alerting.** Alert on SLO-violation *counts* and error-budget burn rate rather than raw percentiles; never on averaged percentiles or on percentiles over tiny windows; alert on drops and impossible durations as defects. Attach exemplars, per-stage breakdown, and concurrent load automatically — a latency alert without a throughput panel is usually a load change.
+## 59.14 Puzzle and exercise
 
-**Flight recorders.** Fixed-size overwriting ring, huge pages, `mlock`ed, pre-touched, ~5–15 ns per record, dumped only on trigger, decode offline, signal-safe dump path, stamped with build id and TSC anchors, rate-limited. The kernel/hardware analogues — Intel PT snapshot mode, `perf --snapshot`, ftrace snapshot, BPF ringbuf — extend the same idea to instruction-level history at ~5% cost. The whole chapter is one curve: cheap always-on aggregates to know *that* something broke, plus always-writing/rarely-reading recorders to know *what* — and nothing unconditional on the critical path above ~30 ns per event.
+### Puzzle: the improving p99
+
+During overload, a dashboard’s p99 latency improves while customers report worse delays. The histogram observation count falls by 80%, the optional event ring drop counter rises, and the exporter is behind.
+
+The dashboard is showing a biased surviving population. Either latency observations share the dropping path, sampling changed with load, or completed fast events are overrepresented while slow/missing events have no end timestamp. The p99 is not evidence of improvement. Alert on telemetry loss and missing outcomes, preserve a counter/histogram path independent enough to survive the event path, and reconstruct from intended starts or external timestamps as Chapter 43 describes.
+
+### Exercise: design and break a telemetry path
+
+For one feed owner, strategy shard, and gateway:
+
+1. define five counters, two gauges/high-water pairs, and three histograms;
+2. calculate maximum label cardinality from configuration;
+3. define one fixed structured record and its schema evolution;
+4. give every buffer a record/byte capacity and full policy;
+5. implement per-owner aggregation without C++ data races;
+6. define head/tail/detail sampling and separate drop counters;
+7. propagate causal IDs and owner sequences across one order/ack;
+8. design a fixed-capacity recorder and safe snapshot ownership;
+9. trigger slow exporter, full ring, clock degradation, and owner stall;
+10. produce an incident bundle and identify which claims are incomplete because telemetry was lost.
+
+Measure the instrumentation in disabled, healthy, full, exporter-failed, and dump modes. Reject a design that becomes unbounded, silently incomplete, or capable of blocking the critical owner outside an explicit mandatory-audit safety policy.
+
+## Prerequisite for Chapter 60
+
+You are ready for deployment and operations when every signal has a semantic owner and version; production telemetry is bounded and drop-aware; readiness/domain health/progress are distinguishable; incidents produce a decodable evidence bundle tied to the deployed artifact/configuration; and sink, disk, collector, clock, or recorder failure has an explicit safe behavior. Chapter 60 operationalizes those contracts.

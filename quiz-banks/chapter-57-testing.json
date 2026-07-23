@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The definition is mechanical rather than stylistic: injected clock, no I/O, no unjoined threads, order-independence. Every clause is enforceable, which is the point — an LD_PRELOAD or seccomp shim that aborts on socket() or clock_gettime in the unit target catches drift far better than convention.",
-      "sourceAnchor": "571-unit-testing",
+      "sourceAnchor": "573-unit-property-differential-and-model-tests--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A template policy parameter costs nothing at runtime because the call is inlined, at the price of instantiating the system under test twice and longer compiles. A virtual interface adds an indirect call that defeats inlining on the hot path, which is exactly the cost the chapter warns testability should not impose.",
-      "sourceAnchor": "571-unit-testing",
+      "sourceAnchor": "573-unit-property-differential-and-model-tests--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "ASSERT_* macros expand to a return statement, and that return exits whatever function contains it. Placed in a helper, the failure is recorded but the test body carries on with a violated precondition — a classic source of tests that look green after something already went wrong. EXPECT_* continues by design.",
-      "sourceAnchor": "571-unit-testing",
+      "sourceAnchor": "573-unit-property-differential-and-model-tests--core",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A large random failing input is nearly useless for diagnosis; the minimized one is a bug report. Shrinking requires a structured generator — frameworks shrink integers toward zero and containers toward empty while preserving constraints — which is why byte-consuming fuzz-style generators shrink poorly unless run through an explicit crash-minimization pass.",
-      "sourceAnchor": "572-property-based-testing",
+      "sourceAnchor": "573-unit-property-differential-and-model-tests--core",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Uniform random events almost never produce a cancel for an order that exists, so the run burns its budget on discards and trivially invalid input. The fix is a stateful generator that draws ids and prices from the current model state, which is precisely where property-based testing converges with model-based testing.",
-      "sourceAnchor": "572-property-based-testing",
+      "sourceAnchor": "573-unit-property-differential-and-model-tests--core",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A property that merely re-implements the code under test in its assertion proves internal consistency and nothing about conformance. This is the same failure mode as generating protocol vectors from your own encoder: only bytes captured from the venue, or its published conformance file, can settle what the wire format actually is.",
-      "sourceAnchor": "572-property-based-testing",
+      "sourceAnchor": "573-unit-property-differential-and-model-tests--core",
       "difficulty": "trap"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Differential testing needs no oracle, only agreement, which is why it fits a hand-vectorized parser against a scalar reference, your book builder against the venue's published snapshot, or an optimized build against an unoptimized one. The hard part is defining equality precisely enough that innocent differences do not fire.",
-      "sourceAnchor": "573-differential-testing",
+      "sourceAnchor": "573-unit-property-differential-and-model-tests--core",
       "difficulty": "recall"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The boundary between accepted and rejected input is exactly where framing and validation defects hide, so asymmetric acceptance must fail the harness. Discarding rejected inputs throws away the most valuable signal, and coverage guidance plus automatic minimization make this combination the strongest technique available for parsers.",
-      "sourceAnchor": "573-differential-testing",
+      "sourceAnchor": "573-unit-property-differential-and-model-tests--core",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The model's value comes from being transparently correct at any cost in speed; the production structure is an array of price levels with intrusive order lists chosen for latency. Sharing code between model and system under test would destroy the independence that makes the comparison meaningful.",
-      "sourceAnchor": "574-model-based-testing",
+      "sourceAnchor": "573-unit-property-differential-and-model-tests--core",
       "difficulty": "recall"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Cheap per-step checks keep sequences long enough to find genuine sequence bugs, while the periodic and final full comparisons catch defects buried deep in the structure — a leaked price level holding zero orders, a stale free-list entry — that a best-bid-only check can never observe.",
-      "sourceAnchor": "574-model-based-testing",
+      "sourceAnchor": "573-unit-property-differential-and-model-tests--core",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The discipline is one seed, sourced once, logged always. A run that passed today may need to be reproduced next week when a related bug surfaces, and CI log truncation means the value has to be there from the start. Established frameworks echo their random seed in the header line for the same reason.",
-      "sourceAnchor": "575-deterministic-random-seeds-and-reproducers",
+      "sourceAnchor": "575-reproducibility-seeds-artifacts-and-virtual-time--core",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With p of 1/200, n repeats miss the bug with probability (1-p)^n, and n of about 3/p leaves roughly a 5% miss rate — so around 600 runs per step. Wrapping the bisect command in a loop of that size is the standard technique, and getting the arithmetic right is a strong interview signal.",
-      "sourceAnchor": "575-deterministic-random-seeds-and-reproducers",
+      "sourceAnchor": "575-reproducibility-seeds-artifacts-and-virtual-time--core",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Shrink, then pin: serialize the minimal input into the repository as a regression corpus entry — a byte file for a fuzz target, a literal command list for a model-based test. The committed artifact survives generator changes; a seed does not, and its value quietly evaporates at the next refactor.",
-      "sourceAnchor": "575-deterministic-random-seeds-and-reproducers",
+      "sourceAnchor": "575-reproducibility-seeds-artifacts-and-virtual-time--core",
       "difficulty": "trap"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Edge-coverage instrumentation alone would give no gradient across an all-or-nothing equality test. Comparison tracing hooks feed the actual operands back to the mutator, and memcmp and strcmp are intercepted for the same reason — which is also why obscuring comparisons behind a precomputed checksum blinds the fuzzer.",
-      "sourceAnchor": "576-fuzzing-native-code",
+      "sourceAnchor": "574-protocol-vectors-and-fuzzing--core",
       "difficulty": "recall"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A checksum computed before the branch destroys the coverage gradient, so the fuzzer stalls at the gate no matter how long it runs. Gating the check behind a build macro used only in fuzz builds is the standard escape. A structure-aware harness helps reach deep logic but stops finding framing bugs, so both harnesses are run.",
-      "sourceAnchor": "576-fuzzing-native-code",
+      "sourceAnchor": "574-protocol-vectors-and-fuzzing--core",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Without a sanitizer the only detectable failure is a hard crash, so an out-of-bounds read that happens to land on mapped memory passes silently. Note that integer overflow checking is not in the default UBSan set and must be requested, and MSan needs every dependency rebuilt instrumented or it drowns in false positives.",
-      "sourceAnchor": "576-fuzzing-native-code",
+      "sourceAnchor": "574-protocol-vectors-and-fuzzing--core",
       "difficulty": "trap"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The ordering runs live or UAT capture, then the venue's published conformance file, then hand-typed spec examples, then your own encoder. Testing a decoder with your encoder's bytes reproduces the round-trip trap: a shared field-offset error cancels out and the suite stays green while the wire format is wrong.",
-      "sourceAnchor": "577-protocol-vector-tests",
+      "sourceAnchor": "574-protocol-vectors-and-fuzzing--core",
       "difficulty": "recall"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Message boundaries are where framing assumptions break: a decoder that only works when a whole message arrives at once is an incident waiting for a day when segments coalesce or split. Byte-at-a-time feeding forces the incremental state machine to be correct, and coalesced and truncated cases cover the rest.",
-      "sourceAnchor": "577-protocol-vector-tests",
+      "sourceAnchor": "574-protocol-vectors-and-fuzzing--core",
       "difficulty": "application"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Unsigned underflow yields roughly 1.8e19, and adding it to bytes_consumed wraps the sum back below buffer_size, so the guard passes and the parser reads far out of bounds. Validate before subtracting: reject when the length is below the header size or above the available bytes, keeping the arithmetic on the known-good side.",
-      "sourceAnchor": "578-malformed-message-fuzzing",
+      "sourceAnchor": "574-protocol-vectors-and-fuzzing--core",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Each malformed input must produce a specified behaviour: reject and resynchronize at the next framing boundary, increment a named counter, and continue — or declare a gap and request replay when the stream is unrecoverable. Silent truncation of a packet produces a stale book that nothing alarms on, which is the worse failure.",
-      "sourceAnchor": "578-malformed-message-fuzzing",
+      "sourceAnchor": "574-protocol-vectors-and-fuzzing--core",
       "difficulty": "recall"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Three independent reasons: x86 TSO never performs the store-store or load-load reordering the bug needs, so an ARM-only failure is invisible; the same binary always reorders the same way, so repetition explores schedules but not compilations; and the memory model is about what is permitted, not what happens to be observed.",
-      "sourceAnchor": "579-concurrency-stress-and-soak-testing",
+      "sourceAnchor": "577-concurrency-testing--core",
       "difficulty": "recall"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The tool instruments compiler-visible memory accesses and understands std::atomic; hand-rolled assembly and intrinsic loads pass straight through unseen. Custom synchronization is likewise invisible unless annotated with the acquire and release annotation hooks. Building lock-free code from std::atomic is what makes it checkable at all.",
-      "sourceAnchor": "579-concurrency-stress-and-soak-testing",
+      "sourceAnchor": "577-concurrency-testing--core",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Thread and address sanitizers cannot be combined and need separate builds — one of the practical limits that makes just run the sanitizer an incomplete answer. Others: roughly five to fifteen times slowdown that can perturb timing until some races become unreachable, bounded per-location access history, and blindness to inline assembly.",
-      "sourceAnchor": "579-concurrency-stress-and-soak-testing",
+      "sourceAnchor": "577-concurrency-testing--core",
       "difficulty": "trap"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The insight is that most concurrency bugs have small depth — the number of ordering constraints needed to trigger them, typically one to three — so inserting d-1 random priority-change points gives a genuine probabilistic lower bound per run. Stress testing offers only hope; this offers arithmetic you can plan a run budget with.",
-      "sourceAnchor": "5710-randomized-scheduler-testing",
+      "sourceAnchor": "577-concurrency-testing--core",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With one thread per isolated core the scheduler never interrupts a critical section, so lock convoys and priority inversions never manifest in testing and appear only when a housekeeping thread lands on the wrong core in production. The remedy is to run the suite deliberately oversubscribed, unpinned, with differentiated priorities.",
-      "sourceAnchor": "5710-randomized-scheduler-testing",
+      "sourceAnchor": "577-concurrency-testing--core",
       "difficulty": "trap"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "State-space explosion limits exhaustive checking to two or three threads with a handful of operations each, so whole-program verification is out of reach. Extracting the skeleton and committing it next to the real code keeps the two edited together; partial-order reduction is what makes even the small cases tractable.",
-      "sourceAnchor": "5711-memory-model-model-checking",
+      "sourceAnchor": "577-concurrency-testing--core",
       "difficulty": "recall"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The four structural requirements are all I/O behind an interface with real and simulated implementations, all time from an injected clock, no real threads, and all randomness from the seeded generator including the simulator's own scheduling and fault choices. Simulation validates logic under adverse orderings, never latency.",
-      "sourceAnchor": "5712-deterministic-simulation",
+      "sourceAnchor": "578-deterministic-simulation-replay-and-faults--core",
       "difficulty": "recall"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Advancing a virtual clock fires due timers in timestamp order, so the assertion is exact and instantaneous. Sleeping is both slow everywhere and flaky on a loaded machine, and shortening the timeout tests a different configuration than the one that ships. Ties at the same virtual nanosecond need a stable insertion-order key.",
-      "sourceAnchor": "5713-virtual-clocks",
+      "sourceAnchor": "575-reproducibility-seeds-artifacts-and-virtual-time--core",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The capture tool reports packets dropped by kernel; gaps introduced by the capture host are indistinguishable from gaps on the feed, so every replay-derived conclusion about recovery becomes unsound. Reject lossy captures. Remember too that capture timestamps are capture-point timestamps, not the venue's send time.",
-      "sourceAnchor": "5714-recorded-packet-replay",
+      "sourceAnchor": "578-deterministic-simulation-replay-and-faults--core",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Run the scenario repeatedly failing the first fallible operation, then the second, and so on until the index exceeds the operation count; every error site is covered deterministically. It composes with deterministic simulation, where the simulator picks the injection point from the seed so each failure replays exactly.",
-      "sourceAnchor": "5715-fault-injection",
+      "sourceAnchor": "578-deterministic-simulation-replay-and-faults--core",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Closed-loop generation lets the system throttle its own measurement, hiding precisely the intervals that matter and understating the tail by orders of magnitude. The fix is open-loop sending on a fixed schedule, with latency recorded against the intended send time, and harness stalls recorded rather than hidden.",
-      "sourceAnchor": "5716-load-burst-and-soak-testing",
+      "sourceAnchor": "579-load-soak-and-performance-regression--core",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A stopped process, a long stall, or an asymmetric partition all stop heartbeats without stopping the primary, and the resumed primary produces split-brain. The assertion is fencing: a monotonic epoch token checked by the exchange session or a shared resource, with a resumed old primary's orders rejected.",
-      "sourceAnchor": "5717-failover-testing",
+      "sourceAnchor": "578-deterministic-simulation-replay-and-faults--core",
       "difficulty": "application"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Only a passive tap or port-mirror capture with hardware timestamps on both market-data ingress and order egress captures everything outside the process. Hardware-in-the-loop exists precisely for what simulation cannot reach: NIC rings and coalescing, bypass and FPGA paths, switch buffering, and BIOS and C-state effects.",
-      "sourceAnchor": "5718-hardware-in-the-loop-testing",
+      "sourceAnchor": "5710-hardware-in-the-loop-and-loopback--role-specific",
       "difficulty": "recall"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Loopback is useful for functional testing and for measuring application processing time, but it removes almost everything that makes the production path expensive. Anything you intend to quote must come from a cable or switch loop — and round trip halved is not one-way latency, since ingress and egress paths are asymmetric.",
-      "sourceAnchor": "5719-loopback-latency-testing",
+      "sourceAnchor": "5710-hardware-in-the-loop-and-loopback--role-specific",
       "difficulty": "trap"
     }
   ]

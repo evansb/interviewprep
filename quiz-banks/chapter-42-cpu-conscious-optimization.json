@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A DRAM miss costs ~80-100 ns and returns exactly one 64-byte line, so the unit of memory cost is the line, not the field; using 8 of 64 bytes means one-eighth of the machine's effective bandwidth. Register residency is tempting because DOD does reduce per-element footprint, but that is a side effect — the layout rules are chosen against line granularity, and issue width is a fixed microarchitectural property no source transformation changes.",
-      "sourceAnchor": "421-data-oriented-design",
+      "sourceAnchor": "423-data-oriented-design-and-aossoa--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The chapter's point is memory-level parallelism: a pointer-rich structure collapses to one outstanding miss because the next address is not computable until the current load returns, while contiguous indexed data gives the prefetcher a stride and lets multiple line-fill buffers work at once. The 'no memory traffic' claim is false — an index still requires loading the element it names; it just makes the address computable in advance.",
-      "sourceAnchor": "421-data-oriented-design",
+      "sourceAnchor": "423-data-oriented-design-and-aossoa--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "AoS with a stride of 16 bytes over a 4-byte field wastes three-quarters of every line and defeats contiguous vector loads, which is exactly the case SoA fixes. The prefetcher answer is the seductive one: hardware prefetchers do learn a constant stride and will fetch ahead, but they fetch whole lines — they cannot compact away the unused bytes, so bandwidth waste is unchanged.",
-      "sourceAnchor": "422-array-of-structures-versus-structure-of-arrays",
+      "sourceAnchor": "427-lookup-tables-compute-versus-fetch--core",
       "difficulty": "application"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Hardware prefetchers track a limited number of streams — typically 16-32 per core for the L2 streamer — and each array also needs its own TLB entry, so a wide SoA scan starves both resources at once; AoSoA with blocks of 8-64 elements is the standard fix. The allocator answer is plausible-sounding but wrong: vector headers are trivial next to the data, and the regression appears even with perfectly packed arrays.",
-      "sourceAnchor": "422-array-of-structures-versus-structure-of-arrays",
+      "sourceAnchor": "427-lookup-tables-compute-versus-fetch--core",
       "difficulty": "trap"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An ordinary store to a line not in cache must first fetch that line to gain exclusive ownership, even when the store will overwrite all 64 bytes — NT stores accumulate a full line in a write-combining buffer and send it straight to memory with no RFO and no cache allocation. The weak-ordering answer states a true property (NT stores really are weakly ordered even under x86-TSO) but draws the wrong conclusion: that ordering relaxation is a correctness hazard requiring `SFENCE`, not the source of the bandwidth win.",
-      "sourceAnchor": "4214-non-temporal-memory-access",
+      "sourceAnchor": "4210-non-temporal-memory-operations--role-specific",
       "difficulty": "recall"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The measurement note is explicit: the AoS-to-SoA win only appears if the loop was memory-bound, and if it was bound on a dependency chain or on branch mispredicts you will have rewritten your data model for zero gain. The tail-loop answer is the tempting one because tails do cost real code in SIMD kernels, but a tail is a fixed small cost, not something that cancels the bandwidth win across a large array.",
-      "sourceAnchor": "422-array-of-structures-versus-structure-of-arrays",
+      "sourceAnchor": "427-lookup-tables-compute-versus-fetch--core",
       "difficulty": "trap"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Branchless wins only when the branch is unpredictable — p_mispredict near 0.5 — because the branchless form pays cost_A plus cost_B every iteration; the chapter states that under roughly a 1% miss rate going branchless is almost certainly a pessimization. The 'saves the full refill' answer states a true fact about mispredict cost but draws the wrong conclusion: at 0.4% the expected saving is a fraction of a cycle, far less than the unconditional extra work.",
-      "sourceAnchor": "423-branchless-programming",
+      "sourceAnchor": "426-branches-branchless-code-and-conditional-moves--core",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Removing the control dependency converts it into a data dependency on the address, serializing the loads; a branchy binary search on a small array can be faster precisely because the predictor speculates the next address and the memory system runs ahead. The multiplier-port answer is plausible because the mask-multiply idiom does exist, but the chapter's own alternative — mask-and specifically to avoid multiplier pressure — shows that is a side issue, not the limit.",
-      "sourceAnchor": "423-branchless-programming",
+      "sourceAnchor": "426-branches-branchless-code-and-conditional-moves--core",
       "difficulty": "trap"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Loop unswitching, sorting or partitioning the input, and replacing dispatch with dense homogeneous batches are named as the higher-yield versions; removing branches at the instruction level is called the least important form. The `[[likely]]` answer is the tempting one because those attributes really do help — but the chapter is explicit that they move cold arms out of line, which is a front-end and I-cache win, not a prediction win.",
-      "sourceAnchor": "423-branchless-programming",
+      "sourceAnchor": "426-branches-branchless-code-and-conditional-moves--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A predicted branch lets the core speculate past the condition and start dependent work immediately, while `cmov` cannot produce a result until all three inputs are ready — that is the whole reason it can lose. The 'only the selected arm executes' claim inverts the truth: `cmov` computes both results, which is exactly why a branch is preferred when one arm is expensive or has side effects.",
-      "sourceAnchor": "424-conditional-moves",
+      "sourceAnchor": "426-branches-branchless-code-and-conditional-moves--core",
       "difficulty": "recall"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the row the chapter says separates strong candidates: if the condition depends on a long-latency load, `cmov` serializes on it while a branch predicts and lets the memory system run ahead. The 'data-dependent means unpredictable' answer confuses two things — the branch predictor keys on outcome history, not on where the value came from, and a memory-sourced condition can be highly predictable.",
-      "sourceAnchor": "424-conditional-moves",
+      "sourceAnchor": "426-branches-branchless-code-and-conditional-moves--core",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Assuming a ternary became a `cmov` without looking is named as a common error, and PGO un-converting predictable branches is called one of the more valuable things PGO does — check with `-S -masm=intel` or Compiler Explorer. The 'standard requires it' answer confuses source semantics with codegen: the standard says nothing about instruction selection, and `-fno-if-conversion` exists precisely because the transform is optional.",
-      "sourceAnchor": "424-conditional-moves",
+      "sourceAnchor": "426-branches-branchless-code-and-conditional-moves--core",
       "difficulty": "trap"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Two failure modes stack here: a table that misses L1 is usually slower than recomputing, and the table consumes cache and TLB capacity the rest of the program needed — a cost invisible to a benchmark that keeps the table hot. The copy-on-write answer misstates the chapter: a `static const` table is shared read-only across processes; it is a *mutable* table that duplicates per process.",
-      "sourceAnchor": "425-lookup-table-optimization",
+      "sourceAnchor": "427-lookup-tables-compute-versus-fetch--core",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "In-register tables are the modern answer precisely because they have zero cache footprint, and `VPERMB` extends the idea to 64 entries. The jump-table option is the trap: a jump table is still an indirect branch, so table-driven state machines that look branchless can be branch-bound at the dispatch and pay 15-20 cycles on a BTB mispredict.",
-      "sourceAnchor": "425-lookup-table-optimization",
+      "sourceAnchor": "427-lookup-tables-compute-versus-fetch--core",
       "difficulty": "recall"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The kernel declares `acc0` and `acc1` explicitly and cross-references the dependency-chain section: latency times throughput sets the number of chains you need to saturate the units. The aligned-load answer repeats old advice the chapter explicitly retires — `loadu` is free on modern cores unless it crosses a cache line, so `movaps`-vs-`movups` no longer matters.",
-      "sourceAnchor": "426-simd-intrinsics",
+      "sourceAnchor": "429-architecture-specific-simd-hazards--reference",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The in-lane rule for `vpshufb`, `vpalignr`, and `vunpck*` is called out as causing more SIMD bugs than anything else. The zeroing answer borrows a real fact from the AVX-SSE discussion — VEX 128-bit writes do zero the upper 128 bits — but that applies to 128-bit-wide VEX instructions, not to a 256-bit shuffle, so the inference does not carry.",
-      "sourceAnchor": "426-simd-intrinsics",
+      "sourceAnchor": "429-architecture-specific-simd-hazards--reference",
       "difficulty": "trap"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Gathers are named as usually slower than scalar loads on Intel — and were microcode-disabled on some parts after Downfall — because internally they retire roughly one element per cycle. The 'parallel against one TLB entry' answer sounds mechanical and plausible, but gathered addresses are arbitrary and may span many pages; there is no single translation to share.",
-      "sourceAnchor": "426-simd-intrinsics",
+      "sourceAnchor": "429-architecture-specific-simd-hazards--reference",
       "difficulty": "recall"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Tiling converts capacity misses into hits by shrinking the working set of the inner loops to fit a chosen cache level, which reduces traffic by about a factor of T. The unit-stride answer describes loop interchange, a different transformation the chapter lists separately — and note the packing answer is wrong on the arithmetic too, since packing is an additional refinement real BLAS adds on top of tiling, not the source of the win.",
-      "sourceAnchor": "427-loop-tiling-and-blocking",
+      "sourceAnchor": "424-alignment-locality-and-loop-tiling--core",
       "difficulty": "application"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Three blocks are live at once, so 3·T²·8 ≤ 32768 gives T ≈ 36, and 32 is chosen because it is a power of two and a SIMD multiple. The 'largest fitting value' answer is the classic mistake the chapter names explicitly: the optimum is not the largest fitting size, because the other arrays, the stack, and a hyperthread sibling all share the same L1.",
-      "sourceAnchor": "427-loop-tiling-and-blocking",
+      "sourceAnchor": "424-alignment-locality-and-loop-tiling--core",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The reordering window is finite, and the chapter does the arithmetic: ~10 iterations of lookahead against a 250-cycle miss is why you must overlap iterations in software. The in-order-retire answer states a true fact — retirement is in order — but the wrong conclusion: out-of-order *execution* proceeds past a pending load, so retirement order is not what caps the lookahead.",
-      "sourceAnchor": "428-software-pipelining",
+      "sourceAnchor": "425-dependency-chains-and-software-pipelining--core",
       "difficulty": "recall"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Serialized probing gives one outstanding miss at a time, n × 80 ns; issuing the next miss early keeps several of the 10-16 per-core fill buffers occupied, which is the standard trick behind fast hash joins. The overlapped-hash answer is tempting because the hash really is computed early, but the hash is a few cycles of ALU work — the win is measured in the ~80 ns misses it overlaps, not the arithmetic.",
-      "sourceAnchor": "428-software-pipelining",
+      "sourceAnchor": "425-dependency-chains-and-software-pipelining--core",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the genuine correctness trap the chapter names: x86-TSO does not cover non-temporal stores, and since a release store lowers to an ordinary `mov` it imposes no fence, so the publish can become visible before the payload. Upgrading to seq_cst is the tempting fix because it does emit a locked instruction — but the option's stated reason (that NT stores bypass the store buffer and arrive early) misdescribes the mechanism; the problem is missing ordering, and `SFENCE` is the documented remedy.",
-      "sourceAnchor": "4214-non-temporal-memory-access",
+      "sourceAnchor": "4210-non-temporal-memory-operations--role-specific",
       "difficulty": "trap"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The rule is D ≈ memory_latency / cycles_per_iteration, so 200/10 gives about 20. The 'harmless overshoot' option is the trap: prefetched lines are allocated into cache, so an over-long distance evicts them before use and displaces other useful data — the chapter lists both too-short and too-long distances as failures that merely look like 'prefetch doesn't help'.",
-      "sourceAnchor": "428-software-pipelining",
+      "sourceAnchor": "425-dependency-chains-and-software-pipelining--core",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A split lock escalates from a core-local cost to a socket-wide stall measured in microseconds, which is why Linux offers `split_lock_detect=fatal`. False sharing is the tempting answer because it is the alignment failure people talk about most, and its ~100 ns per access is real — but it degrades the threads sharing the line, whereas a split lock halts every core on the socket.",
-      "sourceAnchor": "429-alignment-for-cache-lines-and-simd",
+      "sourceAnchor": "424-alignment-locality-and-loop-tiling--core",
       "difficulty": "recall"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Alignment interacts with associativity: identical low address bits map to identical cache sets, which is the classic 'power-of-two matrix stride is catastrophically slow' result, fixed by padding the leading dimension. The page-crossing answer inverts the mechanism — starting *on* a boundary is what avoids a straddle; it is a buffer whose accesses span a boundary that pays.",
-      "sourceAnchor": "429-alignment-for-cache-lines-and-simd",
+      "sourceAnchor": "424-alignment-locality-and-loop-tiling--core",
       "difficulty": "trap"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`vaddps` has 4-cycle latency and 2-per-cycle throughput, so a single accumulator caps the loop at 4 cycles per element — one-eighth of peak — while the compiler reassociates the integer version freely because integer addition is associative. The throughput answer states the right kind of fact but the wrong number and the wrong diagnosis: the cap comes from *latency* on the loop-carried chain, not from issue throughput.",
-      "sourceAnchor": "4210-dependency-chains-and-critical-paths",
+      "sourceAnchor": "425-dependency-chains-and-software-pipelining--core",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Latency times throughput is the number of chains needed to keep the units busy: 4 × 2 = 8 for FP add and FMA, and hand-written GEMM kernels use 12-16. The 'one per vector port' answer confuses ports with chains — two ports can each start an add every cycle, so with 4-cycle latency you need four in flight per port, hence eight total.",
-      "sourceAnchor": "4210-dependency-chains-and-critical-paths",
+      "sourceAnchor": "425-dependency-chains-and-software-pipelining--core",
       "difficulty": "recall"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Low IPC with clean cache and branch counters, concentrated on one instruction, is the textbook latency-bound picture — a 30-90 cycle runtime divide or a single FP accumulator on the loop-carried path. The store-forwarding answer names a real stall the chapter discusses, but a failed forward costs ~12-15 cycles and shows up as a memory-ordering stall spread across loads, not as time parked on one arithmetic instruction.",
-      "sourceAnchor": "4210-dependency-chains-and-critical-paths",
+      "sourceAnchor": "425-dependency-chains-and-software-pipelining--core",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An 8- or 16-bit register write is a partial write: the hardware must merge the new low bits with the old upper bits, creating a false dependency on whatever last wrote `rax`. The encoding-size answer inverts reality — `movzx` is the *longer* instruction, and compilers accept that cost precisely to break the merge dependency.",
-      "sourceAnchor": "4211-partial-register-and-false-dependencies",
+      "sourceAnchor": "429-architecture-specific-simd-hazards--reference",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the textbook false dependency: the decoder treats the destination as an input it does not actually need, serializing what should be independent operations, and compilers work around it by zeroing the destination first. The 'genuine throughput' answer is the tempting one because 3 cycles is `popcnt`'s real latency — but its throughput is one per cycle, so the observed rate is the false chain, not the instruction limit.",
-      "sourceAnchor": "4211-partial-register-and-false-dependencies",
+      "sourceAnchor": "429-architecture-specific-simd-hazards--reference",
       "difficulty": "trap"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The chapter names a trivial `memcpy` appearing to cost hundreds of cycles as the classic presentation of AVX-SSE transitions, which you hit by linking rather than by writing mixed intrinsics. The downclocking answer misfires twice: `-mprefer-vector-width=256` avoids 512-bit code and so is irrelevant to an AVX2 build, and downclocking slows everything uniformly rather than concentrating cost at one call.",
-      "sourceAnchor": "4212-avx-sse-transition-penalties",
+      "sourceAnchor": "429-architecture-specific-simd-hazards--reference",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The asymmetry is the killer: entering the lower license takes microseconds, but returning to full frequency needs ~2 ms of no heavy-vector activity, so a short burst depresses the clock long after it finished — and the drop applies to the whole core, including scalar code, and on some parts neighbouring cores. The 'only while retiring' answer gets the mechanism right but the duration wrong, which is exactly the misunderstanding that makes this bug survive review.",
-      "sourceAnchor": "4213-simd-frequency-downclocking",
+      "sourceAnchor": "429-architecture-specific-simd-hazards--reference",
       "difficulty": "trap"
     }
   ]

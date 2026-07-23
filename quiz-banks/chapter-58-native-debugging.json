@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The safer production sequence is to capture a core with gcore, which stops the process only for the duration of the dump, or to let the process crash into a core and analyse it offline. Live inspection that must not stop the process belongs to uprobes and tracing tools instead.",
-      "sourceAnchor": "581-gdb-and-lldb-fundamentals",
+      "sourceAnchor": "584-gdb-and-lldb-fundamentals",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "It is usually Yama, not file permissions: the scope value of zero allows any same-uid attach, one restricts attaching to a parent, and three forbids it outright. Reaching for chmod or sudo before checking that setting is the classic wasted step.",
-      "sourceAnchor": "581-gdb-and-lldb-fundamentals",
+      "sourceAnchor": "584-gdb-and-lldb-fundamentals",
       "difficulty": "trap"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Each software breakpoint hit costs two context switches to the debugger, which makes one in a ten-million-event loop unusable, and text modification means a checksum over the code section fails under a debugger. Hardware breakpoints are the choice for read-only pages and for JIT or self-modifying code.",
-      "sourceAnchor": "582-breakpoints-and-watchpoints",
+      "sourceAnchor": "584-gdb-and-lldb-fundamentals",
       "difficulty": "recall"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A hardware watchpoint traps in the CPU and is essentially free; a software watchpoint single-steps the whole program and re-evaluates the expression after every instruction. The confirmation message distinguishes the two, and narrowing the watch to one 8-byte field usually gets the hardware path back.",
-      "sourceAnchor": "582-breakpoints-and-watchpoints",
+      "sourceAnchor": "584-gdb-and-lldb-fundamentals",
       "difficulty": "application"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The flag makes the debugger resolve the expression once and watch the resulting address, which is what the corruption workflow needs: run to construction, take the address of the field, watch that location, continue, and the debugger stops on the exact instruction that wrote it, with a stack.",
-      "sourceAnchor": "582-breakpoints-and-watchpoints",
+      "sourceAnchor": "584-gdb-and-lldb-fundamentals",
       "difficulty": "trap"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A breakpoint condition is evaluated in the debugger, so every hit costs two context switches whether or not the condition holds; an ignore count pays exactly the same per-hit price. An in-code comparison that traps, a dprintf, a fast scripted stop predicate, or a uprobe are the practical alternatives.",
-      "sourceAnchor": "582-breakpoints-and-watchpoints",
+      "sourceAnchor": "584-gdb-and-lldb-fundamentals",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "DWARF describes a variable's location as an expression that varies by program counter range, so the debugger is telling the truth rather than failing. Recovery options are to move to a frame or PC where the value is live, read the holding register directly, or recompute it from values that are available.",
-      "sourceAnchor": "583-debugging-optimized-code",
+      "sourceAnchor": "585-debugging-optimized-code",
       "difficulty": "recall"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Debug information lives in sections that are never loaded and never executed; code generation is identical with and without it. The correct default is to build with full optimization plus debug info, then split or strip the debug data into a symbol store keyed by build ID.",
-      "sourceAnchor": "583-debugging-optimized-code",
+      "sourceAnchor": "585-debugging-optimized-code",
       "difficulty": "trap"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Disappearing at -O0 points at undefined behaviour the optimizer exploited, a race whose window changed with scheduling, or uninitialized memory that happened to be zero in the larger unoptimized frames. Sanitizers find the defect rather than the symptom; -Og or disabling inlining is a middle ground that often keeps the bug alive.",
-      "sourceAnchor": "583-debugging-optimized-code",
+      "sourceAnchor": "585-debugging-optimized-code",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With debug information the debugger can display inlined subroutine records, but they are not real frames, so operations like finishing a frame behave oddly and a raw stack read shows nothing of them. Sibling-call optimization deletes the caller's frame outright; disabling it in debug builds restores the link.",
-      "sourceAnchor": "583-debugging-optimized-code",
+      "sourceAnchor": "585-debugging-optimized-code",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The signal information is the most valuable single field for a segmentation fault, since it carries the faulting address. The absence of history is exactly the limitation that record-and-replay tools address, by making execution deterministic so a replay session supports reverse execution and reverse watchpoints.",
-      "sourceAnchor": "584-core-dumps",
+      "sourceAnchor": "581-preserve-evidence-before-reproducing",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The coredump filter is a per-process, inheritable bitmask selecting which mapping classes are dumped, and clearing the huge-page and shared bits typically shrinks a core by orders of magnitude. Excluding specific large regions via a memory advice call is the surgical version, and cores should go to fast local storage with capped retention.",
-      "sourceAnchor": "584-core-dumps",
+      "sourceAnchor": "581-preserve-evidence-before-reproducing",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Deterministic recording works by serializing execution onto one core, recording syscall results, and disabling address randomization; replay then supports reverse execution and reverse watchpoints. The costs are roughly 1.2 to 2 times record overhead, single-core execution, and a requirement for performance-counter access.",
-      "sourceAnchor": "584-core-dumps",
+      "sourceAnchor": "581-preserve-evidence-before-reproducing",
       "difficulty": "application"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A core pattern starting with a pipe sends the dump to a program such as a system core collector, so the file never appears where expected and is retrieved through that daemon's list and debug commands. A setuid process, or one that cleared its dumpable flag, does not dump at all.",
-      "sourceAnchor": "584-core-dumps",
+      "sourceAnchor": "581-preserve-evidence-before-reproducing",
       "difficulty": "trap"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Capturing walks the stack and stores addresses, which is comparatively cheap but still allocates — the type is allocator-aware, so a monotonic resource can be supplied. Resolution costs milliseconds, may open files, and takes locks, which is also why the facility is not async-signal-safe.",
-      "sourceAnchor": "585-stdstacktrace",
+      "sourceAnchor": "583-symbols-dwarf-source-mappings-and-stacks",
       "difficulty": "recall"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Symbolization reads debug information, allocates, and takes locks, so it must never happen on a hot path or inside a signal handler. Capturing addresses with a lightweight unwinder into preallocated storage keeps the cost to microseconds, and shipping addresses plus the build ID lets the symbol store do the rest.",
-      "sourceAnchor": "585-stdstacktrace",
+      "sourceAnchor": "583-symbols-dwarf-source-mappings-and-stacks",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With a frame pointer, the saved pointer and the return address sit at fixed offsets, so each step of the unwind is two loads. Without one, unwinding needs the per-program-counter call frame information, which is correct but expensive and fails in hand-written assembly, some JIT code, or a corrupted stack.",
-      "sourceAnchor": "586-postmortem-register-and-stack-analysis",
+      "sourceAnchor": "586-core-register-stack-and-memory-workflow",
       "difficulty": "recall"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The call pushed a return address before transferring control, so even with no valid instruction pointer the top of the stack identifies the caller. A tiny non-zero value such as eight has the same cause, and an instruction pointer inside a non-executable region means control jumped into data.",
-      "sourceAnchor": "586-postmortem-register-and-stack-analysis",
+      "sourceAnchor": "586-core-register-stack-and-memory-workflow",
       "difficulty": "application"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Dereferencing a member through a null object faults at the member's offset, so the offset narrows the access down to a specific field. Related readings from the same field: a value just below a valid mapping means a guard-page hit from stack overflow, and an all-ones value means an unsigned underflow used as an index or size.",
-      "sourceAnchor": "586-postmortem-register-and-stack-analysis",
+      "sourceAnchor": "586-core-register-stack-and-memory-workflow",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Manual stack scanning identifies plausible return addresses by two tests: the value lands in a mapped executable region, and the bytes just before it decode as a call. False positives from dead frames are the weakness and also a strength, since they show where the code has recently been.",
-      "sourceAnchor": "586-postmortem-register-and-stack-analysis",
+      "sourceAnchor": "586-core-register-stack-and-memory-workflow",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "So a crash in the prologue means the first integer argument register still holds the object pointer. Once the body reuses them the values are gone, and recovering an argument means disassembling backwards from the return address in the caller's frame to find the instructions that set it up.",
-      "sourceAnchor": "586-postmortem-register-and-stack-analysis",
+      "sourceAnchor": "586-core-register-stack-and-memory-workflow",
       "difficulty": "recall"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Exception unwinding needs the call frame information at runtime, so that section is loaded rather than merely descriptive, and it survives stripping while the descriptive debug sections do not. That is exactly why a stripped production binary gives you frame addresses but no names until the symbol store is consulted.",
-      "sourceAnchor": "587-dwarf-and-split-debug-information",
+      "sourceAnchor": "583-symbols-dwarf-source-mappings-and-stacks",
       "difficulty": "recall"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Debug data for a template-heavy program commonly runs five to twenty times the size of the code, so keeping it out of the link is a large win. The side files must remain at their recorded paths or be packaged; the production recipe is optimized plus debug info plus frame pointers plus split debug, stripped, with the artifacts archived by build ID.",
-      "sourceAnchor": "587-dwarf-and-split-debug-information",
+      "sourceAnchor": "583-symbols-dwarf-source-mappings-and-stacks",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A core records the identifier of every mapped module, so the debugger or a network symbol service fetches precisely the right debug data. Without that check, debugging today's core with last week's binary yields a confident and entirely fictional backtrace — the single biggest time sink in postmortem work.",
-      "sourceAnchor": "588-build-ids-and-symbol-servers",
+      "sourceAnchor": "583-symbols-dwarf-source-mappings-and-stacks",
       "difficulty": "recall"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Addresses shift with address randomization and with every rebuild, so hashing them scatters one bug across many buckets. Symbolizing first and hashing names collapses a thousand cores into a handful of distinct defects ranked by frequency, which is what makes fleet-scale triage tractable.",
-      "sourceAnchor": "588-build-ids-and-symbol-servers",
+      "sourceAnchor": "583-symbols-dwarf-source-mappings-and-stacks",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The two are opposites in CPU terms, which makes the first triage step a glance at utilization. In a busy-poll system the reading is ambiguous, since a healthy poll loop also pegs a core, so the diagnosis must be anchored on application progress counters rather than on CPU alone.",
-      "sourceAnchor": "589-deadlock-diagnosis",
+      "sourceAnchor": "588-concurrency-deadlock-blocked-hang-spin-livelock-and-race",
       "difficulty": "recall"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The glibc mutex structure carries the owning thread id, and a lock value indicating locked-with-waiters is what forces a futex syscall on unlock. Walking from each blocked thread to its lock's owner reveals the cycle. This works for std::mutex because it is a thin wrapper over the same structure.",
-      "sourceAnchor": "589-deadlock-diagnosis",
+      "sourceAnchor": "588-concurrency-deadlock-blocked-hang-spin-livelock-and-race",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A condition-variable wait releases the mutex, so no thread holds a resource another needs and there is no cycle to find. The signature to recognize is everyone waiting with the predicate already true, which points at a notification that happened when no waiter existed or at a predicate mutated without the mutex held.",
-      "sourceAnchor": "589-deadlock-diagnosis",
+      "sourceAnchor": "588-concurrency-deadlock-blocked-hang-spin-livelock-and-race",
       "difficulty": "trap"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Only the forking thread survives into the child, and any lock held by another thread at fork time stays held forever. That is why only async-signal-safe calls are legal between fork and exec, and why atfork handlers exist. The signature is a child hung in the allocator's internals right after the fork.",
-      "sourceAnchor": "589-deadlock-diagnosis",
+      "sourceAnchor": "588-concurrency-deadlock-blocked-hang-spin-livelock-and-race",
       "difficulty": "trap"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A flat profile dominated by one function with high instruction throughput is an infinite loop; a profile dominated by an atomic read-modify-write with low throughput is contention. Sampling profilers and counter reads work against a live process with negligible perturbation, unlike attaching a debugger.",
-      "sourceAnchor": "5810-livelock-and-cpu-spin-diagnosis",
+      "sourceAnchor": "588-concurrency-deadlock-blocked-hang-spin-livelock-and-race",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Busy polling deliberately consumes a whole core, so a spin bug and correct operation look identical from utilization alone. The diagnosis has to be based on whether counters advance, and the same trap runs the other way in blocking systems, where low utilization can hide a stall.",
-      "sourceAnchor": "5810-livelock-and-cpu-spin-diagnosis",
+      "sourceAnchor": "588-concurrency-deadlock-blocked-hang-spin-livelock-and-race",
       "difficulty": "trap"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The defining property of heap corruption is that the crash is far from the bug in both time and space, and the allocator's messages about invalid sizes or corrupted top all mean metadata was overwritten by an overflow. Reproducing under the address sanitizer moves the report back to the offending write.",
-      "sourceAnchor": "5811-memory-corruption-diagnosis",
+      "sourceAnchor": "587-memory-corruption-and-heap-diagnosis",
       "difficulty": "recall"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The tools detect non-overlapping defect classes and cannot be combined into one build: memory errors, uninitialized reads, and races each need their own. A race that tears a wide structure, or a use-after-free hidden inside a deferred reclamation scheme, leaves the memory validly allocated throughout, so only happens-before reasoning finds it.",
-      "sourceAnchor": "5811-memory-corruption-diagnosis",
+      "sourceAnchor": "587-memory-corruption-and-heap-diagnosis",
       "difficulty": "application"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Trapping gives an immediate fault with the offending stack, which is strictly more useful than a count that tells you how many but not where. The same assert-the-absence pattern extends to syscalls via a filter and to page faults via minor-fault deltas, and together those three define a clean hot path checkably in continuous integration.",
-      "sourceAnchor": "5812-heap-debugging",
+      "sourceAnchor": "585-debugging-optimized-code",
       "difficulty": "application"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Per-thread arenas produce a footprint that looks alarming and is not a leak; capping the arena count or switching allocator is the standard mitigation, and trimming returns free top-of-heap memory that deallocation alone leaves behind. Exit-time leak checking is separately useless here, so a periodic recoverable check is used instead.",
-      "sourceAnchor": "5812-heap-debugging",
+      "sourceAnchor": "585-debugging-optimized-code",
       "difficulty": "trap"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Without an alternate stack, a stack-overflow fault runs the handler on the exhausted stack, faults again, and produces no output at all. Calling any exit function destroys the most valuable artifact available, so the correct ending restores the default handler and re-raises the original signal.",
-      "sourceAnchor": "5813-crash-handler-limitations",
+      "sourceAnchor": "5812-crash-handler-limitations",
       "difficulty": "application"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Only async-signal-safe functions are legal in a handler, which rules out allocation and therefore strings, streams, formatting into dynamic buffers, and stack capture. Heap corruption commonly faults inside the allocator with its lock already held, which turns the unsafe call into a guaranteed hang.",
-      "sourceAnchor": "5813-crash-handler-limitations",
+      "sourceAnchor": "5812-crash-handler-limitations",
       "difficulty": "trap"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A crashing process cannot be trusted to clean up after itself: a send may block, may need a lock, or may target an already-broken socket, and the handler is bound by async-signal-safety anyway. Putting the safety action in a separate observer removes the dependency on the failed process entirely.",
-      "sourceAnchor": "5813-crash-handler-limitations",
+      "sourceAnchor": "5812-crash-handler-limitations",
       "difficulty": "application"
     }
   ]

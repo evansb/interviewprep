@@ -1,118 +1,154 @@
 # Chapter 17 — Templates
 
-*Interview-focused revision notes. The theme: templates are a compile-time program whose inputs are types and values and whose output is generated code — so every question reduces to what the compiler knows, when it knows it, and what it costs to produce the answer.*
+## Why this matters in an HFT interview — Core
+
+Templates move decisions about types and values into translation. A specialization can expose constants, concrete operations, and exact object layouts to optimization, but it can also multiply parsing, instantiation, machine code, and diagnostics. The useful model is therefore: what is checked at definition, what is deduced or substituted, what becomes instantiated, and what artifact is emitted?
+
+This chapter develops that model through deduction, forwarding, lookup, specialization, constraints, and packs. See Chapter 4 for general overload resolution and value categories, and Chapter 19 for constant evaluation and other modern-language facilities.
+
+## 90-second screen — Core
+
+1. A template is parsed and its non-dependent constructs are checked at definition. Substitution/constraints determine whether a specialization participates; use then determines which definitions must be instantiated.
+2. Function-template deduction matches parameter patterns after specified adjustments. It does not generally search for promotions or user-defined conversions; once arguments are fixed, ordinary conversions can apply.
+3. `T&&` is a forwarding reference only when `T` is deduced by the same call, or for `auto&&`; reference collapsing then makes any `&` in a collapsing pair win.
+4. Non-dependent names bind at the point of definition; dependent names resolve at instantiation via ordinary lookup from the definition point plus ADL from the instantiation point — which is why a member of a dependent base needs `this->`.
+5. Concepts (C++20) express overload participation and ordering. Subsumption works from normalized, identical atomic constraints—not from arbitrary logical implication.
+
+For new C++23 interfaces, prefer named concepts over `enable_if`; keep SFINAE knowledge for existing code and detection internals. Choose static specialization when its runtime benefit is measurable and the type set is controlled. At cold or open-ended boundaries, type erasure may trade one indirect call for lower build cost and smaller instruction footprint; see Chapter 6.
+
+The translation-time control flow is:
+
+```text
+parse template definition
+        |
+call/use -> deduction -> substitution + constraint checking
+                         | failure in allowed immediate context: candidate removed
+                         v
+                  overload/partial ordering
+                         |
+                  selected specialization
+                         |
+                instantiate required definition
+                         | body error: hard diagnostic
+                         v
+                 optimize and possibly emit code
+```
+
+This order explains why SFINAE cannot hide an error in a selected function body and why constraints can improve an interface without guaranteeing cheaper compilation or faster machine code.
 
 ---
 
-## 17.1 Function, Class, Variable and Alias Templates
+## 17.1 Kinds of Templates — Core
 
-A **template** is a pattern from which the compiler generates entities. There are four kinds, and knowing what each can and cannot do is table stakes.
+A template parameter can be a type, a compile-time value, or another template. Defaults and parameter packs are allowed under placement rules covered later. Four common declaration forms are:
 
 ```cpp
-template <class T> T max(T a, T b);                       // function template
-template <class T, size_t N> struct Array { T d[N]; };    // class template
-template <class T> constexpr T pi = T(3.1415926535897932385L);  // variable template (C++14)
-template <class T> using Vec = std::vector<T, MyAlloc<T>>;       // alias template (C++11)
+#include <cstddef>
+#include <type_traits>
+
+template <class T> T max(T a, T b);                              // function template
+template <class T, std::size_t N> struct Array { T data[N]; };    // class template
+template <class T> inline constexpr bool scalar_v =              // variable template
+    std::is_arithmetic_v<T>;
+template <class T> using PairWithInt = Array<T, 2>;               // alias template
+
+static_assert(scalar_v<double>);
+static_assert(sizeof(PairWithInt<int>) == 2 * sizeof(int));
 ```
 
-### Function templates
-
-Deduce their arguments from the call (§17.2), participate in overload resolution alongside non-templates, and can be **overloaded** but only **fully specialized** — never partially. The specialization prohibition is the single most important asymmetry in this section:
+**Function templates** deduce their arguments from the call (§17.2), participate in overload resolution alongside non-templates, and can be overloaded but only *fully* specialized — never partially:
 
 ```cpp
 template <class T> void f(T);            // (1) primary
-template <class T> void f(T*);           // (2) an OVERLOAD, not a specialization
-template <>        void f<int>(int);     // (3) full specialization OF (1)
+template <class T> void f(T*);           // (2) an overload, not a specialization
+template <>        void f<int>(int);     // (3) full specialization of (1)
 ```
-`f(pint)` picks (2) by overload resolution, and (3) never enters the picture. This is Sutter's "why not specialize function templates" argument: specializations do not participate in overload resolution — the compiler first picks the most specialized *primary* template via partial ordering, *then* looks for a specialization of that one. Overloading is almost always what you want; if you truly need per-type behavior, dispatch to a class template's static member (which can be partially specialized) or use constraints (§17.13).
+For an `int*` argument, overload resolution picks (2). Function-template specializations are not independent overload candidates: overload resolution first chooses a primary template, after which an explicit specialization of that primary can supply the definition. Prefer overloading or constraints for function dispatch; use class-template partial specialization when the type pattern itself must vary.
 
-Between a function template and an equally good non-template overload, **the non-template wins**. Between two templates, **partial ordering** picks the more specialized.
+Between a function template and an equally good non-template overload, the non-template wins. Between two templates, partial ordering picks the more specialized.
 
-### Class templates
+**Class templates** support full and partial specialization (§17.6), member templates, static members (one per instantiation), and CTAD (§17.4, C++17). Each distinct instantiation is a distinct type: `Array<int,4>` and `Array<int,5>` share nothing, including static members.
 
-Support full and partial specialization (§17.6), member templates, static members (one per instantiation), and — since C++17 — CTAD (§17.4). Each distinct instantiation is a distinct type: `Array<int,4>` and `Array<int,5>` share nothing, including static members.
+**Variable templates** remove `::value` boilerplate: `std::is_integral_v<T>` exposes `is_integral<T>::value`. Under the corrected C++ rule (CWG2387), the namespace-scope internal-linkage exception for non-volatile `const` variables applies only to non-template variables. Implementations historically differed in applying that defect report. Write header-defined variable templates as `inline constexpr` in C++17 and later: `inline` makes the one-entity ODR intent explicit and avoids depending on older linkage behavior. `_v` syntax is readability, not an intrinsic compile-time optimization over `::value`.
 
-### Variable templates
+**Alias templates** are the subtle one. An alias template is not a class, so:
 
-Introduced in C++14 primarily to remove `::value` boilerplate: `std::is_integral_v<T>` is a variable template defined as `is_integral<T>::value`. At namespace scope they have external linkage and are implicitly `inline` when `constexpr`, so header definitions do not violate the ODR (Ch. 1 §1.6).
-
-### Alias templates
-
-The subtle one. An alias template is **not a class**, so:
-
-- It has **no specializations at all** — neither full nor partial. You cannot `template <> using X<int> = …`.
-- It is **never deduced**. A function parameter of type `Vec<T>` cannot deduce `T` from a `std::vector<int, MyAlloc<int>>` argument in the general case, because alias substitution is not invertible. (C++20 CTAD *for* alias templates was added — §17.4 — but that's construction, not deduction in a parameter.)
-- It is **transparent**: `Vec<int>` and `std::vector<int, MyAlloc<int>>` are the same type, so it does not create a distinct type for overloading. Use a real class (or a strong-typedef wrapper) if you need distinctness.
-- It is **not a non-deduced context by itself** but reliably produces one; the idiom `template <class T> using type_identity_t = typename type_identity<T>::type` is how you deliberately *block* deduction on a parameter:
+- It has no specializations, full or partial. You cannot write `template <> using X<int> = …`.
+- Its substituted result participates in deduction when the resulting pattern exposes the parameter; `template<class T> using Vec = std::vector<T>;` permits deduction through a parameter `Vec<T>`. A parameter in a non-deduced nested-name position still cannot be solved. Alias substitution is not a blanket deduction barrier.
+- It is transparent: `Vec<int>` and `std::vector<int, MyAlloc<int>>` are the same type, so it creates no distinct type for overloading. Use a real class if you need distinctness.
+- `std::type_identity_t<T>` deliberately places `T` in a non-deduced context, which is useful when another parameter should decide `T`:
 
 ```cpp
 template <class T> void g(T, std::type_identity_t<T>);  // deduce only from the first argument
 g(1.0, 2);   // T = double; the int converts. Without identity_t this would be ambiguous.
 ```
 
-Alias templates are also the standard cure for the "template template parameter with a default argument" mismatch, and for shortening dependent names (`typename std::iterator_traits<It>::value_type` → `std::iter_value_t<It>` in C++20).
-
-**Member templates** deserve a note: a member function template of a class template can be declared in-class and defined out-of-line with two `template<>` headers, and a **template constructor never suppresses the implicitly declared copy constructor** — the source of the classic "my perfect-forwarding constructor hijacks copies of non-const objects" bug (§17.17).
+A member function template of a class template defined out of line needs two template parameter lists—`template<class T>` for the class and `template<class U>` for the member—not two `template<>` specialization headers. A constructor template does not suppress implicit declaration of a copy constructor, yet it can win overload resolution for a non-const lvalue; §17.3 diagnoses that case.
 
 ---
 
-## 17.2 Template Argument Deduction
+## 17.2 Template Argument Deduction — Core
 
-Deduction matches the **parameter type P** against the **argument type A** and solves for the template parameters. It is a pattern-match, not a conversion: deduction succeeds only if a consistent substitution exists, and only a very small set of adjustments is permitted.
+Deduction matches each function-parameter type `P` against its argument type `A` and solves for template arguments. It is pattern matching with specified adjustments and limited fallback alternatives, not a general “find any conversion” process.
 
-### The adjustments applied before matching
+For a by-value parameter `P`:
+1. Top-level cv-qualifiers on `A` are dropped (`const int` → `int`).
+2. Array-to-pointer and function-to-pointer decay applies (`int[5]` → `int*`).
 
-For a *by-value* parameter `P`:
-1. Top-level cv-qualifiers on `A` are **dropped** (`const int` → `int`).
-2. **Array-to-pointer and function-to-pointer decay** applies (`int[5]` → `int*`).
-
-For a *reference* parameter `P& `or `P&&`, neither happens — which is why references preserve arrays and constness:
+For a reference parameter `P&` or `P&&`, neither happens — references preserve arrays and constness:
 
 ```cpp
 template <class T> void byval(T);      int a[5];  byval(a);   // T = int*
-template <class T> void byref(T&);                byref(a);   // T = int(&)[5]  — size preserved
-template <class T, size_t N> void arr(T(&)[N]);   arr(a);     // N = 5   ← the idiom
+template <class T> void byref(T&);                byref(a);   // T = int[5]; P is int(&)[5]
+template <class T, size_t N> void arr(T(&)[N]);   arr(a);     // N = 5 — the idiom
 const int c = 0;
 byval(c);   // T = int   (const dropped)
 byref(c);   // T = const int
 ```
-`template <class T, size_t N> constexpr size_t len(T(&)[N]) { return N; }` is the safe replacement for the `sizeof(a)/sizeof(a[0])` macro, because it *fails to compile* on a pointer instead of silently giving 8/4.
+`template <class T, std::size_t N> constexpr std::size_t len(T(&)[N]) { return N; }` preserves the array bound and rejects a pointer.
 
-### Permitted conversions during deduction
-
-Only three: lvalue-to-rvalue/array/function decay (above), qualification conversion (adding `const` to a pointee), and derived-to-base for a class template parameter of the form `Base<T>` deduced from a derived class. Nothing else. **No integral promotion, no user-defined conversion, no arithmetic conversion.** This is why:
+Do not memorize the adjustments as “three conversions.” For non-reference `P`, arrays/functions decay and top-level cv is ignored. For reference `P`, deduction uses the referred-to argument type. If direct matching fails, the standard permits specific alternatives in relevant forms, including certain cv/qualification compatibility and deduction of a class-template pattern from a derived argument. It does not generally apply integral promotions, arithmetic conversions, or user-defined conversions while solving for `T`:
 
 ```cpp
 template <class T> T max(T,T);
-max(1, 2.0);   // ERROR — deduces T=int from arg1 and T=double from arg2, inconsistent
-max<double>(1, 2.0);  // OK — T explicit, ordinary conversions now apply
+max(1, 2.0);            // ERROR — deduces T=int from arg1, T=double from arg2, inconsistent
+max<double>(1, 2.0);    // OK — T explicit, ordinary conversions now apply
 ```
 
-### Non-deduced contexts
-
-Positions where the parameter cannot be solved for; deduction skips them and they must come from elsewhere (explicit arguments, defaults, or other parameters):
+**Non-deduced contexts** — positions the compiler cannot solve for, which must come from elsewhere (explicit arguments, defaults, or another parameter):
 
 | Context | Example |
 |---|---|
 | Nested name qualified by a template parameter | `typename A<T>::type` |
-| Non-type argument involving a template parameter in an expression | `std::array<int, N+1>` |
-| The parameter of a function-type parameter when other args disambiguate | `void(*)(T)` combined with defaults |
-| A parameter with a default argument | `template<class T> void f(T = 0)` — the default doesn't deduce |
-| The type of `std::initializer_list` in a plain `T` parameter | `f({1,2,3})` with `template<class T> void f(T)` fails |
+| Non-type argument that is an expression involving the parameter | `std::array<int, N+1>` |
+| A parameter with a default argument | `template<class T> void f(T = 0)` |
+| The type of a braced-init-list matched against plain `T` | `f({1,2,3})` with `template<class T> void f(T)` fails |
 
-The braced-init-list case is worth memorizing: `template <class T> void f(T)` rejects `f({1,2,3})` (braced lists are non-deduced), but `template <class T> void f(std::initializer_list<T>)` accepts it. This asymmetry is why `auto x = {1,2,3}` deduces `initializer_list<int>` while `template<class T> void f(T)` does not — the one deliberate divergence between `auto` deduction and template deduction (Ch. 2 §2.16).
+`template <class T> void f(T)` rejects `f({1,2,3})`, but `template <class T> void f(std::initializer_list<T>)` accepts it — the one deliberate divergence between `auto` deduction (`auto x = {1,2,3}` deduces `initializer_list<int>`) and template deduction.
 
-### Deduction from multiple parameters
+All deductions for the same template parameter must be consistent. After deduction or explicit specification fixes the specialization, conversions required by the resulting function parameter are considered normally. `auto` return deduction follows placeholder rules modeled on template deduction; `decltype(auto)` instead applies `decltype` rules and can preserve references.
 
-All deductions for the same parameter must agree exactly (after the adjustments). To make one argument non-deducing, wrap it in an identity alias (§17.1) or supply it explicitly.
+### Deduction worksheet
 
-**Return type deduction** (`auto f()`) uses template deduction rules, so it strips references and cv; `decltype(auto)` uses `decltype` rules and preserves them (Ch. 2 §2.17). Getting a proxy-returning forwarding wrapper right requires `decltype(auto)`.
+Work out `T` (or "fails") before checking the answer column.
+
+| `P` | Call | `T` | Why |
+|---|---|---|---|
+| `T` | `f(3)` | `int` | by value, no adjustment needed |
+| `T` | `f(arr)` where `int arr[5]` | `int*` | array-to-pointer decay |
+| `T&` | `f(arr)` where `int arr[5]` | `int[5]` | no decay; resulting parameter is `int(&)[5]` |
+| `T` | `f(ci)` where `const int ci=1` | `int` | top-level cv dropped |
+| `T&` | `f(ci)` where `const int ci=1` | `const int` | cv preserved through reference |
+| `T` | `f(1, 2.0)` for `T f(T,T)` | fails | inconsistent deduction, no arithmetic conversion |
+| `T&&` | `f(x)`, `x` an lvalue `int` | `int&` (collapses to `int&`) | forwarding reference, lvalue rule (§17.3) |
+| `T&&` | `f(5)` | `int` (param becomes `int&&`) | forwarding reference, rvalue rule |
+| `T` | `f({1,2,3})` for `f(T)` | fails | braced-init-list is non-deduced |
 
 ---
 
-## 17.3 Forwarding References and Reference Collapsing
+## 17.3 Forwarding References and Reference Collapsing — Core
 
-A **forwarding reference** (the standard's term; "universal reference" is Meyers') is a parameter of the exact form `T&&` where `T` is a template parameter **being deduced by this call**, or `auto&&`. Nothing else qualifies:
+A forwarding reference (the standard's term; "universal reference" is Meyers') is a parameter of exactly the form `T&&`, where `T` is a template parameter deduced by this call, or `auto&&`. Nothing else qualifies:
 
 ```cpp
 template <class T> void f(T&& x);              // forwarding reference
@@ -121,32 +157,48 @@ template <class T> void h(std::vector<T>&& v); // NOT — not the bare form T&&
 template <class T> struct S {
     void m(T&& x);                             // NOT — T is already fixed by the class
 };
-auto&& r = expr;                               // forwarding reference
 ```
 
-### The mechanism
-
-Deduction has a special rule for `T&&`: if the argument is an **lvalue** of type `A`, then `T` is deduced as `A&`. If the argument is an rvalue, `T` is deduced as `A`. Then **reference collapsing** applies:
+Deduction has a special rule for `T&&`: an lvalue argument of type `A` deduces `T = A&`; an rvalue deduces `T = A`. Reference collapsing then applies:
 
 | Written | Collapses to |
 |---|---|
-| `T& &` | `T&` |
-| `T& &&` | `T&` |
-| `T&& &` | `T&` |
+| `T& &`, `T& &&`, `T&& &` | `T&` |
 | `T&& &&` | `T&&` |
 
-Mnemonic: **lvalue reference is infectious** — any `&` in the pair wins. Reference collapsing only occurs in contexts where a reference-to-reference can arise: template substitution, `auto`, `typedef`/alias substitution, and `decltype`. You still cannot write `int& &` directly.
+Any `&` in the pair wins. Collapsing only happens where a reference-to-reference can arise through substitution — template arguments, `auto`, alias substitution, `decltype` — you still cannot write `int& &` directly.
 
 ```cpp
 int i = 0;
-f(i);    // A = int lvalue → T = int&  → param type int& && → int&
-f(42);   // rvalue        → T = int   → param type int&&
+f(i);    // lvalue → T = int&  → param type int& && → int&
+f(42);   // rvalue → T = int   → param type int&&
 ```
-So the parameter's declared type after substitution is `int&` in the first case and `int&&` in the second — and both cases have a *named* parameter `x`, which is an **lvalue** regardless. That is precisely why you need `std::forward` (§17.17): the parameter's value category is lost the moment it is named.
+The parameter's declared type is `int&` in the first call and `int&&` in the second, but in both cases the expression `x` is an lvalue because it has a name.
 
-### Why forwarding references are greedy
+### Perfect forwarding
 
-`T&&` binds to everything — lvalues, rvalues, const, volatile — with an **exact match**. So it beats almost any other overload:
+`std::forward<T>(x)` is a conditional cast driven by deduced `T`: it produces an lvalue when `T` is an lvalue reference and an xvalue otherwise. This preserves the caller's value category through a forwarding wrapper.
+
+```cpp
+#include <utility>
+
+int category(const int&) { return 1; }
+int category(int&&) { return 2; }
+
+template <class T>
+int relay(T&& value) {
+    return category(std::forward<T>(value));
+}
+
+int main() {
+    int value = 7;
+    return relay(value) == 1 && relay(7) == 2 ? 0 : 1;
+}
+```
+
+Using `std::move(value)` would incorrectly treat an lvalue caller's object as expendable. Passing `value` without a cast would always select the lvalue path. Forward each consumable argument once: forwarding the same rvalue twice can expose a moved-from object to the second consumer. Forwarding preserves category, not lifetime; a callee that stores a reference can still dangle after the full expression. C++23 `std::forward_like<Model>(x)` applies `Model`'s cv/ref pattern to another expression and is useful for forwarding members; Chapter 4 covers the underlying value categories.
+
+A forwarding-reference constructor matches a broad set of cv/ref forms exactly, so it can out-compete an intended copy overload:
 
 ```cpp
 struct Widget {
@@ -154,341 +206,164 @@ struct Widget {
     Widget(const Widget&);                 // copy ctor
 };
 Widget w1{"x"};
-Widget w2{w1};       // calls the TEMPLATE — w1 is non-const lvalue, so T=Widget& is an
-                     // exact match, while the copy ctor requires adding const
+Widget w2{w1};   // calls the TEMPLATE: w1 is a non-const lvalue, T=Widget& is an exact
+                 // match, while the copy ctor needs to add const
 ```
-This is the canonical trap. Fixes: constrain the template with a concept or `enable_if` that excludes `Widget` and its bases (`std::same_as<std::remove_cvref_t<T>, Widget>` exclusion), or use tag dispatch, or in C++20 simply `requires (!std::derived_from<std::remove_cvref_t<T>, Widget>)`. Note that also declaring a `Widget(Widget&)` overload is a workaround that appears in older code.
+Fix by constraining the template to exclude `Widget` and its bases:
 
-`std::remove_cvref_t<T>` (C++20; `std::decay_t` pre-C++20) is the standard way to recover the underlying type inside a forwarding-reference template. `std::decay_t` additionally decays arrays and functions, which is usually *not* what you want when you only meant to strip references and cv.
+```cpp
+template <class T>
+    requires (!std::derived_from<std::remove_cvref_t<T>, Widget>)
+Widget(T&& x);
+```
+`std::remove_cvref_t<T>` (C++20; `std::decay_t` pre-C++20) recovers the underlying type. `std::decay_t` also decays arrays and functions, which is usually not what you want when you only meant to strip references and cv.
 
 ---
 
-## 17.4 Class Template Argument Deduction (CTAD)
+## 17.4 Class Template Argument Deduction (CTAD) — Core
 
-Before C++17 a class template's arguments always had to be written, hence `make_pair`, `make_tuple`, `make_unique` — factory functions existing solely to get function-template deduction. **CTAD** (C++17) lets the class template's arguments be deduced from the constructor arguments.
+CTAD lets class-template arguments be deduced from initialization. Factory functions such as `make_pair` predate CTAD, but they can also apply deliberate decay/reference policies rather than serving only as spelling workarounds.
 
 ```cpp
 std::pair p{1, 2.0};              // std::pair<int, double>
 std::vector v{1, 2, 3};           // std::vector<int>
 std::lock_guard g{mtx};           // std::lock_guard<std::mutex>
-std::array a{1, 2, 3};            // std::array<int, 3>
 ```
 
-### The mechanism: implicit and explicit deduction guides
-
-The compiler forms a set of fictional function templates:
-- one per constructor of the primary template, with the class's template parameters as its own;
-- a copy-deduction candidate;
-- plus any **user-written deduction guides**.
-
-Overload resolution over that set picks the class's arguments.
+The compiler forms a set of fictional function templates — one per constructor of the primary template, a copy-deduction candidate, and any user-written deduction guides — and runs overload resolution over that set. Guides are needed whenever the constructor parameters don't directly expose the class parameters:
 
 ```cpp
 template <class It> Vector(It, It) -> Vector<typename std::iterator_traits<It>::value_type>;
-template <class T, class... U> Array(T, U...) -> Array<T, 1 + sizeof...(U)>;
 ```
-Guides are needed whenever the constructor parameters don't directly expose the class parameters — iterator pairs being the archetype.
 
-### Pitfalls
+Pitfalls: `std::vector v{v2}` copies rather than wraps, because the copy-deduction candidate wins — you get `vector<int>`, not `vector<vector<int>>`. `std::vector v(3, 0)` gives three zeros; `std::vector v{3, 0}` gives the two elements `3` and `0` (initializer-list constructor). CTAD does not accept partial argument lists (`std::pair<int> p{1, 2.0}` is ill-formed) and does not consider base classes' or inherited constructors. C++20 added aggregate deduction candidates (`template <class T> struct P { T a; T b; }; P p{1, 2};`) and alias-template CTAD. An explicit guide can be marked `explicit`, which suppresses CTAD in copy-initialization contexts.
 
-- **`std::vector v{v2}` copies rather than wraps.** The copy-deduction candidate wins, so you get `vector<int>`, not `vector<vector<int>>`. Similarly `std::pair p{p2}` is a copy.
-- **Braces vs parens matter:** `std::vector v(3, 0)` → 3 zeros; `std::vector v{3, 0}` → the two elements 3 and 0 (initializer-list constructor).
-- **CTAD does not apply to partial argument lists.** `std::pair<int> p{1, 2.0}` is ill-formed; it's all or nothing.
-- **CTAD does not consider base classes' or inherited constructors.**
-- **Aggregates**: C++20 added *aggregate deduction candidates*, so `template <class T> struct P { T a; T b; }; P p{1, 2};` works in C++20 but not C++17.
-- **Alias template CTAD** (C++20): `template <class T> using IVec = std::vector<T, MyAlloc<T>>; IVec v{1,2,3};` deduces. It works by transforming the underlying template's guides through the alias.
-- **Explicit guides can be `explicit`**, which suppresses CTAD in copy-initialization contexts.
-
-**Should you use it?** For local variables of well-designed templates, yes — it removes noise. Avoid it in APIs where a reader can't see the deduced type, and be aware `auto x = f()` and CTAD interact badly with proxy types. `make_unique`/`make_shared` remain necessary because they also perform the *allocation* correctly (Ch. 9 §9.4) — CTAD does not replace them.
+Use CTAD where the deduction guide expresses the intended ownership and element type. `make_unique` and `make_shared` remain important because they combine allocation and construction with the intended ownership machinery; Chapter 9 covers those details.
 
 ---
 
-## 17.5 Non-Type Template Parameters (NTTPs)
+## 17.5 Instantiation, Two-Phase Lookup, and Dependent Names — Core
 
-An NTTP is a compile-time **value** parameter. Its permitted types have widened steadily:
+Template definitions are parsed, and non-dependent names and constructs are checked immediately. **Implicit instantiation** occurs when a context requires a specialization. A class specialization generally needs instantiation when its complete type affects semantics—for example, `sizeof(Box<int>)` or an object definition—while declaring `Box<int>*` can use an incomplete specialization. **Explicit instantiation** requests a specialization directly (§17.14).
 
-| Since | Allowed NTTP types |
-|---|---|
-| C++98 | Integral and enum types, pointer/reference to object or function with linkage, `std::nullptr_t` (C++11), pointer-to-member |
-| C++17 | `auto` NTTPs (`template <auto N>`); template argument may be any constant expression of a permitted type, including addresses of objects with internal linkage |
-| C++20 | **Structural types**: literal class types with all-public, non-mutable, structural-typed members and no user-provided copy/move/destructor. Floating point becomes allowed. |
-| C++26 | Constexpr-ness relaxations around structural types; `constexpr` structured bindings interplay |
+Instantiating a class specialization instantiates member declarations, but an ordinary non-deleted member-function definition is not implicitly instantiated until a context requires it:
 
 ```cpp
-template <auto V> struct Constant { static constexpr auto value = V; };  // C++17
-Constant<42>  ci;    Constant<'x'>  cc;    Constant<&glob> cp;
+#include <iostream>
 
-struct FixedString {                                    // C++20 structural type
-    char data[16]{}; size_t n{};
-    constexpr FixedString(const char (&s)[17]) { … }
-};
-template <FixedString Name> void log();                 // string literals as template args!
-log<"order_ack">();
-```
-The `FixedString` NTTP is the enabling trick behind compile-time named channels, `boost::hana`-style string types, and format-site registries in async loggers (Ch. 16 §16.5).
+struct NoStream {};
 
-### Semantics and gotchas
-
-- **Two instantiations with template-argument-equivalent arguments are the same type.** For structural types, equivalence is member-wise, *not* `operator==` — a class with a custom `operator==` doesn't get to define identity here. Floating-point NTTPs compare by value with `-0.0 != 0.0` treated as distinct, and NaN is equal to itself for this purpose.
-- **NTTPs of reference/pointer type require the referent to have static storage duration and (pre-C++17) linkage.** A `constexpr` local's address is not usable.
-- **`template <auto>` cannot deduce the value from a runtime argument** — it must be a constant expression. `std::integral_constant<T, V>` and the `_v` variable templates remain the way to pass values *as types* into deduction.
-- **Array-size NTTPs are the mechanism behind `std::array`, `std::bitset`, and fixed-capacity containers** (Ch. 11 §11.6). The key latency property: `N` is a compile-time constant, so bounds are foldable, loops are fully unrollable, and no capacity field is stored.
-
-### Template template parameters
-
-Adjacent but distinct: a parameter that is itself a template.
-
-```cpp
-template <template <class...> class Container, class T>
-Container<T> make_container(std::initializer_list<T> il) { return Container<T>(il); }
-```
-Pre-C++17, a `template <class, class> class` parameter would *not* match `std::vector` (which has a default second argument) on some compilers — P0522 (C++17) fixed the matching rules so a more-specialized template matches a `class...` parameter. It's still the least ergonomic template feature; most code prefers deducing the whole container type and using `Container::rebind`/`value_type`.
-
----
-
-## 17.6 Full and Partial Specialization
-
-**Specialization** provides an alternative definition for specific arguments. The primary template must be declared first; a specialization is *not* an overload and does not itself take part in overload resolution.
-
-```cpp
-template <class T, class U> struct Pair { … };            // primary
-template <>            struct Pair<int, int> { … };       // FULL (explicit) specialization
-template <class T>     struct Pair<T, T> { … };           // PARTIAL specialization
-template <class T>     struct Pair<T*, T*> { … };         // PARTIAL
-```
-
-| | Class templates | Function templates | Variable templates | Alias templates |
-|---|---|---|---|---|
-| Full specialization | Yes | Yes | Yes (C++14) | **No** |
-| Partial specialization | Yes | **No** — overload instead | Yes (C++14) | **No** |
-
-### Rules that catch people
-
-- **A full specialization is a definition, not a template**, so it obeys the ODR like an ordinary class/function: put it in a header and it must be `inline` (functions) or it will multiply-define.
-- **Full specialization must appear before the first use that would instantiate the primary**, in every TU that uses it. Violating this is IFNDR (ill-formed, no diagnostic required) — a genuinely nasty ODR bug where different TUs get different `std::hash<Key>`.
-- **You may not specialize inside a different namespace**; before C++17 you had to close your namespace and reopen `namespace std`. Since C++17, `template <> struct std::hash<K> { … };` is writable with a qualified name.
-- **Specializing standard library templates is only permitted for user-defined types**, and only for the ones the standard designates (`std::hash`, `std::formatter`, `std::numeric_limits`, `std::tuple_size`/`tuple_element`, `std::common_type`, `std::pointer_traits`, …). Adding declarations to `namespace std` otherwise is UB.
-- **Partial specialization uses partial ordering** to pick the most specialized match; ambiguity is an error, not a silent pick.
-- **Default arguments live on the primary only**; a partial specialization does not restate them.
-- **Member specialization**: you can specialize a single member of a class template without specializing the whole class (`template <> void Ring<int>::push(int)`), but only outside the class and only for a full specialization of the enclosing arguments.
-
-### When to reach for what
-
-Partial specialization is the right tool for structural dispatch on *type shape* (`T*`, `T[N]`, `Container<T>`), which is exactly what `iterator_traits`, `remove_pointer`, `tuple_element` do. Constraints (§17.13) and `if constexpr` (§17.19) are the right tools for dispatch on *type properties*. Reaching for specialization when you meant a constraint produces open-coded, non-extensible dispatch tables that must be updated for each new type.
-
----
-
-## 17.7 Template Instantiation
-
-Templates are **not compiled when defined** — only when *instantiated*. Two kinds:
-
-- **Implicit instantiation** — triggered by use. A class template is instantiated when it becomes **required to be complete** (you name a member, take `sizeof`, derive from it). Merely declaring `Foo<T>* p;` does **not** instantiate it, which is what makes forward declarations of templates useful and pimpl-with-templates feasible.
-- **Explicit instantiation** — you ask for it by name (§17.10).
-
-### Lazy member instantiation
-
-**Member functions of a class template are instantiated only when used.** This is a load-bearing property:
-
-```cpp
 template <class T> struct Holder {
     T v;
-    void print() { std::cout << v; }   // only ill-formed if print() is CALLED for a T
-                                       // that has no operator<<
+    void print() { std::cout << v; }
 };
-Holder<NoStream> h;    // fine
-h.print();             // NOW it fails
+
+int main() {
+    Holder<NoStream> h{};  // fine: print's definition is not required
+    // h.print();          // error if enabled: NoStream is not stream-insertable
+}
 ```
-It is why `std::vector<T>` works for `T` without a default constructor (only `resize(n)` needs it), and why a partially-satisfying type can still be stored. Virtual member functions are the exception: they are instantiated when the class is instantiated, because the vtable must be emitted.
+This permits `Holder<NoStream>` until `print()` is required. Virtual members need a qualification: the standard leaves it unspecified whether an implementation implicitly instantiates a virtual member of a templated class when it would not otherwise be instantiated. Vtable emission can therefore expose an ill-formed virtual body earlier on one implementation than an ordinary member body. Do not use an invalid unused virtual member as a portability boundary; constrain it or make its definition valid for every supported specialization.
 
-### Point of instantiation and the ODR
+An implicit instantiation has one or more **points of instantiation**, determined by the kind of specialization and the use that requires it. Those points affect dependent lookup and whether an explicit specialization was declared soon enough. A specialization with multiple points must have the same meaning at each. In common object formats, multiple translation units may emit coalescible copies of the same specialization, but that weak/COMDAT mechanism is an ABI/toolchain strategy, not the language rule.
 
-Each use has a **point of instantiation** (POI): for function templates, immediately after the enclosing declaration; for class templates, immediately before. Names in the template's definition are looked up at either the **point of definition** (non-dependent names) or a combination of POD and POI via ADL (dependent names) — see §17.8. If the same specialization gets *different* meanings in different TUs, the program is **IFNDR**. This is why adding an overload after including a header can change behavior in one TU and not another.
+### Two-phase lookup
 
-Implicit instantiations are emitted as **weak/COMDAT symbols** in every TU that needs them, and the linker folds duplicates (Ch. 1 §1.12, Ch. 41 §41.11). That's how "define templates in headers" coexists with the ODR — but it means the compiler does redundant work per TU, which §17.22 addresses.
-
-### Instantiation depth and recursion
-
-Recursive templates instantiate a chain of types; each level is a full type with its own symbol and mangled name. `-ftemplate-depth=` (default 900 in GCC/Clang, 1024 in MSVC) bounds it. Deep recursion is *the* compile-time killer: a naively recursive `sum<Ts...>` is O(N) instantiations, while a fold expression (§17.16) is O(1). Rewriting recursion into pack expansion or `if constexpr` is the standard compile-time optimization.
-
----
-
-## 17.8 Two-Phase Name Lookup
-
-Template definitions are checked in two phases:
-
-**Phase 1 — at the point of definition.** Syntax is checked, and every **non-dependent** name is looked up and bound *right there*, using ordinary unqualified lookup plus ADL at that point. Non-dependent constructs are type-checked immediately.
-
-**Phase 2 — at the point of instantiation.** Dependent names are looked up. For dependent *function* calls, the lookup is the union of (a) ordinary lookup at the point of definition and (b) **ADL only** at the point of instantiation. Ordinary (non-ADL) lookup is *not* redone at instantiation.
+**Phase 1**, at the point of definition: non-dependent names are looked up and bound. **Phase 2**, when a specialization is instantiated: dependent constructs are completed. For a dependent function call, ordinary unqualified lookup is anchored at the template definition; argument-dependent lookup can add declarations from associated namespaces visible at the definition or instantiation context:
 
 ```cpp
 void g(double);
 template <class T> void f(T t) { g(t); g(1); }
 void g(int);              // declared AFTER the template
-f(1);                     // g(t) is dependent → ADL at POI, but ADL on int finds nothing
-                          // in the global namespace via ADL... so g(double) is called.
-                          // g(1) is non-dependent → bound at definition → g(double).
+
+f(1);   // g(t) is dependent → ADL at the instantiation point finds nothing for int → g(double)
+        // g(1) is non-dependent → bound at definition → g(double)
 ```
-The takeaway: **a later-declared ordinary function will not be found by a template unless ADL reaches it.** Practical consequence — customization points must be findable by ADL (which is why `swap`, `begin`, `end` use the "`using std::swap; swap(a,b)`" two-step, and why C++20 replaced that pattern with **customization point objects** `std::ranges::swap`/`begin`, which do the two-step internally and cannot be hijacked).
+A later ordinary declaration is not found merely because it precedes the instantiation; ADL must reach an associated namespace. This is why customization functions are placed where ADL can find them. The `using std::swap; swap(a, b);` pattern supplies a standard fallback while leaving the call unqualified for ADL.
 
-MSVC historically did *not* implement two-phase lookup, accepting code that GCC and Clang reject; `/permissive-` enables conformance and is the flag to name when asked why "it compiles on Windows only."
+A template body's non-dependent constructs are checked at definition time even if the template is never instantiated. `static_assert(false)` in an `if constexpr` branch used to require a dependent workaround for this reason; CWG2518 (C++23) legitimizes a literal `false` inside a *discarded* `if constexpr` branch specifically (§17.12).
 
-**Practical rule:** a template that uses a name not dependent on its parameters is checked immediately, so errors in a never-instantiated template body **are still errors** if they are non-dependent. `static_assert(false)` in an uninstantiated `else` branch is the classic victim — it must be made dependent (`static_assert(sizeof(T) == 0 && false)` historically, or `static_assert(false)` legitimized only for uninstantiated `if constexpr` branches by CWG2518 in C++23).
+### Dependent names and disambiguators
 
----
-
-## 17.9 Dependent Names and Disambiguators
-
-A **dependent name** is one whose meaning depends on a template parameter. The compiler parsing the template *before* knowing `T` must decide whether `T::X` is a type, a value, or a template — and it defaults to **not a type** and **not a template**. Hence the two disambiguators:
+A dependent qualified name is not assumed to denote a type or template unless the grammar or prior declarations establish that meaning. Two disambiguators resolve ambiguous parses:
 
 ```cpp
 template <class T> void f() {
     typename T::value_type v;              // 'typename': T::value_type is a TYPE
-    T::template rebind<int> r;             // 'template': rebind is a TEMPLATE
-    typename T::template rebind<int>::other o;   // both
+    typename T::template rebind<int> r;     // both disambiguators can be needed
 }
 ```
-Without `typename`, `T::value_type * p;` parses as a multiplication expression. Without `template`, `p->get<int>()` parses `<` as less-than.
+Without `typename`, `T::value_type * p;` can parse as multiplication. Without `template`, `<` after a dependent object can parse as less-than. Several contexts already assume a type, and C++20 expanded that set; the durable rule is to ask whether the parser can know the dependent qualified name is a type in that grammar, not whether the text appears inside or outside a function.
 
-### `typename` relaxations (C++20, P0634)
+### Worked example: dependent base lookup
 
-C++20 makes `typename` optional in contexts where **only a type can appear**: return types and parameter types of function declarations at namespace/class scope, trailing return types, the type in a `static_cast`-family cast, base-clause entries, member declarations, `using` alias definitions, and the type-id of `new`. It is still required inside function *bodies* for local declarations. Knowing which side of the line you're on is a useful modern-C++ detail.
-
-### Names from dependent base classes
-
-The subtlest case. Unqualified lookup **does not look into dependent base classes**:
+Unqualified lookup does not search a dependent base class, because a specialization of that base might not define the member. This first fragment is intentionally ill-formed:
 
 ```cpp
-template <class T> struct Base { int value; void helper(); };
+template <class T> struct Base {
+    int value = 42;
+    virtual void helper() {}
+};
 template <class T> struct Derived : Base<T> {
     void f() {
-        value = 1;          // ERROR — 'value' not found; Base<T> is dependent
-        this->value = 1;    // OK — makes it dependent, looked up at instantiation
-        Base<T>::helper();  // OK — but disables virtual dispatch
-        using Base<T>::value;   // OK — a using-declaration in the class body
+        value = 1;          // ERROR: use of undeclared identifier 'value'
     }
 };
 ```
-The reason: `Base<T>` might be specialized for some `T` such that `value` doesn't exist or means something else, so the compiler cannot bind it in phase 1. **`this->` is the idiomatic fix** and appears constantly in CRTP code (Ch. 6 §6.19). Missing it is a top-three cause of "compiles on MSVC, fails on GCC/Clang."
+Make the name dependent so lookup happens at instantiation:
 
-Recognizing the error text ("there are no arguments to `X` that depend on a template parameter, so a declaration of `X` must be available") and immediately answering "add `this->`" is a strong signal.
+```cpp
+template <class T> struct Derived : Base<T> {
+    using Base<T>::value;      // brings 'value' into this scope — a member-declaration,
+                                // so it must appear directly in the class body, not in f()
+    void f() {
+        this->value = 1;       // also fixes it, without a using-declaration
+        Base<T>::helper();     // qualified call — compiles, but suppresses virtual dispatch
+        value = 2;             // OK now, thanks to the using-declaration above
+    }
+};
+```
+These fixes act differently: `this->value` makes that use dependent; `using Base<T>::value;` introduces the base member into the derived scope for unqualified uses and must appear at class scope. `Base<T>::helper()` is explicitly qualified and therefore suppresses virtual dispatch; `this->helper()` would preserve it.
 
 ---
 
-## 17.10 Explicit Instantiation and `extern template`
+## 17.6 Full and Partial Specialization — Core
 
-**Explicit instantiation definition** forces the compiler to generate code for a specialization in this TU:
-
-```cpp
-// in a .cpp
-template class RingBuffer<Order>;                     // all members of the class
-template void process<Order>(std::span<Order>);       // one function
-```
-**Explicit instantiation declaration** (`extern template`, C++11) tells every other TU *not* to implicitly instantiate — it will be found at link time:
+Specialization provides an alternative definition for specific arguments. The primary template must be declared first; a specialization is not an overload and does not itself participate in overload resolution.
 
 ```cpp
-// in the header
-extern template class RingBuffer<Order>;
+template <class T, class U> struct Pair { /* ... */ };            // primary
+template <>            struct Pair<int, int> { /* ... */ };       // FULL specialization
+template <class T>     struct Pair<T, T> { /* ... */ };           // PARTIAL specialization
 ```
 
-### Why this exists
+| | Class templates | Function templates | Variable templates | Alias templates |
+|---|---|---|---|---|
+| Full specialization | Yes | Yes | Yes | No |
+| Partial specialization | Yes | No — overload instead | Yes | No |
 
-Implicit instantiation happens in every TU that uses the specialization; each produces identical COMDAT code, the compiler does the work N times, and the linker discards N−1 copies. For heavy templates (`std::basic_string<char>`, `std::vector<MyBigType>`, a parser template) this is a large share of build time and object-file size. The `extern template` in the header + explicit instantiation in one `.cpp` pattern is the standard fix — libstdc++ does exactly this for `basic_string<char>` and `basic_ostream<char>`.
+Key rules:
 
-### Trade-offs
+- A full specialization can be declared and later defined. Its definition obeys the ordinary ODR; a function specialization defined in a header normally needs `inline`.
+- Declare a full specialization before any use that would instantiate the primary, in every translation unit where such use occurs. Violating that ordering makes the program ill-formed and cross-translation-unit diagnostics are not dependable.
+- Specializing a standard-library template is allowed only where that template's specification permits it and the program meets its requirements, usually involving a program-defined type. `std::hash` and `std::formatter` are common permitted customization points; adding arbitrary declarations to `namespace std` is not.
+- Partial specialization uses partial ordering to pick the most specialized match; ambiguity is an error.
+- Default arguments live on the primary only; a partial specialization does not restate them.
+- A single member can be specialized without specializing the whole class (`template <> void Ring<int>::push(int)`), but only outside the class, for a full specialization of the enclosing arguments.
 
-| Aspect | Effect of `extern template` |
-|---|---|
-| Compile time | Improves — one instantiation instead of N |
-| Object size / link time | Improves substantially |
-| Runtime performance | **Can degrade**: the out-of-line definition is no longer visible for inlining unless LTO is on (Ch. 40 §40.3) |
-| Coupling | The instantiating TU must be linked in; a missing explicit instantiation is a *link* error, and a link error for a template is far less informative than a compile error |
-| Compatibility | Explicit instantiation ignores constraints/`if constexpr` branches you never wanted instantiated — the whole class body must be valid for that `T` |
-
-The last point is a real gotcha: explicit instantiation of a class template instantiates **all** its member functions, including ones that would be ill-formed for that `T` and would never have been called. If that happens, explicitly instantiate individual members instead.
-
-Explicit instantiation is also how you keep template implementations *out* of headers: define the template in a `.cpp` and explicitly instantiate the finite set of types you support. This is fine for closed type sets (a serializer for a known message set), and hostile for open ones.
+Partial specialization is suited to type shape (`T*`, `T[N]`, `Container<T>`). Concepts (§17.7) and `if constexpr` (§17.12) express properties and branch validity more directly. The trade-off is openness: specialization associates behavior with exact patterns, whereas a semantic concept can admit future types that satisfy its contract.
 
 ---
 
-## 17.11 SFINAE
+## 17.7 Concepts and Constraints — Core
 
-**Substitution Failure Is Not An Error**: when the compiler substitutes deduced/explicit template arguments into a function template's *declaration* (signature, return type, template parameter defaults, and — since C++11 — default template arguments), and the result is ill-formed, that candidate is silently removed from the overload set instead of producing an error.
+A concept (C++20) is a named compile-time boolean predicate over template parameters.
 
-**Only the immediate context counts.** An error deeper inside — in an instantiated class body or function body — is a hard error, not a substitution failure:
+### Type traits as compile-time queries
 
-```cpp
-template <class T> typename T::type f(T);              // SFINAE-friendly: immediate context
-template <class T> void g(T) { typename T::type x; }   // NOT — hard error on instantiation
-```
-This is why `std::iterator_traits` was made SFINAE-friendly in C++17 (a partial specialization that is empty when the required members are absent) and why "SFINAE-friendly" is a real API property.
+Standard type traits are class templates that expose either a `value` or a nested `type`. Convenience aliases such as `std::remove_cvref_t<T>` and variable templates such as `std::is_integral_v<T>` shorten `typename std::remove_cvref<T>::type` and `std::is_integral<T>::value`; they do not change the abstract result or promise less compiler work.
 
-### The `enable_if` idiom
-
-```cpp
-// 1. return type (cannot be used for constructors)
-template <class T> std::enable_if_t<std::is_integral_v<T>, T> f(T);
-// 2. extra defaulted template parameter (works for constructors; the modern default)
-template <class T, std::enable_if_t<std::is_integral_v<T>, int> = 0> void g(T);
-// 3. extra defaulted function parameter (leaks into the signature; avoid)
-template <class T> void h(T, std::enable_if_t<std::is_integral_v<T>, int> = 0);
-```
-Form 2 is preferred because it works everywhere and doesn't perturb the visible signature. Note that two overloads distinguished only by `enable_if` in the *default template argument* have the same signature and are a redefinition — you must use different conditions, and `= 0` vs `= nullptr` does not distinguish them.
-
-### `if constexpr` and concepts do not replace it entirely
-
-`if constexpr` (§17.19) handles *branching inside one function* but cannot remove an overload from the set — so it cannot resolve ambiguity, cannot make a type non-constructible, and does not affect `std::is_invocable`. Concepts (§17.13) replace SFINAE for constraining, with better errors and subsumption, and are strictly preferable in C++20. SFINAE remains relevant for: pre-C++20 codebases, detecting expression validity in a trait, and library internals.
-
-### Expression SFINAE
-
-```cpp
-template <class T>
-auto size(const T& c) -> decltype(c.size()) { return c.size(); }   // valid only if c.size() compiles
-```
-`decltype` in a trailing return type puts an arbitrary *expression* in the immediate context. This is the foundation of the detection idiom (§17.12). `std::void_t`, `std::declval<T>()` (an unevaluated-context-only way to produce a `T&&` without constructing one) and trailing return types are the three tools.
-
----
-
-## 17.12 The Detection Idiom and `void_t`
-
-`std::void_t<Ts...>` (C++17) is `template <class...> using void_t = void;` — an alias that discards its arguments. Its power comes from the fact that *substituting into its arguments can fail*, and that failure is in the immediate context of a partial specialization.
-
-```cpp
-template <class T, class = void>
-struct has_reserve : std::false_type {};
-
-template <class T>
-struct has_reserve<T, std::void_t<decltype(std::declval<T&>().reserve(size_t{}))>>
-    : std::true_type {};
-```
-If `T::reserve(size_t)` doesn't exist, the specialization's argument list is ill-formed, the partial specialization drops out, and the primary (`false_type`) is selected. Note the empty-`void_t` detail: **CWG1558** made it defined that unused alias template arguments are still substituted — pre-fix compilers required a helper struct.
-
-The generalized form (`std::experimental::is_detected`, never standardized but ubiquitous):
-
-```cpp
-template <template <class...> class Op, class... Args>
-constexpr bool is_detected_v = /* … */;
-template <class T> using reserve_t = decltype(std::declval<T&>().reserve(0));
-static_assert(is_detected_v<reserve_t, std::vector<int>>);
-```
-
-### What replaced it
-
-C++20 concepts express the same thing far more directly, with better diagnostics and with subsumption (§17.14):
-
-```cpp
-template <class T> concept HasReserve = requires (T& t, size_t n) { t.reserve(n); };
-```
-A `requires`-expression's requirements come in four flavors — **simple** (`t.reserve(n);` — expression must be valid), **type** (`typename T::value_type;`), **compound** (`{ t.size() } noexcept -> std::convertible_to<size_t>;`), and **nested** (`requires HasReserve<T>;`). The compound form is the one that subsumes `decltype`-based detection *and* adds return-type and `noexcept` checking, which `void_t` could only do awkwardly.
-
-**The trap that survives into concepts:** a `requires`-expression only checks that the expression *compiles*, not that it does anything sane, and a requires-expression used as a plain boolean (`if (requires { … })`) versus a constraint (`requires requires { … }`) is a common syntax confusion — the double `requires` is correct and intentional.
-
-Detection is inherently duck-typed, and both idioms share the deeper weakness: they check syntax, not semantics. Concepts partly address this with named semantic concepts (`std::regular`, `std::sized_sentinel_for`) whose extra requirements are documented but unenforced.
-
----
-
-## 17.13 Concepts and Constraints
-
-A **concept** (C++20) is a named compile-time boolean predicate over template parameters, usable to constrain templates. Concepts are the interface layer templates always lacked.
+Traits answer the exact property they specify. `is_convertible_v<From, To>` models an imaginary conversion in its defined context; it does not prove that conversion is cheap or semantically appropriate. Some traits place conditions on incomplete types when completion could change the answer, so check the trait's preconditions rather than treating all unevaluated queries as harmless. Do not specialize standard traits unless their specification explicitly permits it.
 
 ```cpp
 template <class T>
@@ -496,329 +371,296 @@ concept Arithmetic = std::is_arithmetic_v<T>;
 
 template <class T>
 concept Hashable = requires (const T& t) {
-    { std::hash<T>{}(t) } -> std::convertible_to<size_t>;
+    { std::hash<T>{}(t) } -> std::convertible_to<std::size_t>;
 };
 ```
 
-Four equivalent constraint syntaxes, in increasing verbosity:
+A `requires`-expression's requirements come in four flavors: **simple** (`t.reserve(n);` — must compile), **type** (`typename T::value_type;`), **compound** (`{ t.size() } noexcept -> std::convertible_to<std::size_t>;` — also checks the return type and `noexcept`), and **nested** (`requires HasReserve<T>;`). A requires-expression can be used as a boolean; a requires-clause whose operand is a requires-expression legitimately contains the word twice: `requires requires { ... }`.
+
+For this concept, four declaration forms express the same constraint:
 
 ```cpp
-void f(Arithmetic auto x);                                  // abbreviated (terse)
+void f(Arithmetic auto x);                                  // abbreviated
 template <Arithmetic T> void f(T x);                        // constrained parameter
 template <class T> requires Arithmetic<T> void f(T x);      // requires-clause
 template <class T> void f(T x) requires Arithmetic<T>;      // trailing requires-clause
 ```
-The trailing form is the one that can reference the *function parameters* and is required when the constraint depends on more than the template parameters. `auto` parameters (abbreviated form) create an **invented** template parameter, so two `auto` parameters are independent types — `void f(auto a, auto b)` is a two-parameter template.
+The trailing form can name function parameters, which the pre-declarator form cannot.
 
-### What concepts buy over `enable_if`
-
-| | `enable_if` SFINAE | Concepts |
-|---|---|---|
-| Diagnostics | Wall of substitution failures | "constraint not satisfied: `T` does not satisfy `Hashable` because `std::hash<T>{}(t)` is invalid" |
-| Overload ranking | All-or-nothing; you must write mutually exclusive conditions | **Subsumption** orders overloads automatically (§17.14) |
-| Readability | Condition hidden in the signature | Named, reusable, documentable |
-| Compile time | Instantiates `enable_if` per check | Concepts are cached per (concept, args) — normally faster |
-| Placement | Awkward for constructors, impossible on some declarations | Uniform, including on non-template member functions of class templates |
-
-### Non-obvious rules
-
-- **Constraints are checked before the function body is instantiated**, and a constraint failure removes the candidate — same as SFINAE, but with normalization and subsumption on top.
-- **Atomic constraint identity is by source expression + parameter mapping.** Two textually identical `requires` clauses written in two different places are *different* atomic constraints and do not subsume each other. This is why you should name concepts rather than inline `requires` clauses if you want ordering.
-- **Concepts cannot be recursive** and cannot be explicitly specialized.
-- **A constrained non-template member function** of a class template is legal and is the clean way to conditionally provide a member: `void push_back(const T&) requires std::copy_constructible<T>;`. Under the old regime you needed a dummy template parameter. `std::optional` and `std::vector` use this for conditionally-trivial special members.
-- **`requires` on a class template's member disables it without disabling the class**, replacing an entire family of `enable_if` base-class tricks.
-- **Standard library concepts** live in `<concepts>` (`same_as`, `derived_from`, `convertible_to`, `integral`, `totally_ordered`, `invocable`, `regular`) and `<iterator>`/`<ranges>` (`input_iterator`, `sized_range`, …). Reaching for them instead of hand-rolling is expected in modern code (Ch. 14 §14.9).
-- **C++26** adds `static_assert` with a user-generated message and improved constraint diagnostics; concepts themselves are stable.
-
-Zero runtime cost — constraints exist entirely at compile time. The relevant cost is *compile* time, and concepts are generally cheaper than the `enable_if` they replace because satisfaction results are memoized.
-
----
-
-## 17.14 Constraint Subsumption
-
-**Subsumption** is the partial ordering of constrained declarations: if constraint A implies constraint B, A is *more constrained*, and when both candidates are otherwise equally good, the more-constrained one wins. This is what lets you write overload sets that refine each other without mutually exclusive conditions.
+### `enable_if` versus a concept, the same function two ways
 
 ```cpp
-template <std::input_iterator It>  void advance_(It, int);        // (1)
-template <std::random_access_iterator It> void advance_(It, int); // (2)
-// random_access_iterator subsumes input_iterator → (2) wins for a vector iterator
+// SFINAE / enable_if
+template <class T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+constexpr T clamp_nonneg_sfinae(T v) { return v < 0 ? 0 : v; }
+
+// Concept-constrained
+template <std::integral T>
+constexpr T clamp_nonneg(T v) { return v < 0 ? 0 : v; }
 ```
-Under `enable_if` you would need `enable_if_t<is_random_access>` on one and `enable_if_t<is_input && !is_random_access>` on the other — quadratic bookkeeping that concepts eliminate. This is why `std::advance` and every ranges algorithm can select an optimal implementation cleanly.
+Both reject `double` before the body is selected. The concept version exposes a named interface condition and participates in constraint subsumption. Diagnostic wording and compile-time caching are implementation properties; `_v`, `enable_if`, and a concept do not carry universal relative compile-time costs.
 
-### How the compiler decides
+Concepts cannot be recursively defined or explicitly specialized. A constrained non-template member of a class template is legal: `void push(const T&) requires std::copy_constructible<T>;`. Prefer an existing standard concept when its semantics match; a requires-expression checks syntax and selected properties, not the full meaning promised by names such as `regular`.
 
-Constraints are **normalized** into a *conjunctive/disjunctive normal form* of **atomic constraints**. Concept names are expanded; `&&` and `||` in a constraint-expression become conjunctions and disjunctions in the normal form. A subsumes B if every disjunctive clause of A implies some clause of B, where implication is decided purely by **identity of atomic constraints** — no logical reasoning about the atoms themselves.
+### Subsumption
 
-Consequences that trip people up:
+Subsumption is the standard's formal partial ordering of normalized constraints. When two otherwise comparable candidates are viable, the more constrained one can win; the compiler does not invoke a general theorem prover.
 
-- **`&&`/`||` inside a `requires`-expression or inside a `bool` expression do NOT decompose.** `requires (std::integral<T> && std::signed_integral<T>)` — where the whole thing is one atomic constraint — subsumes nothing. Only `&&`/`||` at the top level of the *constraint-expression* decompose.
-- **Type-trait constraints don't subsume each other.** `requires std::is_integral_v<T>` and `requires std::is_signed_v<T>` are unrelated atoms; the compiler has no idea one implies the other. **Concepts subsume, traits do not** — the practical reason to define named concepts as thin wrappers even over traits, and to build concepts by conjunction of other concepts (`concept SignedIntegral = Integral<T> && IsSigned<T>;`).
-- **Atomic constraints from different declarations are only identical if they come from the same source expression** (same token sequence, same declaration). Copy-pasting a `requires` clause creates a distinct atom.
-- **Ambiguity is an error, not a silent choice**, which is a feature: unrelated constraints that both match produce a clear diagnostic.
-- Subsumption is checked *after* ordinary overload-resolution tiebreakers such as conversion ranking and template partial ordering; it is a late tiebreaker, not an override.
+```cpp
+template <std::input_iterator It>          void advance_(It, int);  // (1)
+template <std::random_access_iterator It>  void advance_(It, int);  // (2)
+// random_access_iterator refines input_iterator, so (2) wins for a vector iterator.
+```
+Constraints are normalized into atomic constraints; concept names expand, and top-level `&&`/`||` in the *constraint-expression* decompose into conjunctions/disjunctions. Subsumption is decided by **identity of atomic constraints**, not by logical reasoning about what they mean:
 
-**Interview framing:** "Why did my two `requires is_integral_v<T>` / `requires is_integral_v<T> && is_signed_v<T>` overloads become ambiguous?" — because the first isn't an atom shared by the second unless you factor it into a named concept and conjoin. That answer demonstrates you've actually written constrained overload sets.
+```cpp
+template <class T> requires std::is_integral_v<T> void f(T);                          // (1)
+template <class T> requires (std::is_integral_v<T> && std::is_signed_v<T>) void f(T);  // (2)
+f(1);  // ambiguous: the repeated trait expression is not the same atomic constraint
+```
+The `is_integral_v<T>` in (1) and the textually repeated occurrence in (2) come from different source expressions, so they are not identical atomic constraints. Factoring the shared condition into a named concept reuses its normalized atom:
+
+```cpp
+template <class T> concept Integral = std::is_integral_v<T>;
+template <class T> concept SignedIntegral = Integral<T> && std::is_signed_v<T>;
+template <Integral T>        int f(T);   // (1)
+template <SignedIntegral T>  int f(T);   // (2) subsumes (1)
+```
+Two atomic constraints are identical only if they come from the same source expression (same declaration) — copy-pasting a `requires` clause creates a distinct atom. Ambiguity is an error, not a silent choice. Subsumption is checked after ordinary overload-resolution tiebreakers (conversion ranking, template partial ordering) — it is a late tiebreaker.
+
+| Constraint relationship | Result for otherwise equal candidates |
+|---|---|
+| One candidate reuses a named concept and adds a conjunct | The added-conjunct candidate can subsume the base |
+| Each declaration repeats equivalent trait text independently | Atoms are distinct; neither may subsume the other |
+| Constraints are semantically related but normalize to unrelated atoms | No logical inference; ambiguity remains possible |
+| One candidate already has a better conversion sequence | Ordinary overload ranking decides before constraints need to break the tie |
+
+**Exercise.** Define `concept C1 = std::integral<T>;` and `concept C2 = C1<T> && std::same_as<T, int>;`. Write two overloads of `g`, then predict why `g(1)` selects `C2` while `g(1u)` selects `C1`. Replace `C1<T>` inside `C2` by a fresh `std::integral<T>` expression and diagnose the resulting ambiguity.
 
 ---
 
-## 17.15 Parameter Packs and Pack Expansion
+## 17.8 Parameter Packs and Fold Expressions — Core
 
-A **template parameter pack** holds zero or more template arguments; a **function parameter pack** holds zero or more function parameters. **Pack expansion** is `pattern...`, which repeats the pattern once per pack element, comma-separated.
+A template parameter pack holds zero or more template arguments; a function parameter pack holds zero or more function parameters. A pack expansion, `pattern...`, repeats its pattern once per element.
 
 ```cpp
-template <class... Ts>                 // Ts is a template parameter pack
-void f(Ts... args) {                   // args is a function parameter pack
-    g(args...);                        // expands to g(a0, a1, a2)
-    g(h(args)...);                     // g(h(a0), h(a1), h(a2))
-    g(std::forward<Ts>(args)...);      // the perfect-forwarding expansion
-    (void)std::initializer_list<int>{ (h(args), 0)... };  // pre-C++17 "for each" hack
+#include <utility>
+#include <vector>
+
+template <class... Ts>
+auto sum(Ts... values) {
+    return (0 + ... + values);  // binary left fold; empty pack returns 0
 }
-sizeof...(Ts)                          // number of elements (NOT sizeof of anything)
+
+template <class V, class... Ts>
+void push_all(V& out, Ts&&... values) {
+    (out.push_back(std::forward<Ts>(values)), ...);
+}
+
+int main() {
+    std::vector<int> values;
+    push_all(values, 1, 2, 3);
+    return sum(1, 2, 3) == 6 && values.size() == 3 ? 0 : 1;
+}
 ```
+The expansion point matters: `h(args)...` applies `h` to each element; `h(args...)` passes the entire pack to one call. `sizeof...(Ts)` is the element count. Multiple packs in one pattern expand in lockstep and must have equal lengths.
 
-The expansion point matters: `h(args)...` applies `h` per element; `h(args...)` passes all elements to one `h`. Multiple packs in one pattern expand **in lockstep** and must have equal length: `g(std::pair<Ts, Us>(ts, us)...)`.
+A template parameter pack in a primary **class** template must be last. In a **function** template, later template parameters are permitted when they have defaults or can be deduced. A different rule applies to function parameters: a function parameter pack that is not at the end of the function parameter list is a non-deduced context, so `template<class... Ts> void f(Ts..., int);` cannot infer a nonempty `Ts...` from leading call arguments. Reorder the parameters or package the prefix explicitly. Chapter 18 covers lambda pack captures.
 
-### Where packs may appear and where they may not
+Pack expansion is permitted only in specified grammatical contexts, including argument lists, initializer lists, base lists, and `using` declarations. Placement decides what syntax repeats.
 
-- Packs must be **last** in a function template's parameter list to be deducible from a call (otherwise the trailing parameters are non-deduced).
-- Packs in a *class* template must be last, full stop.
-- There are **no pack indexing** or slicing operations in C++11–C++23; you index with recursion, `std::tuple_element`, or `std::get<I>`. **C++26 adds pack indexing** (`Ts...[I]` and `args...[I]`), which removes a large amount of metaprogramming boilerplate.
-- **Packs cannot be captured directly in a lambda before C++20**; since C++20, `[...xs = std::forward<Ts>(args)]` init-capture pack expansion is legal (§18.2).
-- A pack cannot be expanded into a nested pattern that itself introduces a pack of different length.
-
-### Expansion contexts
-
-Function argument lists, initializer lists, template argument lists, base-specifier lists, member initializer lists, lambda captures (C++20), `sizeof...`, fold expressions, and attribute lists. The base-specifier expansion is the mechanism behind the **overloaded visitor** idiom (§18.7 / Ch. 15 §15.4):
-
-```cpp
-template <class... Fs> struct overloaded : Fs... { using Fs::operator()...; };
-template <class... Fs> overloaded(Fs...) -> overloaded<Fs...>;   // CTAD guide (C++17)
-std::visit(overloaded{[](int i){…}, [](std::string s){…}}, v);
-```
-Note the *using-declaration pack expansion* `using Fs::operator()...;` — a C++17 addition that makes all the inherited call operators visible in one overload set. In C++20 the deduction guide became unnecessary (aggregate CTAD).
-
-### Compile-time cost
-
-Recursive pack processing costs one instantiation per element and is the dominant compile-time expense in older metaprogramming. Prefer, in order: fold expressions (§17.16) → pack expansion into an initializer list or a `constexpr` array → `if constexpr` recursion → full template recursion. Cutting a linear recursion to a fold routinely halves the compile time of a variadic-heavy header.
-
----
-
-## 17.16 Fold Expressions
-
-C++17 folds collapse a pack with a binary operator, replacing recursive helper templates:
+### Fold expressions (C++17)
 
 | Form | Name | Expands to | Empty pack |
 |---|---|---|---|
-| `(... op pack)` | unary left fold | `((a0 op a1) op a2)` | ill-formed except `&&`, `||`, `,` |
+| `(... op pack)` | unary left fold | `((a0 op a1) op a2)` | ill-formed except `&&`, `\|\|`, `,` |
 | `(pack op ...)` | unary right fold | `(a0 op (a1 op a2))` | same |
 | `(init op ... op pack)` | binary left fold | `((init op a0) op a1)` | `init` |
 | `(pack op ... op init)` | binary right fold | `(a0 op (a1 op init))` | `init` |
 
-Mnemonic: **the `...` sits on the side it associates toward** — `...` on the left means left fold.
+`...` sits on the side it associates toward. Empty-pack defaults: `&&` → `true`, `||` → `false`, `,` → `void()`; everything else needs the binary form with an explicit identity.
 
-```cpp
-template <class... Ts> auto sum(Ts... v)      { return (v + ... + 0); }        // binary, safe on empty
-template <class... Ts> bool all(Ts... v)      { return (... && v); }           // true if empty
-template <class... Ts> void print(Ts&&... v)  { ((std::cout << v << ' '), ...); }  // comma fold
-template <class... Ts> void push(Vec& d, Ts&&... v) { (d.push_back(std::forward<Ts>(v)), ...); }
-```
-The empty-pack defaults are: `&&` → `true`, `||` → `false`, `,` → `void()`. Everything else needs the binary form with an explicit identity.
+A comma fold guarantees left-to-right sequencing. A plain function call with pack expansion, `g(f(v)...)`, leaves argument evaluation order unspecified (Chapter 4), which matters when elements mutate shared state. Left versus right fold matters for non-associative operators, including subtraction and floating-point addition (Chapter 23).
 
-### The subtleties
-
-- **Comma folds guarantee sequencing.** `(f(v), ...)` evaluates left to right with a sequence point between elements. The pre-C++17 `initializer_list` hack also guaranteed order; a plain function call with a pack expansion `g(f(v)...)` **does not** — argument evaluation order is unspecified (Ch. 4 §4.3). This is a real bug source when the operations have side effects (writing into a serialization buffer, incrementing an offset).
-- **Left vs right fold matters for non-associative operators** and for floating-point accumulation (Ch. 23 §23.7 — summation order changes the result).
-- **Short-circuiting is preserved** in `&&` and `||` folds, so `(check(v) && ...)` stops at the first failure. That's genuinely useful for validation chains.
-- **You may fold arbitrary binary operators** including `<<`, `->*`, and `=`; the `<<` case gives the concise stream-printer above but reintroduces iostream cost.
-- **Wrap the whole fold in parentheses** — they are part of the grammar, not optional.
-- Folding over a *comparison* chain (`(a < ...)`) is legal syntax but yields nonsense semantics because it chains as `((a0 < a1) < a2)`.
-
-Folds are strictly better than recursion for compile time — one instantiation instead of N — and produce identical or better codegen because everything is inlined into the single frame.
+A recursive helper typically creates one function/class specialization per element; one fold expression can process the whole pack inside one enclosing specialization. The compiler still analyzes every expanded operand, so this reduces instantiation depth and event count rather than making compile work independent of pack length.
 
 ---
 
-## 17.17 Perfect Forwarding
+## 17.9 Compile-Time and Code-Size Cost — Core
 
-**Perfect forwarding** means a wrapper passes its arguments to a target preserving type, value category, and cv-qualification exactly, so the target behaves as if called directly.
+Templates can trade build resources and binary size for runtime specialization. None of those outcomes is automatic: a specialization may be inlined away, merged with an identical body, or never emitted.
+
+**Compile time** can grow through repeated header parsing, repeated instantiation work across translation units, deep recursive metaprograms, expensive constant evaluation, and large overload candidate sets. **Object and binary size** can grow when distinct specializations require emitted bodies or metadata. Linkers may coalesce equivalent definitions, and optimizers may merge or remove code, but the front end already paid to parse and instantiate it.
+
+Larger hot code can increase instruction-cache and iTLB pressure; cold emitted specializations may mainly affect disk, load time, and link time. Confirm runtime impact with instruction-front-end counters and production-shaped control flow (Chapter 28), not binary size alone.
+
+| Technique | Mechanism and trade-off |
+|---|---|
+| Thin-template / fat-base idiom | Type-independent logic in a non-template base; the template is a thin façade. |
+| Type erasure at a cold boundary | Reduces specialization count but adds an indirect-dispatch/ownership contract; see Chapter 6. |
+| `extern template` (§17.14) | Can suppress repeated out-of-line instantiation for a closed type set; requires a linked definition. |
+| Fold over recursive helpers (§17.8) | Reduces recursive specialization depth while retaining per-operand analysis. |
+| One constrained entry plus `if constexpr` | Can shrink an overload set; gives up open extension through new overloads. |
+| Reduced header fan-out | Avoids repeated parsing; may require a stable non-template boundary or pimpl (Chapter 44). |
+| Toolchain code folding/LTO | May merge bodies across TUs; increases link work and is platform/configuration-specific (Chapter 41). |
+
+### Lab: measuring instantiation cost with `-ftime-trace`
+
+Clang's `-ftime-trace` can emit JSON events for parsing and instantiation:
+
+```bash
+clang++ -std=c++23 -ftime-trace=heavy-trace.json -c heavy.cpp -o heavy.o
+```
+Check that the local compiler supports the option and named-output form. Compare clean builds of the same TU, compiler, flags, machine load, and cache state. Count `InstantiateFunction`/`InstantiateClass` events and inspect the longest events. Rewrite one recursive pack helper as a fold, then compare trace structure and wall time; expect fewer recursive specializations, not a guaranteed speedup. For code size, compare optimized linked artifacts with `size`, `nm`/`llvm-nm`, a linker map, or `bloaty` when available. Record text size and instruction-front-end counters separately.
+
+---
+
+## 17.10 Non-Type Template Parameters — Reference / Deep dive
+
+A non-type template parameter (NTTP) carries a constant template argument. C++23 accepts structural types: scalar types, lvalue-reference types, and qualifying literal class types whose bases and non-static data members are public, non-mutable, and themselves structural types or arrays of them. `auto` can deduce the NTTP type.
 
 ```cpp
-template <class... Args>
-decltype(auto) invoke_logged(Args&&... args) {
-    return target(std::forward<Args>(args)...);
-}
+#include <algorithm>
+#include <cstddef>
+
+template <std::size_t N>
+struct FixedString {
+    char data[N]{};
+    constexpr FixedString(const char (&s)[N]) { std::copy_n(s, N, data); }
+};
+template <std::size_t N>
+FixedString(const char (&)[N]) -> FixedString<N>;
+
+template <FixedString Name>
+constexpr std::size_t channel_width() { return sizeof(Name.data); }
+
+static_assert(channel_width<"order_ack">() == 10); // 9 characters plus '\0'
 ```
-Three ingredients: **forwarding reference parameters** (§17.3), **`std::forward<T>`** in the call, and **`decltype(auto)`** as the return type if the target may return a reference.
+The placeholder `FixedString` in the template parameter uses class template argument deduction, so each literal supplies its own bound. Hard-coding one `FixedString<N>` would reject every other literal length.
 
-`std::forward<T>(x)` is a conditional cast implemented as `static_cast<T&&>(x)` — combined with reference collapsing, `T=U&` yields `U&` (lvalue preserved) and `T=U` yields `U&&` (rvalue restored). It must be called with an **explicit** template argument; `std::forward(x)` is a compile error by design because deducing it would defeat the purpose. `std::move` is unconditional (`static_cast<remove_reference_t<T>&&>`).
+Template-argument equivalence for a structural class is determined recursively from its subobjects, not by calling its `operator==`. Floating arguments also follow template-argument-equivalence rules rather than ordinary runtime equality: `C<-0.0>` and `C<0.0>` are distinct specializations. Such details make floating NTTPs poor semantic identifiers unless bit-sensitive identity is intended. An NTTP argument must satisfy constant-expression and permitted-value restrictions; `template<auto>` does not turn a runtime value into a template argument. A known `N` lets optimization specialize loops and storage, but does not guarantee unrolling.
 
-**Rule: `std::move` for rvalue references, `std::forward` for forwarding references.** `std::move` on a forwarding reference silently steals from the caller's lvalue.
+**Template template parameters** are adjacent but distinct — a parameter that is itself a template:
 
-### What perfect forwarding cannot forward
+```cpp
+template <template <class...> class Container, class T>
+Container<T> make_container(std::initializer_list<T> il) { return Container<T>(il); }
+```
+Template-template parameter matching has exact language rules for compatible parameter lists. In application interfaces, deducing a complete container type and constraining the operations it must provide is often less coupled to a particular template signature.
 
-| Case | Why | Workaround |
-|---|---|---|
-| Braced-init-lists | `{1,2}` has no type; non-deduced context (§17.2) | Declare an `initializer_list` parameter, or construct at the call site |
-| `0`/`NULL` as a null pointer | Deduces to `int`/`long` | `nullptr` |
-| Bitfield members | Cannot bind a non-const reference to a bitfield | Copy into a local first |
-| Overloaded function names / function templates | No unique type to deduce | Cast to the target signature or wrap in a lambda |
-| In-class `static const` without a definition | Pre-C++17 the reference bind ODR-uses it, so it needs an out-of-line definition | C++17 makes them implicitly `inline` — fixed |
+---
 
-These five are Meyers' canonical list and a common interview question.
+## 17.11 SFINAE and the Detection Idiom — Deep dive
 
-### The greedy-constructor hazard (recap and cure)
+Substitution Failure Is Not An Error: when substituting deduced or explicit arguments into a function template's declaration (signature, return type, defaults) is ill-formed, that candidate is silently dropped instead of erroring. Only the **immediate context** counts — an error deeper inside an instantiated body is a hard error, not a substitution failure:
 
-Covered in §17.3 — a `template <class T> Widget(T&&)` constructor out-competes both the copy constructor (for non-const lvalues) and derived-class copies. Constrain it:
+```cpp
+template <class T> typename T::type f(T);              // SFINAE-friendly: immediate context
+template <class T> void g(T) { typename T::type x; }   // NOT — hard error on instantiation
+```
+
+```cpp
+// enable_if idiom
+template <class T> std::enable_if_t<std::is_integral_v<T>, T> f(T);                  // return type
+template <class T, std::enable_if_t<std::is_integral_v<T>, int> = 0> void g(T);      // template parameter
+```
+The template-parameter form works for constructors, which have no return type. A common failure is writing two declarations that differ only in a default template argument: defaults are not part of a function-template signature, so that can be a redefinition rather than two overloads. Make the constraint affect a signature component correctly, or use concepts.
+
+`if constexpr` (§17.12) branches inside one selected specialization but cannot remove an overload candidate, so it cannot resolve ambiguity or change whether that declaration is invocable. Concepts are the clearer C++20/C++23 interface tool; SFINAE remains relevant when reading older code and implementing compatibility layers.
+
+### `void_t` and expression SFINAE
 
 ```cpp
 template <class T>
-    requires (!std::derived_from<std::remove_cvref_t<T>, Widget>)
-Widget(T&& x);
+auto size(const T& c) -> decltype(c.size()) { return c.size(); }   // valid only if c.size() compiles
 ```
+`decltype` in a trailing return type puts an expression in the immediate context — the foundation of the detection idiom. `std::void_t<Ts...>` (C++17) is `template <class...> using void_t = void;`; its power is that substituting into its arguments can fail, and that failure is in the immediate context of a partial specialization:
 
-### Forwarding and latency
+```cpp
+template <class T, class = void>
+struct has_reserve : std::false_type {};
+template <class T>
+struct has_reserve<T, std::void_t<
+    decltype(std::declval<T&>().reserve(std::size_t{}))>>
+    : std::true_type {};
+```
+If `T::reserve(size_t)` doesn't exist, the partial specialization's argument list is ill-formed and drops out, leaving the `false_type` primary.
 
-- Perfect forwarding removes copies but **does not remove the object's cost**; forwarding a `std::string` by value into a container still moves. `emplace_back(args...)` forwards constructor arguments and constructs in place, avoiding one move over `push_back(T(args...))` (Ch. 11 §11.2).
-- **`std::forward_like<T>(x)`** (C++23) forwards the *value category and constness of another expression* onto `x` — designed for "deducing this" member functions forwarding a member (Ch. 19 §19.11).
-- **Forwarding through `std::invoke`** (C++17) handles the callable-shape cases (member pointers, member data) that a plain `f(args...)` cannot (Ch. 4 §4.11). `std::invoke_r` (C++23) adds an explicit return type.
-- A forwarding wrapper is fully inlined at `-O2`, so the abstraction is genuinely zero-cost in the ABI sense — but it *does* instantiate a new function per argument-category combination, contributing to code bloat (§17.22).
+Concepts express the same check as a named interface condition and participate in subsumption:
+
+```cpp
+template <class T>
+concept HasReserve = requires (T& t, std::size_t n) { t.reserve(n); };
+```
+Both idioms are duck-typed: they check that an expression compiles, not that it does anything sane. Named semantic concepts (`std::regular`, `std::sized_sentinel_for`) document additional requirements the compiler does not enforce.
 
 ---
 
-## 17.18 Tag Dispatch
+## 17.12 Tag Dispatch and `if constexpr` — Deep dive
 
-**Tag dispatch** selects an overload by passing an extra argument whose *type* encodes a compile-time property, letting ordinary overload resolution do the branching.
+**Tag dispatch** selects an overload by passing an extra argument whose type encodes a compile-time property, letting ordinary overload resolution branch:
 
 ```cpp
 template <class It>
-void advance_impl(It& i, ptrdiff_t n, std::random_access_iterator_tag) { i += n; }
+void advance_impl(It& i, std::ptrdiff_t n,
+                  std::random_access_iterator_tag) { i += n; }
 template <class It>
-void advance_impl(It& i, ptrdiff_t n, std::input_iterator_tag) { while (n--) ++i; }
+void advance_impl(It& i, std::ptrdiff_t n,
+                  std::input_iterator_tag) {
+    while (n > 0) { ++i; --n; }
+}
 
 template <class It>
-void advance(It& i, ptrdiff_t n) {
+void advance(It& i, std::ptrdiff_t n) {
     advance_impl(i, n, typename std::iterator_traits<It>::iterator_category{});
 }
 ```
-This is the classic `std::advance`/`std::distance` implementation and the reason iterator category tags form an **inheritance hierarchy** (`random_access_iterator_tag : bidirectional_iterator_tag : …`): derived-to-base conversion gives you a *fallback ordering* for free — a bidirectional iterator matches the bidirectional overload exactly and the input overload by conversion, and exact match wins (Ch. 14 §14.7).
+Iterator category tags form an inheritance hierarchy, so ordinary conversion ranking orders helper overloads: a random-access tag matches its overload exactly and an input-tag overload through a base conversion.
 
-### Standard tag types
+| Mechanism | Overload participation | Selection mechanism | Main limitation |
+|---|---|---|---|
+| Tag dispatch | Helper overloads remain candidates | Ordinary conversion ranking | Requires tag plumbing and lookup design |
+| `enable_if` SFINAE | Failed substitution removes candidate | Overload resolution | Indirect syntax and implementation-dependent diagnostics |
+| `if constexpr` | Does not remove enclosing candidate | Constant condition inside selected function | Closed branches; cannot repair overload ambiguity |
+| Concepts | Unsatisfied constraint removes candidate | Constraints plus subsumption | Atomic-constraint identity can surprise |
 
-`std::true_type`/`false_type` (via `std::integral_constant`), the iterator category tags, `std::in_place_t`/`std::in_place_type_t<T>`/`std::in_place_index_t<I>`, `std::allocator_arg_t`, `std::nothrow_t`, `std::piecewise_construct_t`, `std::defer_lock_t`/`try_to_lock_t`/`adopt_lock_t`. Each exists to disambiguate an otherwise-ambiguous overload — `std::optional<T>(std::in_place, args...)` versus `std::optional<T>(U&&)` is the canonical example, and knowing *why* `in_place_t` exists (to distinguish "construct T from args" from "construct T from one arg that happens to be a T") is a good sign.
+Tag dispatch remains useful when an unqualified helper and ADL deliberately form an open customization set, or when a tag such as `std::in_place_t` disambiguates an operation. Concepts constrain whether an interface participates; `if constexpr` selects valid implementation code after that interface has already been chosen.
 
-### Comparison of the dispatch mechanisms
+### `if constexpr` mechanics
 
-| Mechanism | Removes overload? | Errors | Extensible by third parties | Compile cost | Since |
-|---|---|---|---|---|---|
-| Tag dispatch | No — resolves by conversion ranking | Good (a missing overload is a clear "no match") | Yes, by adding overloads | Low | C++98 |
-| `enable_if` SFINAE | Yes | Poor | Yes | Medium | C++11 |
-| `if constexpr` | No — single function | Excellent | **No** — closed set inside one body | Lowest | C++17 |
-| Concepts | Yes, with subsumption | Best | Yes | Low | C++20 |
-
-Tag dispatch remains preferable to `if constexpr` when you need an **open** set (library users adding overloads for their own types) and preferable to SFINAE pre-C++20 for readability. In C++20, concepts subsume most of its uses, but tag dispatch survives wherever the tag carries *data* as well as identity, and in `in_place`-style disambiguation where there is no predicate to constrain on.
-
-A related pattern: **overload-set-as-customization-point** with a tag type (`tag_invoke`, P1895 — not standardized, but influential and used in senders/receivers, Ch. 20 §20.5). It solves the "customization points pollute the namespace and can't be constrained" problem by routing everything through one ADL-found `tag_invoke(tag, args...)`.
-
----
-
-## 17.19 `if constexpr`
-
-`if constexpr (cond)` (C++17) discards the untaken branch **at instantiation time**: the discarded statement is not instantiated, so it may contain code that would be ill-formed for the current template arguments.
+`if constexpr (cond)` selects a compile-time branch. In a templated entity whose condition remains value-dependent, the unchosen statement is not instantiated for that specialization, so it may contain dependent code that is invalid for that specialization's type.
 
 ```cpp
 template <class T>
 std::string to_text(const T& v) {
-    if constexpr (std::is_arithmetic_v<T>)      return std::format("{}", v);
-    else if constexpr (requires { v.to_string(); }) return v.to_string();
-    else                                        return std::string(v);
+    if constexpr (std::is_arithmetic_v<T>)           return std::to_string(v);
+    else if constexpr (requires { v.to_string(); })  return v.to_string();
+    else                                             return std::string(v);
 }
 ```
-This replaces whole families of tag dispatch and `enable_if` overload pairs with straight-line code.
 
-### The precise rules
+- The condition must be a constant expression contextually convertible to `bool`.
+- Outside a template, both substatements must be well-formed even when one is discarded. Inside a template, non-dependent errors are still checked at definition; only specialization-dependent invalidity is protected by discarding.
+- C++23 implementations incorporating CWG2518 permit `static_assert(false)` in a branch discarded for every instantiated specialization. Older modes/toolchains may need a dependent-false helper.
+- A template with deduced `auto` return type can return different types from mutually discarded branches because only the selected return statements participate for that specialization.
+- It does not remove a candidate from an overload set, cannot resolve ambiguity, cannot affect `std::is_invocable_v`, and is not an open extension point.
+- The selected specialization does not require runtime selection between branches. Compile-time and generated-code effects still depend on the bodies and implementation.
 
-- **The condition must be a contextually-converted constant expression of type `bool`.**
-- **Discarding only happens inside a template.** In a non-template function, both branches are fully checked — `if constexpr` there only prunes codegen, not semantics. This surprises people who try to use it to guard platform-specific code in a plain function.
-- **The discarded branch is still parsed and its non-dependent constructs are still checked** (§17.8). `if constexpr (false) { garbage_syntax; }` is an error; `if constexpr (false) { T::nonexistent(); }` inside a template is fine.
-- **`static_assert(false)` in a discarded branch was ill-formed** until CWG2518 (adopted as a DR, shipping in C++23 compilers) because it is non-dependent. The old workaround was a dependent false: `static_assert(dependent_false_v<T>)` or `[]<bool F = false>{ static_assert(F); }()`.
-- **Returns from different branches may have different types** when the return type is `auto` — this is legal precisely because only one branch is instantiated. It is *not* legal in a non-template.
-- **`if constexpr` in a lambda** works, and combined with a generic lambda gives you an inline type switch (§18.7).
-
-### What it does *not* do
-
-- It does not remove a function from an overload set, so it cannot fix ambiguity, cannot make `std::is_invocable_v` false, and cannot conditionally delete a member.
-- It does not make an *open* extension point; adding support for a new type means editing the function.
-- It is not a substitute for `constexpr` evaluation — the *condition* is compile-time; the branches are ordinary runtime code.
-
-### Related C++23 additions
-
-- **`if consteval`** — takes the "is this evaluation happening at compile time" branch, replacing the fragile `std::is_constant_evaluated()` in an `if constexpr` (which is always `true` there — a notorious trap: `if constexpr (std::is_constant_evaluated())` is *always* taken, because the condition is itself evaluated in a constant context). Use plain `if (std::is_constant_evaluated())` or `if consteval`.
-- **`static_assert` with a computed message** (C++26) improves the diagnostics from an `else` fallback.
-
-**Codegen note:** `if constexpr` folds at compile time with no branch emitted, so it is strictly better than a runtime `if` on a `constexpr` flag when the untaken side would be expensive to compile or invalid — but for merely *predictable* runtime conditions, an ordinary `if` costs ~0 after branch prediction (Ch. 27 §27.8), so `if constexpr` is about validity and compile time, not about branch elimination.
+Chapter 19 covers `if consteval` and constant evaluation; it is a different question from type-based template dispatch.
 
 ---
 
-## 17.20 Compile-Time Type Traits
+## 17.13 Expression Templates — Role-specific / Deep dive
 
-A **type trait** is a class or variable template that computes a property of, or a transformation on, a type. `<type_traits>` (C++11, expanded through C++26) is the metaprogramming standard library.
-
-### The three families
-
-| Family | Shape | Examples |
-|---|---|---|
-| Predicates | `trait<T>::value`, `trait_v<T>` (a `bool_constant`) | `is_integral`, `is_trivially_copyable`, `is_base_of`, `is_nothrow_move_constructible`, `is_invocable_r` |
-| Transformations | `trait<T>::type`, `trait_t<T>` | `remove_reference`, `remove_cvref` (C++20), `decay`, `conditional`, `common_type`, `underlying_type`, `add_pointer` |
-| Compiler-intrinsic-only | Cannot be written in the language | `is_trivially_copyable`, `is_polymorphic`, `is_enum`, `is_union`, `is_aggregate`, `is_final`, `has_unique_object_representations`, `is_layout_compatible` (C++20) |
-
-The third row is worth naming: several traits are **impossible to implement without compiler support** (`__is_enum`, `__is_trivially_destructible`, …). This is a good answer to "how does `std::is_polymorphic` work?" — it doesn't; the compiler tells you.
-
-### Traits that matter for latency and correctness
-
-- `std::is_trivially_copyable_v` — gates `memcpy`, `std::atomic<T>`, register passing (Ch. 3 §3.5).
-- `std::is_nothrow_move_constructible_v` — gates `move_if_noexcept`, i.e. whether `vector` reallocation moves or copies (Ch. 10 §10.3).
-- `std::has_unique_object_representations_v` — gates byte-wise hashing and CAS (Ch. 3 §3.2).
-- `std::is_invocable_r_v<R, F, Args...>` — the correct way to check a callable's shape, superseding hand-rolled detection.
-- `std::alignment_of_v`, `std::is_standard_layout_v`, `std::is_layout_compatible_v` (C++20) — wire-format assertions (Ch. 3 §3.12).
-- `std::conditional_t<B, T, F>` — compile-time type selection; note both branches must be *valid types*, unlike `if constexpr` branches which need not be valid *code*.
-
-### Implementation patterns worth being able to write on a whiteboard
+This section is skippable unless the role uses numeric/domain-specific libraries. An expression template builds a type representing an expression tree and defers evaluation until a consumer materializes the result.
 
 ```cpp
-template <class T> struct remove_reference      { using type = T; };
-template <class T> struct remove_reference<T&>  { using type = T; };
-template <class T> struct remove_reference<T&&> { using type = T; };
-
-template <bool B, class T, class F> struct conditional      { using type = T; };
-template <class T, class F>         struct conditional<false, T, F> { using type = F; };
-
-template <class T, class U> inline constexpr bool is_same_v = false;
-template <class T>          inline constexpr bool is_same_v<T, T> = true;   // variable-template partial spec
-```
-Being able to produce `is_same_v` and `remove_reference` from memory demonstrates that you understand partial specialization as pattern matching, which is the whole point of §17.6.
-
-### Costs and modern alternatives
-
-Trait *instantiations* are memoized per specialization, but a deep trait chain still costs. Variable templates (`_v`) are cheaper than class templates (`::value`) because they avoid instantiating a class. Compiler builtins (`__is_same`, `__remove_reference_t`) are dramatically cheaper still, and libstdc++/libc++ increasingly define the standard traits directly in terms of them — which is why "hand-rolled `is_same`" is now *slower to compile* than the standard one.
-
-C++20 `std::type_identity`, C++23 `std::is_scoped_enum`, `std::to_underlying`, and `std::is_implicit_lifetime` (C++23) round out the set; C++26's static reflection (Ch. 19 §19.14) will eventually replace much of this with direct queries.
-
----
-
-## 17.21 Expression Templates
-
-An **expression template** is a template that, instead of computing a result, builds a *type* representing the expression tree, deferring evaluation until it is assigned or consumed. The purpose is to eliminate temporaries in composite expressions.
-
-The problem it solves:
-
-```cpp
-Vector a, b, c, d, r;
-r = a + b + c + d;    // naive operator+: three heap-allocated temporaries,
-                      // four full passes over memory, all bandwidth-bound
+Vector a, b, c, d, result;
+result = a + b + c + d; // naive eager operators may create three temporaries
 ```
 
-The expression-template version:
-
 ```cpp
+// Conceptual sketch: ownership, concepts, size checks, and alias handling omitted.
 template <class L, class R> struct Sum {
     const L& l; const R& r;
     double operator[](size_t i) const { return l[i] + r[i]; }
@@ -831,144 +673,110 @@ Vector& Vector::operator=(const auto& expr) {          // the fusion point
     return *this;
 }
 ```
-`a + b + c + d` now has type `Sum<Sum<Sum<Vector,Vector>,Vector>,Vector>` — no allocation, and assignment runs **one fused loop with one pass over memory**. For a memory-bandwidth-bound kernel this is the difference between 4× and 1× the DRAM traffic (Ch. 29 §29.5), which is the entire performance story.
+The expression's type encodes its tree. In this sketch, lightweight nodes themselves do not allocate, and assignment can evaluate one fused element loop. Whether that beats eager temporaries depends on optimizer visibility, destination allocation, vectorization, cache residency, and memory bandwidth; Chapter 29 covers numeric-kernel measurement.
 
-Users: **Eigen**, **Blaze**, **Armadillo**, **Boost.uBLAS**, **Boost.Spirit** (parser combinators), **Boost.Phoenix**, and CUDA/Kokkos kernels.
+**Lifetime is the first correctness boundary.** Nodes above hold references. `auto expr = a + b;` remains valid only while both operands live; `auto expr = a + Vector{...};` dangles after the initializer's full expression. A production design can own rvalue operands and reference lvalues, forbid storage/rvalues, or eagerly materialize. `auto` is not itself wrong—it exposes the lazy node type whose lifetime contract must be understood.
 
-### The hazards
-
-- **Dangling by design.** Nodes hold *references* to their operands. `auto e = a + b;` stores an expression referring to `a` and `b`, and `auto e = a + Vector{…};` refers to a destroyed temporary. Eigen's documentation warns about exactly this, and it is the number-one expression-template bug. `auto` is the enemy here — the intended usage is immediate consumption. Mitigations: store temporaries by value and lvalues by reference (via a `std::conditional_t` on the operand's value category), or forbid rvalue operands.
-- **Compile time and diagnostics.** A moderately long expression produces a deeply nested type; error messages are famously enormous, and instantiation cost is superlinear in expression length.
-- **Debug builds are much slower.** Without inlining, every `operator[]` on every node is a real call; a `-O0` Eigen build can be 10–100× slower than `-O2`.
-- **Aliasing.** `r = r * m;` where `r` appears on both sides evaluates element-by-element and reads already-overwritten elements. Eigen requires an explicit `.eval()` for such cases; this is the same aliasing problem as `restrict` (Ch. 40 §40.7).
-
-### What is replacing them
-
-**Lazy range views** (C++20, Ch. 14 §14.10) are the standardized, general form of the same idea for sequences: `v | views::filter(p) | views::transform(f)` builds a composed view type and fuses the loop at consumption, with the same dangling hazards (`views::owning_view` and the borrowed-range machinery are the standard's answer). For numeric code, expression templates remain unmatched; for pipelines, ranges are the idiom. C++26's `std::simd` and explicit blocking often beat both for hand-tuned kernels.
+Expression depth also creates distinct types and larger diagnostics. In debug builds, uninlined accessor layers may be visible at runtime. Aliasing is separate: if the destination also appears in an expression whose element `i` depends on other destination elements, element-by-element assignment can overwrite data before it is read. Detect aliasing or materialize a temporary. Chapter 14 covers range views rather than repeating their lifetime model here.
 
 ---
 
-## 17.22 Template Code Bloat and Compile-Time Cost
+## 17.14 Explicit Instantiation and Build Tooling — Reference / Deep dive
 
-Templates trade compile time and binary size for runtime specialization. In a large low-latency codebase both costs are first-order, and being able to reason about them is a differentiator.
+An **explicit instantiation definition** requests instantiation in one translation unit:
 
-### Where compile time goes
+```cpp
+template class RingBuffer<Order>;                     // all members of the class
+template void process<Order>(std::span<Order>);       // one function
+```
+An **explicit instantiation declaration** (`extern template`) suppresses an implicit instantiation that the translation unit would otherwise perform; one matching explicit definition must exist in the program when the specialization is required:
 
-1. **Header parsing, repeated per TU.** `<algorithm>`, `<ranges>`, `<format>` are tens of thousands of lines each; including them in a widely-included header multiplies across every TU.
-2. **Instantiation, repeated per TU.** Each TU instantiates the same specializations and the linker throws away the duplicates.
-3. **Deep instantiation chains.** Recursive metaprogramming, long `enable_if` chains, `std::tuple` operations on large tuples.
-4. **Overload resolution over large candidate sets** — each candidate requires substitution.
+```cpp
+extern template class RingBuffer<Order>;   // in the header
+```
 
-### Where binary size goes
+Without this arrangement, front ends may repeat instantiation work in each translation unit that uses the specialization. Object-file coalescing can remove duplicate emitted definitions later, but it cannot refund parsing and semantic-analysis time. Place the `extern template` declaration in the header seen by clients and one matching explicit instantiation definition in a source file that sees the template definition.
 
-1. **One function body per distinct specialization.** `std::sort` instantiated for 30 comparator/type combinations is 30 bodies.
-2. **Forwarding wrappers multiplying by value category.** `template <class... A> void f(A&&...)` called with 3 arguments generates up to 2³ signatures (though most collapse after inlining).
-3. **Inline expansion at each call site.**
-
-Bloat matters for latency because of **instruction cache and iTLB pressure** (Ch. 28 §28.16). A hot loop competing with megabytes of cold template instantiations suffers front-end stalls that don't show up in a microbenchmark. This is the argument behind BOLT/PGO hot-cold splitting (Ch. 40 §40.10) and `-ffunction-sections -Wl,--gc-sections`.
-
-### Mitigations, roughly in order of payoff
-
-| Technique | Effect |
+| Aspect | Possible effect and condition |
 |---|---|
-| **Thin-template / fat-base idiom** | Put type-independent logic in a non-template base or a `void*`-based implementation; the template is a thin type-safe façade. This is how MSVC's `std::vector<T*>` collapses all pointer instantiations to one `vector<void*>` body. |
-| **Erase where dispatch is cold** | `std::function`/`function_ref`/a virtual interface at cold boundaries; templates only on the hot path (Ch. 6 §6.20). |
-| **`extern template`** (§17.10) | One instantiation instead of N; costs inlining unless LTO. |
-| **Fold expressions over recursion** (§17.16) | O(1) vs O(N) instantiations. |
-| **`if constexpr` over overload sets** | Fewer candidates, less substitution. |
-| **Compiler builtins for traits** | libstdc++/libc++ already do this; avoid hand-rolled traits. |
-| **Reduce header fan-out** | Forward declarations, pimpl (Ch. 44 §44.14), and *not* including `<iostream>`/`<format>` in headers. |
-| **Precompiled headers / unity builds** | Amortize parsing; unity builds also amortize instantiation but hurt incremental rebuilds (Ch. 44 §44.13). |
-| **Modules** (C++20) | Structurally eliminate re-parsing and much re-instantiation; the real long-term fix (Ch. 19 §19.6). |
-| **Identical Code Folding** (`--icf=all`) | The linker merges byte-identical instantiations — very effective against pointer-type bloat (Ch. 41 §41.11). |
+| Compile time | Less repeated instantiation work when many TUs use the same costly specialization |
+| Object/link work | Fewer emitted copies before coalescing; impact depends on compiler/linker |
+| Inlining | `extern template` does not hide a definition that remains in the header; moving the definition out of line can restrict inlining without LTO |
+| Coupling | The instantiating TU must be linked in; a missing explicit instantiation is a link error |
 
-### Tooling to name
+At its point, an explicit instantiation definition of a class specialization also explicitly instantiates eligible non-template members whose definitions are visible and not previously explicitly specialized. That can expose an ill-formed member that lazy implicit instantiation never needed. Move the explicit-instantiation point before unrelated member definitions or instantiate selected members individually when appropriate.
 
-`-ftime-trace` (Clang) emits a Chrome-tracing JSON showing per-template instantiation cost — the single most useful tool here, visualized with `ClangBuildAnalyzer`. `-ftime-report` (GCC/Clang) gives phase totals. `templight` traces instantiation trees. `nm --size-sort --demangle` and `bloaty` attribute binary size to symbols. `include-what-you-use` and `clang-include-cleaner` prune headers. `ccache`/`sccache` and `ninja` address the rebuild side rather than the per-TU cost.
-
-**The interview-grade framing:** templates give you monomorphized, inlinable, allocation-free code on the hot path — that's why HFT codebases are template-heavy. The price is compile time, binary size, and icache pressure, so the discipline is *template where the code is hot and the type set is small; erase where the code is cold or the type set is open.*
+Keeping a template definition in a `.cpp` and explicitly instantiating a finite supported set creates a closed type boundary: unsupported types fail to link or cannot instantiate. That is appropriate only when the supported set is deliberate and tested. Use the §17.9 trace/size workflow to verify the build benefit and a representative runtime benchmark to check that code-placement changes did not regress the hot path.
 
 ---
 
-## Key Interview Questions
+## 17.15 Recall and Practice — Core
 
-1. **Why can't you partially specialize a function template, and what do you do instead?** — The language only allows full specialization; overload and let partial ordering choose, or forward to a class template's static member. Specializations don't participate in overload resolution.
-2. **What can an alias template not do?** — Be specialized (fully or partially) and be deduced from a function argument. It creates no distinct type.
-3. **What conversions are allowed during template argument deduction?** — Only decay, qualification conversion, and derived-to-base for `Base<T>` parameters. No promotions, no user-defined conversions — hence `max(1, 2.0)` fails.
-4. **What exactly is a forwarding reference?** — Precisely `T&&` where `T` is deduced by this call, or `auto&&`. `const T&&` and `vector<T>&&` are not, and neither is `T&&` on a member of an already-instantiated class template.
-5. **State the reference collapsing rules.** — Any `&` in the pair wins; only `&& &&` gives `&&`.
-6. **Why does a perfect-forwarding constructor hijack copies?** — For a non-const lvalue, `T&&` deduces `T=Widget&` and is an exact match, beating the copy constructor which requires adding `const`. Constrain it with `requires (!derived_from<remove_cvref_t<T>, Widget>)`.
-7. **What can't be perfectly forwarded?** — Braced-init-lists, `0`/`NULL` as null pointers, bitfields, overloaded function names, and (pre-C++17) undefined in-class statics.
-8. **What is CTAD and name two pitfalls.** — Deducing class template arguments from constructor arguments; `vector v{v2}` copies instead of wrapping, and `vector v(3,0)` vs `vector v{3,0}` differ.
-9. **What types can be non-type template parameters?** — Integral/enum/pointer/reference/member-pointer classically; `auto` NTTPs in C++17; **structural class types and floating point in C++20**, which is what allows string literals as template arguments.
-10. **When is a class template member function instantiated?** — Only when used (except virtuals, which are instantiated with the class). This is why `vector<T>` works for `T` lacking a default constructor.
-11. **Explain two-phase lookup.** — Non-dependent names bind at the point of definition; dependent names bind at instantiation using ordinary lookup from the definition point plus ADL from the instantiation point. `/permissive-` makes MSVC conform.
-12. **Why do you need `this->` in a class template derived from a dependent base?** — Unqualified lookup skips dependent bases, since a specialization of the base might not have the member.
-13. **What does `extern template` do and what does it cost?** — Suppresses implicit instantiation in this TU, cutting compile time and object size; you lose inlining unless LTO is on, and an explicit instantiation definition instantiates *all* members.
-14. **What is SFINAE and what is the "immediate context"?** — Substitution failure in a declaration removes a candidate; failures inside a function body or an instantiated class are hard errors.
-15. **How does `void_t` detection work?** — A partial specialization whose argument is `void_t<decltype(expr)>` drops out if `expr` is invalid, falling back to the `false_type` primary.
-16. **Why prefer concepts over `enable_if`?** — Diagnostics, uniform placement including constructors and non-template members, memoized satisfaction, and **subsumption-based overload ordering**.
-17. **Why don't two type-trait `requires` clauses subsume each other?** — Subsumption compares *atomic constraints by identity*; `is_integral_v<T>` and `is_signed_v<T>` are unrelated atoms. Factor into named concepts and conjoin with top-level `&&`.
-18. **What are the empty-pack defaults for unary folds?** — Only `&&` (true), `||` (false), and `,` (void) are allowed; everything else needs a binary fold with an explicit identity.
-19. **Why is a comma fold safer than a pack expansion in a function call?** — The comma fold guarantees left-to-right sequencing; function argument evaluation order is unspecified.
-20. **What can `if constexpr` not do that SFINAE/concepts can?** — Remove a declaration from an overload set, resolve ambiguity, affect `is_invocable`, or provide an open extension point.
-21. **Why is `if constexpr (std::is_constant_evaluated())` always true?** — The condition is itself evaluated in a constant expression context; use `if consteval` (C++23) or a plain runtime `if`.
-22. **What are expression templates and their two main dangers?** — Deferred expression trees that fuse loops and eliminate temporaries; they dangle when bound to `auto` or built from temporaries, and they explode compile time and debug-build performance.
-23. **How do you reduce template code bloat?** — Thin-template/fat-base, type erasure at cold boundaries, `extern template`, folds over recursion, `--icf=all`, and reduced header fan-out; measure with `-ftime-trace` and `bloaty`.
+### Recall card
 
----
+- Template definitions are parsed and non-dependent constructs checked before instantiation; substitution and constraints govern candidate participation.
+- Deduction uses specified adjustments and limited alternatives, not general promotions or user-defined conversions.
+- `T&&` is a forwarding reference only when `T` is deduced by this call (or `auto&&`); any `&` in a collapsing pair wins.
+- A named parameter is an lvalue expression; use `std::forward<T>` to preserve a forwarding reference's incoming category.
+- Non-dependent names bind at definition; dependent names resolve at instantiation via definition-point lookup plus instantiation-point ADL — members of a dependent base need `this->`.
+- Ordinary member definitions are instantiated when required; eager instantiation of an otherwise-unneeded virtual member is unspecified.
+- A function-template specialization does not join the overload set; overload resolution selects a primary first.
+- Concepts subsume by identity of atomic constraints, not by logical implication between traits — wrap traits in named, conjoined concepts to get ordering.
+- A fold avoids recursive helper specializations, but the compiler still analyzes every expanded operand.
+- In a template specialization, `if constexpr` can discard dependent invalid code; it does not remove the enclosing overload.
 
-## Common Traps
+### Common traps
 
-- **Specializing a function template and expecting it to beat an overload** — it never enters overload resolution.
-- **Trying to partially specialize a function or alias template** — not allowed.
-- **`max(1, 2.0)`** — inconsistent deduction; no arithmetic conversions during deduction.
-- **`f({1,2,3})` on `template <class T> void f(T)`** — braced-init-lists are a non-deduced context.
-- **Thinking `const T&&` or `vector<T>&&` is a forwarding reference.**
-- **`std::move` on a forwarding reference** — steals from the caller's lvalue.
-- **`std::forward` without an explicit template argument** — intentionally ill-formed.
-- **An unconstrained `template <class T> Widget(T&&)` constructor** — hijacks the copy constructor for non-const lvalues.
-- **`std::vector v{other_vector}`** — CTAD's copy candidate wins; you get a copy, not a nested vector.
-- **`std::vector v{3, 0}` vs `v(3, 0)`** — two elements vs three zeros.
-- **Full specialization declared after first use in some TU** — IFNDR; different TUs silently get different behavior.
-- **Full specialization in a header without `inline`** (functions) — multiple definition.
-- **Specializing a standard template for a non-user-defined type** — UB.
-- **Missing `this->` on a member of a dependent base** — fails on GCC/Clang, "works" on MSVC without `/permissive-`.
-- **Missing `typename`/`template` disambiguators** in dependent nested names.
-- **Explicit instantiation of a class whose members aren't all valid for that `T`** — instantiates everything.
-- **`enable_if` in a default template argument used to distinguish two overloads** — same signature, redefinition error.
-- **SFINAE on something outside the immediate context** — hard error instead of a removed candidate.
-- **Two identical inline `requires` clauses in different declarations** — distinct atoms, no subsumption, ambiguity.
-- **Unary fold over an empty pack with `+`** — ill-formed; use the binary form.
-- **Left vs right fold on a non-associative operator** — including floating-point summation.
-- **`static_assert(false)` in a discarded `if constexpr` branch** — non-dependent, so it fires; fixed only by CWG2518 in C++23.
-- **`if constexpr` in a non-template function** — both branches are fully checked.
-- **`auto e = a + b;` with expression templates** — dangling references to operands.
-- **Aliasing in expression templates** (`r = r * m`) — needs an explicit `.eval()`.
-- **`#include <format>`/`<ranges>` in a widely-included header** — multiplied parse cost across every TU.
+- Reporting the resulting parameter type (`int(&)[5]`) when asked for deduced `T` (`int[5]`).
+- Calling every `T&&` an rvalue reference or forwarding with `std::move`.
+- Assuming an alias template is always a non-deduced context, or trying to specialize an alias.
+- Omitting `typename`, `template`, or `this->` for a genuinely dependent name.
+- Defining a header variable template as plain `constexpr` and relying on disputed historical linkage behavior instead of `inline constexpr`.
+- Copying logically equivalent trait expressions into constraints and expecting semantic subsumption.
+- Placing a function parameter pack before a deduced suffix and expecting the prefix length to be inferred.
+- Treating `_v` traits, concepts, folds, or templates in general as intrinsically cheaper without a trace and linked-size measurement.
+- Adding `extern template` without one reachable explicit definition, or explicitly instantiating a class whose visible member definitions are invalid for that type.
 
----
+### Questions
 
-## Compact Recall Summary
+1. Why can a function template be overloaded but not partially specialized?
+2. What can a class template do that an alias template cannot, and when can deduction still pass through an alias?
+3. Which adjustments occur for by-value versus reference parameters, and why does `f(1, 2.0)` fail for `f(T, T)`?
+4. What distinguishes a forwarding reference from an ordinary rvalue-reference parameter?
+5. Why can an unconstrained `template <class T> Widget(T&&)` constructor win over the copy constructor for a non-const lvalue?
+6. Why may an invalid virtual member body be diagnosed earlier than an unused ordinary member body, and what is portable guidance?
+7. Why does a member of a dependent base require `this->`, and what does `using Base<T>::member;` do differently?
+8. Why do `requires std::is_integral_v<T>` and `requires (std::is_integral_v<T> && std::is_signed_v<T>)` fail to subsume each other, and how do you fix it?
+9. Why is a comma fold safer than a plain pack-expanded function call when the elements have side effects?
+10. What can `if constexpr` not do that a removed-overload mechanism (SFINAE or a concept) can?
 
-**Kinds.** Function templates deduce and overload but only fully specialize. Class templates fully and partially specialize. Variable templates (C++14) give `_v` traits. Alias templates cannot be specialized or deduced and create no distinct type; `type_identity_t` is the standard deduction blocker.
+### Code-reading puzzle
 
-**Deduction.** Pattern matching with only decay, qualification conversion, and derived-to-`Base<T>` allowed. By-value drops top-level cv and decays arrays; by-reference preserves both, which is what makes `T(&)[N]` capture array extents. Non-deduced contexts: `typename A<T>::type`, expressions in NTTPs, defaulted parameters, braced-init-lists.
+```cpp
+#include <iostream>
 
-**Forwarding.** `T&&` (deduced) and `auto&&` are forwarding references; lvalues deduce `T=A&` and collapsing yields `A&`. Any `&` in a collapsing pair wins. `std::forward<T>` restores the value category; `std::move` is unconditional. Forwarding references are greedy and hijack copy constructors — constrain them. Cannot forward braced lists, `0`, bitfields, or overload names.
+template <class T>
+struct Base {
+    virtual void go() { std::cout << "base\n"; }
+    virtual ~Base() = default;
+};
 
-**CTAD** (C++17) uses implicit guides from constructors plus user guides; watch the copy-deduction candidate and brace-vs-paren. Aggregate and alias CTAD arrive in C++20.
+template <class T> struct Derived : Base<T> {
+    void go() override { std::cout << "derived\n"; }
+    void call() { go(); Base<T>::go(); this->go(); }
+};
 
-**NTTPs.** Integral/pointer/enum classically; `auto` NTTPs in C++17; **structural class types and floats in C++20**, which enables string-literal template arguments. Equivalence is member-wise, not `operator==`.
+int main() {
+    Derived<int>{}.call();
+}
+```
 
-**Instantiation and lookup.** Implicit instantiation is lazy per member (virtuals excepted) and emitted as COMDAT in every TU. Non-dependent names bind at the definition point; dependent names use ADL at instantiation — so customization points must be ADL-reachable, and members of dependent bases need `this->`. `typename`/`template` disambiguate dependent names; C++20 makes `typename` optional where only a type is possible. `extern template` + one explicit instantiation cuts build time at the cost of inlining.
+Predict the three output lines. Which two calls use virtual dispatch semantics, why is the qualified base call different, and why does unqualified `go()` not need `this->` here?
 
-**Constraining.** SFINAE removes candidates on substitution failure in the *immediate context only*; `enable_if` in an extra defaulted template parameter is the portable form; `void_t` + partial specialization is the detection idiom. C++20 concepts replace all of it with named predicates, `requires`-expressions (simple/type/compound/nested), better errors, and **subsumption** — which orders overloads automatically but only over atomic constraints compared by identity, so wrap traits in named concepts and conjoin at the top level.
+### Implementation exercise
 
-**Packs.** `pattern...` expands per element; multiple packs expand in lockstep; packs must be last to deduce. `sizeof...` counts. Fold expressions (C++17) replace recursion in O(1) instantiations — `...` sits on the associating side, empty packs are only valid for `&&`/`||`/`,`, and comma folds are the only expansion form with guaranteed sequencing. C++26 adds pack indexing.
+Write `template <class T> concept Printable = requires (std::ostream& os, const T& t) { os << t; };` and a function `dump(const auto&... xs)` that prints each argument space-separated using a fold expression, constrained so it fails to compile — with a named-constraint diagnostic, not a wall of substitution errors — for any argument that isn't `Printable`. Then write the same dump function with `enable_if` instead of the concept and compare the two error messages by passing a non-printable type to each.
 
-**Dispatch.** Tag dispatch resolves by conversion ranking over a tag hierarchy (the `std::advance` design) and stays open to third-party extension; `if constexpr` (C++17) gives closed, in-function branching that discards uninstantiated branches — but only inside templates, and it cannot remove overloads. Concepts do both jobs better where the language version allows.
+### Prerequisites for Chapter 18
 
-**Traits.** Predicates, transformations, and compiler-intrinsic-only traits (`is_trivially_copyable`, `is_polymorphic`) that cannot be written in the language. Know `is_trivially_copyable_v`, `is_nothrow_move_constructible_v`, `has_unique_object_representations_v`, and `is_invocable_r_v` and what each gates. `_v` variable templates beat `::value` for compile time; builtins beat both.
-
-**Cost.** Expression templates fuse composite expressions into one memory pass (Eigen) at the cost of dangling `auto`, huge diagnostics, and slow debug builds; lazy range views are the standardized sequence analogue with the same lifetime hazards. Template bloat costs compile time, binary size, and — the one that matters at runtime — icache and iTLB pressure. Mitigate with thin-template/fat-base, type erasure at cold boundaries, `extern template`, folds, ICF, header hygiene, and eventually modules; measure with `-ftime-trace`, `ClangBuildAnalyzer`, and `bloaty`.
+Chapter 18 assumes you can deduce a forwarding-reference parameter, apply reference collapsing, recognize a non-deduced context, and read constraints on a callable. Chapter 6 covers type erasure; Chapter 18 applies these template rules to closure types without repeating deduction.

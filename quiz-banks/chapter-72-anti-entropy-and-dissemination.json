@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Availability and latency require acknowledging after W < N acks, so a replica can miss a write via a dropped message, an outage, or a concurrent write with no leader to order it. Correctness rests on eventual convergence, not on never diverging.",
-      "sourceAnchor": "721-the-problem-replicas-diverge",
+      "sourceAnchor": "722-failure-walkthrough-how-replicas-diverge--core",
       "difficulty": "application"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Foreground techniques like read repair and hinted handoff are low-latency but limited to keys clients touch; background Merkle repair is periodic and expensive but sweeps every key, so a never-read key can only be fixed by the background backstop.",
-      "sourceAnchor": "722-anti-entropy-convergence-and-repair",
+      "sourceAnchor": "723-the-layered-repair-stack--core",
       "difficulty": "recall"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Broadcast is cheap in messages and immediate but offers a single path to each target with no topological retry. Gossip trades extra messages for redundant paths so no single failure strands a node.",
-      "sourceAnchor": "723-dissemination-approaches-the-overview",
+      "sourceAnchor": "729-gossip-and-epidemic-dissemination--core",
       "difficulty": "recall"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The coordinator already has all responses, so comparing versions and issuing a corrective write to laggards is cheap. It heals exactly the read-hot key set at the moment a client cares about that key.",
-      "sourceAnchor": "724-read-repair",
+      "sourceAnchor": "727-hinted-handoff-and-read-repair--core",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "By pushing the fresh value into laggards before the read completes, blocking repair closes the residual gap that dropped writes leave in an R+W>N scheme, adding an ordering guarantee. Async repair is best-effort and lower latency.",
-      "sourceAnchor": "725-blocking-vs-asynchronous-read-repair",
+      "sourceAnchor": "727-hinted-handoff-and-read-repair--core",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "On the common no-conflict path only one payload plus tiny hashes move; a mismatch escalates to a full read of the disagreeing replicas. It is the read-path analogue of the Merkle idea: summarize to detect, transfer to repair.",
-      "sourceAnchor": "726-digest-reads-saving-bandwidth",
+      "sourceAnchor": "724-versions-digests-and-compact-summaries--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The hint proactively fills the gap left by a transient outage instead of waiting for a read or full repair. Hints carry a TTL (max_hint_window, roughly 3 hours by default); past it, collection stops and full repair is expected.",
-      "sourceAnchor": "727-hinted-handoff",
+      "sourceAnchor": "727-hinted-handoff-and-read-repair--core",
       "difficulty": "recall"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "R+W>N guarantees the read and write sets intersect by node only when both sets are the N owners. A sloppy quorum writes to non-owners for availability, so the value can sit as hints invisible to a normal preference-list read until it is handed off.",
-      "sourceAnchor": "728-sloppy-quorums-and-hinted-handoff",
+      "sourceAnchor": "727-hinted-handoff-and-read-repair--core",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A recovered node under heavy prior write load faces a thundering herd of simultaneous hint replays that can knock it back over. Backpressure, the TTL that caps backlog, and randomized replay start times spread the load.",
-      "sourceAnchor": "729-hint-storms-and-handoff-failure-modes",
+      "sourceAnchor": "727-hinted-handoff-and-read-repair--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because a hint lives only on the node that stored it, a holder crash or disk failure before replay destroys it. Hints reduce repair work but can vanish, so the background repair backstop must assume they can be lost.",
-      "sourceAnchor": "729-hint-storms-and-handoff-failure-modes",
+      "sourceAnchor": "727-hinted-handoff-and-read-repair--core",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Leaves hash key sub-ranges and internal nodes hash their children, so an equal root proves whole-dataset agreement in one comparison, and descent transfers only the data in differing leaf ranges rather than the whole dataset.",
-      "sourceAnchor": "7210-merkle-trees-for-anti-entropy",
+      "sourceAnchor": "725-merkle-trees-localize-before-streaming--core",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Detection is cheap (O(log M)) but construction requires hashing every key in the range, which in Cassandra is a validation compaction that reads the whole range. That heavy full read is why repair is throttled and run infrequently.",
-      "sourceAnchor": "7210-merkle-trees-for-anti-entropy",
+      "sourceAnchor": "725-merkle-trees-localize-before-streaming--core",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Only the divergent ranges are streamed, not the whole dataset, and last-write-wins timestamps (or version vectors) resolve which value survives. Full, incremental, and sub-range variants change how much data the trees cover.",
-      "sourceAnchor": "7211-merkle-tree-repair-in-cassandra-nodetool-repair",
+      "sourceAnchor": "725-merkle-trees-localize-before-streaming--core",
       "difficulty": "recall"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because a delete is a tombstone collected after gc_grace_seconds (default 10 days), a replica that never saw the delete can reintroduce the old data once the tombstone is gone everywhere. Repair frequency is thus a correctness requirement for deletion.",
-      "sourceAnchor": "7211-merkle-tree-repair-in-cassandra-nodetool-repair",
+      "sourceAnchor": "725-merkle-trees-localize-before-streaming--core",
       "difficulty": "trap"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A mismatching leaf marks its entire range divergent, so coarse leaves force transferring a whole range for a single changed key, while fine leaves need far more memory and hashing. You size the tree to fit memory while keeping over-streaming tolerable.",
-      "sourceAnchor": "7212-merkle-tree-granularity-trade-offs",
+      "sourceAnchor": "725-merkle-trees-localize-before-streaming--core",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A replica usually has seen a contiguous prefix of another node's updates, compressible to one integer, plus occasional gaps stored as bits. This keeps metadata roughly O(nodes) and lets reconciling replicas compute exactly which dots are missing.",
-      "sourceAnchor": "7213-bitmap-version-vectors-and-compact-causal-metadata",
+      "sourceAnchor": "724-versions-digests-and-compact-summaries--core",
       "difficulty": "recall"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The infected set grows geometrically, so latency is logarithmic; each node participates in about log n rounds sending fan-out messages, giving near-linear-times-log traffic. The extra log factor is redundant delivery, the premium for reliability without a coordinator.",
-      "sourceAnchor": "7214-gossip-dissemination-epidemic-protocols",
+      "sourceAnchor": "729-gossip-and-epidemic-dissemination--core",
       "difficulty": "recall"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Pure push wastes late rounds landing on informed peers; pure pull wastes early rounds hitting ignorant peers. Doing both combines the fast start of push with the fast finish of pull, collapsing the tail so the uninformed set shrinks doubly exponentially.",
-      "sourceAnchor": "7215-push-pull-and-push-pull",
+      "sourceAnchor": "729-gossip-and-epidemic-dissemination--core",
       "difficulty": "application"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "SIR nodes stop spreading after seeing an update redundantly enough times, which caps the wasted traffic of SI (spread-forever) at the cost of a small chance some susceptible node is never reached. The stop threshold k tunes reliability against cost.",
-      "sourceAnchor": "7216-the-epidemic-model-si-sir-and-the-math",
+      "sourceAnchor": "729-gossip-and-epidemic-dissemination--core",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because rounds scale as log base (b+1) of n, doubling b barely dents the round count while linearly increasing per-round traffic. There is also a percolation threshold below which the spread can die out, so a small constant like 3 to 4 is used.",
-      "sourceAnchor": "7217-fan-out-rounds-and-the-cost-trade-offs",
+      "sourceAnchor": "729-gossip-and-epidemic-dissemination--core",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because gossip delivers the same fact via many paths in arbitrary orders, merging must converge to the same result no matter the order or repetition. Versioning with heartbeat counters or CRDT-like merges provides this, and failure detection piggybacks on the counters.",
-      "sourceAnchor": "7218-gossip-mechanics-peer-selection-and-state-reconciliation",
+      "sourceAnchor": "729-gossip-and-epidemic-dissemination--core",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A structured topology like a tree or ring reaches each node about once in O(n) messages but a failed structural node severs paths and must be repaired, whereas random unstructured gossip heals around failures at the price of O(n log n) redundant messages.",
-      "sourceAnchor": "7219-overlay-networks-structured-vs-unstructured",
+      "sourceAnchor": "7211-overlay-and-product-reference--skippable",
       "difficulty": "recall"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The eager tree delivers payloads once in O(n) messages; the lazy mesh advertises message IDs cheaply. When a tree link fails, a node that hears a lazy header for a missing message pulls it, grafts that link into the tree, and prunes the broken branch, self-healing without a central rebuild.",
-      "sourceAnchor": "7220-hybrid-gossip-plumtree-and-spanning-tree-backbones",
+      "sourceAnchor": "7211-overlay-and-product-reference--skippable",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The union of small active views forms a connected low-diameter random graph, so messages still reach everyone in O(log n) rounds while no node knows more than a handful of peers. The passive view supplies replacements to keep the active graph connected under churn.",
-      "sourceAnchor": "7221-partial-views-hyparview-and-scalable-membership",
+      "sourceAnchor": "7211-overlay-and-product-reference--skippable",
       "difficulty": "recall"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Read repair only touches read keys and hinted handoff only covers writes during outages (and can be lost), so a written-once, never-read key falls through both. Only background Merkle repair sweeps the entire dataset to reconcile such keys.",
-      "sourceAnchor": "7222-choosing-gossip-vs-broadcast-tree-vs-anti-entropy",
+      "sourceAnchor": "723-the-layered-repair-stack--core",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With one authority ordering all writes and standbys replaying the identical log, a replica can only be behind, never hold a conflicting value. There are no independent writes, hence no conflicts, no per-key causal metadata, and no repair to run.",
-      "sourceAnchor": "7223-the-postgresql-contrast-why-single-leader-needs-almost-none-of-this",
+      "sourceAnchor": "7211-overlay-and-product-reference--skippable",
       "difficulty": "recall"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "One is a storage mechanism and the other is a consistency policy about which acks satisfy W. In Cassandra hints do not count toward the consistency level by default, so it uses hinted handoff without a true sloppy quorum in the acking sense.",
-      "sourceAnchor": "728-sloppy-quorums-and-hinted-handoff",
+      "sourceAnchor": "727-hinted-handoff-and-read-repair--core",
       "difficulty": "trap"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Both are compact set summaries, but reconciliation needs exactness: a version vector's base-counter-plus-tail-bits reports precisely which dots are missing, whereas a Bloom filter (Ch. 21 section 21.19) could falsely claim a replica has an update it lacks, which would silently skip needed repair.",
-      "sourceAnchor": "7213-bitmap-version-vectors-and-compact-causal-metadata",
+      "sourceAnchor": "724-versions-digests-and-compact-summaries--core",
       "difficulty": "trap"
     }
   ]

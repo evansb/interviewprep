@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The vDSO can only work if the counter itself is readable without a privilege transition, and `rdtsc` on a core-local register is the one that qualifies. The 'shared counter page' answer is the tempting near-miss because it describes how paravirtual `kvm-clock` works, but a shared page is not what makes `tsc` special — `hpet` and `acpi_pm` require an uncached MMIO or port access that user space cannot perform, which is exactly why demotion turns `clock_gettime` into a syscall.",
-      "sourceAnchor": "351-linux-clock-sources",
+      "sourceAnchor": "352-the-linux-timekeeping-stack--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A clocksource demotion is the classic overnight regression: `dmesg` shows 'Switched to clocksource hpet' and `current_clocksource` confirms it, and the cost jumps from a ~20 ns user-space computation to a ~250 ns syscall on a device that also serializes across cores. The NTP-slew answer is tempting because slewing really does happen continuously, but the correction is folded into the mult/shift the vDSO already applies, so it costs nothing extra per read.",
-      "sourceAnchor": "351-linux-clock-sources",
+      "sourceAnchor": "352-the-linux-timekeeping-stack--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The distinction is discipline, not monotonicity: both are monotonic and neither counts suspend, but only `MONOTONIC` has its rate slewed to follow real elapsed seconds. The claim that `RAW` is 'more finely disciplined' inverts the whole point — `RAW` is correct for TSC calibration precisely because it is undisciplined, so NTP's adjustments cannot contaminate the frequency you are trying to measure.",
-      "sourceAnchor": "352-monotonic-realtime-and-raw-clocks",
+      "sourceAnchor": "353-choosing-a-clock--core",
       "difficulty": "recall"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`high_resolution_clock` is an implementation-defined alias, and libstdc++ picks the clock that steps — which is why the chapter's rule is simply never to use it. The unfenced-TSC answer is the seductive one because unfenced `rdtsc` genuinely does distort measurements, but `high_resolution_clock` goes through the vDSO's seqlock-protected read, which cannot reorder the two observations; only a realtime step produces a negative interval.",
-      "sourceAnchor": "352-monotonic-realtime-and-raw-clocks",
+      "sourceAnchor": "353-choosing-a-clock--core",
       "difficulty": "trap"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`constant_tsc` fixes frequency scaling — the counter ignores P-states — and `nonstop_tsc` adds the second half, namely that idle states do not halt it, which is what makes `rdtsc` usable as a clock on a machine that sleeps. The cross-core synchronization answer is the most tempting because skew is a real hazard, but that is a separate property handled by `IA32_TSC_ADJUST` and boot-time skew checks; invariance says nothing about alignment between cores.",
-      "sourceAnchor": "353-tsc-synchronization-and-monotonicity",
+      "sourceAnchor": "356-synchronization-and-timestamp-domains--core",
       "difficulty": "recall"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`rdtscp` is only half serializing: it waits for prior instructions to retire, which is why it is the right closing read, but nothing prevents the code you meant to measure from being hoisted above it, so a trailing `lfence` is still needed at both ends. The 'core cycles under turbo' answer is plausible to anyone who half-remembers the TSC story, but it is backwards — the TSC ticks at the invariant base rate, so turbo makes the delta represent more real work, not less.",
-      "sourceAnchor": "353-tsc-synchronization-and-monotonicity",
+      "sourceAnchor": "356-synchronization-and-timestamp-domains--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Cross-socket TSC skew is the textbook cause and a negative one-way latency is its diagnostic signature; the fix is per-core offset calibration or pinning both endpoints to one socket. The turbo answer is the most seductive because frequency and the TSC feel related, but an invariant TSC ticks at the fixed base rate regardless of the core's current P-state, so turbo cannot make one socket's counter outrun another's.",
-      "sourceAnchor": "353-tsc-synchronization-and-monotonicity",
+      "sourceAnchor": "356-synchronization-and-timestamp-domains--core",
       "difficulty": "trap"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The TSC frequency is the invariant base rate, discoverable from `CPUID` or the `tsc: Detected` line, and the conversion should be a multiply-and-shift rather than a floating-point divide on a hot path. The `CLOCK_REALTIME` calibration answer is tempting because calibrating against a system clock is genuinely one of the documented options — but the chapter specifies `CLOCK_MONOTONIC_RAW` for exactly this, since a realtime step or slew during the calibration window corrupts the result.",
-      "sourceAnchor": "353-tsc-synchronization-and-monotonicity",
+      "sourceAnchor": "356-synchronization-and-timestamp-domains--core",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A relative sleep guarantees only a lower bound, so every iteration's wakeup latency plus work time is added to the period and the error accumulates without bound; computing an absolute deadline from the schedule rather than from the wake time makes the loop drift-free. The `SCHED_FIFO` answer is the tempting one because real-time priority genuinely tightens the jitter distribution, but it lowers the per-iteration overshoot without ever making it zero, so the accumulation continues.",
-      "sourceAnchor": "354-timer-facilities",
+      "sourceAnchor": "355-timers-and-periodic-work--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`timer_slack` is invisible by design — the kernel batches expiries within the window to save power — and real-time policies get zero slack automatically, which is why the same code behaves differently under `SCHED_FIFO`. The timer-wheel answer is the strongest distractor because the wheel really is jiffy-granular, but `timerfd` is built on hrtimers in a per-CPU red-black tree programmed into the APIC in TSC-deadline mode, so wheel resolution never enters the picture.",
-      "sourceAnchor": "354-timer-facilities",
+      "sourceAnchor": "355-timers-and-periodic-work--core",
       "difficulty": "trap"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The design is driven by the workload: a retransmit timer is armed for every segment and almost always cancelled by the ACK, so insertion and cancellation dominate and deliberately imprecise batched expiry is the right trade. The 'wheel gives nanosecond resolution' option is the giveaway inversion — the wheel's entire cost is resolution, one jiffy of 1–10 ms, which is why timers that must fire on time go to the hrtimer tree instead.",
-      "sourceAnchor": "355-timer-wheels",
+      "sourceAnchor": "355-timers-and-periodic-work--core",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is the kernel's own trade applied in user space: intrusive hooks make cancellation a pointer unlink with no search, and 1 ms buckets are ample for second-scale timeouts. The binary-heap answer is the tempting one because an index really does let you locate the element in O(1), but removing it still requires a sift to restore the heap invariant, so cancellation remains O(log n) — precisely the cost the wheel exists to eliminate.",
-      "sourceAnchor": "355-timer-wheels",
+      "sourceAnchor": "355-timers-and-periodic-work--core",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Path symmetry is the load-bearing assumption, and real networks have asymmetric queueing, which is one of the two reasons NTP tops out around 10–100 µs even on a tuned LAN. The hardware-timestamping option is the closest miss: it is true that NTP uses software timestamps and that this hurts accuracy, but that is a separate error source layered on top — the formula itself makes no claim about where the stamps are taken.",
-      "sourceAnchor": "356-ntp-synchronization",
+      "sourceAnchor": "356-synchronization-and-timestamp-domains--core",
       "difficulty": "recall"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`systemd-timesyncd` has no control loop at all, and the deeper point is that even chrony on a quiet LAN only reaches 10–100 µs, which leaves no margin against a 100 µs regulatory bound and cannot support cross-venue comparison. The 'steps rather than slews' answer is the tempting one because stepping really is the mechanism that breaks duration measurements, but the disqualifying property here is the absence of any discipline, not the step policy.",
-      "sourceAnchor": "356-ntp-synchronization",
+      "sourceAnchor": "356-synchronization-and-timestamp-domains--core",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The algebra is structurally identical to NTP's; all the accuracy comes from stamping at the wire and from cancelling switch queueing, which is why PTP without PTP-aware switches degrades toward NTP-class numbers. The BMCA option is the plausible-sounding trap: BMCA does choose the hierarchy, but it ranks priority1, clock class, accuracy, variance, priority2 and clock identity — measured delay is not an input, and hierarchy selection is not what buys precision.",
-      "sourceAnchor": "357-ptp-synchronization",
+      "sourceAnchor": "356-synchronization-and-timestamp-domains--core",
       "difficulty": "recall"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Load-correlated offset excursions with hardware timestamping confirmed is the signature of missing transparent clocks: switch residence time is never subtracted, so queueing shows up directly as path asymmetry. The `phc2sys` answer is the most tempting because forgetting it is the classic PTP error, but `phc2sys` bridges the PHC to the system clock — `ptp4l` is what disciplines the PHC, and its own reported offset would not be affected by `phc2sys` at all.",
-      "sourceAnchor": "357-ptp-synchronization",
+      "sourceAnchor": "356-synchronization-and-timestamp-domains--core",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The two-stage structure is the single most-missed operational detail: network to PHC is `ptp4l`, PHC to `CLOCK_REALTIME` is `phc2sys`, and running only the first gives perfect packet timestamps beside a system clock nobody is steering. The TAI-versus-UTC option is the strongest distractor because the 37 s offset really does exist and really is seconds-scale, but `phc2sys` applies exactly such an offset when told to, so a scale mismatch is configurable rather than unbridgeable.",
-      "sourceAnchor": "358-ptp-hardware-clocks",
+      "sourceAnchor": "356-synchronization-and-timestamp-domains--core",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The cost is physical: crossing PCIe to read a device register is microsecond-class, which is why PHC reads belong only in calibration code and why `PTP_SYS_OFFSET_PRECISE` exists to cross-timestamp atomically. The 'not in the vDSO, so it is a syscall' answer is the trap — the premise is true and a syscall is genuinely more expensive than a vDSO call, but that inference lands two orders of magnitude short because the dominant term is the bus transaction, not the kernel entry.",
-      "sourceAnchor": "358-ptp-hardware-clocks",
+      "sourceAnchor": "356-synchronization-and-timestamp-domains--core",
       "difficulty": "trap"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Monotonicity survives a step because `CLOCK_MONOTONIC` is never set discontinuously, but it is still disciplined, so a slew does change its rate — only `MONOTONIC_RAW` is immune to both. The option claiming a slew touches `REALTIME` alone is the near-miss most people give, and it is exactly why the chapter stresses that `MONOTONIC` tracks true SI seconds rather than the raw oscillator.",
-      "sourceAnchor": "359-clock-steps-slews-and-leap-seconds",
+      "sourceAnchor": "353-choosing-a-clock--core",
       "difficulty": "recall"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The default condattr clock is `CLOCK_REALTIME` and the deadline is absolute, so a backwards step of one hour pushes the wake time an hour into the future. The `wait_for` option is the trap for C++ programmers: `wait_until` with a `system_clock` time point does have this hazard, but `wait_for` is specified in terms of a steady clock and is the recommended form precisely because it does not.",
-      "sourceAnchor": "359-clock-steps-slews-and-leap-seconds",
+      "sourceAnchor": "353-choosing-a-clock--core",
       "difficulty": "trap"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The throttle reserves 5% of each period for non-RT work, which for a thread that never yields means a spectacular 50 ms stall once per second — one of the most confusing failures in this area, fixed with `kernel.sched_rt_runtime_us = -1` plus a watchdog. The inverted-percentage option is the tempting misread: the 950000-of-1000000 figures give RT tasks 95% of the period, not 5%.",
-      "sourceAnchor": "3510-sysctl-procfs-and-sysfs-tuning",
+      "sourceAnchor": "359-host-inventory-and-safe-mutation--runbook",
       "difficulty": "recall"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The PM QoS write pins the cores to shallow idle states for the duration of the run, so `cyclictest` silently measures a machine configured better than yours — a 120 µs residual is exactly C3/C6 exit latency reappearing. The `SCHED_FIFO` 99 option is tempting because RT priority genuinely matters, but priority 99 is throttled like any other RT task, and the 10–100 ppm figure in the raw-clock option could never account for a 100 µs discrepancy.",
-      "sourceAnchor": "3510-sysctl-procfs-and-sysfs-tuning",
+      "sourceAnchor": "359-host-inventory-and-safe-mutation--runbook",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The name is misleading: under `intel_pstate` there are only `performance` and `powersave`, and the latter is a hardware-driven adaptive mode that reacts at roughly 1 ms granularity rather than a fixed low frequency. The 'sampling governor with a 10–100 ms period' answer describes `ondemand` and `conservative` under `acpi-cpufreq`, a different driver stack — `intel_pstate` bypasses the generic governor framework entirely.",
-      "sourceAnchor": "3511-cpu-frequency-governors",
+      "sourceAnchor": "358-conditional-tuning-matrix--core",
       "difficulty": "recall"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A core sitting at 800 MHz needs both a load observation and a voltage ramp before it reaches full speed, so the first message after idle runs at a fraction of steady-state speed — a distinctive bimodal distribution correlated with idle gaps, and the reason busy-polling helps by never letting the core drop down. The `performance`-governor option is the tempting inversion: that governor holds the maximum non-turbo frequency and is recommended precisely because it does not back off when idle.",
-      "sourceAnchor": "3511-cpu-frequency-governors",
+      "sourceAnchor": "358-conditional-tuning-matrix--core",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An `rdtsc` delta is really a time measurement expressed in base-rate ticks, so under turbo the core executed more genuine clocks than the delta suggests — `turbostat`'s `Bzy_MHz` versus `TSC_MHz` columns show the ratio directly. The C1 option is the tempting one because halting on idle was the behaviour of pre-invariant TSCs, but `nonstop_tsc` means the counter runs through C-states, which is exactly the property that makes it usable as a clock.",
-      "sourceAnchor": "3512-turbo-boost",
+      "sourceAnchor": "358-conditional-tuning-matrix--core",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The single-thread gain is worth having on a serialized hot path, but the frequency depends on how many neighbours are active and on thermal headroom, so a code change can appear to help purely because that run happened to be cooler. The p99 option is the exact inversion of the real trade: turbo lowers the mean and p50 while widening the distribution, so it is p99/p99.9 that turbo hurts.",
-      "sourceAnchor": "3512-turbo-boost",
+      "sourceAnchor": "358-conditional-tuning-matrix--core",
       "difficulty": "trap"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "This is by a wide margin the most common 'production is 100× the benchmark' story: a tight benchmark loop keeps the core in C0 while a real, sparsely-loaded feed lets it fall into C6, and the exit dominates a budget measured in microseconds. The inverted C-state option is the tempting one for anyone who has the numbers but not their order — C1 exits in ~1–2 µs and C6 in 50–150 µs, not the other way round.",
-      "sourceAnchor": "3513-cpu-c-states-and-p-states",
+      "sourceAnchor": "358-conditional-tuning-matrix--core",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`idle=poll` does eliminate exit latency, but it burns maximum power on every core, and the heat eats into the turbo budget — so a change made to reduce latency can reduce peak frequency instead. The 'still permits package C-states' answer is seductive because package states really are the worst offenders; the flaw is that a package cannot enter a deep state while any core is spinning in C0, so `idle=poll` genuinely does prevent them.",
-      "sourceAnchor": "3513-cpu-c-states-and-p-states",
+      "sourceAnchor": "358-conditional-tuning-matrix--core",
       "difficulty": "trap"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Latency that changes minutes after boot with no deployment is the fingerprint of `irqbalance` redistributing vectors, and the widely-held belief that `isolcpus` protects against it is simply wrong — the boot-time `irqaffinity=` mask is the durable answer. The `managed_irq` option inverts its meaning: that flag isolates the listed CPUs from managed device interrupts rather than steering them there.",
-      "sourceAnchor": "3514-irq-affinity",
+      "sourceAnchor": "3510-isolation-real-time-and-wake-up-tests--role-specific",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Coalescing is the direct latency-versus-CPU trade, and the low-latency setting is `rx-usecs 0 rx-frames 1 adaptive-rx off`, accepting an interrupt per packet at high CPU cost. The busy-poll answer describes `net.core.busy_poll`, a different knob that happens to use the same units — conflating the two is easy because both are microsecond-valued and both concern how the receive path spends time waiting.",
-      "sourceAnchor": "3514-irq-affinity",
+      "sourceAnchor": "3510-isolation-real-time-and-wake-up-tests--role-specific",
       "difficulty": "recall"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`ksoftirqd/N` is the overflow path — softirqs normally run on return from the hard IRQ, and only the remainder past the budget is deferred to the thread, which runs at normal priority and steals time from you. The `rcu_nocbs` option is the strongest distractor because RCU backlog genuinely can drive softirq load, but offloading sends callbacks to `rcuo` kthreads on other CPUs, so seeing this on an isolated core means the isolation is broken, not working.",
-      "sourceAnchor": "3515-softirqs-and-kernel-workqueues",
+      "sourceAnchor": "359-host-inventory-and-safe-mutation--runbook",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Turning handlers into kthreads is what lets you give the NIC IRQ `SCHED_FIFO` 50 and pin it while demoting a disk IRQ, and the extra context switch is the price — a higher mean for a much better tail, which is the recurring real-time trade. The 'removes the softirq layer' answer is the tempting overreach: threaded handlers can sleep, but softirq processing still exists, and it is PREEMPT_RT that separately threads and accounts it.",
-      "sourceAnchor": "3515-softirqs-and-kernel-workqueues",
+      "sourceAnchor": "359-host-inventory-and-safe-mutation--runbook",
       "difficulty": "recall"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Adaptive-tick mode requires exactly one runnable task, so spawning a second thread on the core — or letting a kernel thread land there — brings the tick back with no diagnostic whatsoever, which is why the chapter insists on verifying with LOC counts rather than trusting the command line. The accounting-tick option is arithmetically self-defeating: a 1 Hz residual tick would produce single-digit counts over ten seconds, not ten thousand.",
-      "sourceAnchor": "3516-kernel-command-line-isolation-options",
+      "sourceAnchor": "3510-isolation-real-time-and-wake-up-tests--role-specific",
       "difficulty": "trap"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Isolation is a set of independent options — `nohz_full` for the tick, `rcu_nocbs` for callbacks, `irqaffinity=` for device interrupts, workqueue cpumasks for `kworker/u*` — and `isolcpus` covers only load balancing and task placement. The 'deprecated no-op' answer is the plausible half-truth: `isolcpus` is deprecated in form and cgroup v2 isolated partitions are the modern complement, but it still functions and is still universally used.",
-      "sourceAnchor": "3516-kernel-command-line-isolation-options",
+      "sourceAnchor": "3510-isolation-real-time-and-wake-up-tests--role-specific",
       "difficulty": "application"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "RT bounds the worst case at the cost of 5–15% throughput and a higher mean, which is a clear win for a hard-deadline control system and usually a loss for a design whose whole strategy is to stay out of the kernel. The 'never merged' claim is the currency-check trap: PREEMPT_RT landed in mainline Linux 6.12 in 2024 after two decades out of tree, so availability is not the reason it is declined.",
-      "sourceAnchor": "3517-preempt_rt",
+      "sourceAnchor": "3510-isolation-real-time-and-wake-up-tests--role-specific",
       "difficulty": "application"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Those four mechanisms are the whole answer, with `raw_spinlock_t` surviving for the few genuinely atomic sites. The 'disable preemption to bound sections' option is the exact inversion of the design: RT makes the kernel more preemptible, so that a high-priority task can interrupt kernel code that is holding a lock rather than waiting behind it.",
-      "sourceAnchor": "3517-preempt_rt",
+      "sourceAnchor": "3510-isolation-real-time-and-wake-up-tests--role-specific",
       "difficulty": "recall"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Secondary modes are diagnostic by their position: 50–150 µs is C-state exit, and millisecond-scale clusters are periodic kernel work. The writeback and compaction option is the closest miss because those really are a documented secondary-mode cause — but they show up at the millisecond scale, an order of magnitude above the 80 µs cluster described here.",
-      "sourceAnchor": "3518-cyclictest",
+      "sourceAnchor": "3510-isolation-real-time-and-wake-up-tests--role-specific",
       "difficulty": "application"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`cyclictest` sums timer delivery, hard IRQ, softirq, scheduler wakeup, context switch and C-state exit — a path a spinning thread never enters, so the two numbers are not comparable. Treating its result as authoritative for your application is the trap; the right move is to keep `cyclictest` as a box-qualification test and measure the hot path with `rdtsc` histograms and `oslat`, which measures how long a busy-spinning thread is stolen from.",
-      "sourceAnchor": "3518-cyclictest",
+      "sourceAnchor": "3510-isolation-real-time-and-wake-up-tests--role-specific",
       "difficulty": "trap"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`compact_stall` counts direct compaction entered from the allocation path, so the cost is paid synchronously in your thread with no warning — the single worst tail-latency source in the memory subsystem, and directly attributable. The `khugepaged` option is the strongest distractor because collapse with TLB shootdowns is a genuine THP stall mechanism, but it is background work counted by `thp_collapse_alloc`, not by `compact_stall`.",
-      "sourceAnchor": "3519-transparent-huge-page-latency-spikes",
+      "sourceAnchor": "3511-vm-cgroups-and-namespaces--role-specific",
       "difficulty": "application"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The insight is that you want huge pages but not transparent ones: reservation moves all the work to boot, so nothing can decide to manufacture a page on your critical path. The 'lazy first touch spreads the cost' answer is the tempting inversion — reserved pages are guaranteed available up front, and spreading compaction across the run is exactly the unbounded-stall behaviour THP is being disabled to avoid.",
-      "sourceAnchor": "3519-transparent-huge-page-latency-spikes",
+      "sourceAnchor": "3511-vm-cgroups-and-namespaces--role-specific",
       "difficulty": "recall"
     },
     {
@@ -572,7 +572,7 @@
       ],
       "correctIndex": 0,
       "explanation": "CFS bandwidth throttling stops the entire cgroup once the quota is spent, so sixteen threads can burn a four-core quota in 25 ms and then sit frozen for 75 ms — `cpu.max` on a trading container is essentially always wrong. Raising `cpu.weight` is the tempting fix because both knobs live on the `cpu` controller, but weight only sets a relative share under contention and has no effect on quota enforcement.",
-      "sourceAnchor": "3520-cgroups-and-namespaces",
+      "sourceAnchor": "3511-vm-cgroups-and-namespaces--role-specific",
       "difficulty": "application"
     },
     {
@@ -586,7 +586,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A `veth` pair plus bridge means the packet is processed by the stack twice, which is why host networking, macvlan, or SR-IOV is the answer for a latency-sensitive container. The 1–2 µs option borrows a real number from elsewhere in the chapter — that is the PCIe MMIO read cost — and applying it here understates the namespace penalty by more than an order of magnitude.",
-      "sourceAnchor": "3520-cgroups-and-namespaces",
+      "sourceAnchor": "3511-vm-cgroups-and-namespaces--role-specific",
       "difficulty": "recall"
     },
     {
@@ -600,7 +600,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`sched_switch` carries both `prev_comm` and `next_comm`, so a per-CPU count names the offender outright — the single most useful jitter query in the chapter's methodology, with `ftrace`'s `preemptirqsoff` and `wakeup_rt` following up for the causal kernel path. The `perf stat` option is the plausible near-miss: counting mode aggregates totals and has no notion of which task displaced yours, and `strace` only ever sees syscalls made by the process it is attached to.",
-      "sourceAnchor": "3521-ebpf-ftrace-and-bpftrace",
+      "sourceAnchor": "3512-tracing-and-device-topology--reference-runbook",
       "difficulty": "application"
     },
     {
@@ -614,7 +614,7 @@
       ],
       "correctIndex": 0,
       "explanation": "In-kernel aggregation is the whole distinction: no per-event user-space wakeup, which is why the overhead is 1–10% rather than `strace`'s 100–500×. The 'only static tracepoints' option is the tempting half-truth — tracepoints are the cheapest and most stable attach point, but eBPF also attaches to kprobes, fentry/fexit trampolines, uprobes and PMU events, and nothing about tracepoint delivery is batched per jiffy.",
-      "sourceAnchor": "3521-ebpf-ftrace-and-bpftrace",
+      "sourceAnchor": "3512-tracing-and-device-topology--reference-runbook",
       "difficulty": "recall"
     },
     {
@@ -628,7 +628,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because DDIO puts the packet in cache rather than DRAM, the local case gets much better while the remote case turns into a cross-socket line transfer plus interconnect contention — so the gap between correct and incorrect placement widens. The 'writes straight to DRAM' option is tempting for anyone who remembers DMA as a memory operation; that was the pre-DDIO behaviour, and under it locality would matter less, not more.",
-      "sourceAnchor": "3522-pcie-topology-for-device-locality",
+      "sourceAnchor": "3512-tracing-and-device-topology--reference-runbook",
       "difficulty": "trap"
     },
     {
@@ -642,7 +642,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Posted versus non-posted is the entire distinction: a write is fire-and-forget while a read stalls the core for a full PCIe round trip, roughly the size of an entire tick-to-trade budget. The IOMMU option is the plausible-sounding trap — `iommu=pt` exists precisely so DMA avoids per-transfer translation, so passthrough mode removes that cost rather than imposing it.",
-      "sourceAnchor": "3522-pcie-topology-for-device-locality",
+      "sourceAnchor": "3512-tracing-and-device-topology--reference-runbook",
       "difficulty": "application"
     }
   ]

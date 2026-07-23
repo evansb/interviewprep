@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Channels are the parallelism unit that carries bandwidth: each has its own command and data path, so per-channel rates add. The rank-based answer is the tempting one because ranks do overlap internal operations, but ranks share one channel's bus and therefore share, not multiply, its bandwidth. Bank groups likewise affect back-to-back timing (tCCD_S vs tCCD_L), not aggregate throughput.",
-      "sourceAnchor": "291-dram-channels-ranks-banks-and-rows",
+      "sourceAnchor": "292-dram-cells-rows-banks-and-address-selection--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The controller scatters bank and rank bits through the physical address, so a pathological stride can land every request on the same bank, converting bank-level parallelism into a serial queue of row conflicts. It is the DRAM analogue of cache-set conflict. Blaming split lines is the plausible near-miss: a fixed large stride keeps each access inside one line, and split lines are an L1 effect, not a bank effect. Refresh is driven by tREFI and temperature, never by an access pattern.",
-      "sourceAnchor": "291-dram-channels-ranks-banks-and-rows",
+      "sourceAnchor": "292-dram-cells-rows-banks-and-address-selection--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The costs accumulate as work is added: a hit pays only tCL, an empty bank adds tRCD to activate a row, and a conflict additionally pays tRP to precharge the wrong row first. The ordering that puts the conflict cheapest inverts the whole model — closing a row is extra work, never a shortcut. Note these are device times only; controller queuing and interconnect traversal push end-to-end local DRAM to 70–100 ns.",
-      "sourceAnchor": "292-row-buffer-behavior",
+      "sourceAnchor": "292-dram-cells-rows-banks-and-address-selection--core",
       "difficulty": "recall"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Many concurrent random streams per bank mean the open row is almost always the wrong one, so the device pays tRP+tRCD+tCL, and the controller's queue is deep because utilization is high. The closed-page answer is the most tempting because closed-page really is the better policy for random workloads, but it turns accesses into row-empty (~33 ns), not row hits — it reduces the penalty, it does not remove it. The row buffer is direct-mapped per bank, not a shared victim cache.",
-      "sourceAnchor": "292-row-buffer-behavior",
+      "sourceAnchor": "292-dram-cells-rows-banks-and-address-selection--core",
       "difficulty": "application"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "First-Ready comes before First-Come-First-Served: row hits are cheap enough that promoting them raises bus utilization substantially, and age is only the tiebreak. Reversing that priority is the near-miss — it sounds fairer and is what the expanded name suggests if you read it backwards, but it throws away most of the row-buffer benefit. Strict arrival order is wrong too: the IMC is a reordering engine, one more layer of reordering beneath the core's own.",
-      "sourceAnchor": "293-memory-controllers",
+      "sourceAnchor": "293-memory-controllers-bandwidth-latency-and-queueing--core",
       "difficulty": "recall"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Shared queues, not shared data, are what couple the two processes — which is exactly why you must leave bandwidth headroom in a latency-critical deployment, and why `mlc --loaded_latency` is the tool that demonstrates it. The row-buffer answer is tempting because row conflicts are real contention, but the row buffer belongs to a bank, not to a core, and the dominant effect here is queuing delay. The curve is hyperbolic well before saturation, not a step at 100%, and the IMC has no notion of scheduler priority.",
-      "sourceAnchor": "293-memory-controllers",
+      "sourceAnchor": "293-memory-controllers-bandwidth-latency-and-queueing--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An L1 miss must occupy a fill buffer for its whole lifetime, so 10–16 of them is the literal cap on outstanding line fetches, which is why one core tops out near 12 × 64 B / 80 ns ≈ 10 GB/s. The L2 figure is the seductive one because it is a real number in the same table, but it is a superset that can never be filled past what the LFBs allow. The ROB only bounds how far ahead you can look for independent misses; it does not track them.",
-      "sourceAnchor": "294-memory-level-parallelism",
+      "sourceAnchor": "294-memory-level-parallelism-and-loadstore-machinery--core",
       "difficulty": "recall"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Pointer chasing is MLP=1 by construction: the dependence is on the load's *result*, so neither ROB capacity nor prefetch capacity nor the hardware prefetcher has anything to work with. The fill-buffer answer is the trap because the premise is true — a prefetch really is a non-blocking miss that raises MLP — but you cannot issue one for an address you do not yet have. The ~3 ms figure is what an array scan of the same data costs, which is the point of the 25× comparison.",
-      "sourceAnchor": "294-memory-level-parallelism",
+      "sourceAnchor": "294-memory-level-parallelism-and-loadstore-machinery--core",
       "difficulty": "trap"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Concurrency equals bandwidth times latency, and dividing the required 250 outstanding lines by a per-core capacity of 12 gives roughly 21 cores — the rigorous form of \"one core cannot saturate memory.\" The version that treats the fill buffers as socket-wide is the most tempting error: they are per-core, which is precisely why the answer scales with core count rather than being fixed. Assuming one line per core ignores that a core can overlap 10–16 misses.",
-      "sourceAnchor": "295-memory-bandwidth-and-latency",
+      "sourceAnchor": "293-memory-controllers-bandwidth-latency-and-queueing--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "All three symptoms point the same way: high MLP plus near-peak DRAM counters plus flat thread scaling is the signature of a bandwidth limit, and the only lever is moving fewer bytes. The prefetch-and-batch answer is the classic misdiagnosis — it is the right fix for the opposite signature, where MLP sits at 1–2 and the counters are far below peak. Compression is also a latency-bound remedy, and here it would add CPU cost for no bandwidth relief beyond what a layout change gives.",
-      "sourceAnchor": "295-memory-bandwidth-and-latency",
+      "sourceAnchor": "293-memory-controllers-bandwidth-latency-and-queueing--core",
       "difficulty": "trap"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Fill buffers track outstanding cache-line fills, so \"fill buffers full\" is an unambiguous statement that you have hit the MLP ceiling described in §29.4 — it is the counter to name when asked to prove memory-parallelism limitation. The store-buffer reading is the tempting confusion because that stall is real and common, but it has its own counter, `resource_stalls.sb`. Write-combining pressure shows up as poor PCIe/NT store efficiency, not as fill-buffer occupancy.",
-      "sourceAnchor": "296-load-store-queues",
+      "sourceAnchor": "294-memory-level-parallelism-and-loadstore-machinery--core",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The FIFO store buffer gives StoreStore ordering with no instruction at all, and the entire cost of seq_cst is closing the one reordering x86 permits, via `xchg` or `mfence`. The bypass-to-L1 answer is the plausible near-miss: every store on x86 goes through the store buffer and drains only after retirement, so no store is exempt. Both kinds of store need the line in M/E eventually, so RFO is not what distinguishes them.",
-      "sourceAnchor": "297-store-buffers",
+      "sourceAnchor": "294-memory-level-parallelism-and-loadstore-machinery--core",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A UC store is uncached, uncombined, and strongly ordered — each is a separate PCIe transaction of hundreds of nanoseconds, and since stores drain in order the buffer backs up and stalls retirement. WC mapping is exactly why NIC drivers map doorbells that way: writes buffer and a 64-byte descriptor can merge into one TLP. Adding a fence is the tempting inversion — fences force *more* serialized draining, which is what destroys store throughput, not what relieves it. Device registers are not cached, so no RFO is involved.",
-      "sourceAnchor": "297-store-buffers",
+      "sourceAnchor": "294-memory-level-parallelism-and-loadstore-machinery--core",
       "difficulty": "trap"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Full physical addresses are not available until translation completes, so the core compares the page-offset bits for speed and accepts occasional false positives — hence the classic anomaly where two buffers separated by exactly a page run slower than the same buffers separated by 4160 bytes. The counter is `ld_blocks_partial.address_alias`. The L1-set answer is the tempting one because conflict misses are a real effect at similar strides, but this stall happens even when both lines are resident; it is a disambiguation false positive, not an eviction.",
-      "sourceAnchor": "298-memory-disambiguation",
+      "sourceAnchor": "294-memory-level-parallelism-and-loadstore-machinery--core",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The disambiguation logic sees matching offsets within the page and stalls the load until the older store's real address resolves, roughly 5 cycles per iteration — visible precisely because the offset is *exactly* a multiple of 4096 and gone at 4160. The split-page answer is the strongest distractor since split-page accesses are genuinely costly, but nothing here straddles a boundary: both accesses are aligned within their own pages. Bank conflicts are a DRAM effect and would not vanish from a 64-byte change in offset.",
-      "sourceAnchor": "298-memory-disambiguation",
+      "sourceAnchor": "294-memory-level-parallelism-and-loadstore-machinery--core",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Forwarding requires the load to be fully contained in a *single* store, so two narrow stores feeding one wide load is the canonical failure — the load must wait for both to reach L1. The narrower-load case is the tempting near-miss: a contained, aligned 4-byte load out of an 8-byte store usually forwards fine. A same-address, same-width pair is the ideal case at about 5 cycles, and a load to a different address never needed forwarding in the first place.",
-      "sourceAnchor": "299-store-to-load-forwarding",
+      "sourceAnchor": "294-memory-level-parallelism-and-loadstore-machinery--core",
       "difficulty": "recall"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The store buffer is per-core and invisible to other cores, so a peer core simply waits for the producer's stores to drain and for the line to arrive coherently — forwarding is not in the picture at all. The STLF-failure answer is the trap because that exact write pattern *does* cause forwarding failures when the same core reads it back; the cross-core detail is what changes the answer, and it is a distinction interviewers probe deliberately. Disambiguation is likewise an intra-core mechanism.",
-      "sourceAnchor": "299-store-to-load-forwarding",
+      "sourceAnchor": "294-memory-level-parallelism-and-loadstore-machinery--core",
       "difficulty": "trap"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Writing requires M or E, so a shared line must first be upgraded by invalidating all peers and collecting their acknowledgements — this is the hidden cost behind write-allocate's doubled traffic, false-sharing ping-pong, and contended `fetch_add`. The write-then-invalidate-later answer is the tempting one because it describes how an incoherent or write-back-buffered system might behave, but it would break coherence: a peer could read stale data after the write became visible locally.",
-      "sourceAnchor": "2910-read-for-ownership",
+      "sourceAnchor": "298-remote-coherence-read-for-ownership-and-sharing--core",
       "difficulty": "recall"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Privatizing the data removes sharing, which removes the invalidation round trip entirely — the only structural fix. Relaxed `fetch_add` is the most tempting because relaxed genuinely does relax ordering, but on x86 every `lock`-prefixed op is a full barrier and still needs the line in M, so the code generated is identical and the RFO remains. Padding to 64 bytes is a real fix for *false* sharing, but here the cores contend for the same counters, so the invalidations survive the padding; `volatile` affects only the compiler.",
-      "sourceAnchor": "2910-read-for-ownership",
+      "sourceAnchor": "298-remote-coherence-read-for-ownership-and-sharing--core",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "WC memory is weakly ordered even on x86 and the buffer flushes only when full, on a fence or lock, on a serializing instruction, or on a context switch — so without the trailing fence the doorbell can sit indefinitely and the packet goes out at an arbitrary later moment. The stale-descriptor answer is the tempting one because it is exactly what the *first* `sfence` prevents; that fence is present here, so ordering between descriptor and doorbell is fine. Posted writes are never acknowledged, so no completion timeout can occur.",
-      "sourceAnchor": "2911-write-combining",
+      "sourceAnchor": "2910-split-accesses-and-write-combining--role-specific",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The whole point is combining plus buffering: one 64-byte TLP instead of four serialized transactions, which many NICs also require for their whole-descriptor fast path. The ordering answer inverts reality — UC is the strongly ordered type and WC is the documented weak-ordering exception to x86-TSO, which is why the fences are needed. Reads from WC memory are uncached, slow, and force a flush, so they are never a reason to choose it.",
-      "sourceAnchor": "2911-write-combining",
+      "sourceAnchor": "2910-split-accesses-and-write-combining--role-specific",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Atomicity normally comes from holding one line in M and refusing snoops; when the operand spans two lines that trick fails and the fallback serializes the whole coherence fabric — about 1,000 cycles for the issuing core plus tens of microseconds of machine-wide disruption. The two-RFO answer is the most plausible wrong model: it sounds like a bounded 2× cost, and the reason split locks are notorious is precisely that the cost is *not* bounded to the offending core. Cross-socket HITM is expensive but is ordinary coherence, not a bus lock.",
-      "sourceAnchor": "2912-split-line-and-split-page-accesses",
+      "sourceAnchor": "2910-split-accesses-and-write-combining--role-specific",
       "difficulty": "recall"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`std::atomic<T>` is naturally aligned by the implementation, so you can only get a split lock by defeating that — packing, `atomic_ref` over a misaligned member, hand-written `lock cmpxchg`, or an atomic inside a parsed-in-place wire struct. Sharing a line between several atomics is the tempting answer because it genuinely hurts, but that is false sharing: each operand is still wholly within one line, so the normal M-state mechanism applies. Heavy contention and relaxed ordering change cost, not alignment.",
-      "sourceAnchor": "2912-split-line-and-split-page-accesses",
+      "sourceAnchor": "2910-split-accesses-and-write-combining--role-specific",
       "difficulty": "trap"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Total Store Order means stores are seen by all cores in one agreed order and the store buffer's lazy drain is the single permitted relaxation, StoreLoad — the reason Dekker's litmus test can produce r1==0 && r2==0. The variant that also allows Store→Store is the most tempting, but the store buffer is FIFO, which is exactly what makes release stores free on x86. Non-temporal stores, WC memory and `clflushopt` are the documented exceptions to all of this.",
-      "sourceAnchor": "2913-x86-tso",
+      "sourceAnchor": "299-hardware-ordering-at-the-useful-level--role-specific",
       "difficulty": "recall"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The entire cost of a seq_cst store on x86 is the `xchg` or `mfence` that closes StoreLoad reordering; a release store is a plain `mov`, so this is one of the highest-yield atomics changes on the platform. Touching the load side is the tempting near-miss: all x86 loads are already acquire and seq_cst loads compile to a plain `mov`, so there is nothing there to save. A `lock`-prefixed RMW costs about 20 cycles and is a full barrier — no cheaper, and semantically different.",
-      "sourceAnchor": "2913-x86-tso",
+      "sourceAnchor": "299-hardware-ordering-at-the-useful-level--role-specific",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "ARM permits Load→Load reordering, so without `ldar` on the consumer the payload load can execute before the pointer load returns — the single most common real-world weak-memory bug, and invisible on x86 where every load is already acquire. Multi-copy atomicity is the sharpest distractor: ARMv8 really does have it, but it constrains *when a store becomes visible to all cores*, not the order in which the reading core issues its own two loads. Nothing here faults; a wrong memory order is a data race, not a trap.",
-      "sourceAnchor": "2914-weak-hardware-memory-ordering",
+      "sourceAnchor": "299-hardware-ordering-at-the-useful-level--role-specific",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The trick works because any `lock`-prefixed operation is a full barrier at roughly 20 cycles, cheaper than `mfence`'s 30–40, and the top of the current stack is guaranteed already owned so the RFO is free. The \"no coherence traffic\" answer inverts this: the instruction needs the line in M and its cheapness comes from that being already true, not from avoiding ownership. It is a real instruction with real ordering effects, so calling it a compiler barrier is wrong.",
-      "sourceAnchor": "2915-hardware-memory-barriers",
+      "sourceAnchor": "299-hardware-ordering-at-the-useful-level--role-specific",
       "difficulty": "recall"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`volatile` prevents the compiler eliding or reordering accesses to the volatile object and nothing more — it constrains hardware not at all — and `sfence` exists for non-temporal stores and WC memory, being a no-op for normal write-back stores that x86 already orders. The \"correct on x86, broken on ARM\" answer is the tempting half-truth: `volatile` inter-thread communication is a data race everywhere; it merely happens to survive on x86 because TSO already gives the ordering. `lfence` orders loads, not stores.",
-      "sourceAnchor": "2915-hardware-memory-barriers",
+      "sourceAnchor": "299-hardware-ordering-at-the-useful-level--role-specific",
       "difficulty": "trap"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "x86 gives no cheaper atomic RMW than a `lock` op, and that op is unconditionally a full barrier, so the requested order changes nothing in the emitted instruction — on ARM with LSE, `ldadd` versus `ldaddal` genuinely do differ. The extra-`mfence` answer is the most tempting because that pattern is exactly what a seq_cst *store* looks like; an RMW is already ordered, so no fence is appended. Dropping the `lock` prefix would simply not be atomic.",
-      "sourceAnchor": "2916-locked-instructions-and-atomic-operations",
+      "sourceAnchor": "299-hardware-ordering-at-the-useful-level--role-specific",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Every CAS attempt, successful or not, RFOs the line away from the other cores, so the line ping-pongs N times per update; test-and-test-and-set removes the useless RFOs, and exponential backoff with `pause` complements it. The strong-CAS answer is the tempting one because spurious failure is real — but only on LL/SC machines, and `compare_exchange_strong` is implemented as the same retry loop, so the coherence traffic is unchanged. Replicating the head would break the algorithm: all threads must agree on one head.",
-      "sourceAnchor": "2916-locked-instructions-and-atomic-operations",
+      "sourceAnchor": "299-hardware-ordering-at-the-useful-level--role-specific",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "SNC partitions the mesh, LLC and memory controllers into 2–4 NUMA nodes so that a correctly pinned thread takes fewer hops — a real 10–15% memory-latency win, but only if placement follows. Without pinning you have simply created new remote paths inside a socket. The forced-interleave answer is tempting because interleaving genuinely does spread allocations, but SNC changes the topology exposed to the kernel; the default policy remains local-first, which is exactly why pinning determines the outcome.",
-      "sourceAnchor": "2917-numa-topology",
+      "sourceAnchor": "295-numa-topology-and-the-localremote-path--core",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Linux places a physical page in the page-fault handler on the node of the CPU that first touches it, so single-threaded initialization strands the whole array on one node and roughly half the parallel accesses become remote at 1.6–2.2× the latency. Parallel first touch with the same decomposition is the canonical fix. The allocation-time answer is the tempting one — `malloc`/`mmap` only create a VMA, and no physical page exists until the fault — and pages are never migrated by ordinary reads.",
-      "sourceAnchor": "2918-first-touch-allocation",
+      "sourceAnchor": "296-first-touch-memory-policy-and-migration--core",
       "difficulty": "application"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Recycling across threads is the classic slow leak of NUMA locality: the physical page keeps its original node forever, so a block first-touched on node 0 and later handed to a node-1 thread is remote for the rest of its life — the fix is per-node or per-thread arenas first-touched at startup. Automatic NUMA balancing is the tempting alternative because it really does migrate pages at unpredictable times, but it moves pages *toward* the accessing node, and it is the thing you disable for latency-critical work, not a source of drift toward remote. Transparent huge pages compound the problem by binding 2 MB at a time to one node.",
-      "sourceAnchor": "2918-first-touch-allocation",
+      "sourceAnchor": "296-first-touch-memory-policy-and-migration--core",
       "difficulty": "trap"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Remote DRAM runs about 1.6–2.2× local, and a line dirty in a remote core's cache is worse still because the request must reach the owner and pull the data back across the interconnect. The compressed variant is the seductive one: it gets the ordering right but understates the penalty so badly that it would make NUMA placement not worth doing — and the whole design discipline of pinning threads, memory and NICs to one node rests on the gap really being that large. The ~20 ns figure belongs to a local LLC hit.",
-      "sourceAnchor": "2919-remote-memory-access",
+      "sourceAnchor": "295-numa-topology-and-the-localremote-path--core",
       "difficulty": "recall"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Updates to one line serialize globally, and each handoff pays the remote-HITM cost, so the reciprocal of a few hundred nanoseconds is the whole throughput budget — which is why hot shared structures must never span nodes and read-mostly data should be replicated per node. The bandwidth answer is the tempting one because interconnect bandwidth really is 5–8× below local, but a few million 64-byte transfers per second is a trickle; the limit here is latency in a serialized chain. Bus locks come from split operands, not from remote ownership.",
-      "sourceAnchor": "2919-remote-memory-access",
+      "sourceAnchor": "295-numa-topology-and-the-localremote-path--core",
       "difficulty": "application"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "AMD's L3 is per-CCX, so there is no cheap \"another core's L3\" — within the CCX is fast at roughly 40 cycles, but crossing to another CCD goes over the fabric through the IO die and costs 100+ ns even inside a single NUMA node. The unified-L3 answer is the tempting mental transplant from Intel's shared, sliced LLC. NPS settings can expose CCD groupings as nodes, but CCX/CCD boundaries matter independently of whatever NPS mode is configured.",
-      "sourceAnchor": "2920-cpu-interconnects",
+      "sourceAnchor": "2912-cpu-interconnects-ddio-and-memory-tiers--reference",
       "difficulty": "recall"
     },
     {
@@ -516,7 +516,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Everything must land on the NIC's node — sysfs tells you which one, irqbalance must be stopped or it silently undoes the affinity, and first touch by the already-pinned thread places the buffers. Matching the thread to the buffers on node 1 is the tempting partial fix: it removes two crossings but leaves the NIC's DMA and every descriptor poll crossing the interconnect, which under DDIO is worse still since the packet lands in node 0's LLC. Interleaving trades latency for bandwidth, and NUMA balancing adds unpredictable migrations and TLB shootdowns.",
-      "sourceAnchor": "2921-thread-memory-and-nic-numa-locality",
+      "sourceAnchor": "2911-thread-memory-nic-and-dma-locality--role-specific",
       "difficulty": "application"
     },
     {
@@ -530,7 +530,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Reads are non-posted: the CPU must wait for a completion TLP, and the load cannot retire meanwhile, so each poll burns a microsecond of core time — which is why every well-designed fast path polls host memory that the device DMA-wrote, at tens of nanoseconds via cache or DDIO. Calling the read posted inverts the key distinction; posted writes are the fire-and-forget direction at 100–300 ns. WC mapping helps doorbell *writes*, and reading WC memory is itself slow and forces a flush.",
-      "sourceAnchor": "2922-pcie-and-dma",
+      "sourceAnchor": "2911-thread-memory-nic-and-dma-locality--role-specific",
       "difficulty": "application"
     },
     {
@@ -544,7 +544,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Strict invalidation means every buffer unmap synchronously flushes the IOTLB, and that flush is a round trip to the device — the dominant per-packet cost at high PPS, which is why `iommu=pt` identity-maps host-owned devices and why DPDK maps its huge-page pool once at startup. IOTLB misses causing I/O page walks are the tempting partial answer: they cost hundreds of nanoseconds and are real, but they are what huge pages and a static mapping already mitigate, whereas map/unmap churn is what strict mode specifically adds. DMA on x86 stays coherent in every IOMMU mode.",
-      "sourceAnchor": "2923-iommu",
+      "sourceAnchor": "2911-thread-memory-nic-and-dma-locality--role-specific",
       "difficulty": "application"
     },
     {
@@ -558,7 +558,7 @@
       ],
       "correctIndex": 0,
       "explanation": "DDIO's inbound allocation is confined to a small slice of the LLC, so an oversized ring plus buffer pool thrashes it: packets land in the LLC and are evicted before being read, giving the DRAM path *and* the eviction traffic — hence the counterintuitive guidance that a smaller ring is faster, with 512–1024 descriptors typical. The IOTLB answer is the tempting one because huge-page IOTLB coverage is a genuine DPDK concern, but DPDK maps its pool once at startup and ring size does not change that; the observable signature here is a rising DDIO miss rate in `pcm-iio` as packet rate climbs.",
-      "sourceAnchor": "2924-intel-ddio",
+      "sourceAnchor": "2912-cpu-interconnects-ddio-and-memory-tiers--reference",
       "difficulty": "trap"
     }
   ]

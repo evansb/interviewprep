@@ -1,488 +1,798 @@
 # Chapter 11 — Sequence Containers
 
-*Interview-focused revision notes. The theme: every sequence container is a different answer to one question — where do the elements live relative to each other in memory — and on modern hardware that single choice dominates asymptotic complexity, iterator stability, and allocation behavior alike.*
+## Why this matters — Core
+
+Container choice is a joint decision about **layout, mutation, handle stability, and allocation**. `std::vector` is often the right starting point because contiguous traversal and compact storage suit modern processors, but “use vector by default” is not a complete engineering argument. A vector that grows on the critical path can allocate and move every element. A deque keeps references stable during end insertion but is segmented and can still allocate. A list keeps all surviving elements stationary but normally pays for a node allocation and a dependent pointer load per element.
+
+The interview-quality answer therefore starts with a workload:
+
+1. Is the maximum count fixed, bounded, or unbounded?
+2. Is access a scan, indexed access, end mutation, or mutation at a known position?
+3. Must pointers, references, or iterators survive a mutation?
+4. May allocation or element movement occur in the latency-critical phase?
+5. Is overflow impossible by contract, an error, or a condition that needs backpressure?
+
+Those questions usually select the representation before Big-O notation does. This chapter covers the C++23 standard library and clearly labels non-standard alternatives. C++23 has no standard fixed-capacity vector named `std::inplace_vector`; that type belongs to a later standard. In C++23 code, a fixed-capacity vector is a third-party or application type.
 
 ---
 
-## 11.1 `std::array`
+## 90-second screen — Core
 
-`std::array<T, N>` is an **aggregate** wrapping a raw `T[N]`. It has no constructors, no allocator, no dynamic storage, and — critically — no indirection: the elements *are* the object.
+1. `std::array<T, N>` stores exactly `N` contiguous `T` objects inline. `std::vector<T>` stores a variable number of contiguous `T` objects in allocator-provided storage. `std::deque<T>` is random-access but not contiguous. `std::list` and `std::forward_list` are node-based.
+2. For `vector`, reallocation invalidates every iterator, pointer, and reference. Without reallocation, insertion invalidates handles at or after the insertion point; erasure invalidates handles at or after the erased position.
+3. For `deque`, insertion at either end invalidates iterators but preserves pointers and references to existing elements. Middle insertion or erasure has much broader invalidation. Never infer pointer stability from iterator stability or vice versa.
+4. `reserve` changes vector capacity, not size. Reserve once before a growth phase when a useful bound is known. Calling `reserve(size() + 1)` before every append defeats amortized growth and produces quadratic movement.
+5. List insertion is O(1) only after the position is known. A search followed by insertion is still O(n), with poor locality. Lists are compelling when a stable iterator is already available and nodes must be spliced or erased.
+6. A bounded inline vector avoids allocation but needs an explicit overflow policy. A small-vector-optimized type is different: it stores a small count inline and allocates when that count is exceeded.
+7. A fixed-capacity ring is usually the sequence for bounded FIFO traffic. It needs a separate concurrency protocol if producer and consumer are different threads; container layout alone does not make a queue thread-safe.
 
-```cpp
-template <class T, size_t N>
-struct array {
-    T __elems[N];        // the entire representation
-    // ... member functions, no data
-};
-static_assert(sizeof(std::array<int, 8>) == 32);
-static_assert(std::is_trivially_copyable_v<std::array<int, 8>>);
-static_assert(std::is_standard_layout_v<std::array<int, 8>>);
-```
+Two choices to defend:
 
-Because it is an aggregate with a public array member, `std::array` is standard-layout and trivially copyable whenever `T` is (Ch. 3 §3.5, §3.6). It can go in shared memory, be `memcpy`'d, be an NTTP in C++20, and be used in `constexpr` code end to end.
-
-### What it buys over `T[N]`
-
-| Property | `T arr[N]` | `std::array<T,N>` |
-|---|---|---|
-| Decays to a pointer | **Yes** (Ch. 2 §2.15) | No |
-| Knows its size after passing | No | `size()` |
-| Assignable / copyable | No | Yes (element-wise) |
-| Returnable from a function | No | Yes |
-| Comparison operators | Pointer comparison (a bug) | Lexicographic (`<=>` in C++20) |
-| Works with range-for, `begin`/`end` | Yes (via ADL `std::begin`) | Yes |
-| Bounds-checked access | No | `at()` throws |
-| Zero-size case | Ill-formed (`T x[0]` is a GNU extension) | `array<T,0>` is valid, `empty()`, `data()` may return null, **`begin()==end()`**, `front()`/`back()` are UB |
-
-### Initialization traps
-
-```cpp
-std::array<int, 3> a;         // DEFAULT-init: elements are INDETERMINATE for trivial T
-std::array<int, 3> b{};       // value-init: all zero
-std::array<int, 3> c{1};      // {1, 0, 0} — remaining elements value-initialized
-std::array<int, 3> d = {1,2,3};
-std::array<std::array<int,2>,2> e{{{1,2},{3,4}}};   // the double-brace question
-```
-
-The double brace is because `array` has one member (the inner C array), so brace elision applies but is not always deducible; `{{...}}` is always correct. C++17 CTAD gives `std::array a{1,2,3};` → `array<int,3>`, and `std::to_array` (C++20) handles the cases CTAD cannot, notably `to_array("hi")` → `array<char,3>` and arrays of non-copyable types from a braced list.
-
-### Structured bindings and tuple protocol
-
-`std::array` models the tuple protocol (`tuple_size`, `tuple_element`, `get<I>`), so `auto [x, y, z] = a;` works and `std::get<I>(a)` is compile-time bounds-checked — unlike `a[i]`, which is unchecked, and `a.at(i)`, which throws.
-
-### Low-latency notes
-
-- **Zero indirection**: iterating `array<T,N>` is iterating a contiguous block; the hardware prefetcher (Ch. 28) handles it perfectly. Contrast `vector`, where the data is one pointer dereference away and typically on a different page from the container object.
-- **`alignas` composes**: `alignas(64) std::array<double, 8> v;` gives you a cache-line-aligned, SIMD-friendly block (Ch. 42).
-- **Large `array` as a member is a stack-size hazard.** `std::array<char, 1<<20>` as a local blows an 8 MB default stack in 8 frames and can skip the guard page on older compilers (`-fstack-clash-protection` mitigates; Ch. 32).
-- **Passing by value copies all N elements.** Take `const std::array&`, or better `std::span<const T>` (Ch. 13) to accept any contiguous range.
-- `std::array` is the natural element type for fixed-shape market-data messages and for lookup tables that you want in `.rodata` (`constexpr std::array` is a compile-time table with no static initialization order concerns — Ch. 5).
+- Choose `vector` for append-then-scan data when handles do not cross a reallocating mutation; reserve before the measured hot phase if a bound is available.
+- Choose stable storage or stable generational handles when other components retain element identity. Do not repair a dangling-pointer design by hoping that capacity will be “large enough.”
 
 ---
 
-## 11.2 `std::vector`
+## 11.1 The governing model: storage topology — Core
 
-`std::vector<T>` is a contiguous, dynamically-sized array. Every mainstream implementation stores **three pointers**:
+All of these containers maintain an ordered sequence, but they place its elements differently:
 
+```text
+array object:   [ T ][ T ][ T ][ T ]             fixed, contiguous, inline
+
+vector object:  [metadata] ──> [ T ][ T ][ T ]   variable, contiguous allocation
+                                      [spare]
+
+deque object:   [metadata] ──> [block][block]...  variable, segmented
+                                [T T]  [T T]
+
+list object:    [metadata] ──> [links|T] <─> [links|T] <─> ...
 ```
-struct vector {
-    T* begin_;      // start of the buffer
-    T* end_;        // one past the last constructed element   → size()     = end_ - begin_
-    T* cap_;        // one past the allocated buffer            → capacity() = cap_ - begin_
-};
-sizeof(std::vector<int>) == 24 on x86-64 (libstdc++, libc++)
+
+The standard guarantees the observable properties—contiguity, complexity, and invalidation—not these exact metadata layouts. Implementations are free to represent a vector, deque, or list differently while preserving the specified behavior. Code must not copy container objects with `memcpy`, assume a particular `sizeof`, or calculate a deque block boundary.
+
+### Common sequence operations
+
+Sequence containers organize elements by position rather than by key. Their interfaces overlap, but the overlap is not complete:
+
+| Operation or property | `array` | `vector` | `deque` | `list` | `forward_list` |
+|---|---:|---:|---:|---:|---:|
+| Fixed size | Yes | No | No | No | No |
+| Contiguous elements | Yes | Yes | No | No | No |
+| Constant-time indexed access | Yes | Yes | Yes | No | No |
+| Constant-time insertion at back | — | Amortized | Yes | Yes | — |
+| Constant-time insertion at front | — | No | Yes | Yes | Yes |
+| Constant-time insertion at a known middle position | — | No | No | Yes | Yes, after predecessor |
+| Iterator category | Random access, contiguous | Random access, contiguous | Random access | Bidirectional | Forward |
+| Allocator-aware | No | Yes | Yes | Yes | Yes |
+
+“Constant time” does not mean fixed latency. A deque end insertion may allocate a block; a list insertion normally allocates a node; a vector append occasionally reallocates and moves the existing sequence. Complexity counts operations as input size grows. It does not bound allocator locks, page faults, cache misses, element constructor work, or exception paths.
+
+`std::array` is the fixed-size exception to most mutating sequence APIs: it has no `insert`, `erase`, `push_back`, or `clear` because all `N` elements always exist. `std::forward_list` uses `insert_after` and `erase_after`; a singly linked node does not know its predecessor.
+
+### Contiguous versus segmented versus node-based
+
+Contiguous storage gives three practical advantages:
+
+- A scan reads densely packed bytes and exposes predictable addresses to hardware prefetching.
+- Indexed access is address arithmetic.
+- The range can be passed as `std::span<T>` or as a pointer and length to an appropriate C interface.
+
+Its main cost is displacement. Growing a vector beyond capacity moves or copies existing elements into a new allocation. Inserting in the middle shifts the suffix even when capacity is available.
+
+Segmented storage avoids moving the whole sequence when it grows at an end. A deque typically manages separately allocated blocks through indexing metadata. The standard does not specify the block size or the form of that metadata. Indexed access remains O(1), but a range can cross block boundaries and `data()` is unavailable.
+
+Node-based storage makes the address of each surviving element independent of changes elsewhere. That stability costs link fields, allocation metadata, and pointer chasing. The next node's address becomes known only after reading the current node, which forms a dependency chain. The penalty depends on node placement and cache residency; it is not a universal number of nanoseconds.
+
+### A compact decision flow
+
+```text
+Fixed element count known at compile time?
+  yes ──> array
+  no
+   │
+Hard maximum with no allocation allowed?
+  yes ──> fixed-capacity inline vector, array+size, or ring
+  no
+   │
+Need FIFO overwrite/wrap or bounded producer-consumer traffic?
+  yes ──> ring, with a separate synchronization protocol if shared
+  no
+   │
+Need surviving element addresses stable across mutation?
+  end insertion only ──> consider deque
+  arbitrary splice/erase with a held iterator ──> consider list/intrusive list
+  identity outlives storage changes ──> pool/slab plus generational handle
+  no ──> vector
 ```
 
-libstdc++ and libc++ both use pointer triples; MSVC also uses three pointers. A size/capacity pair of `size_t` would be the same 24 bytes but requires an extra add per dereference, which is why pointers won.
-
-The vector object itself is 24 bytes on the stack (or wherever it lives); the **elements are elsewhere**, so `v[i]` costs a load of `begin_` plus the element load — two dependent loads, potentially two cache misses. This is the fundamental difference from `std::array` and the reason a hot inner loop should hoist `v.data()` into a local.
-
-### Guarantees
-
-- **Contiguity** is guaranteed since C++03/C++11 wording clarifications: `&v[n] == v.data() + n`, so `v.data()` can be handed to `read()`, `memcpy`, or a C API.
-- `operator[]` is unchecked (UB out of range); `at()` throws `std::out_of_range`.
-- `vector<bool>` is a **specialization that is not a container**: it packs bits, `operator[]` returns a proxy `reference`, `data()` does not exist, `&v[0]` does not give a `bool*`, and it breaks generic code. Universally regarded as a mistake. Use `std::vector<char>`, `std::vector<uint8_t>`, `std::bitset` (Ch. 15), or `boost::dynamic_bitset`.
-
-### Complexity
-
-| Operation | Complexity | Notes |
-|---|---|---|
-| `operator[]`, `front`, `back`, `data` | O(1) | one indirection |
-| `push_back` / `emplace_back` | **Amortized O(1)** | O(n) on reallocation |
-| `pop_back` | O(1) | never shrinks capacity |
-| `insert`/`erase` at position `p` | O(n − index) | shifts the tail by move-assignment |
-| `erase` at the end | O(1) | |
-| `clear` | O(n) destructors, O(1) for trivially destructible | **capacity unchanged** |
-| `resize` down | O(n) destructors | capacity unchanged |
-| Iterating | O(n), maximally cache-friendly | |
-
-### `push_back` vs `emplace_back`
-
-`emplace_back(args...)` forwards to a placement-new in the buffer, avoiding a temporary. `push_back(T&&)` requires an already-constructed `T`. For `vector<std::string>`, `v.emplace_back("abc")` constructs in place; `v.push_back("abc")` builds a temporary and moves it (which for SSO strings is nearly the same, since a short-string move is a copy of the inline buffer).
-
-Two non-obvious points: `emplace_back` uses **direct-initialization**, so it can invoke `explicit` constructors that `push_back` cannot (`std::vector<std::unique_ptr<T>> v; v.emplace_back(new T);` compiles and is a leak hazard — prefer `emplace_back(std::make_unique<T>())`). And `emplace_back` returns a `T&` since C++17, `push_back` returns `void`.
-
-### Reference invalidation from self-referencing arguments
-
-```cpp
-v.push_back(v[0]);      // safe — the standard requires implementations to handle it
-v.insert(v.begin(), v.back());   // also required to work
-```
-Implementations construct the new element before deallocating the old buffer precisely for this. But `v.push_back(v.data()[0])` after you cached `T* p = v.data()` is *not* safe — your own cached pointer dangles (§11.8).
-
-### Low-latency posture
-
-`vector` is the default sequence container and the right answer to "which container?" absent a specific reason. The hot-path concerns are: (a) the reallocation `malloc` (Ch. 7) — fix with `reserve`; (b) the extra indirection versus `array`/`inplace_vector`; (c) destructor loops on teardown for non-trivially-destructible `T`; (d) `vector<vector<T>>` being a pointer-chasing disaster — flatten to one `vector` plus an offset array, or use `mdspan` (Ch. 13). For a preallocated hot path, a `vector` `reserve`d once at startup with a custom or monotonic allocator (Ch. 8) behaves like a fixed array with a size.
+The final branch is deliberately biased toward `vector`. Replace it only when the workload names the guarantee that vector cannot provide.
 
 ---
 
-## 11.3 Vector Growth and Capacity
+## 11.2 Correctness first: invalidation and exception boundaries — Core
 
-**Size** is the number of constructed elements; **capacity** is how many fit before reallocation. `push_back` when `size == capacity` performs: allocate a new buffer of `growth(capacity)`, transfer elements (move-if-noexcept, Ch. 10 §10.3), destroy the old elements, deallocate the old buffer, then construct the new element.
+A handle is an iterator, pointer, or reference that designates an element or a position. An operation **invalidates** a handle when subsequent use is no longer permitted. Dereferencing an invalid handle is undefined behavior; even operations such as incrementing an invalid iterator are invalid. A pointer can dangle although its stored bits still resemble the old address.
 
-### The growth factor
+### Authoritative invalidation table
 
-The standard requires only **amortized constant** `push_back`, which forces *geometric* growth (any constant factor > 1). Actual factors:
+The table separates iterators from pointers/references because `deque` treats them differently. “At/after” includes the old past-the-end iterator.
 
-| Implementation | Factor |
-|---|---|
-| libstdc++ (GCC) | 2 |
-| libc++ (Clang) | 2 |
-| MSVC | 1.5 |
-| folly `fbvector` | 1.5 |
-
-Amortized analysis: with factor `k`, inserting `n` elements moves `n·k/(k−1)` elements total — 2n for k=2, 3n for k=1.5 — so both are O(1) amortized, and k=2 does *fewer* total moves.
-
-The argument for 1.5 is **allocator memory reuse**: with k=2, the sum of all previously freed blocks (1+2+4+…+2^(i−1) = 2^i − 1) is always strictly less than the next request (2^i), so a freed-block coalescing allocator can never reuse the old blocks for the new one. With k < φ ≈ 1.618, the sum of previous blocks eventually exceeds the next request, so reuse is possible and the address space is not walked forward indefinitely. This is the standard interview question about growth factors and the golden ratio, and the correct answer includes the caveat that it only helps with allocators that coalesce, and that k=2 is cheaper in move count.
-
-Neither is mandated. Do not write code that depends on capacity values; only on `capacity() >= size()` and the invalidation rules.
-
-### Controlling capacity
-
-```cpp
-v.reserve(n);        // capacity >= n; reallocates once if needed; NEVER shrinks
-v.resize(n);         // changes SIZE, value-initializing or destroying elements
-v.shrink_to_fit();   // NON-BINDING request; may reallocate, may do nothing
-v.clear();           // size = 0, capacity UNCHANGED
-std::vector<T>().swap(v);            // the pre-C++11 idiom to actually free
-v = std::vector<T>{};                // modern equivalent (move-assign frees the old buffer)
-```
-
-`reserve` is the single most valuable vector optimization: it converts n allocations and O(n) total moves into one allocation and zero moves.
-
-Two traps:
-- **`reserve` does not create elements.** `v.reserve(10); v[0] = x;` is UB. Use `resize` if you want elements.
-- **`reserve` in a loop is quadratic.** `for (...) { v.reserve(v.size()+1); v.push_back(x); }` reallocates every iteration because `reserve` grows to *exactly* `n`, defeating geometric growth. Reserve once, up front.
-- **`resize` grows geometrically? No** — `resize(n)` where `n > capacity` typically allocates exactly `n` in libstdc++ (actually `max(2*capacity, n)` in some paths; libc++ allocates exactly `n` for `resize`). Repeated `resize(size()+k)` can therefore be quadratic. Prefer `reserve` + `push_back`, or `resize` once.
-
-### `assign`, `insert`, and bulk operations
-
-`v.assign(first, last)` and range `insert` compute the distance for forward iterators and allocate once — strictly better than a `push_back` loop. C++23 adds **`append_range`, `assign_range`, `insert_range`, and `std::ranges::to<std::vector>`**, which do the same for any range and size the allocation from `ranges::size` when available.
-
-### Memory footprint reality
-
-After growth, the allocation is the *new* buffer while the old one is still live during the transfer — so peak RSS during a `vector` grow is ~1.5× (k=1.5) to 3× (k=2, both buffers) the final size. For a multi-gigabyte vector that is a real OOM risk and an argument for `deque` or a chunked structure.
-
-**`shrink_to_fit` is non-binding**, and even when honored it allocates a new buffer and copies, so it can *increase* peak memory momentarily and it invalidates everything. It is also a poor fit for a hot path.
-
----
-
-## 11.4 `std::deque`
-
-`std::deque<T>` ("double-ended queue") gives O(1) `push_front`, `push_back`, `pop_front`, `pop_back`, and O(1) random access — but is not contiguous.
-
-### Structure
-
-```
-  map (a dynamically-allocated array of pointers, itself reallocated occasionally)
-  +----+----+----+----+
-  | p0 | p1 | p2 | p3 |
-  +--|-+--|-+--|-+--|-+
-     v    v    v    v
-   [chunk][chunk][chunk][chunk]      each chunk holds K elements contiguously
-```
-
-Random access is `map[i / K][i % K]` — a division (usually a shift, since K is a power of two in element count only if `sizeof(T)` cooperates; libstdc++ uses a *byte* size of 512, so K = max(1, 512/sizeof(T)) which is often not a power of two, making `operator[]` a real integer division or a multiply-by-reciprocal).
-
-Chunk sizes: **libstdc++ 512 bytes**, **libc++ max(4096/sizeof(T), 16) elements** (so 4 KB per chunk for small T), **MSVC 16 bytes or 1 element** — a notoriously bad choice that makes MSVC's `deque` allocate roughly one block per element for anything larger than a pointer, giving it a reputation the other implementations don't deserve.
-
-### Guarantees that vector cannot give
-
-**Inserting or erasing at either end invalidates iterators but NOT references or pointers to existing elements.** This is `deque`'s unique property and its main reason to exist:
-
-```cpp
-std::deque<Order> d;
-Order& o = d.front();
-d.push_back(x);          // &o still valid!  (vector would have invalidated it)
-d.push_front(y);         // still valid
-d.erase(d.begin()+3);    // NOW everything may be invalidated (middle erase)
-```
-
-Contrast: `list` keeps references valid through *any* operation; `vector` invalidates on any reallocation.
-
-### Trade-offs
-
-| | `vector` | `deque` |
-|---|---|---|
-| Contiguous / `data()` | Yes | **No** |
-| `push_front` | O(n) | **O(1)** |
-| Reference stability on end insert | No | **Yes** |
-| Random access cost | 1 indirection | 2 indirections + div/mod |
-| Iteration cost | Optimal | ~1.5–3× slower; iterator holds 4 pointers and must check chunk boundaries |
-| Memory overhead | ≤ (k−1)·size wasted | Chunk granularity + map |
-| Allocations to build n elements | O(log n) | O(n/K) but each is small |
-| Empty container allocations | **Zero** | libstdc++ allocates one chunk + map eagerly (~512 B) |
-| Peak memory during growth | Up to 2–3× | ~1× (only the map is reallocated) |
-
-That last row matters: growing a huge `deque` never doubles memory, which is why it is the right container for very large sequences where you cannot afford the reallocation spike, and why `std::stack` and `std::queue` default to `deque`.
-
-**`deque` iterators are fat** — typically four pointers (cur, first, last, node) — so passing them around and comparing them is more expensive, and `std::sort` on a deque is measurably slower than on a vector even though both are random-access.
-
-### Low-latency verdict
-
-`deque` is rarely the right hot-path answer. If you need a FIFO, a **fixed-capacity ring buffer** (Ch. 21, Ch. 26) is contiguous, allocation-free, and cache-friendly, and it is what real trading systems use. `deque` is appropriate when you need unbounded growth with reference stability and O(1) both ends and cannot bound the size — for example a growable staging queue outside the critical path. Note also that `std::queue`/`std::stack` are **container adaptors**, and `std::stack<T, std::vector<T>>` is usually faster than the `deque` default.
-
----
-
-## 11.5 `std::list` and `std::forward_list`
-
-`std::list<T>` is a doubly-linked list; `std::forward_list<T>` (C++11) is singly-linked.
-
-```
-list node:          [prev][next][T]        24 + sizeof(T) bytes, one allocation each
-forward_list node:  [next][T]              8 + sizeof(T) bytes
-```
-
-`std::list` is a **circular** doubly-linked list with a sentinel node embedded in the container object, which is how `end()` works and why `sizeof(std::list<T>)` is 24 in libstdc++ (two pointers plus a size — `size()` became O(1) and required in C++11).
-
-`std::forward_list` is deliberately minimal: `sizeof == 8`, **no `size()`**, no `back()`, no `push_back`, and its mutating operations are `_after` variants (`insert_after`, `erase_after`, `emplace_after`) because a singly-linked list cannot reach the predecessor. `before_begin()` provides the handle for inserting at the front position.
-
-### The guarantees
-
-- **Every reference, pointer, and iterator remains valid across every operation except erasure of that element.** No other standard container is this stable.
-- **O(1) `splice`**: moving a range of nodes between lists (or within one) is pure pointer surgery, no allocation, no element moves. `list::splice` for a single element is O(1); the range overload is O(1) if the lists are the same, O(distance) otherwise because `size()` must be maintained.
-- `sort`, `merge`, `reverse`, `unique`, `remove` are **member functions** because the free algorithms require random access (`std::sort`) or would be O(n) moves. `list::sort` is a bottom-up merge sort operating on links — it never moves elements, so it works for immovable types and is stable.
-- `remove_if` and `unique` return the count erased since C++20.
-
-### Why it is almost always the wrong choice
-
-| Cost | Detail |
-|---|---|
-| One allocation per element | `malloc` per `push_back` (Ch. 7); catastrophic without a pool allocator |
-| 16–24 bytes overhead per element | A `list<int>` is 3–6× the memory of `vector<int>` |
-| Pointer chasing | Every `++it` is a **dependent load**: the address of the next node is unknown until the current one arrives. The hardware prefetcher (Ch. 28) cannot help, memory-level parallelism (Ch. 29) is zero, and each step is a potential full ~80 ns cache miss. |
-| Traversal to a position is O(n) | So "O(1) insert" is only true if you already hold the iterator |
-
-Benchmarks consistently show `vector` beating `list` for insert-in-middle workloads up to tens of thousands of elements, because the O(n) `memmove` runs at many GB/s with perfect prefetching while the O(1) list insert requires an O(n) pointer-chasing traversal to find the position plus an allocation. Bjarne Stroustrup's demonstration of this is a standard interview reference.
-
-### When a linked list *is* correct
-
-1. **You hold the iterator already** and must splice, not copy — e.g. an LRU cache (Ch. 21): `std::list` + `unordered_map<K, list::iterator>` gives O(1) promote-to-front with stable iterators. This is the canonical legitimate use.
-2. **Reference stability is a hard requirement** and the elements are large or immovable.
-3. **Intrusive lists** (Ch. 21) — the node hooks live *inside* the element, so there is no per-element allocation, no separate node cache miss, and O(1) erase given only the element pointer. `boost::intrusive::list` and the Linux kernel's `list_head` are the model. **For low-latency work, an intrusive list is the answer and `std::list` is not** — the object is allocated once from a pool, the hook is a member, and the container never allocates.
-
-`std::forward_list` exists for the memory-constrained case and is genuinely 8 bytes per node cheaper; it is rare in practice.
-
----
-
-## 11.6 `std::inplace_vector` and Fixed-Capacity Vectors
-
-`std::inplace_vector<T, N>` (**C++26**, P0843) is a sequence container with `vector`'s dynamic-size interface and `array`'s storage: capacity `N` fixed at compile time, elements stored **inline in the object**, no allocator, no allocation ever.
-
-```
-inplace_vector<T, N>:  [ aligned uninitialized storage for N T's ][ size_type size_ ]
-```
-
-It is `boost::container::static_vector`, `folly::small_vector<T,N,NoHeap>`, `absl::FixedArray`'s cousin, and EASTL's `fixed_vector` — an idiom so common it was standardized.
-
-### Semantics
-
-```cpp
-std::inplace_vector<Order, 32> book;
-book.push_back(o);                 // throws std::bad_alloc if size() == 32
-book.try_push_back(o);             // returns pointer or nullptr — NO exception
-book.unchecked_push_back(o);       // UB if full — the hot-path form
-static_assert(book.capacity() == 32);
-```
-
-The three-way `push_back` / `try_push_back` / `unchecked_push_back` split is the design point worth naming: it lets a hot path opt out of both the branch and the exception after the caller has proven capacity.
-
-Key properties:
-- **Trivially copyable and trivially destructible when `T` is** — a deliberate specification requirement (via conditionally trivial special members, C++20). So `inplace_vector<int, 8>` can be `memcpy`'d, put in shared memory (Ch. 3 §3.12), and passed in registers when small.
-- **`constexpr`-usable** throughout when `T` is trivial.
-- **`inplace_vector<T, 0>` is valid and empty**, and is trivially everything.
-- Iterators and references are invalidated only by operations that shift elements — and *never* by capacity growth, because there is none.
-
-### Why it matters for low latency
-
-| Property | `vector` | `inplace_vector<T,N>` | `array<T,N>` |
+| Container and operation | Iterators | Pointers and references to elements | Past-the-end iterator |
 |---|---|---|---|
-| Allocation | Heap, on growth | **None, ever** | None |
-| Indirection to elements | 1 | **0** | 0 |
-| Dynamic size | Yes | Yes | No |
-| Overflow behavior | Grows | Throws / null / UB (your choice) | N/A |
-| `sizeof` | 24 | `N*sizeof(T)` + size field | `N*sizeof(T)` |
-| Suitable inside a message struct | No | **Yes** | Yes |
+| `array`: element assignment | Remain valid | Remain valid; designated value may change | Remains valid |
+| `array`: `swap` | Remain associated with the same array object | Remain associated with the same element slot; value is exchanged | Remains valid |
+| `vector`: `reserve` with requested capacity no greater than current capacity | Remain valid | Remain valid | Remains valid |
+| `vector`: `reserve` that increases capacity | All invalidated | All invalidated | Invalidated |
+| `vector`: end insertion without reallocation | Existing element iterators remain valid | Existing element handles remain valid | Invalidated |
+| `vector`: any insertion with reallocation | All invalidated | All invalidated | Invalidated |
+| `vector`: middle insertion without reallocation | At and after insertion invalidated | At and after insertion invalidated | Invalidated |
+| `vector`: erase or `pop_back` | Erased element and everything after it invalidated | Same | Invalidated |
+| `vector`: `clear` | All element iterators invalidated | All element handles invalidated | Invalidated |
+| `vector`: `shrink_to_fit` | All invalidated if capacity is reduced; otherwise none | Same | Same |
+| `deque`: insert at either end | All invalidated | Existing element handles remain valid | Invalidated |
+| `deque`: insert in the middle | All invalidated | All invalidated | Invalidated |
+| `deque`: erase at the front | Only handles to erased elements invalidated | Same | Remains valid |
+| `deque`: erase at the back | Handles to erased elements invalidated | Same | Invalidated |
+| `deque`: erase in the middle | All invalidated | All invalidated | Invalidated |
+| `list`/`forward_list`: insert | Remain valid | Remain valid | Remains valid |
+| `list`/`forward_list`: erase | Only handles to erased elements invalidated | Same | Remains valid |
+| `list`/`forward_list`: splice | Remain valid; moved-element iterators now refer into the destination | Remain valid | Remains valid |
 
-Zero indirection is the headline: the elements are in the same cache line(s) as the container, so a small collection is one cache miss instead of two, and the object can be embedded in a market-data message, an order struct, or a lock-free queue slot (Ch. 26) with no pointer at all.
+For deque erasure of a range, classify the operation by whether the range is wholly at the beginning, wholly at the end, or in the middle. Conservative code should recalculate `end()` after every size-changing operation rather than encode container-specific past-the-end exceptions into a loop.
 
-The cost is that `sizeof` is always `N` elements even when empty, so it is unsuitable for large `N` or for containers-of-containers, and moving one is O(size) element moves rather than a pointer steal — a `vector`'s move is O(1), an `inplace_vector`'s is O(n).
+`swap` deserves special care. Standard container rules generally preserve element handles while changing which container owns the elements, subject to allocator requirements. `std::array::swap` is different in mechanism: it swaps corresponding element values, so a reference continues to refer to the same slot in the same array. For allocator-aware containers, unequal non-propagating allocators can restrict or change the legality and cost of swap; Chapter 8 owns allocator propagation.
 
-**Availability today:** C++26. Before that, `boost::container::static_vector` (identical semantics, throws `std::bad_alloc` on overflow) is the drop-in.
+### Stable does not mean synchronized
 
----
+Reference stability says that a single-threaded mutation does not relocate a particular element. It grants no permission for concurrent unsynchronized access. If one thread modifies a deque while another reads it without a valid synchronization protocol, a data race can still occur. Similarly, a list iterator remaining valid after insertion says nothing about visibility between threads. Chapters 25 and 26 own data races and concurrent queues.
 
-## 11.7 Small-Vector Optimization
+### Exception guarantees affect latency and state
 
-**Small-vector optimization (SVO)**, also called small-buffer optimization (SBO), stores up to `N` elements inline in the container object and falls back to a heap allocation beyond that. It is the same idea as small-string optimization (Ch. 13) generalized to arbitrary `T`, and it is *not* in the standard library for vectors — `llvm::SmallVector<T,N>`, `folly::small_vector`, `absl::InlinedVector<T,N>`, `boost::container::small_vector`, and EASTL's `fixed_vector` are the implementations.
+Allocation and element construction can throw. The most important vector case is reallocation:
 
-### Layout
+1. allocate new storage;
+2. construct the new sequence there, transferring old elements;
+3. destroy the old elements;
+4. release the old storage.
 
-```
-small_vector<T, N>:
-    union {
-        T inline_storage[N];
-        struct { T* heap; size_t capacity; };
-    };
-    size_t size;                 // plus a flag/encoding for which arm is active
-```
+To preserve the original vector if transfer fails, standard-library implementations commonly copy when `T` has a potentially throwing move constructor and is copy-constructible. If `T` is move-only and its move can throw, a failed reallocation cannot always restore already moved-from elements; the strong guarantee may be waived and effects can be unspecified. A `noexcept` move constructor therefore affects both the failure model and the transfer strategy an implementation can safely choose. Chapter 10 develops that rule.
 
-Implementations encode the "is inline" flag cleverly — `llvm::SmallVector` compares `data()` against the address of the inline buffer (`isSmall()` is `BeginX == getFirstEl()`), costing no extra byte; `folly::small_vector` can steal a high bit of the size field.
+List and deque operations can also allocate. Node or block allocation failure is not made predictable by their asymptotic complexity. For a latency-critical phase, the robust policy is to establish capacity/storage beforehand, use an allocator/resource with understood behavior, or choose a bounded representation whose full condition is explicit.
 
-### The trade-off
+### Correct erasure idioms
 
-| | Win | Cost |
-|---|---|---|
-| No allocation for ≤ N elements | Removes a `malloc`/`free` pair (~50–100 ns each, plus lock contention) and a cache miss | |
-| Elements co-located with the container | 1 fewer indirection; usually the same cache line | |
-| | | `sizeof` grows by `N*sizeof(T)` — bad in a container-of-containers, bad on the stack |
-| | | Every access needs the small/large discrimination (usually free after inlining, since `data()` returns the right pointer either way) |
-| | | **Move is O(n) when small** — you must move elements individually, not steal a pointer. `std::swap` on two small vectors is O(N). |
-| | | The type is **not trivially relocatable** in general (Ch. 3 §3.5) — a small-mode buffer has interior pointers in some designs, breaking `memcpy`-based reallocation of a `vector<small_vector<...>>` |
-
-That last point is the sharp one: `llvm::SmallVector` deliberately avoids self-pointers so it *is* relocatable, and `folly` tags its types with `IsRelocatable`. A naive SVO that stores `T* data_ = inline_buf_` is self-referential and cannot be `memcpy`'d — the classic SVO implementation bug.
-
-### Choosing N
-
-`N` should be chosen so the common case fits and `sizeof` stays reasonable — typically so the whole object is one or two cache lines. LLVM's convention is `SmallVector<T, 0>` when the size is unknown (giving a plain vector with LLVM's API) and small powers of two otherwise. Measure the size distribution; an SVO sized for the p99 wastes memory on every instance, and one sized below the median gives you the allocation you were trying to avoid plus the inline bloat.
-
-### Where it pays in trading systems
-
-- Per-order fill lists, per-message field lists, per-symbol subscriber lists — collections that are almost always 0–4 elements.
-- Anything constructed and destroyed inside the hot path, where the allocation is the entire cost.
-- Note the alternative: if the maximum is *bounded*, `inplace_vector` (§11.6) is strictly better — no branch, no heap path, trivially copyable. SVO is for "usually small, occasionally unbounded."
-
-**`std::function`'s SBO** (Ch. 18) is the same idea for callables, with the same trap: exceeding the inline buffer silently allocates, and the buffer size is implementation-defined (libstdc++ 16 bytes, libc++ 24, MSVC 64), so a lambda capturing three pointers allocates on GCC and does not on MSVC.
-
----
-
-## 11.8 Container Iterator Invalidation
-
-An iterator (or pointer, or reference) is **invalidated** when the operation may have moved or destroyed the element it designates. Using an invalidated iterator is UB — commonly a use-after-free, and one of the highest-yield interview tables.
-
-### The master table
-
-| Container | Insert / emplace | Erase | Notes |
-|---|---|---|---|
-| `array` | — | — | Never invalidated |
-| `vector` | **All** iterators/pointers/refs if reallocation; otherwise those **at or after** the insertion point | Those **at or after** the erased element; `end()` always | Reallocation is the killer |
-| `deque` | **All iterators**; **references stay valid** if insert at either end. Middle insert invalidates everything. | At an end: only the erased element's iterators/refs. In the middle: **all**. | The reference/iterator asymmetry is the exam question |
-| `list` / `forward_list` | **None** | Only the erased element | Total stability |
-| `set`/`map`/`multiset`/`multimap` | **None** | Only the erased element | Node-based |
-| `unordered_*` | **All iterators if rehash occurs** (i.e. if `size+1 > max_load_factor*bucket_count`); **references/pointers never** | Only the erased element's | See Ch. 12 |
-| `string` | Like `vector` | Like `vector` | SSO transition also invalidates |
-
-Two rules compress most of it:
-1. **Node-based containers (`list`, `forward_list`, `map`, `set`, `unordered_*`) never invalidate references or pointers to elements that still exist.** The element never moves; only the links change.
-2. **Contiguous containers invalidate on reallocation, and from the modification point onward otherwise.**
-
-`end()` is invalidated by essentially every size-changing operation on every container — a `for (it = v.begin(); it != v.end(); ...)` loop that caches `end()` is a classic bug.
-
-### The erase idioms
+Erasing while iterating must use the iterator returned by `erase`:
 
 ```cpp
-// WRONG — erase invalidates it, then ++it is UB
-for (auto it = v.begin(); it != v.end(); ++it) if (pred(*it)) v.erase(it);
+#include <vector>
 
-// Right: erase returns the next valid iterator
-for (auto it = v.begin(); it != v.end(); )
-    it = pred(*it) ? v.erase(it) : std::next(it);
+struct Order {
+    bool cancelled;
+};
 
-// Better for vector/deque/string: erase-remove, O(n) instead of O(n^2)
-v.erase(std::remove_if(v.begin(), v.end(), pred), v.end());
+int main() {
+    std::vector<Order> orders{{false}, {true}, {false}};
 
-// C++20: std::erase / std::erase_if — one call, correct for every container
-std::erase_if(v, pred);       // free functions for vector, deque, list, string, map, set, unordered_*
+    for (auto it = orders.begin(); it != orders.end();) {
+        if (it->cancelled) {
+            it = orders.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
 ```
-`std::erase_if` (C++20) is the modern answer and dispatches to the efficient form per container (`remove_if`+`erase` for sequence containers, node-wise iteration for associative ones). It returns the number erased.
 
-Note that **`remove_if` does not erase** — it partitions and returns the new logical end, leaving the tail in a moved-from state (Ch. 10 §10.2). Calling `remove_if` without `erase` is the second-most-common container bug.
+Incrementing `it` after `orders.erase(it)` would increment an invalid iterator. For vector-like containers, repeated single-element erasure can also be O(n²) because every erase shifts a suffix. C++20's `std::erase_if(orders, predicate)` performs the appropriate bulk removal and is normally clearer.
 
-For **node-based containers**, the pre-C++11 idiom `m.erase(it++)` is correct (post-increment yields the old value, which is then erased). Since C++11, `it = m.erase(it)` works because the associative `erase` returns an iterator.
+The classic erase-remove form remains useful:
 
-### Reference-stability requirements as a design driver
+```cpp
+orders.erase(
+    std::remove_if(orders.begin(), orders.end(), predicate),
+    orders.end());
+```
 
-If the design says "another thread/component holds a pointer to this element," you have eliminated `vector` and `deque`-middle-insert from consideration. The options are:
-- Node-based container (accept the allocation and pointer chasing).
-- **Stable indices into a preallocated slab**: an index is not invalidated by anything, is 4 bytes instead of 8, is trivially serializable and shareable across processes (Ch. 3 §3.12), and can carry a generation counter to detect stale handles. This is the standard low-latency answer and is what an "indexed free list" (Ch. 21) provides.
-- `std::deque` when only end-insertion happens (references survive).
-- `inplace_vector`/`array` with a fixed slot layout.
+`std::remove_if` alone changes no container size. It moves retained elements toward the front and returns the new logical end; `erase` destroys the tail.
 
-**Interview framing:** *"You have a `vector` of orders and other components hold pointers to them. What goes wrong and what do you do?"* — the first `push_back` past capacity dangles every pointer; the answer is generational indices into a preallocated pool, not `deque` and not `list`.
+### External identity needs more than a stable address
 
-### Special cases worth knowing
+Suppose another component retains an order handle while the owning sequence mutates. Options include:
 
-- **`reserve` invalidates everything if it reallocates**, even though it changes no element.
-- **`shrink_to_fit` invalidates everything** if honored.
-- **`std::vector::swap` swaps the buffers**, so iterators remain valid but now refer *into the other container*. Same for `list::splice`: spliced iterators remain valid and now belong to the destination list — a unique guarantee.
-- **`resize` down** invalidates iterators to removed elements only; `resize` up may reallocate and invalidate all.
-- **Sanitizers catch this**: AddressSanitizer with `-D_GLIBCXX_SANITIZE_VECTOR` / libc++'s `_LIBCPP_HARDENING_MODE_DEBUG` or `ASAN_OPTIONS=detect_container_overflow=1` detect use of invalidated vector iterators via container annotations. `-D_GLIBCXX_DEBUG` gives full checked iterators at a large runtime cost — a debug-build-only tool (Ch. 44).
+- a deque when mutations are strictly at the ends and erased elements are never retained;
+- a node-based container when stable addresses and arbitrary erasure are required;
+- individually owned objects with a separate sequence of owning or non-owning handles;
+- a preallocated slab addressed by an index plus generation.
 
----
-
-## Key Interview Questions
-
-1. **What is `std::array`'s representation, and why does it matter?** — An aggregate holding a raw `T[N]` and nothing else, so it is standard-layout and trivially copyable when `T` is, with zero indirection to the elements.
-2. **`std::array<int,3> a;` vs `a{};`?** — Default-init leaves elements indeterminate; value-init zeroes them.
-3. **What are the three data members of `std::vector`, and what is `sizeof`?** — `begin_`, `end_`, `cap_` pointers; 24 bytes on x86-64. The elements are a separate allocation, so `v[i]` is two dependent loads.
-4. **Why is `vector<bool>` a mistake?** — It is a bit-packed specialization whose `operator[]` returns a proxy; no `data()`, no `bool*`, and it silently breaks generic code.
-5. **Why do implementations disagree between growth factors 2 and 1.5?** — Factor 2 does fewer total moves (2n vs 3n); factor < φ lets a coalescing allocator reuse the sum of previously freed blocks for the next request. Neither is standardized.
-6. **What does `clear()` do to capacity?** — Nothing. Use `vector<T>{}.swap(v)` or move-assign an empty vector to release memory; `shrink_to_fit` is non-binding.
-7. **Why is `reserve` inside a push loop pathological?** — It grows to exactly `n`, defeating geometric growth and making the loop O(n²) allocations.
-8. **What is `deque`'s structure and its unique guarantee?** — A map of pointers to fixed-size chunks; insertion at either end invalidates iterators but **not references or pointers** to existing elements.
-9. **Why does `std::stack` default to `deque`?** — No reallocation spike and no element moves on growth; but `stack<T, vector<T>>` is usually faster in practice.
-10. **Why is `std::list` almost always slower than `std::vector` even for middle insertion?** — One allocation and 16–24 bytes overhead per node, plus traversal by dependent loads that defeat prefetching and memory-level parallelism; a `memmove` of n elements runs at GB/s.
-11. **When is a linked list genuinely correct?** — When you already hold the iterator and need O(1) splice with reference stability (LRU cache), or when it is *intrusive* so there is no per-node allocation and no extra indirection.
-12. **What does `forward_list` give up and why?** — `size()`, `back()`, `push_back`, and all non-`_after` mutators, because a singly-linked node cannot reach its predecessor; in exchange, 8 bytes per node and `sizeof(container) == 8`.
-13. **What is `std::inplace_vector` and what problem does it solve?** — C++26 fixed-capacity, inline-storage vector: dynamic size, zero allocation, zero indirection, trivially copyable when `T` is, with `try_push_back`/`unchecked_push_back` for hot paths.
-14. **Small-vector optimization: what does it cost?** — `sizeof` grows by the inline capacity, moves become O(n) instead of pointer steals, and a naive implementation that stores a pointer to its own buffer is not trivially relocatable.
-15. **Which containers never invalidate references to surviving elements?** — All node-based ones: `list`, `forward_list`, `map`/`set` family, and `unordered_*` (whose *iterators* are invalidated by rehash but whose references are not).
-16. **What exactly does `vector::insert` invalidate?** — Everything if it reallocates; otherwise iterators/references at and after the insertion point, plus `end()` always.
-17. **Why is `remove_if` without `erase` a bug?** — It only partitions and returns a new logical end; the container's size is unchanged and the tail holds moved-from elements. Use `std::erase_if` (C++20).
-18. **Other components hold pointers into your `vector` of orders. What do you use instead?** — Generational indices into a preallocated slab; indices are 4 bytes, never invalidated, and shareable across processes.
+A bare index prevents relocation from changing the handle, but it does not detect slot reuse. Pairing the index with a generation lets lookup reject a handle after the slot has been released and reacquired. It still requires synchronization if access is concurrent. Chapter 21 develops indexed free lists; this chapter uses the pattern only as a container-selection alternative.
 
 ---
 
-## Common Traps
+## 11.3 `std::array`: fixed count, inline elements — Core
 
-- **`std::array<T,N> a;` at block scope** — elements are indeterminate for trivial `T`.
-- **Passing `std::array` by value** — copies all N elements; take `const&` or `std::span`.
-- **A large `std::array` as a local** — stack overflow past the guard page.
-- **Caching `v.data()` or `&v[0]` across a `push_back`** — dangles on reallocation.
-- **Caching `v.end()` in a loop that modifies `v`.**
-- **`v.reserve(n); v[0] = x;`** — reserve creates no elements; that is UB.
-- **`reserve` inside the insertion loop** — quadratic.
-- **Expecting `clear()` or `pop_back()` to free memory** — capacity is retained.
-- **Expecting `shrink_to_fit` to do anything** — non-binding, and it reallocates and invalidates when honored.
-- **`vector<bool>` in generic code** — proxy references, no `data()`, `auto x = v[0]` gives a proxy, not a `bool`.
-- **`emplace_back(new T)` into a `vector<unique_ptr<T>>`** — direct-init allows the explicit ctor; leaks if the vector's growth throws.
-- **A non-`noexcept` move constructor on the element type** — vector growth copies everything (Ch. 10 §10.3).
-- **Assuming `deque` references are invalidated by `push_back`** — they are not; the *iterators* are.
-- **Using MSVC's `std::deque` for large elements** — a 16-byte block size means roughly one allocation per element.
-- **`std::list` for anything performance-sensitive** — use an intrusive list plus a pool.
-- **`forward_list::insert` (doesn't exist) instead of `insert_after`.**
-- **`v.erase(it); ++it;`** — use `it = v.erase(it)`.
-- **`std::remove_if` without the follow-up `erase`.**
-- **Iterating an `unordered_map` while inserting** — a rehash invalidates all iterators.
-- **A small-vector implementation that stores `data_ = inline_buffer_`** — self-referential, not relocatable, breaks `memcpy`-based container growth.
-- **Sizing an SVO/SBO buffer by guess** — measure the distribution; oversizing bloats every instance, undersizing gives you the allocation anyway.
+`std::array<T, N>` is an aggregate containing exactly `N` elements in contiguous order. Its size never changes, it has no allocator, and access to an element requires no container-managed pointer to a separate buffer. Those are portable semantic guarantees. An exact implementation struct, object size, padding pattern, and type-trait result should be queried on the target rather than asserted as part of a portable design.
+
+For `N > 0`, `data()` points at the first element and `data() + size()` is the end of the contiguous range. `std::array<T, 0>` is valid and `begin() == end()`, but calling `front()` or `back()` is undefined. Code should not assume whether `data()` for the zero-size case is null.
+
+### Initialization is the main correctness trap
+
+```cpp
+#include <array>
+#include <cassert>
+#include <tuple>
+
+int main() {
+    std::array<int, 3> values{};       // {0, 0, 0}
+    std::array<int, 3> partial{7};     // {7, 0, 0}
+    std::array deduced{2, 4, 6};       // std::array<int, 3>
+
+    auto [a, b, c] = deduced;          // tuple protocol
+    assert(a == 2 && b == 4 && c == 6);
+    assert(values[1] == 0 && partial[2] == 0);
+}
+```
+
+At block scope, `std::array<int, 3> values;` default-initializes its `int` elements; in C++23, reading them before writing them has undefined behavior. Braces value-initialize the remaining elements. `std::to_array("OK")` produces an array that also contains the terminating null character.
+
+Unlike a built-in array, `std::array` does not decay to a pointer during ordinary expression use, is assignable element by element, supports lexicographical comparison, and participates in the tuple protocol. It can still expose its elements through `data()` or convert to `std::span`.
+
+### Workloads and costs
+
+Choose `array` when the element count is part of the type or protocol: a fixed set of feed fields, a lookup table, a vector of SIMD lanes, or a bounded set of book levels whose every slot is a live object. It gives:
+
+- no allocation;
+- no reallocation or iterator invalidation;
+- dense traversal;
+- object size proportional to `N * sizeof(T)` plus any permitted padding.
+
+That final property is also a cost. Passing a large array by value copies or moves every element. Embedding it in another object enlarges every instance, even if a separate logical `size` says few entries are used. A large automatic array consumes stack space. Pass read-only data as `std::span<const T>` when callers may supply different contiguous containers, and measure object placement rather than assuming “inline” always means cache-resident.
+
+An `array<T, N>` constructs all `N` elements. It is not a substitute for a fixed-capacity vector when only the first `size` slots should have live `T` objects, especially if `T` is expensive to default-construct or not default-constructible.
 
 ---
 
-## Compact Recall Summary
+## 11.4 `std::vector`: the contiguous dynamic default — Core
 
-**`array`.** An aggregate over `T[N]`; standard-layout and trivially copyable when `T` is, zero indirection, `constexpr`-friendly, no decay, comparison operators, tuple protocol, `array<T,0>` valid. Default-init leaves trivial elements indeterminate. CTAD and `std::to_array` (C++20) for construction. Large ones on the stack are a hazard; pass as `span`.
+`std::vector<T>` owns a variable-size contiguous sequence. The vector object stores metadata; its elements occupy allocator-provided storage. The exact metadata layout is unspecified. Once the first element address has been loaded, an optimized scan can keep that pointer in a register and advance through contiguous memory. It is therefore misleading to price every `v[i]` as a mandatory repeated “two-load” sequence; inspect generated code and measure the actual loop.
 
-**`vector`.** Three pointers, 24 bytes, contiguous, `data()` guaranteed, elements one indirection away. Amortized O(1) `push_back`, O(n−i) insert/erase in the middle, unchecked `[]`, throwing `at()`. `vector<bool>` is a bit-packed non-container. `emplace_back` is direct-init (allows explicit ctors) and returns `T&`.
+### Guarantees and operation costs
 
-**Growth.** Geometric, factor 2 (libstdc++, libc++) or 1.5 (MSVC, folly). Factor 2 minimizes moves; factor < φ enables allocator block reuse. `reserve` once, never in the loop; `reserve` creates no elements; `clear`/`pop_back` retain capacity; `shrink_to_fit` is non-binding; peak RSS during growth is 2–3× the final size. C++23 `append_range`/`ranges::to` size the allocation up front.
+| Operation | Complexity | Invalidation/cost consequence |
+|---|---:|---|
+| `operator[]`, `front`, `back`, `data` | O(1) | `operator[]` is unchecked; precondition is that the element exists |
+| `at` | O(1) | Checks bounds and throws `std::out_of_range` |
+| `push_back`, `emplace_back` | Amortized O(1) | Reallocating call is O(n) and invalidates all handles |
+| `pop_back` | O(1) | Destroys last element; capacity is unchanged |
+| insert/erase at index `i` | O(size − i) | Shifts the suffix; invalidates from the position onward |
+| `clear` | O(n) destruction | Size becomes zero; capacity is unchanged |
+| sequential traversal | O(n) | Dense, predictable access |
 
-**`deque`.** Map of pointers to chunks (libstdc++ 512 B, libc++ 4 KB, MSVC 16 B). O(1) at both ends, O(1) indexed access via two indirections plus div/mod, fat 4-pointer iterators, no contiguity. **End insertion invalidates iterators but not references** — its defining property. No reallocation spike; default for `stack`/`queue`. Rarely right on a hot path; use a ring buffer.
+Contiguity means that for a valid element index, `&v[i] == v.data() + i`. The buffer can be viewed as `std::span<T>` and can be passed to an interface that accepts a pointer and element count. This does not make an arbitrary `T` buffer byte-serializable; object representation rules remain those of Chapter 3.
 
-**`list`/`forward_list`.** Total reference/iterator stability, O(1) `splice`, member `sort`/`merge`/`unique` because the free algorithms need random access. One allocation and 8–16 bytes of links per node; traversal is a chain of dependent loads with zero prefetchability. Legitimate uses: LRU with an accompanying hash map, and — for real low-latency work — intrusive lists with pool-allocated objects, never `std::list`.
+`emplace_back(args...)` constructs the new element from the supplied arguments. `push_back(value)` copies or moves an existing `T`. Emplacement removes a temporary only when the call site would otherwise create one; it does not avoid vector growth, element transfer, allocation, or the cost of the constructor itself. Prefer whichever form makes ownership and construction clear.
 
-**Fixed-capacity.** `std::inplace_vector<T,N>` (C++26, ex-`boost::static_vector`): inline storage, no allocator, no allocation, zero indirection, conditionally trivially copyable, `push_back`/`try_push_back`/`unchecked_push_back`. Move is O(n). Embeddable in messages and queue slots.
+### `vector<bool>` is a deliberate specialization
 
-**SVO.** Inline buffer for ≤ N elements, heap beyond: `llvm::SmallVector`, `folly::small_vector`, `absl::InlinedVector`, `boost::small_vector`. Removes the allocation and an indirection at the cost of `sizeof`, O(n) moves, and — if implemented with a self-pointer — trivial relocatability. Size N to the observed distribution. Same idea and same silent-allocation trap as `std::function`'s SBO.
+`std::vector<bool>` may pack bits. Its reference type is a proxy rather than `bool&`, and its iterators do not necessarily satisfy assumptions made by generic code about ordinary contiguous `T` storage. It has no ordinary `bool*` data buffer. Use it when compact bit storage is the actual requirement and the proxy semantics are acceptable. Use `std::vector<std::uint8_t>` when ordinary addressable byte-sized elements matter, or a dedicated bit-vector type when bit operations dominate.
 
-**Invalidation.** Node-based containers never invalidate references to surviving elements; contiguous ones invalidate on reallocation and from the modification point onward. `deque` end-insert: iterators yes, references no. `unordered_*` rehash: iterators yes, references no. `end()` is invalidated by nearly everything. Use `it = c.erase(it)` or `std::erase_if` (C++20); `remove_if` alone erases nothing. When external code holds handles into a sequence, use generational indices into a preallocated slab rather than pointers.
+### Aliasing an element during insertion
+
+A direct call such as `v.push_back(v.front())` must preserve the value of its aliased argument even if growth occurs. That does not rescue a pointer invalidated by an earlier operation:
+
+```cpp
+#include <cassert>
+#include <vector>
+
+int main() {
+    std::vector<int> values{9};
+
+    while (values.size() < values.capacity()) {
+        values.push_back(0);
+    }
+
+    values.push_back(values.front());  // source is an element of this vector
+    assert(values.back() == 9);
+
+    [[maybe_unused]] int* cached = values.data();
+    while (values.size() < values.capacity()) {
+        values.push_back(0);
+    }
+    values.push_back(1);               // necessarily grows: cached now dangles
+    // Reading *cached here would be undefined behavior.
+}
+```
+
+The distinction is temporal: `values.front()` is valid when the container operation begins, so the operation must implement its specified semantics in the presence of that alias. `cached` becomes invalid when the later reallocation completes. Passing `*cached` after it has already become invalid would dereference a dangling pointer before vector could protect anything.
+
+### Erasing cheap-to-move values
+
+For small trivially copyable or cheap-to-move elements, shifting a contiguous suffix can be competitive with a node-based “constant-time” insertion because the shift is sequential while finding a list position is a pointer-chasing scan. The relevant estimate is not merely O(n):
+
+```text
+vector middle erase:
+    elements moved = size - erased_index - 1
+    bytes touched  ≈ elements moved × sizeof(T)
+
+list erase by value:
+    nodes visited  = distance from known start to target
+    each visit depends on loading the previous node's link
+```
+
+If the position is already known through a list iterator, the search term disappears and list may win. If it is not known, compare measured suffix movement with measured node traversal and allocation behavior on the target workload.
+
+### C++23 range insertion
+
+C++23 adds range-oriented vector operations including `assign_range`, `insert_range`, and `append_range`, as well as range construction facilities. They express whole-range intent and can exploit range properties such as a known size. They do not change the fundamental rule: if capacity is insufficient, element relocation and global invalidation can occur.
+
+---
+
+## 11.5 Vector growth, capacity, and failure cost — Core
+
+`size()` counts constructed elements. `capacity()` counts how many elements can fit in the current allocation before another allocation is required. The interval `[size(), capacity())` is storage, not a range of live elements.
+
+```cpp
+#include <cassert>
+#include <vector>
+
+int main() {
+    std::vector<int> values;
+    values.reserve(8);
+
+    assert(values.empty());
+    assert(values.capacity() >= 8);
+
+    values.push_back(4);  // values[0] now exists
+    values.resize(4);     // adds three value-initialized ints
+    assert(values[3] == 0);
+}
+```
+
+Writing `values[0]` immediately after `reserve(8)` is undefined because no `int` exists there. `resize(8)` would create elements; `reserve(8)` does not.
+
+### What geometric growth guarantees—and what it does not
+
+Repeated `push_back` has amortized constant complexity. Implementations obtain that result by reserving spare capacity rather than allocating exactly one additional slot on every append. The standard does not specify a growth factor, an initial capacity, or the capacity observed after a particular append sequence. Those choices can vary by library version, element size, allocator, and requested size.
+
+When growth occurs, old and new buffers may coexist while elements are transferred. Peak live allocation therefore includes both buffers plus allocator overhead. For large sequences, a reallocating call can create a memory-pressure and latency spike even though the average append cost is constant.
+
+If a model assumes a fixed multiplicative growth factor `g > 1`, the number of old elements transferred over many reallocations forms a geometric series. A larger `g` usually reduces transfer frequency but leaves more spare capacity; a smaller `g` usually uses space more tightly but reallocates more often. This is a model for reasoning, not a portable prediction of `capacity()`.
+
+### Capacity controls
+
+- `reserve(n)` ensures capacity is at least `n`; it reallocates only if `n` exceeds current capacity.
+- `resize(n)` changes the number of live elements, constructing or destroying as required.
+- `clear()` destroys all elements but does not reduce capacity.
+- `shrink_to_fit()` is a non-binding request. If capacity is reduced, all handles are invalidated.
+
+Reserve once before a known growth phase. This pattern is deterministic with respect to vector growth until the bound is exceeded:
+
+```cpp
+std::vector<Event> events;
+events.reserve(max_events_for_batch);
+for (const Event& event : input) {
+    events.push_back(event);
+}
+```
+
+By contrast, this pattern is quadratic:
+
+```cpp
+for (const Event& event : input) {
+    events.reserve(events.size() + 1);  // defeats spare-capacity growth
+    events.push_back(event);
+}
+```
+
+Each reserve request can force allocation and movement of the entire existing prefix. If no useful bound is known, normal vector growth is better than manufacturing an exact-capacity sequence.
+
+### Releasing capacity is allocator-sensitive
+
+Destroying a vector asks its allocator to deallocate its buffer. Swapping with a compatible empty vector or assigning an empty temporary may release the vector's current allocation, subject to allocator equality and propagation rules. A polymorphic memory resource may retain the returned block for later use, and an operating-system allocator may keep freed pages in the process. Therefore “capacity became zero,” “the allocator accepted deallocation,” and “resident memory fell” are different observations.
+
+Capacity release is normally a control-plane operation, not a hot-path optimization. It can allocate during transfer, invalidate every handle, and worsen the next growth phase. Measure the quantity that matters—container capacity, allocator resource usage, or resident memory—instead of assuming they move together.
+
+### Low-latency policy
+
+For append-then-process batches:
+
+1. obtain a defensible upper bound or measured percentile;
+2. reserve before entering the critical phase;
+3. define what happens if the estimate is exceeded;
+4. keep stored handles shorter-lived than the next possible reallocation;
+5. measure allocation count, bytes moved, and high-percentile operation latency.
+
+If exceeding the estimate is unacceptable, `vector` plus `reserve` is not a hard bound. Use a fixed-capacity type and make “full” part of the interface.
+
+---
+
+## 11.6 `std::deque`: end growth with stable references — Core
+
+`std::deque<T>` is a variable-size random-access sequence whose elements are not required to be contiguous. A typical implementation uses multiple allocated blocks plus indexing metadata, but block dimensions and metadata representation are implementation details.
+
+The defining guarantee is precise:
+
+- inserting at either end invalidates all iterators;
+- pointers and references to existing elements survive that end insertion;
+- inserting in the middle invalidates all iterators, pointers, and references.
+
+That makes deque suitable when a sequence grows at its ends while another component temporarily retains a reference to an existing element. It does not make references to erased elements safe, and it does not permit concurrent access without synchronization.
+
+### Costs relative to vector
+
+| Property | `vector` | `deque` |
+|---|---|---|
+| Element layout | Contiguous | Segmented |
+| Random access | O(1) | O(1) |
+| `data()` | Yes | No |
+| Append at back | Amortized O(1), may move all elements | O(1), does not move existing elements |
+| Push at front | O(n) | O(1) |
+| Existing references after end insert | May dangle on reallocation | Remain valid |
+| Middle insert/erase | Shifts suffix | Moves the shorter side in typical designs; O(n), broad invalidation |
+| Allocation pattern | Occasional growing buffer | Additional blocks and occasional metadata growth |
+
+Deque's O(1) indexed access can involve more address calculations and metadata reads than vector access. Whether that matters depends on the loop, compiler, element size, and cache state. A sequential deque scan may still be efficient within blocks, but it cannot be treated as one contiguous byte range.
+
+### A valid stability use
+
+```cpp
+#include <cassert>
+#include <deque>
+
+int main() {
+    std::deque<int> queue{10, 20};
+    int& first = queue.front();
+
+    queue.push_back(30);
+    queue.push_front(5);
+    assert(first == 10);       // reference survived both end insertions
+
+    // An iterator saved before either insertion would be invalid.
+    // Erasing the element denoted by first would invalidate first itself.
+}
+```
+
+A deque end operation can still allocate, so it does not provide an allocation-free tail-latency bound. For a bounded FIFO on a hot path, a preallocated ring is usually a better match. For an unbounded staging sequence outside the critical path, deque may be the simpler standard type.
+
+`std::queue` and `std::stack` are adaptors, and deque is their default underlying container. The default is a semantic choice that supports the required end operations; it is not proof that deque is fastest for every stack or queue workload. A vector-backed stack can be attractive when only back operations are needed and capacity is planned.
+
+---
+
+## 11.7 `std::list` and `std::forward_list` — Core, skippable after selection
+
+`std::list<T>` is a bidirectional node-based sequence. `std::forward_list<T>` is singly linked and exposes only forward traversal. Both keep iterators, pointers, and references to surviving elements valid across insertion, erasure elsewhere, and splice operations.
+
+`std::list::size()` is constant time. `forward_list` deliberately has no `size()`, `back()`, or `push_back()`. Mutation occurs after a known predecessor through operations such as `insert_after` and `erase_after`. That interface exposes the actual singly linked mechanism rather than hiding an O(n) predecessor search.
+
+### The O(1) claim needs its precondition
+
+Given an iterator to the position, list insertion and erasure are constant time. Given only a value or index, finding that position is linear. This difference is the center of most list interview questions.
+
+An LRU structure illustrates a legitimate use:
+
+- a hash table maps a key to a `list` iterator;
+- the list records recency order;
+- `splice` moves a known node to the front without moving its value or invalidating its iterator;
+- eviction removes the known back node.
+
+The associative lookup belongs to Chapter 12. The sequence-side reason for the list is that the position is already known and node identity must survive reordering.
+
+### Splice and allocator compatibility
+
+`splice` transfers nodes within a list or between compatible lists without copying or moving the contained `T`. A single-node splice is constant time. Some range and whole-list cases have different complexity because sizes may need to be determined or updated. For splicing between distinct lists, allocator compatibility is a correctness precondition; unequal allocators can make the operation undefined. Do not reduce splice to “pointer changes, always O(1)” without stating which overload and which containers are involved.
+
+List-specific `sort`, `merge`, `reverse`, `unique`, and removal operations manipulate links. `std::sort` cannot accept list iterators because it requires random-access iterators; use `list::sort`. Link-based sorting preserves references and can sort types that should not be repeatedly moved, though locality often makes sorting a vector preferable when values are movable.
+
+### The resource bill
+
+A standard list normally incurs:
+
+- storage for links and allocator bookkeeping in addition to `T`;
+- allocation/deallocation behavior per node unless a resource pools nodes;
+- a dependent address chain during traversal;
+- more cache and translation footprint than a packed vector of the same payloads.
+
+Exact node size and allocation strategy are implementation- and allocator-dependent. Measure them on the target; do not publish a universal byte count.
+
+An intrusive list places link fields inside an application object. It is not a standard library container, but it can remove a separate node allocation when objects already come from a pool. The trade-off is intrusive ownership discipline: an object must not be linked into incompatible lists through the same hook, unlinking and destruction invariants become the application's responsibility, and the hook enlarges every object.
+
+Choose a standard list when the held-iterator and stability properties dominate and allocator behavior is acceptable. Choose an intrusive structure only when object lifetime is already centrally controlled and measurement shows node allocation or indirection to be material.
+
+---
+
+## 11.8 Worked reasoning: predict, estimate, choose — Core
+
+### Prediction: which handles survive?
+
+Consider:
+
+```cpp
+std::vector<int> v{10, 20, 30};
+v.reserve(8);
+int& first = v[0];
+auto middle = v.begin() + 1;
+
+v.push_back(40);
+v.insert(v.begin() + 2, 25);
+```
+
+Reason operation by operation:
+
+1. After `reserve(8)`, capacity is at least eight and all prior handles would have been invalidated if reserve increased capacity. The handles shown are acquired afterward.
+2. `push_back(40)` cannot reallocate because four elements fit. `first` and `middle` remain valid; the old `end()` would not.
+3. `insert` at index two also fits without reallocation. Handles before the insertion point remain valid, so `first` remains valid. `middle` denotes index one, also before the insertion point, and remains valid. A handle to the old element at index two would be invalidated because that element is shifted.
+
+Now append until `size() == capacity()`, cache `&v[0]`, and append once more. The new size cannot fit in current storage, so reallocation occurs and the cached pointer dangles. No implementation growth factor is needed to make that prediction.
+
+### Estimate: vector movement versus list traversal
+
+Suppose a sequence contains `n` small records and an erase occurs at index `i`.
+
+- Vector transfers approximately `n - i - 1` records and destroys the old final record.
+- List erasure is constant time only if the iterator is already held. If code starts at `begin()` and searches for the index, it performs `i` dependent link traversals before the constant-time unlink.
+
+For an erase near the front, vector moves more bytes. For a cold list whose iterator is not known, traversal can dominate. For a large or expensive-to-move `T`, the balance can reverse. The benchmark must preserve the real element type, mutation distribution, allocator, cache state, and need for stable handles. A microbenchmark that repeatedly edits one warm sequence answers a different question from a production workload with many cold sequences.
+
+### Choose the container: five latency-sized workloads
+
+| Workload | Choice | Deciding condition | Invalidation/allocation consequence |
+|---|---|---|---|
+| A protocol message has exactly eight numeric lanes | `std::array<Lane, 8>` | Count is part of the protocol | No size mutation or reallocation; all eight objects always exist |
+| A batch receives up to a known operational limit, then is scanned and discarded | Reserved `std::vector<Event>` | Contiguous scan and one bounded growth phase | No invalidation until the reserved bound is exceeded; exceeding it reallocates and is a defined fallback, not a hard cap |
+| A staging sequence grows at both ends while a formatter retains a reference to an existing item | `std::deque<Item>` if access is synchronized and mutation is end-only | Reference must survive end insertion; count is unbounded | End insertion preserves the reference but invalidates iterators and may allocate |
+| An LRU index already maps every key to the recency node | `std::list<Entry>` plus associative index, or an intrusive list with pooled entries | Reordering starts from a held iterator | Splice preserves node handles; standard list allocation behavior must be controlled |
+| A single-threaded bounded handoff buffer rejects new input when full | Fixed-capacity ring | FIFO order, slot reuse, explicit hard bound | No container allocation after setup; reuse invalidates the old logical occupant; full is visible |
+
+Two nearby workloads choose differently:
+
+- A per-order fill list that is usually small but must accept arbitrarily many valid fills favors an SVO vector, because heap fallback preserves correctness.
+- A book side whose protocol enforces a hard maximum favors a fixed-capacity inline sequence, because fallback allocation would hide a contract violation.
+
+### Choosing is also choosing a failure mode
+
+The strongest answer states what happens outside the common case:
+
+- reserved vector: reallocates and invalidates if the estimate is exceeded;
+- deque: allocates another block or propagates allocation failure;
+- list: allocates a node or propagates allocation failure;
+- fixed-capacity sequence: reports full, throws, terminates, or relies on a precondition;
+- SVO: switches to heap storage and invalidates inline handles;
+- ring: rejects, overwrites, or applies backpressure.
+
+Tail behavior is not an afterthought. It is part of the container contract.
+
+---
+
+## 11.9 Fixed-capacity inline sequences in C++23 — Role-specific
+
+C++23 does not provide `std::inplace_vector`. When a codebase uses that spelling, it is either targeting a later language/library mode or using a non-standard type in another namespace. For C++23, there are three practical patterns:
+
+1. `std::array<T, N>` plus a logical size, when constructing all `N` objects is acceptable.
+2. A vetted third-party static/fixed-capacity vector that manages object lifetimes in inline storage.
+3. An application-specific type, justified only when its lifetime, exception, iterator, and overflow contracts are fully tested.
+
+The core semantics are dynamic size, fixed capacity, inline storage, and no allocator fallback. The overflow policy is part of the type's contract: insertion might report failure, throw, terminate, or have a precondition that capacity remains. Those behaviors are not interchangeable on a low-latency path.
+
+### `array` plus size
+
+For cheap default-constructible values, the simple pattern is often sufficient:
+
+```cpp
+#include <array>
+#include <cstddef>
+#include <span>
+
+struct Level {
+    int price{};
+    int quantity{};
+};
+
+template <std::size_t Capacity>
+class BookSide {
+    std::array<Level, Capacity> levels_{};
+    std::size_t size_{};
+
+public:
+    bool push_back(Level level) noexcept {
+        if (size_ == Capacity) {
+            return false;
+        }
+        levels_[size_++] = level;
+        return true;
+    }
+
+    std::span<const Level> levels() const noexcept {
+        return {levels_.data(), size_};
+    }
+};
+
+int main() {
+    BookSide<32> bids;
+    return bids.push_back({101, 8}) ? 0 : 1;
+}
+```
+
+This constructs 32 `Level` objects and assignment replaces their values. A true fixed-capacity vector would keep only `size()` live `T` objects in raw inline storage. Implementing that correctly requires alignment, explicit lifetime start and end, exception-safe partial construction, copy/move operations, destruction, and iterator rules. Reuse a reviewed type rather than compressing those rules into interview pseudocode.
+
+### Invalidation and move cost
+
+A fixed-capacity inline vector never reallocates, so appending at the end preserves existing element pointers and references. Middle insertion and erasure still shift elements and invalidate handles at or after the modification. Moving the container generally has to move its inline elements; unlike an ordinary vector with compatible allocators, it cannot necessarily transfer ownership by stealing one buffer pointer.
+
+The container object is large enough for its maximum capacity even when empty. This removes allocation and an element-buffer indirection, but increases the size of every parent object and the cost of moving or copying that parent. Select `N` from a protocol limit or measured distribution, not from a cache-line slogan.
+
+---
+
+## 11.10 Small-vector optimization — Role-specific
+
+A small-vector-optimized type stores up to an inline capacity inside the container object and switches to allocated storage when the sequence grows beyond it. Several non-standard libraries provide such types; their APIs, allocator support, growth policy, move behavior, and invalidation details differ.
+
+The crucial distinction is:
+
+| Question | Fixed-capacity inline vector | Small-vector-optimized vector |
+|---|---|---|
+| Maximum size | Hard limit | Limited only by allocation/resources |
+| Allocation | Never | Begins after inline capacity |
+| Overflow | Explicit policy | Falls back to heap |
+| Object size | Includes fixed storage | Includes inline storage plus state |
+| Append invalidation | No reallocation, but full must be handled | Switching to heap invalidates all element handles |
+| Move | Usually moves inline elements | May move inline elements or steal heap storage |
+
+SVO is attractive for collections that are usually small but must preserve correctness for a long tail: a fill list that normally contains two entries but occasionally contains many, for example. It trades a smaller common-case allocation count for larger container objects and a bimodal path. Crossing the inline threshold is exactly the kind of rare event that can appear in tail latency.
+
+Measure:
+
+- the distribution of sizes, including bursts;
+- the fraction that crosses the inline threshold;
+- object density in the parent array or pool;
+- allocations and bytes moved;
+- typical and high-percentile append latency.
+
+If “never allocate” is a requirement, SVO is the wrong type because heap fallback is its defining escape hatch. If size is formally bounded, a fixed-capacity type makes the contract visible and avoids maintaining two storage modes.
+
+---
+
+## 11.11 Fixed-capacity rings — Role-specific
+
+A ring stores a bounded logical sequence in a fixed array and wraps indices at the end. It is the natural representation for FIFO traffic when old front slots can be reused. After initialization, a simple ring needs no container-storage allocation and moves no surviving element merely to pop the front; operations performed by `T` can still allocate.
+
+```cpp
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <utility>
+
+template <class T, std::size_t Capacity>
+class Ring {
+    static_assert(Capacity > 0);
+
+    std::array<T, Capacity> storage_{};
+    std::size_t head_{};
+    std::size_t size_{};
+
+public:
+    bool push_back(T value) {
+        if (size_ == Capacity) {
+            return false;
+        }
+        const auto slot = (head_ + size_) % Capacity;
+        storage_[slot] = std::move(value);
+        ++size_;
+        return true;
+    }
+
+    T& front() {
+        assert(size_ != 0);
+        return storage_[head_];
+    }
+
+    void pop_front() {
+        assert(size_ != 0);
+        head_ = (head_ + 1) % Capacity;
+        --size_;
+    }
+
+    bool empty() const noexcept { return size_ == 0; }
+};
+
+int main() {
+    Ring<int, 4> ring;
+    assert(ring.push_back(7));
+    assert(ring.front() == 7);
+    ring.pop_front();
+    assert(ring.empty());
+}
+```
+
+This compact version constructs every slot and is appropriate for cheap, default-constructible value types. Its own storage does not allocate after construction, but assignment of a general `T` still could. It also leaves a popped value alive until that slot is overwritten or the ring is destroyed. A general ring must manage the lifetime of only occupied slots, as a fixed-capacity vector does.
+
+The full condition needs an explicit policy:
+
+- reject the new element and return failure;
+- overwrite the oldest element;
+- block or apply backpressure outside the container;
+- record loss and continue;
+- treat full as a violated precondition.
+
+Each policy changes correctness. Overwriting also invalidates the logical object previously occupying that slot even though the slot's address is stable. A generation counter can detect reuse when handles escape.
+
+A ring shared between threads is a concurrent algorithm, not merely this container with atomic indices added. Publication ordering, ownership of slots, wraparound, false sharing, and progress guarantees belong to Chapter 26. Use the single-threaded ring here only as a layout and capacity model.
+
+---
+
+## 11.12 Measurement checklist — Role-specific
+
+When container choice is performance-sensitive, benchmark the actual decision rather than isolated syntax. Record:
+
+1. size and mutation-position distributions;
+2. element size, alignment, and move/copy/destructor cost;
+3. allocation count, allocated bytes, and resource behavior;
+4. bytes moved per operation;
+5. working-set size and cache state;
+6. typical, high-percentile, and worst observed latency;
+7. memory footprint per live element and per empty container;
+8. handle lifetime and invalidation events;
+9. overflow, allocation-failure, and estimate-exceeded paths.
+
+Use an optimized build and ensure the benchmark consumes results. Separate construction from steady-state traversal if production does so. Randomize or reproduce the real access distribution; otherwise a hot repeated scan can exaggerate locality. Hardware counters can help attribute cache and branch effects, while allocator instrumentation identifies the rare calls that dominate a tail.
+
+The rollback should also be explicit. For example: “Replace the list with a vector if measured middle-edit latency remains within the budget and no consumer requires stable references,” or “reduce the SVO inline count if parent-object density harms scan time more than saved allocations help.”
+
+---
+
+## Recall card — Core
+
+- **Topology selects behavior:** array and vector are contiguous; deque is segmented; list-like containers are node-based.
+- **`array`:** fixed count, inline elements, no allocation, no size-changing operations. Braces matter for initialization.
+- **`vector`:** dynamic contiguous storage and the default for append/scan. Reallocation invalidates everything; middle edits invalidate from the edit onward.
+- **Capacity:** `reserve` creates no objects. Reserve once before a bounded phase. `clear` retains capacity; `shrink_to_fit` is non-binding.
+- **`deque`:** constant-time operations at both ends and stable references during end insertion, but all iterators are invalidated by end insertion and the range is not contiguous.
+- **Lists:** stable surviving element handles and constant-time edits at a known position. Searching for that position is linear and traversal is pointer-dependent.
+- **Fixed capacity:** C++23 has no `std::inplace_vector`. Use `array+size` for simple values or a vetted fixed-capacity type; define full behavior explicitly.
+- **SVO:** small inline, heap fallback. It reduces common-case allocation but crossing the inline threshold can allocate and invalidate all handles.
+- **Ring:** bounded FIFO with slot reuse. It is not concurrently safe without a separate synchronization algorithm.
+- **Identity:** if a handle must outlive storage mutation and slot reuse, use stable ownership or an index plus generation—not a pointer into a vector.
+
+---
+
+## Common traps — Core
+
+- Reading elements of a default-initialized local `std::array<int, N>` before writing them.
+- Assuming `sizeof(std::array<T, N>) == N * sizeof(T)` or a particular vector/deque metadata layout as a portable ABI rule.
+- Writing through `v[0]` after `v.reserve(n)` while `v.size()` is still zero.
+- Retaining `v.data()`, an element pointer, or an iterator across a possibly reallocating vector operation.
+- Caching `end()` across a size-changing operation.
+- Calling `reserve(size() + 1)` on every append.
+- Expecting `clear`, `pop_back`, or element erasure to reduce vector capacity.
+- Treating `shrink_to_fit` as mandatory or harmless.
+- Using repeated vector `erase` in a loop when one `std::erase_if` expresses the operation.
+- Calling `remove_if` without erasing the returned tail.
+- Assuming deque end insertion preserves iterators because it preserves references.
+- Treating deque or list operations as allocation-free because their complexity is constant.
+- Quoting list insertion as O(1) when the position must first be searched.
+- Splicing between lists without checking allocator compatibility.
+- Treating a stable address as permission for unsynchronized cross-thread access.
+- Calling an SVO type fixed-capacity even though it allocates beyond the inline count.
+- Teaching `std::inplace_vector` as C++23.
+- Implementing raw inline storage without complete object-lifetime and exception-safety rules.
+- Treating a fixed ring as a concurrent queue merely because indices can be atomic.
+
+---
+
+## Reasoning questions
+
+1. A vector has spare capacity. Which handles survive an insertion at the end, and which survive an insertion at index three? Explain without saying only “no reallocation.”
+2. Why can a deque reference survive `push_front` while a deque iterator does not? What implementation freedom does that distinction preserve?
+3. A team calls `reserve` with the 99th-percentile batch size. What correctness and latency behavior remains for the largest one percent, and how would a hard-cap design differ?
+4. Compare erasing a small record near the middle of a vector with erasing it from a list when the caller has only the record's value, not an iterator. What must be measured?
+5. An SVO fill list removes almost every allocation but enlarges every `Order`. Describe a benchmark that can detect whether the trade improved end-to-end latency.
+6. A pointer into a fixed-capacity ring retains the same address after many wraps. Why can it still be a stale handle, and what metadata can detect reuse?
+7. A deque solves reference invalidation for an end-growing work queue. Why might it still be unacceptable on a critical thread?
+8. Choose among `array`, reserved `vector`, fixed-capacity vector, SVO vector, and ring for: an exact protocol tuple, a bounded batch, a hard-bounded variable list, a usually small unbounded list, and a FIFO. State each overflow or invalidation consequence.
+9. A type is move-only and its move constructor may throw. What happens to vector's reallocation strategy and exception guarantee?
+10. Why is “list has O(1) insertion, vector has O(n), therefore list is faster” an incomplete argument on both the algorithmic and hardware axes?
+
+---
+
+## Prerequisite for Chapter 12
+
+Chapter 12 assumes that you can classify a container as contiguous, segmented, or node-based; predict iterator/reference/pointer invalidation from a mutation; distinguish amortized complexity from a latency bound; and separate a standard guarantee from a common implementation. Associative containers reuse the same stability vocabulary, especially when rehashing invalidates iterators without necessarily invalidating references.

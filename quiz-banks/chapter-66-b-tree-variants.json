@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because copy-on-write never overwrites a live page, a crash mid-update leaves the old tree fully intact and the new tree simply does not commit, so there is no half-written page to defend against and no need for full-page-writes or a doublewrite buffer.",
-      "sourceAnchor": "661-why-variants-exist-the-limits-of-the-classic-b-tree",
+      "sourceAnchor": "661-the-axes-that-matter--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "PostgreSQL's nbtree is an in-place, mutable, latch-coupled Lehman-Yao B-link tree, and its MVCC lives in the heap rather than the index. The variants in this chapter are what LMDB, WiredTiger, TokuDB, and Hekaton do differently from that baseline.",
-      "sourceAnchor": "662-the-baseline-postgresqls-nbtree-lehman-yao-in-place",
+      "sourceAnchor": "667-postgresql-access-methods-choose-by-predicate--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Postgres keeps MVCC information (xmin/xmax) on heap tuples, not in the index. The B-tree is a secondary structure whose leaves hold key plus TID and may reference tuples later reclaimed by VACUUM, which is why nbtree needs no in-tree versioning.",
-      "sourceAnchor": "662-the-baseline-postgresqls-nbtree-lehman-yao-in-place",
+      "sourceAnchor": "667-postgresql-access-methods-choose-by-predicate--core",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "One axis ranges over in-place, copy-on-write, buffered, and delta-log write strategies; the other ranges over latch coupling, single-writer, and latch-free CAS concurrency. Each engine picks one option from each axis, such as LMDB being copy-on-write plus single-writer.",
-      "sourceAnchor": "663-the-design-space-two-axes",
+      "sourceAnchor": "661-the-axes-that-matter--core",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Since copy-on-write writes fresh copies of the whole root-to-leaf path and only then flips one root pointer, there is no window in which the tree is partially updated. The structure itself provides atomicity, so no separate redo or undo log is required for it.",
-      "sourceAnchor": "664-copy-on-write-b-trees-shadow-paging",
+      "sourceAnchor": "662-case-study-one-copy-on-write-trees--core",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "To change one leaf, copy-on-write must produce new copies of the leaf, its parent, and every ancestor up to a new root, so a one-byte change costs a number of page writes equal to the tree height. Keeping fan-out high and height small is what keeps this affordable.",
-      "sourceAnchor": "664-copy-on-write-b-trees-shadow-paging",
+      "sourceAnchor": "662-case-study-one-copy-on-write-trees--core",
       "difficulty": "recall"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Two concurrent copy-on-write writers would each try to produce their own new root, which is difficult to merge. LMDB sidesteps this by serializing writers with one mutex while readers run unlimited and lock-free, so writers never block readers and readers never block writers.",
-      "sourceAnchor": "665-lmdb-the-copy-on-write-b-tree-in-production",
+      "sourceAnchor": "662-case-study-one-copy-on-write-trees--core",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "LMDB maps the entire database file into the address space and returns pointers directly into it, so a read is a memory access with no serialization or buffer-pool management. The operating system's page cache is LMDB's cache, which keeps its code remarkably small.",
-      "sourceAnchor": "665-lmdb-the-copy-on-write-b-tree-in-production",
+      "sourceAnchor": "662-case-study-one-copy-on-write-trees--core",
       "difficulty": "recall"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "LMDB fsyncs the new data pages first, then writes the new root and transaction id into the meta page not currently authoritative and fsyncs it. A crash before that write leaves the previous meta page intact, so recovery simply picks the highest valid transaction id.",
-      "sourceAnchor": "666-lmdb-meta-page-double-buffering",
+      "sourceAnchor": "663-case-study-two-buffered-bε-trees--core",
       "difficulty": "application"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The pair exists so commits can alternate slots: writes go to the meta page that is not currently authoritative, so the previous committed root always survives untouched as a recovery fallback. It has nothing to do with hosting multiple databases or replicas.",
-      "sourceAnchor": "666-lmdb-meta-page-double-buffering",
+      "sourceAnchor": "663-case-study-two-buffered-bε-trees--core",
       "difficulty": "trap"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Pages freed by a transaction are tagged with its transaction id, and the oldest live reader's transaction id is the reclamation horizon: anything freed before it is safe to reuse. A long-lived reader pins old pages and bloats the file, mirroring the Postgres VACUUM problem.",
-      "sourceAnchor": "667-space-reclamation-and-the-free-list",
+      "sourceAnchor": "662-case-study-one-copy-on-write-trees--core",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The invariant-heavy split, merge, and rebalance logic is written once, and only the leaf behavior of producing an updated node differs. In-place update returns the same page id, while copy-on-write returns a new page id that forces path-copying to propagate upward.",
-      "sourceAnchor": "668-abstracting-node-updates-one-codebase-two-strategies",
+      "sourceAnchor": "665-abstract-node-updates-without-hiding-semantics--core",
       "difficulty": "recall"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A lazy B-tree accumulates changes rather than pushing each one to its leaf page immediately, amortizing the expensive leaf write across many logical updates. The price is read amplification, since a read may have to consult buffers along the path as well as the leaf.",
-      "sourceAnchor": "669-lazy-b-trees-buffering-updates-at-nodes",
+      "sourceAnchor": "663-case-study-two-buffered-bε-trees--core",
       "difficulty": "recall"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "WiredTiger keeps a clean on-disk image plus an update-list skiplist per in-memory page; reconciliation walks those updates, picks the values visible to the checkpoint snapshot, and serializes new page images. It also performs splits and merges, so structural maintenance happens lazily here.",
-      "sourceAnchor": "6610-wiredtiger-in-memory-images-checkpoints-and-reconciliation",
+      "sourceAnchor": "669-research-and-product-reference--reference",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because reconciled pages go to fresh offsets and the block manager tracks reusable extents in a free list, an in-progress checkpoint never overwrites the blocks of the last durable one. This gives the same torn-page immunity as LMDB, applied at checkpoint granularity.",
-      "sourceAnchor": "6610-wiredtiger-in-memory-images-checkpoints-and-reconciliation",
+      "sourceAnchor": "669-research-and-product-reference--reference",
       "difficulty": "recall"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Block-level copy-on-write protects only the checkpointed tree, and checkpoints are around sixty seconds apart in MongoDB's default. Individual commits between checkpoints are made durable by a journal that is fsynced far more often, unlike LMDB whose per-transaction commits are themselves durable.",
-      "sourceAnchor": "6610-wiredtiger-in-memory-images-checkpoints-and-reconciliation",
+      "sourceAnchor": "669-research-and-product-reference--reference",
       "difficulty": "trap"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The LA-tree attaches a cascaded update buffer to each subtree and, adaptively, keeps buffers small in read-heavy subtrees and large in write-heavy ones. This dynamically balances read cost against write amortization, foreshadowing the read/write knob the Bε-tree formalizes.",
-      "sourceAnchor": "6611-the-lazy-adaptive-tree-la-tree",
+      "sourceAnchor": "669-research-and-product-reference--reference",
       "difficulty": "recall"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With data spread across several leveled sorted runs, a naive search would binary-search each run independently. Fractional cascading copies a sample of each level's keys upward as fence pointers, so after one real search you follow fences down, keeping total search near single-tree cost.",
-      "sourceAnchor": "6612-fd-trees-fractional-cascading-on-flash",
+      "sourceAnchor": "669-research-and-product-reference--reference",
       "difficulty": "application"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An FD-tree keeps a small head tree and a sequence of increasingly large sorted runs; when a level fills it is merged into the next larger level with a sequential write, exactly the leveled compaction of an LSM tree. Fractional cascading then keeps multi-level search cheap.",
-      "sourceAnchor": "6612-fd-trees-fractional-cascading-on-flash",
+      "sourceAnchor": "669-research-and-product-reference--reference",
       "difficulty": "recall"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A Bε-tree writes an insert as a message into the cached root buffer, one cheap write. When a node's buffer fills, its messages flush down to children carrying many messages per I/O, so the per-message write cost is amortized across the whole batch.",
-      "sourceAnchor": "summary",
+      "sourceAnchor": "667-postgresql-access-methods-choose-by-predicate--core",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because writes are buffered high in the tree and cascade down slowly, the most recent value of a key may be a message still pending in a buffer along the path. A read therefore checks each node's buffer on the root-to-leaf path, which is the read-amplification cost of buffering.",
-      "sourceAnchor": "common-traps",
+      "sourceAnchor": "663-case-study-two-buffered-bε-trees--core",
       "difficulty": "trap"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The parameter divides each node between pivot keys and message buffer, continuously interpolating between structures. At ε=1 the node is all pivots (a B-tree: fast point queries, one I/O per insert); as ε approaches zero it becomes LSM-like with maximal insert amortization and costlier queries.",
-      "sourceAnchor": "summary",
+      "sourceAnchor": "667-postgresql-access-methods-choose-by-predicate--core",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Inter-node references hold logical page ids rather than physical addresses, and the mapping table maps each id to its current location. Changing a page becomes a single compare-and-swap on its slot, and no other node needs modifying because they all reference the stable id.",
-      "sourceAnchor": "6615-bw-trees-the-latch-free-b-tree",
+      "sourceAnchor": "664-case-study-three-bw-tree-delta-chains--core",
       "difficulty": "recall"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The Bw-tree never rewrites a page in place; it allocates a small delta record whose next pointer is the current head and installs it with a compare-and-swap on the page's mapping slot. The CAS is the linearization point: it either succeeds or the thread retries, so no one ever blocks.",
-      "sourceAnchor": "6615-bw-trees-the-latch-free-b-tree",
+      "sourceAnchor": "664-case-study-three-bw-tree-delta-chains--core",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The split installs a split delta on the child (making moved keys reachable via a side-link, Lehman-Yao style) and then an index-term delta on the parent, each a lone CAS. Because the half-done state is searchable and correct, a thread arriving mid-split cooperatively completes the missing step.",
-      "sourceAnchor": "6616-bw-tree-consolidation-and-structural-modifications",
+      "sourceAnchor": "664-case-study-three-bw-tree-delta-chains--core",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Delta chains grow with each update and slow reads that must replay them, so when a chain exceeds a threshold a thread builds a consolidated base page and CASes it into the slot. If the CAS fails because a delta was added meanwhile, the work is discarded and retried later.",
-      "sourceAnchor": "6616-bw-tree-consolidation-and-structural-modifications",
+      "sourceAnchor": "664-case-study-three-bw-tree-delta-chains--core",
       "difficulty": "recall"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A thread can CAS away an old chain while a reader still points at it, so freeing at once would be a use-after-free. Epoch reclamation defers freeing an epoch's garbage until no thread remains active in that epoch or earlier, guaranteeing no live reference to the removed object survives.",
-      "sourceAnchor": "6617-epoch-based-reclamation-freeing-memory-without-locks",
+      "sourceAnchor": "664-case-study-three-bw-tree-delta-chains--core",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "LLAMA owns the mapping table (a page id may resolve to RAM or a flash offset), appends pages and deltas to a sequential log rather than overwriting, and manages caching and eviction with compare-and-swap. It gives the Bw-tree LSM-like sequential-write durability under a B-tree index.",
-      "sourceAnchor": "6618-llama-log-structured-storage-under-the-bw-tree",
+      "sourceAnchor": "664-case-study-three-bw-tree-delta-chains--core",
       "difficulty": "recall"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The recursive van Emde Boas split packs about log B consecutive levels of any root-to-leaf path into one contiguous block for every block size at once. So the search achieves the same block-transfer bound a specifically tuned B-tree would, without knowing any cache line, page, or disk block size.",
-      "sourceAnchor": "6619-cache-oblivious-b-trees-and-the-van-emde-boas-layout",
+      "sourceAnchor": "669-research-and-product-reference--reference",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Cache-oblivious means the structure is simultaneously efficient at the L1, L2, page, and disk levels without any of their sizes appearing in its design, thanks to the recursive van Emde Boas layout. It is the opposite of indifferent to caching; it is optimal without being told the parameters.",
-      "sourceAnchor": "6619-cache-oblivious-b-trees-and-the-van-emde-boas-layout",
+      "sourceAnchor": "669-research-and-product-reference--reference",
       "difficulty": "recall"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "LMDB pairs copy-on-write with a single writer, WiredTiger buffers in-memory page images and checkpoints copy-on-write, TokuDB and PerconaFT ship the Bε-tree as fractal trees, and Hekaton and Cosmos DB use the latch-free Bw-tree. Naming the map correctly is the core interview skill here.",
-      "sourceAnchor": "6620-putting-it-together-the-comparison-table",
+      "sourceAnchor": "668-comparison-matrix--core",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The two names describe the same structure: fractal tree was Tokutek's marketing term for the Bε-tree they shipped in TokuDB and PerconaFT. Both put message buffers in internal nodes and cascade updates downward, so there is no substantive difference between them.",
-      "sourceAnchor": "common-traps",
+      "sourceAnchor": "663-case-study-two-buffered-bε-trees--core",
       "difficulty": "trap"
     }
   ]

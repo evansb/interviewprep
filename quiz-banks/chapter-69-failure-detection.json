@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With no bound on delay or processing speed, a slow node might answer just after you give up, so silence is produced identically by a crash, a slow node, and a partition. No finite timeout resolves the ambiguity.",
-      "sourceAnchor": "691-the-problem-crash-slow-or-partitioned",
+      "sourceAnchor": "691-why-failures-cannot-be-observed-directly--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A failure detector is an unreliable local oracle that outputs the set of currently suspected nodes. It can make false positives and false negatives, and the algorithms above it are designed to tolerate those mistakes.",
-      "sourceAnchor": "692-a-failure-detector-is-suspicion-not-fact",
+      "sourceAnchor": "692-a-failure-detector-is-suspicion-not-fact--core",
       "difficulty": "recall"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Suspecting a node that is actually alive is a false positive (a mistake). Its cost is real: needless failover, fencing a good node, data reshuffling, and often a cascade as the reshuffle load stresses survivors.",
-      "sourceAnchor": "692-a-failure-detector-is-suspicion-not-fact",
+      "sourceAnchor": "692-a-failure-detector-is-suspicion-not-fact--core",
       "difficulty": "application"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Completeness is the liveness guarantee that crashed processes are eventually suspected, while accuracy is the safety guarantee that correct processes are not falsely suspected. Strong, weak, and eventual variants refine each.",
-      "sourceAnchor": "693-formal-properties-completeness-and-accuracy",
+      "sourceAnchor": "693-completeness-and-accuracy--core",
       "difficulty": "recall"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Suspecting everyone always is trivially complete (no real failure is missed) but maximally inaccurate, constantly accusing healthy nodes. The engineering difficulty is achieving completeness and accuracy simultaneously.",
-      "sourceAnchor": "693-formal-properties-completeness-and-accuracy",
+      "sourceAnchor": "693-completeness-and-accuracy--core",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Strong accuracy requires never suspecting a live-but-slow node, which requires an upper bound on message delay; asynchrony provides none. Any deadline can be exceeded (mistake) and never giving up breaks completeness, so P is unachievable.",
-      "sourceAnchor": "694-why-a-perfect-detector-is-impossible-in-an-asynchronous-system",
+      "sourceAnchor": "694-why-a-perfect-detector-is-impossible--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Real networks are partially synchronous: mostly timely, occasionally not. In that model an Eventually Perfect (P-diamond) detector is achievable, adapting its timeouts upward after mistakes so accuracy is regained once the system behaves synchronously.",
-      "sourceAnchor": "694-why-a-perfect-detector-is-impossible-in-an-asynchronous-system",
+      "sourceAnchor": "694-why-a-perfect-detector-is-impossible--core",
       "difficulty": "recall"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Detection time and mistake rate move in opposite directions on one knob: shortening the timeout speeds detection but crosses the threshold more often on transient delays, raising false positives. You pick a point on this curve, not escape it.",
-      "sourceAnchor": "695-the-three-way-tension-completeness-accuracy-and-speed",
+      "sourceAnchor": "693-completeness-and-accuracy--core",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Latency is continuous, noisy, and fat-tailed. A fixed timeout set low flaps on load spikes; set high it detects real crashes slowly. And a static value chosen for today's load is wrong once traffic patterns shift.",
-      "sourceAnchor": "696-timeouts-the-crude-baseline",
+      "sourceAnchor": "696-heartbeats-timeouts-and-adaptation--core",
       "difficulty": "recall"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The variance term makes the timeout sit above the mean by a multiple of measured jitter. A steady link has small RTTVAR and a tight timeout; a jittery link has large RTTVAR and a loose one, adapting without hand-tuning.",
-      "sourceAnchor": "697-choosing-a-timeout-and-adaptive-timeouts",
+      "sourceAnchor": "697-adaptive-timeouts--core",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Push has the monitored node emit periodic heartbeats (a one-way signal, cheap, natural for gossip). Pull has the monitor send a probe and wait for an ack, which tests the full round trip and catches asymmetric receive-but-not-send failures.",
-      "sourceAnchor": "698-heartbeats-and-pings-push-vs-pull",
+      "sourceAnchor": "698-push-heartbeats-versus-pull-probes--core",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "You must wait roughly n missed intervals, so detection time is at least n * T_hb. Message load scales as 1/T_hb per link, so halving the interval doubles traffic, illustrating the cost versus detection-time trade.",
-      "sourceAnchor": "699-heartbeat-interval-and-the-costdetection-time-trade",
+      "sourceAnchor": "699-interval-misses-and-message-cost--core",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Nodes increment their own counter, gossip the whole vector, and merge by taking the largest counter seen per member plus the local time it was first seen. The detector never times out; each consumer applies its own freshness policy.",
-      "sourceAnchor": "6910-timeout-free-failure-detectors",
+      "sourceAnchor": "6910-timeout-free-signal-not-timeout-free-decision--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "When a direct ping fails, k other members probe the target in parallel; suspicion requires all k+1 independent paths to fail together, a far better proxy for real death. Because the indirect probes are parallel, base detection time is unchanged.",
-      "sourceAnchor": "6911-outsourced-heartbeats-and-indirect-probing-swims-ping-req",
+      "sourceAnchor": "6911-indirect-probing-ping-req--core",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Rather than a boolean, phi-accrual emits a continuous phi that grows the longer a heartbeat is overdue. Because the accusation decision is decoupled from the raw signal, different applications apply different phi thresholds to the same stream.",
-      "sourceAnchor": "6912-the-phi-accrual-failure-detector",
+      "sourceAnchor": "6912-phi-accrual-suspicion-as-model-surprise--core",
       "difficulty": "recall"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Phi equals the negative base-10 log of the probability that a gap this long is normal, so phi = 8 means P_later = 10^-8, about a 1-in-100-million mistake probability. The threshold is the tolerated mistake rate as a negative exponent.",
-      "sourceAnchor": "6912-the-phi-accrual-failure-detector",
+      "sourceAnchor": "6912-phi-accrual-suspicion-as-model-surprise--core",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Phi is derived from the measured distribution: a larger sigma shrinks z = (dt - mu)/sigma, raising P_later and lowering phi for the same silence. The detector grows more patient on jittery links with no manual retuning.",
-      "sourceAnchor": "6913-phi-accrual-the-math-and-a-worked-example",
+      "sourceAnchor": "6913-worked-phi-calculation-and-simulation--core",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The default phi_convict_threshold is 8 (range 5-16). On noisy cloud networks operators raise it to 10-12 so transient latency spikes do not falsely convict peers and trigger expensive hinted-handoff and data streaming.",
-      "sourceAnchor": "6914-cassandra-and-akka-phi_convict_threshold-in-practice",
+      "sourceAnchor": "6914-product-knobs-are-versioned-evidence--role-specific",
       "difficulty": "recall"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "If a link is unrealistically steady, sigma approaches zero and phi spikes on any tiny delay, causing flapping on healthy nodes. Flooring sigma builds in a noise-tolerance band, acknowledging that real heartbeats always have a noise floor.",
-      "sourceAnchor": "6914-cassandra-and-akka-phi_convict_threshold-in-practice",
+      "sourceAnchor": "6914-product-knobs-are-versioned-evidence--role-specific",
       "difficulty": "application"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "SWIM separates dissemination from detection but rides updates on the probe traffic already flowing. Infection-style gossip spreads a change exponentially, reaching all nodes in O(log n) rounds at essentially zero extra message cost.",
-      "sourceAnchor": "6915-gossip-based-detection-swim-in-detail",
+      "sourceAnchor": "6915-swim-membership-and-dissemination--core",
       "difficulty": "recall"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A failed probe marks the node suspect and gossips that; peers that can still reach it may refute the suspicion, and only after a timeout does it become dead. This correctable middle state is the gossip analogue of phi-accrual's continuous phi.",
-      "sourceAnchor": "6915-gossip-based-detection-swim-in-detail",
+      "sourceAnchor": "6915-swim-membership-and-dissemination--core",
       "difficulty": "application"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A live node bumps its own incarnation and broadcasts Alive with the newer value, which overrides the stale Suspect everywhere. Because only the node itself increments its incarnation, no other node can forge the refutation, and a dead node emits nothing.",
-      "sourceAnchor": "6916-incarnation-numbers-refuting-a-false-suspicion",
+      "sourceAnchor": "6916-incarnation-numbers-refuting-a-false-suspicion--core",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "SWIM probes one random target plus a constant k indirect probes per period, independent of n, so per-node load is O(1) and cluster-wide is O(n). All-to-all heartbeating is O(n) per node and O(n^2) total, which caps its scalability.",
-      "sourceAnchor": "6917-scalability-o1-vs-on-load-per-node",
+      "sourceAnchor": "6917-scalability-under-stated-assumptions--deep-dive",
       "difficulty": "recall"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Instead of outsiders inferring health from silence, each node reports its own health to a sink and self-fences on losing quorum or its lease. It catches richer, faster self-observable failures, but a fully crashed node cannot report anything, so external detection is still required.",
-      "sourceAnchor": "6918-reversing-the-problem-self-monitoring-and-the-sink-approach",
+      "sourceAnchor": "6918-self-reporting-and-local-health--role-specific",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A lease is a self-expiring TTL grant the holder must keep renewing. If it stops (crash, slow, or partition), the lease expires by the grantor's clock alone and the protected resource is released, turning a suspicion into a fenced, provable fact.",
-      "sourceAnchor": "6919-leases-sessions-and-fencing-zookeeper-etcd-and-patroni",
+      "sourceAnchor": "6919-leases-fencing-and-safe-action--core",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Postgres has no native membership, so Patroni holds a leader key with a TTL (default 30 s) in a DCS, renewed every loop_wait (10 s). If the primary cannot renew, the key vanishes and replicas elect a new leader; the old primary self-demotes on DCS loss before its TTL expires, avoiding two live primaries.",
-      "sourceAnchor": "6919-leases-sessions-and-fencing-zookeeper-etcd-and-patroni",
+      "sourceAnchor": "6919-leases-fencing-and-safe-action--core",
       "difficulty": "application"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A stop-the-world GC freezes every thread, including the heartbeat sender, so the node is indistinguishable from a crash, the pure slow case. If the conviction threshold is below the worst pause, healthy nodes get evicted on every collection; the fix is to set the threshold above the worst tolerable pause.",
-      "sourceAnchor": "6920-practical-concerns-flapping-gc-pauses-and-tuning",
+      "sourceAnchor": "6920-operational-policy-flapping-pauses-and-tuning--core",
       "difficulty": "trap"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Detectors track elapsed intervals (time since last heartbeat, lease TTL), not absolute instants. A wall-clock (NTP-steppable) source can jump forward or backward and instantly expire or extend everything; a monotonic clock never goes backward and ignores NTP corrections.",
-      "sourceAnchor": "6920-practical-concerns-flapping-gc-pauses-and-tuning",
+      "sourceAnchor": "6920-operational-policy-flapping-pauses-and-tuning--core",
       "difficulty": "trap"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Gossip-based SWIM keeps each node's probe load constant regardless of cluster size and spreads updates in O(log n) rounds, whereas all-to-all heartbeating is O(n) per node and O(n^2) total, hitting a hard ceiling. This is why large membership layers are gossip-based.",
-      "sourceAnchor": "6921-putting-it-together-choosing-a-detector",
+      "sourceAnchor": "6921-choosing-a-detector--core",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because a detector can be wrong, promoting on a bare suspicion risks two simultaneous primaries. A lease or fencing token with a deadline guarantees that even a mistaken suspicion cannot yield two live primaries, which is why leases beat raw detectors.",
-      "sourceAnchor": "common-traps",
+      "sourceAnchor": "6919-leases-fencing-and-safe-action--core",
       "difficulty": "trap"
     }
   ]

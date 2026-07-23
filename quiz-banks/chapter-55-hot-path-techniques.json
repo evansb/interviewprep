@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The ban is about the shape of the distribution, not the mean: p50 is fine while p99.99 is catastrophic, because slow paths take a lock, a syscall, and a run of minor faults. The 'shared thread cache' answer sounds right but inverts the design — the thread cache is per-thread, which is precisely why the fast path is lock-free. The KPTI framing is also wrong: `malloc`'s fast path makes no syscall at all.",
-      "sourceAnchor": "551-hot-path-preallocation",
+      "sourceAnchor": "553-preallocation-residency-and-pools--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Reserving address space says nothing about physical residency: Linux populates lazily, so the first touch of each page traps, and only prefaulting plus `mlock` makes residency guaranteed and durable. The cache-miss answer is the most tempting because it is true that a cold arena misses, but an L3 miss is ~80 ns, not microseconds, and it cannot produce the observed magnitude. `brk` is not re-entered per access either — the fault is the page-fault handler, not a repeated syscall.",
-      "sourceAnchor": "551-hot-path-preallocation",
+      "sourceAnchor": "553-preallocation-residency-and-pools--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "First-touch policy binds the physical page to the node of whichever thread wrote it first, so prefaulting on a foreign thread makes every subsequent hot access a remote one — a permanent tax rather than a warm-up cost. The 'cold but then fine' answer is the tempting one because it correctly describes cache behaviour, but NUMA placement is not fixed by warming: DRAM latency stays ~130 ns instead of ~80 ns forever. `mlock` succeeds regardless of node, so that variant is false too.",
-      "sourceAnchor": "551-hot-path-preallocation",
+      "sourceAnchor": "553-preallocation-residency-and-pools--core",
       "difficulty": "trap"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Both mechanisms reduce TLB pressure, so the deciding factor is jitter: the kernel's background compaction thread stalls the process at unpredictable moments, which is exactly the tail behaviour the chapter forbids. The claim that THP is file-backed only is backwards — THP historically applies to anonymous memory, which is what an arena is. The page-size claim is also wrong; x86-64 huge pages are 2 MB (or 1 GB), and a 1 GB working set needs 512 of them versus 262,144 4 KB entries.",
-      "sourceAnchor": "551-hot-path-preallocation",
+      "sourceAnchor": "553-preallocation-residency-and-pools--core",
       "difficulty": "application"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The trade is a lower mean for a constant one: because the sustainable boost bin depends on conditions outside your control and can change mid-burst, Turbo makes the clock a source of jitter, and the chapter's thesis is that predictability beats speed at the tail. The transition-cost answer is the closest miss — the 10–50 μs figure is real, but the chapter attaches it to P-state governor transitions generally, and the stated objection to Turbo is variability of the achievable frequency. Turbo neither conflicts with `isolcpus` nor alters C-state exit latency.",
-      "sourceAnchor": "5511-reducing-power-state-jitter",
+      "sourceAnchor": "557-syscalls-busy-polling-placement-and-power--core",
       "difficulty": "recall"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "LIFO hands back the most recently freed slot, which is still resident in L1/L2; FIFO walks the entire pool before reusing anything, so once the pool exceeds L2 every acquire touches a cold line. The prefetcher answer is the seductive one — the sweep really is sequential — but the miss is on the payload slot the caller is about to write, and the miss is incurred at acquire time regardless of what a prefetcher eventually learns. The arithmetic cost of the counter update is not what distinguishes the two.",
-      "sourceAnchor": "552-hot-path-object-pools",
+      "sourceAnchor": "553-preallocation-residency-and-pools--core",
       "difficulty": "application"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The stated benefits are footprint (32 bits instead of 64 in hot structures), shared-memory stability, and reuse as the order-correlation key. The 'lets the pool grow' answer is the plausible trap: it is a real property of indices in general, but a hot-path pool has fixed compile-time capacity and never reallocates, so it is not the reason given. `release` still computes `p - slots_`, and indices grant the compiler no aliasing guarantee.",
-      "sourceAnchor": "552-hot-path-object-pools",
+      "sourceAnchor": "553-preallocation-residency-and-pools--core",
       "difficulty": "recall"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The prescription is per-thread pools plus an SPSC return ring, so neither side executes an atomic RMW beyond the ring's single sequence counter. The multi-producer CAS answer is exactly the design error the chapter names: it reintroduces an atomic into acquire and brings an ABA hazard with it. The copy-across variant does avoid sharing but pays a full event copy per message, which the chapter's single-writer plus return-ring pattern exists to avoid.",
-      "sourceAnchor": "552-hot-path-object-pools",
+      "sourceAnchor": "553-preallocation-residency-and-pools--core",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Spinning only pays off when the steady state contains no syscall, which requires kernel bypass or busy-poll socket options; a `recvfrom` per iteration keeps the 1–3 μs mode-switch cost and adds the cost of a fully consumed core. The 'better on latency, worse on power' answer is the tempting half-truth — it credits the design with removing the wakeup while ignoring that a syscall per iteration reinstates a comparable cost. `recvfrom` is a genuine syscall, not a vDSO call.",
-      "sourceAnchor": "553-busy-spin-event-loops",
+      "sourceAnchor": "557-syscalls-busy-polling-placement-and-power--core",
       "difficulty": "trap"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "In a contention spin, `PAUSE` reduces memory-order-violation machine clears and stops the thread from starving its SMT sibling; in a polling loop against a NIC or ring there is no such violation to avoid, so the ~35-cycle delay is pure added latency. The inverted variant is the strongest distractor because it invents a sensible-sounding rationale — giving DMA time to land — but nothing about `PAUSE` accelerates a DMA write, and delaying the poll only delays detection.",
-      "sourceAnchor": "553-busy-spin-event-loops",
+      "sourceAnchor": "557-syscalls-busy-polling-placement-and-power--core",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The chapter's cost table marks the frequency and C-state effect as deliberate — a busy core stays out of deep idle states, which is the strongest single argument for spinning given C6 exit latencies up to 150 μs. The 'whole core is a feature' answer is the tempting one, but the chapter lists core consumption squarely as a cost requiring capacity planning; SMT bandwidth is a separate concern addressed by isolating siblings. Power and lack of fairness are also listed as costs needing mitigation.",
-      "sourceAnchor": "553-busy-spin-event-loops",
+      "sourceAnchor": "557-syscalls-busy-polling-placement-and-power--core",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The thousand-per-second cadence is the signature of the `CONFIG_HZ=1000` scheduler tick, which `isolcpus` does not stop; `nohz_full` does, provided exactly one runnable task is on the core. The `SCHED_FIFO` answer is the most tempting because scheduling policy is genuinely part of the isolation discussion, but with real `isolcpus` nothing competes, so `SCHED_OTHER` is adequate and policy is only a backstop. Adding a second thread would make things worse, since it re-enables the tick.",
-      "sourceAnchor": "554-isolated-core-thread-pinning",
+      "sourceAnchor": "557-syscalls-busy-polling-placement-and-power--core",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Logical CPU indices are assigned by firmware enumeration and carry no topological meaning, so hardcoding them can silently place the RX thread on a sibling hyperthread or across a socket from the NIC's PCIe root complex. The 'share a core with the IRQ handler' answer inverts the chapter's rule: interrupts are moved off the isolated core entirely, and the pairing rule is NUMA-node locality to the NIC, not L1 sharing. `nohz_full` requires a single runnable task, not a wider affinity mask.",
-      "sourceAnchor": "554-isolated-core-thread-pinning",
+      "sourceAnchor": "557-syscalls-busy-polling-placement-and-power--core",
       "difficulty": "trap"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With genuine isolation `SCHED_OTHER` suffices since nothing competes; FIFO is offered only as insurance, carrying the real hazard that a spin loop which never yields blocks kernel threads that legitimately need the core. The 'it is required' framing is the plausible miss — it correctly notes that `isolcpus` is about load balancing, but on an isolated core there is no competing runnable task for CFS to schedule. Real-time priority does not interact with `nohz_full` in the way the forbidden-variant claims.",
-      "sourceAnchor": "554-isolated-core-thread-pinning",
+      "sourceAnchor": "557-syscalls-busy-polling-placement-and-power--core",
       "difficulty": "recall"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The decisive property is that shared acquisition is itself a store, so concurrent readers serialize on coherence traffic — which is why `shared_mutex` can be slower than a plain mutex under read-heavy hot-path load, and why a store-free seqlock reader wins. Writer starvation is the strongest distractor: it is a real hazard of some reader-writer designs, but it is a fairness concern about the cold writer, not the hot-path latency argument the chapter makes. `std::shared_mutex` does not allocate per acquisition.",
-      "sourceAnchor": "555-lock-avoidance",
+      "sourceAnchor": "556-single-writer-ownership-locks-and-queues--core",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The hierarchy runs from no sharing at zero cost, through SPSC hand-offs at 20–40 ns, to seqlock reads around 5 ns, with mutexes reserved for the cold path. The 'uncontended mutex is affordable' answer is the most tempting because the 20 ns figure is correct — but the rule is categorical precisely because contention is unbounded, costing 2–10 μs to resume and potentially convoying. An MPMC queue costs 40–100 ns under contention, and a relaxed RMW is 7–20 ns, not 1 ns, with cross-core bouncing on top.",
-      "sourceAnchor": "555-lock-avoidance",
+      "sourceAnchor": "556-single-writer-ownership-locks-and-queues--core",
       "difficulty": "trap"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The writer increments the counter before and after the payload write, so odd marks an in-progress update whose data cannot be trusted; the reader spins and retries, and the second read of the counter catches any update that started during the copy. The 'complete but unpublished' answer is the closest miss — it describes a plausible publication protocol, but here odd strictly brackets the write itself. Seqlocks impose no single-reader rule; multiple readers are exactly the case they serve.",
-      "sourceAnchor": "555-lock-avoidance",
+      "sourceAnchor": "556-single-writer-ownership-locks-and-queues--core",
       "difficulty": "recall"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "For `CLOCK_MONOTONIC` the vDSO maps timekeeping data into userspace, so there is no mode switch — it is a ~20–25 ns function call, acceptable once per event but not three times, and `rdtsc` at ~7 ns with offline conversion is the hot-path pattern. The KPTI-syscall answer is the most tempting because syscall costs really did jump post-2018, but that premise does not apply to a vDSO-served clock. The compiler cannot merge the calls, since each must observe a fresh time value.",
-      "sourceAnchor": "556-system-call-avoidance",
+      "sourceAnchor": "557-syscalls-busy-polling-placement-and-power--core",
       "difficulty": "application"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The chapter's point is that a syscall evicts your instruction and data footprint and disturbs the predictors, so the slowdown extends past the return into your own code — invisible to a loop that measures only the syscall. The frequency answer is plausible-sounding but conflates the power-state material of a later section with the mode-switch cost, and syscall bursts are not what keeps a busy core out of Turbo. Store-buffer drain is not the mechanism described.",
-      "sourceAnchor": "556-system-call-avoidance",
+      "sourceAnchor": "557-syscalls-busy-polling-placement-and-power--core",
       "difficulty": "recall"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The chapter lists lazy PLT binding among the hidden syscalls: the first call to each shared-library function runs a dynamic-loader resolution costing microseconds, removed by eager binding or static linking. The demand-paging answer is the strongest distractor because first-touch faults on library text are a real phenomenon — but it does not explain a per-symbol first-call cost, and it is not the mechanism named. The loader does not lock every cross-library call, and a warm PLT entry predicts fine.",
-      "sourceAnchor": "556-system-call-avoidance",
+      "sourceAnchor": "557-syscalls-busy-polling-placement-and-power--core",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Static storage duration is what makes the deferral safe, and it shrinks the record dramatically since only 8 bytes are captured on the hot side. The offline-decoder answer is the tempting near-miss: the chapter does describe an offline decoder, but for the further refinement where each call site gets a compile-time integer ID and a build-time dictionary — raw pointer values are not stable across restarts under ASLR. Alignment is incidental, not the reason.",
-      "sourceAnchor": "557-allocation-free-logging",
+      "sourceAnchor": "558-logging-and-observability-boundary--core",
       "difficulty": "recall"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Deferred formatting means the consumer dereferences the pointer long after the local has died, and the failure surfaces minutes later on a different thread with no link to the original code — so the API must reject non-static pointers at compile time. The 'drained within microseconds' answer is the most seductive because it sounds like a bounded window, but the ring's drain latency is not a lifetime guarantee and the local dies at scope exit regardless. `c_str()` does not allocate, and the record never copies the characters.",
-      "sourceAnchor": "557-allocation-free-logging",
+      "sourceAnchor": "558-logging-and-observability-boundary--core",
       "difficulty": "trap"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The producer must be bounded, non-blocking, and non-allocating, so dropping is the only admissible outcome — but silent dropping is forbidden, hence the exported drop counter. The 'block briefly' answer is the strongest distractor because its motivation is real: bursts are when records matter most. Yet blocking puts the consumer's I/O tail directly on the hot path, which is exactly what the split architecture exists to prevent. Growing the ring reintroduces allocation.",
-      "sourceAnchor": "557-allocation-free-logging",
+      "sourceAnchor": "558-logging-and-observability-boundary--core",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The chapter is explicit that branch elimination is worth roughly nothing for a well-predicted branch; the gains are I-cache footprint from dropping the dead code, constant propagation enabling bounds-check folding and unrolling, removed loads, and `%` becoming `&`. The inlining answer is tempting because inlining is a genuine template benefit, but a direct call to `encode_ouch` was already inlinable without the template. `if constexpr` is a compile-time construct, not a linker layout mechanism.",
-      "sourceAnchor": "558-compile-time-hot-path-specialization",
+      "sourceAnchor": "555-branches-indirection-and-specialization--core",
       "difficulty": "application"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The resolution is one dispatch at the boundary followed by a fully monomorphic run loop, so the indirect call is paid per connection rather than per message. The per-message function-pointer table is the plausible trap: it is true that such a call predicts well, but a function pointer remains an inlining barrier, so the specialized bodies stop folding into the caller and the main benefit is lost. Runtime configuration does not make instantiation impossible — the switch selects among instantiations.",
-      "sourceAnchor": "558-compile-time-hot-path-specialization",
+      "sourceAnchor": "555-branches-indirection-and-specialization--core",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Their effect is layout: the likely side falls through and the cold side is pushed out of line, improving I-cache density, and profile-guided optimization plus BOLT do the same job across the whole binary from real data — commonly 5–15% on hot-path trading binaries. The 'biases the predictor's initial state' answer is the most tempting because it sounds like a mechanism, but no such training channel exists. `[[likely]]` is not ignored at `-O2`; it is simply a layout hint rather than a predictor hint.",
-      "sourceAnchor": "558-compile-time-hot-path-specialization",
+      "sourceAnchor": "555-branches-indirection-and-specialization--core",
       "difficulty": "trap"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The dispatch cost is small; the loss is that the compiler cannot inline through the indirect call, so it cannot constant-fold, cannot vectorize across it, must assume a memory clobber, and must spill caller-saved registers — while the direct call vanishes entirely into the caller. The vptr-miss answer is the strongest distractor: cache misses on the header are real in scattered object graphs, but a tight benchmark loop keeps the object hot, and the ratio persists anyway. The RSB is not disturbed by an ordinary indirect call.",
-      "sourceAnchor": "559-avoiding-virtual-dispatch",
+      "sourceAnchor": "555-branches-indirection-and-specialization--core",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Data-oriented partitioning fixes two problems at once: the call becomes monomorphic and inlines, and the objects are contiguous rather than scattered, so the per-element cache miss disappears. Marking leaves `final` plus LTO is the closest miss — the chapter genuinely calls `final` the cheapest devirtualization win, but it cannot help a call site whose static type is the polymorphic base and whose container legitimately holds several types. `std::function` is disqualified outright as an allocating inlining barrier.",
-      "sourceAnchor": "559-avoiding-virtual-dispatch",
+      "sourceAnchor": "555-branches-indirection-and-specialization--core",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Session, account, sender and header fields are invariant, so writing them once at startup into a per-instrument warm buffer leaves the hot path editing two or three fields — the chapter's ~30-stores-to-~6 figure, with encode times of a handful of nanoseconds. The AVX answer is the tempting one because a single wide store sounds optimal, but the chapter warns that incidental wide vector instructions trigger frequency licensing and downclock the core. A vector destination is still a full re-encode.",
-      "sourceAnchor": "5510-fixed-layout-serialization",
+      "sourceAnchor": "554-cache-friendly-layout-and-fixed-serialization--core",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A pointer to a packed member may be misaligned for its type, which is UB in C++ and traps on strict-alignment targets — hence `-Waddress-of-packed-member` and the advice to `memcpy` fields out of foreign formats. The x86-64 answer is the most tempting because hardware really does tolerate unaligned loads, but tolerance at the ISA level does not make the language construct defined, and the code stops working the moment it is built for ARM. Aligning the outer struct cannot fix interior packing.",
-      "sourceAnchor": "5510-fixed-layout-serialization",
+      "sourceAnchor": "554-cache-friendly-layout-and-fixed-serialization--core",
       "difficulty": "trap"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The chapter's checklist for a decode measuring hundreds of nanoseconds names exactly these causes: hidden container or formatting calls, a table-driven tag parse, an unaligned buffer, or a cold destination page. The bounds-check answer is the most tempting because the check is real and mandatory, but it is a compare and a highly predictable branch worth a handful of cycles — and skipping it is how a malformed message becomes an out-of-bounds read. Byte swapping is about one cycle per field, not 100 ns.",
-      "sourceAnchor": "5510-fixed-layout-serialization",
+      "sourceAnchor": "554-cache-friendly-layout-and-fixed-serialization--core",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The constraint lives only as long as the open file description; closing it withdraws the request, which is why the chapter calls a held-open descriptor the detail that distinguishes candidates who have actually done the work. The 'permanent system-wide cap' answer is the natural assumption from the write-once-and-forget model of other `/proc` and `/sys` knobs, but PM QoS is deliberately fd-scoped. The interface caps idle-state exit latency, not frequency, and it is global rather than per-affinity.",
-      "sourceAnchor": "5511-reducing-power-state-jitter",
+      "sourceAnchor": "557-syscalls-busy-polling-placement-and-power--core",
       "difficulty": "trap"
     }
   ]

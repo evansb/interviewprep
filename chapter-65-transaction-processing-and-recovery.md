@@ -1,830 +1,912 @@
 # Chapter 65 — Transaction Processing and Recovery
 
-*Interview-focused revision notes. The theme: a transaction is a promise — atomic, durable, and isolated from its neighbors — made on top of hardware that offers none of those things. This chapter is the machinery that keeps the promise: a buffer pool that lies about where data lives, a write-ahead log that is the real source of truth, and a concurrency-control scheme that lets many transactions believe they are alone. PostgreSQL is the reference throughout, and its two defining choices — steal + no-force durability, and MVCC instead of an undo log — explain almost everything that follows. Where Postgres sits at one end, we name who sits at the other: ARIES/System R, InnoDB, Oracle.*
+A database update crosses three different worlds:
+
+1. a page changes in volatile memory;
+2. a log record makes the change recoverable after a crash;
+3. concurrency control decides who may observe which logical version.
+
+Those worlds cooperate, but they are not interchangeable. A mutex release can make bytes visible to another CPU without making them durable. An `fsync` can make a WAL prefix durable without making an uncommitted row visible. A snapshot can hide an aborted tuple even when the tuple's bytes already reached a data file.
+
+This chapter first studies the mechanisms separately—buffer pool, WAL/recovery, and transactions/isolation—and only then joins them into one commit path.
+
+> **Optional-track contract.** The Core path ends at §65.16 and is sufficient for the chapter exercises. §65.17 onward is a skippable PostgreSQL implementation and operations reference.
+
+## 65.1 The 90-Second Screen
+
+If you can explain the following, you have the chapter's backbone:
+
+- A **transaction** is a logical unit that commits or aborts. Atomicity says its effects are all-or-nothing; durability says acknowledged durable commits survive the stated failures; isolation constrains what concurrent transactions may observe.
+- A **buffer pool** maps persistent page identifiers to in-memory frames. A **pin** prevents frame reuse; a **latch** protects in-memory structure; a transaction **lock** protects logical data. These have different lifetimes.
+- A dirty page may be written before its transaction commits (**steal**) and need not be written at commit (**no-force**). This makes the common path fast but requires recovery.
+- **Write-ahead logging (WAL)** imposes two orderings:
+  1. the log describing a page update must be durable before that dirty page is allowed to reach persistent storage;
+  2. under a durable-commit policy, the commit record and its preceding transaction log must be durable before success is reported.
+- An **LSN** orders log records. A page LSN records which update the page reflects. Recovery can skip redo whose LSN is already represented on the page.
+- Textbook **ARIES** performs analysis, redo that repeats history, then undo of loser transactions using compensation log records. This is an architecture, not a synonym for every product's recovery.
+- Isolation is about histories, not disks. MVCC chooses visible versions from a snapshot; locking controls conflicts; serializable execution must be equivalent to some serial order.
+- Snapshot isolation can still permit **write skew**. PostgreSQL Repeatable Read and Serializable behavior must be discussed with a PostgreSQL version label, not inferred from the SQL level names alone.
+- **Visibility**, **CPU publication**, and **durability** are three separate predicates.
+
+The shortest useful mental model is:
+
+```text
+logical transaction
+       │  locks / validation / MVCC visibility
+       ▼
+buffered page change ──LSN──> WAL record
+       │                         │
+       │ write page only after   │ flush commit prefix
+       └──────────────┬──────────┘
+                      ▼
+              persistent storage
+```
+
+### Claim labels used in this chapter
+
+Database internals discussions often turn one implementation into a universal law. The following labels prevent that:
+
+- **[Architecture]** A general mechanism or correctness invariant.
+- **[PostgreSQL 18]** Behavior documented for PostgreSQL 18. Recheck the deployed major version and configuration.
+- **[Product/version]** A choice that differs among engines, releases, filesystems, or devices.
+- **[Measured]** A performance statement that must be established on the target workload and machine.
+
+Unless otherwise marked, the Core path describes architecture.
 
 ---
 
-## 65.1 Why a Buffer Pool Exists
+**Core path begins here.**
 
-The data lives on a block device; the CPU can only compute on bytes in RAM. Between them sits the **buffer pool** (Postgres: `shared_buffers`), a fixed region of memory that caches on-disk pages so that hot data is served without touching the device. Every read and write in a disk-based engine goes *through* the buffer pool — the access methods (B-tree, heap) never touch the file directly.
+## 65.2 Module I — Why the Database Owns a Buffer Pool
 
-The justification is the latency gap of Ch. 30: a DRAM access is ~100 ns, a random NVMe read ~50–100 µs, a random seek on spinning rust ~10 ms. That is three to five orders of magnitude. A buffer pool converts the *second* access to a hot page from a device round-trip into a pointer dereference. Because real workloads are skewed (a small hot set is touched constantly), even a pool far smaller than the database serves the overwhelming majority of accesses from memory.
+Persistent tables and indexes are divided into pages. An operator wants a page by stable identity—perhaps `(file, fork, block)`—while memory is a fixed set of reusable frames.
 
-```
-        access methods (B-tree, heap)  — ask for "page (rel, blockno)"
-                    │  ReadBuffer(rel, blockno)
-                    ▼
-        ┌───────────────────────────────────────────┐
-        │  Buffer pool (shared_buffers)              │
-        │   buffer table (hash: tag → frame)         │  hit?  return frame, pin++
-        │   NBuffers frames of 8 KB each             │
-        │   buffer descriptors (state, pin, usage)   │  miss? evict a victim,
-        └───────────────────────────────────────────┘         read from disk
-                    │  read/write 8 KB blocks
-                    ▼
-              block device  (Ch. 34 I/O)
+```text
+page table
+  PageId A:17 ─────────> frame 42 [page bytes | metadata]
+  PageId B:03 ─────────> frame  7 [page bytes | metadata]
+  PageId C:91            absent
+
+free/replacement candidate frames <──── replacement policy
 ```
 
-The buffer pool is a **cache with write-back semantics**, not write-through: a modified ("dirty") page can sit in memory long after the transaction that changed it committed, and is flushed to the data file lazily. That single fact is why a durability subsystem — the write-ahead log — is mandatory: if the authoritative page is still in volatile RAM at crash time, something else on stable storage must be able to reconstruct it (§65.8, §65.11).
+A buffer pool is not merely a performance cache. It is also where the engine coordinates page identity, concurrent access, dirty state, WAL dependencies, and writeback. Its basic operations are:
 
-The unit of caching is the **page** (Postgres `BLCKSZ` = 8 KB, InnoDB 16 KB, Oracle typically 8 KB), matching the on-disk page so that a fetch is one aligned block transfer. The pool is sized in pages: `NBuffers = shared_buffers / BLCKSZ`. A 4 GB `shared_buffers` is 524288 frames.
+1. look up a page ID;
+2. if absent, select an unpinned victim;
+3. if that victim is dirty, write it safely;
+4. read the requested page and install the mapping;
+5. pin the frame while the caller uses it;
+6. latch the content while inspecting or mutating bytes;
+7. mark it dirty and record the update LSN after a logged mutation;
+8. unlatch and eventually unpin it.
+
+### Pin, latch, and lock
+
+These words are not synonyms.
+
+| Mechanism | Protects | Typical lifetime | May wait for transaction? | Failure if omitted |
+|---|---|---:|---:|---|
+| Pin/reference | frame-to-page association | while caller holds page reference | no | frame reused beneath caller |
+| Content latch | in-memory page bytes/metadata | critical section | no, by protocol | data race or torn in-memory structure |
+| Transaction lock | logical row, key range, table, predicate | statement or transaction | yes | invalid concurrent history |
+
+Suppose a B-tree search pins and read-latches a node. The pin says “do not evict this frame.” The latch says “do not split or rewrite these bytes while I inspect them.” Neither says “another transaction may not update the row I found.” That is concurrency control.
+
+**Latch crabbing** or latch coupling acquires the child latch before releasing the parent latch during a tree descent. B-link designs can use right links and high keys to reduce how many page latches must be held. Those are index-structure protocols, not transaction isolation.
+
+### Buffer lookup and replacement
+
+A shared hash table or comparable directory maps page IDs to frames. The lookup structure itself requires synchronization, often partitioned to avoid one global hot lock. Replacement policies approximate future value using recency, frequency, scan resistance, or workload hints:
+
+- exact LRU is intuitive but costly to maintain under contention;
+- CLOCK gives pages “second chances” with a usage counter or reference bit;
+- a scan-resistant ring confines one-pass traffic to a small working set;
+- specialized pools may separate index, data, temporary, or recovery traffic.
+
+The correctness requirement is small: never reuse a pinned frame; never expose a half-installed mapping; safely write a dirty victim. The “best” victim policy is **[Measured]**, because a sequential scan, a Zipfian OLTP workload, and a bulk loader reward different choices.
+
+### Dirty pages and writeback
+
+A page becomes **dirty** when its in-memory bytes differ from its persistent image. Writeback can occur:
+
+- because a foreground request needs the frame;
+- proactively from a background writer;
+- as part of a checkpoint's progress;
+- under memory or operating-system pressure.
+
+Writeback is not necessarily persistence. With buffered I/O, a database `write` can copy bytes into the kernel page cache and return. The filesystem or device may still hold volatile state. The engine's durability protocol must use supported flush primitives and honor the filesystem/device contract.
+
+## 65.3 The Buffer Pool Is Not the Kernel Page Cache
+
+The database buffer pool and kernel page cache can contain the same logical bytes, but they answer different questions:
+
+| Layer | Main identity | Knows transaction/WAL state? | Controls eviction for query value? | Is persistence? |
+|---|---|---:|---:|---:|
+| CPU cache | cache line/address | no | no | no |
+| DB buffer pool | database page ID | yes | yes | no |
+| Kernel page cache | file offset | no | broadly | no |
+| Device volatile cache | device block | no | device policy | not necessarily |
+| Durable medium | sector/block | no | n/a | according to failure contract |
+
+With buffered I/O, a read may flow from kernel cache into a DB frame, and a write may flow back into kernel cache before a flush. With direct I/O, an engine may bypass much of the kernel page cache for selected paths, but alignment, metadata, and device behavior remain **[Product/version]** concerns.
+
+Three distinctions prevent common bugs:
+
+1. **CPU visibility:** synchronization such as a mutex handoff establishes when another thread may observe memory writes.
+2. **database visibility:** locks, snapshots, and transaction status establish whether another transaction may logically observe a version.
+3. **durability:** the configured storage protocol establishes whether state survives a stated crash.
+
+A C++ release store is not an `fsync`. An `fsync` does not commit a transaction. A committed version might not be in a reader's older snapshot. Never use one of these facts to prove another.
+
+## 65.4 Buffer-Pool Invariants and Costs
+
+The important invariants are more durable than any replacement algorithm:
+
+- A page ID maps to at most one authoritative writable frame in a pool, unless a more complex coherence protocol says otherwise.
+- A caller may dereference frame bytes only while holding the required pin and latch.
+- A victim must be unpinned, and its old mapping must not remain concurrently discoverable after reuse.
+- A dirty page may be written only after its required WAL prefix is durable.
+- An I/O error cannot silently transform a dirty page into a clean page.
+- Checkpoint completion means the engine-specific checkpoint contract is satisfied; it does not mean “every byte everywhere was synchronously rewritten at one instant.”
+
+Performance follows a queueing story:
+
+```text
+miss latency
+  = directory lookup
+  + victim search
+  + optional WAL flush
+  + optional dirty writeback
+  + page read
+  + contention
+```
+
+A high hit ratio can coexist with poor tail latency if pins are held too long, the directory is hot, dirty victims force WAL flushes, or checkpoint writeback saturates storage. Observe wait events, dirty-victim rates, writeback latency, and working-set shape—not hit ratio alone.
 
 ---
 
-## 65.2 The Buffer Pool vs the OS Page Cache
+## 65.5 Module II — Transactions, Failure, and the Log
 
-Here is a subtlety unique to Postgres and a favorite interview probe: **Postgres reads and writes through the OS page cache (Ch. 32), so a page can be cached twice** — once in `shared_buffers`, once in the kernel's page cache. This is **double buffering**, and it is a deliberate, defensible design, not a bug.
+A transaction has a state machine:
 
-```
-   Postgres backend
-        │ read()/write() on the data file (buffered I/O, no O_DIRECT)
-        ▼
-   ┌──────────────────────┐   copy       ┌───────────────────────┐
-   │ shared_buffers       │◀────────────▶│ OS page cache (Ch. 32)│
-   │ (Postgres frames)    │              │ (kernel page frames)  │
-   └──────────────────────┘              └───────────────────────┘
-                                                   │ actual device I/O
-                                                   ▼  writeback, readahead
-                                              block device
+```text
+BEGIN ──> ACTIVE ──> COMMITTING ──> COMMITTED
+                    │
+ACTIVE ──error────> ABORTING ─────> ABORTED
 ```
 
-Why not use **direct I/O** (`O_DIRECT`, Ch. 34) and own the cache entirely, like InnoDB and Oracle do? The Postgres position, historically:
+`COMMIT` and `ROLLBACK` are not cosmetic SQL delimiters. They cause the engine to publish transaction status, release or transfer locks, retain or discard versions, and emit recovery metadata.
 
-- **The kernel does work Postgres would have to reimplement**: readahead (sequential prefetch), write coalescing, and — crucially — using *all otherwise-free RAM* as cache. `shared_buffers` is fixed; the page cache grows to fill the machine. A box with 128 GB RAM and 8 GB `shared_buffers` still caches ~110 GB of hot data in the kernel.
-- This is why Postgres tuning advice caps `shared_buffers` around **25% of RAM** rather than 80%: you are deliberately leaving room for the OS page cache to act as a large L2 behind the small L1 of `shared_buffers`. A cache hit in `shared_buffers` is a pointer dereference; a "miss" that hits the page cache is a `memcpy`, not a device I/O — much cheaper than a real miss.
+Savepoints introduce partial rollback inside a transaction. Prepared transactions introduce a durable **prepared** state before the global decision in two-phase commit. Both complicate cleanup: a forgotten prepared transaction can retain locks and resources across process lifetimes.
 
-The costs, which the alternative engines cite:
+### ACID, precisely enough to reason
 
-- **Wasted RAM** to double-caching the hottest pages.
-- **Loss of control over eviction and writeback timing** — the kernel may write dirty pages back on its own schedule, and `fsync` (§65.12) becomes the only way to force ordering. The infamous *fsyncgate* (2018) was exactly this: on some kernels a failed writeback could be reported once and the dirty page silently dropped, so a later `fsync` returned success while data was lost. Postgres now panics on `fsync` failure to force full recovery.
+- **Atomicity:** after recovery, a transaction's externally defined effects are all present or all absent.
+- **Consistency:** each committed transition preserves declared and application invariants, assuming transaction code and constraints are correct. The engine cannot infer every business rule.
+- **Isolation:** permitted observations are constrained as if by the selected isolation contract.
+- **Durability:** after the system reports a commit at a stated durability level, the effects survive the failures covered by that level.
 
-InnoDB and Oracle instead set `O_DIRECT` (InnoDB: `innodb_flush_method=O_DIRECT`) and make the buffer pool large (50–80% of RAM), owning caching, readahead, and writeback themselves — no double buffering, at the cost of reimplementing what the kernel already does. Postgres 16+ has been adding direct-I/O and asynchronous-I/O paths (via `io_uring`, Ch. 34) precisely to close this gap, but the buffered-I/O + page-cache model is still the default mental model to bring to an interview.
+Durability is conditional. “Survives database-process crash,” “survives OS crash,” “survives host power loss,” and “survives loss of the primary region” require different mechanisms. A product setting can intentionally acknowledge before local or remote persistence. State the failure model.
 
----
+### Why recovery is required
 
-## 65.3 Buffer Pool Structure
+An update may exist in several places at crash time:
 
-Concretely, the pool is three parallel arrays plus a hash table, all in shared memory so every backend process (Ch. 61 §61.3) sees the same cache.
+- only in a CPU or process buffer;
+- in an in-memory database frame;
+- in an in-memory WAL buffer;
+- in the kernel page cache;
+- in a device's volatile cache;
+- on durable media;
+- on one or more replicas at receipt, flush, or apply stages.
 
-```
-Buffer table (hash)          Buffer descriptors[NBuffers]        Buffer blocks[NBuffers]
- tag → buf_id                 ┌───────────────────────────┐       ┌──────────────────┐
- {rel, fork, blocknum}        │ tag: {rel,fork,blocknum}  │       │  8 KB page image │
-   ─────────► buf_id 5 ─────► │ state: flags | usagecount  │ ────► │  (frame 5)       │
-                              │        | refcount (pins)   │       └──────────────────┘
-                              │ content_lock (LWLock)      │
-                              │ io_in_progress lock         │
-                              │ freeNext (free list link)  │
-                              └───────────────────────────┘
-```
+Recovery interprets the **durable log prefix**, not the application's intention. It must tolerate any data-page subset allowed by the writeback policy.
 
-- The **buffer tag** identifies a page uniquely: `{relation, fork number, block number}`. (A relation has multiple *forks*: the main data fork, the free-space map, the visibility map.)
-- The **buffer table** is a shared hash table mapping tag → `buf_id`. A `ReadBuffer` hashes the tag, probes the table, and either finds the frame (hit) or misses. The table is sharded into partitions each guarded by its own `LWLock` (the `BufMappingLock` partitions) to reduce contention — the same partitioning idea as a striped lock (Ch. 24), avoiding one global mutex on the hottest path.
-- Each **buffer descriptor** holds the tag, a packed atomic `state` word (flags + `usagecount` + `refcount`), a `content_lock` (an `LWLock`, §65.27) that readers/writers of the page take in shared/exclusive mode, and an I/O-in-progress indicator.
-- The **buffer block** is the actual 8 KB frame holding the page image.
+## 65.6 Steal/No-Steal and Force/No-Force
 
-Modifying the packed `state` word is done with atomic compare-and-swap (Ch. 23) rather than a lock, because pin/unpin is on the hottest path and taking a spinlock per pin would be a scalability disaster; false sharing (Ch. 28) on these descriptors is a real tuning concern in high-core-count builds.
+Two independent choices explain much of recovery design:
 
----
+- **Steal:** the buffer manager may write a page containing an uncommitted update. A recovery design must make those effects harmless or undoable.
+- **No-steal:** such a page cannot be written before commit. This simplifies abort but can pin a large dirty working set.
+- **Force:** commit forces all transaction data pages to persistent storage. This reduces redo need but makes commit random-I/O-heavy.
+- **No-force:** commit need only secure recovery information; data pages can follow later. This requires redo.
 
-## 65.4 Pinning and the Pin Count
+| Policy | Uncommitted data may reach disk? | Committed data may be absent from pages? | Recovery consequence |
+|---|---:|---:|---|
+| no-steal + force | no | no | simplest, expensive |
+| no-steal + no-force | no | yes | redo |
+| steal + force | yes | no | undo or logical invisibility |
+| steal + no-force | yes | yes | redo plus undo/invisibility mechanism |
 
-Before a backend reads or writes a page's bytes, it must **pin** the buffer: increment the descriptor's `refcount`. The pin is a promise — "I am using this frame; do not evict it or repoint it at a different page." When done, the backend **unpins** (decrements). A buffer with `refcount > 0` is **ineligible for eviction**, because evicting it would pull the page out from under a reader mid-access.
+Many high-performance designs choose steal + no-force, but the exact undo strategy varies. A textbook ARIES engine restores physical state by undoing loser actions. An MVCC engine may instead leave some loser-created versions physically present while transaction status makes them logically invisible, then reclaim them later. “Steal implies an ARIES undo pass” is therefore too strong.
 
-```
-ReadBuffer:  pin (refcount++), then take content_lock (shared/excl) to touch bytes
-              ... use the page ...
-ReleaseBuffer: release content_lock, then unpin (refcount--)
-```
+## 65.7 WAL: The Two Orderings
 
-Two distinct protections, and conflating them is a classic error:
+A log is an append-oriented sequence of records. A record can contain:
 
-- **The pin (`refcount`)** protects the *frame–page association*: while pinned, this frame keeps holding *this* page. It says nothing about who may read or write the bytes.
-- **The `content_lock` (an `LWLock`)** protects the *bytes*: shared mode for readers, exclusive for a writer. Many transactions can hold a shared content lock on a pinned page at once.
+- transaction ID and previous-record pointer;
+- LSN;
+- affected page or object;
+- redo information;
+- undo information or a reference to it;
+- commit, abort, prepare, checkpoint, or compensation state.
 
-A page can therefore be pinned by many backends simultaneously (each has `refcount++`), all reading concurrently. Eviction requires `refcount == 0`. This is why a long-held cursor over a huge table does not, by itself, wedge the buffer pool: a backend pins a page, copies out the tuples it needs, and unpins promptly — it does not hold the pin across the whole scan. Holding a pin too long is a bug pattern that stalls eviction.
+Logging may be physical (“replace these bytes”), logical (“insert key K”), or physiological (“perform operation O within page P”). Products mix forms.
 
-The pin count is the buffer-pool analogue of a reference count (Ch. 19's `shared_ptr`): the resource cannot be reclaimed while any user holds a reference. It is *not* a transaction-duration lock (§65.27) — pins are physical, short-lived, and released well before commit.
+### Ordering 1: log before data
 
----
+Let `pageLSN(P)` be the newest logged update reflected by page `P`, and let `durableLSN` be the highest log position known durable under the storage contract.
 
-## 65.5 Page Replacement Policies
-
-When a page must be brought in and no frame is free, the pool must **evict** a victim. The eviction policy is a bet about future access; every policy is a heuristic approximation of the unachievable optimal (Bélády's: evict the page used furthest in the future).
-
-**FIFO.** Evict the oldest-loaded page. Trivial (a queue), but ignores usage — it will evict a hot page just because it was loaded early. Rarely used alone; suffers *Bélády's anomaly* (more frames can mean more misses).
-
-**LRU (Least Recently Used).** Evict the page not touched for the longest time. Excellent for skewed workloads — the hot set stays resident. Two problems:
-
-- **Cost.** True LRU requires moving a page to the head of a list on *every* access, which is a linked-list mutation under a lock on the hottest path — a scalability killer in a shared pool.
-- **Scan resistance (the sequential-flooding problem).** One large sequential scan (e.g. a `SELECT count(*)` over a big table) touches millions of pages exactly once. Pure LRU treats each as "most recently used" and evicts the genuinely hot working set to make room for pages that will never be touched again. A single analytical query trashes the cache for every OLTP query. This is the defining weakness of naive LRU.
-
-**LFU (Least Frequently Used).** Evict the least-accessed page by a frequency counter. Scan-resistant (one-touch pages have low counts) but slow to adapt: a page that was hot yesterday keeps a high count and resists eviction long after it cooled ("cache pollution"). Needs aging.
-
-**CLOCK / second-chance.** Approximate LRU without per-access list surgery. Arrange frames in a ring; each has a *reference bit*. On access, set the bit. To evict, a hand sweeps the ring: if a frame's bit is set, clear it and give a "second chance" (skip); if clear, evict it. This approximates LRU (recently-used pages get their bit re-set before the hand returns) but the only per-access work is setting one bit — no locking, no list moves. This is why virtually every real buffer pool uses a CLOCK variant.
-
-```
-CLOCK ring, hand sweeps clockwise; ref bit gives a "second chance"
-        [P0:1]───[P1:0]───[P2:1]
-          │                  │
-        [P7:0]            [P3:1]
-          │                  │
-        [P6:1]───[P5:0]───[P4:0]
-                    ▲
-                   hand:  bit==0 → evict P5; bit==1 → clear it, advance
+```text
+page P may be written only if pageLSN(P) <= durableLSN
 ```
 
-| Policy | Per-access cost | Scan-resistant? | Adapts quickly? | Notes |
-|---|---|---|---|---|
-| FIFO | O(1) | no | n/a | ignores usage; Bélády anomaly |
-| LRU | O(1) but list mutation + lock | **no** | yes | sequential flooding evicts hot set |
-| LFU | O(1) + counter | yes | **no** | cache pollution without aging |
-| CLOCK | set one bit | approx (with counts) | yes | LRU approximation, lock-light |
-| ARC / 2Q / LRU-K | more state | yes | yes | scan-resistant refinements |
+If not, a crash could preserve the data change but lose the only record needed to explain, redo, or undo it.
 
-Advanced policies (**LRU-K**, **2Q**, **ARC**) explicitly separate "seen once" from "seen many times" so that a scan flows through a probationary queue without evicting the frequently-used set — solving scan resistance directly. InnoDB uses a **midpoint-insertion LRU**: new pages enter at the "5/8 point," not the head, so a scan cannot promote its pages to the hot end unless they are re-read after a delay.
+This rule concerns the WAL record for the page state being written. It does not require the transaction to be committed. That is how steal remains possible.
 
----
+### Ordering 2: commit record before durable acknowledgement
 
-## 65.6 Postgres's Clock-Sweep with Usage Counts
+Let `commitLSN(T)` be transaction `T`'s commit record. Under the chapter's **durable local commit policy**:
 
-Postgres uses a specific CLOCK variant called the **clock-sweep**, and knowing its exact rules is a strong interview signal.
-
-Each buffer descriptor carries a small `usage_count` (0–5, capped by `BM_MAX_USAGE_COUNT = 5`) instead of a single reference bit — this folds a bit of LFU into CLOCK. A shared **`nextVictimBuffer`** pointer is the clock hand.
-
-- **On unpin** (a page has just been used), `usage_count` is incremented, saturating at 5.
-- **To find a victim**, the sweep advances the hand over descriptors. For each candidate: if `refcount > 0` (pinned), skip it — it cannot be evicted. Else if `usage_count > 0`, **decrement it and skip** (second chance). Else (`usage_count == 0` and unpinned), **choose it as the victim**.
-
-```
-clock-sweep victim search (simplified):
-  loop:
-    buf = descriptors[nextVictimBuffer]; advance nextVictimBuffer (mod NBuffers)
-    if buf.refcount > 0:           continue           # pinned, cannot evict
-    if buf.usage_count > 0:        buf.usage_count--; continue   # second chance
-    else:                          return buf          # evict this one
+```text
+report durable success only if commitLSN(T) <= durableLSN
 ```
 
-A page touched 5 times survives five full sweeps of the hand before becoming eligible — cheap frequency weighting. A one-touch page from a sequential scan enters with `usage_count = 1` and is reclaimed after a single sweep, giving partial scan resistance.
+The commit record follows the transaction's prior records in the log, so a durable prefix through `commitLSN` also contains them. Group commit lets one flush make many commit records durable.
 
-Postgres adds an explicit scan-protection mechanism on top: **buffer ring / ring buffer strategies** (`BufferAccessStrategy`). Sequential scans of large tables (larger than ~`shared_buffers`/4), `VACUUM`, and bulk `COPY` do not use the main clock-sweep at all; they cycle through a *small fixed ring* of buffers (a few hundred KB), reusing the same handful of frames. This is Postgres's direct answer to sequential flooding: a `SELECT count(*)` over a 500 GB table cannot evict your OLTP hot set because it is confined to its own ring.
+This is a deliberately named policy, not a universal definition of `COMMIT`. **[Product/version]** Asynchronous-commit settings may acknowledge earlier and explicitly allow recent acknowledged transactions to disappear after a crash. Synchronous replication may require a remote receipt, remote write, remote durable flush, or remote apply before acknowledgement. Those are different commit points.
 
-If the sweep finds a **dirty** victim, it must be written out before the frame can be reused (§65.7). A free list of never-used buffers is consulted first at startup; once warmed, essentially all allocation goes through the clock-sweep.
+### Append is not flush
 
----
+“Written” is dangerously ambiguous:
 
-## 65.7 Dirty Pages, Write-Back, the Background Writer and Checkpointer
-
-A page modified in the buffer pool is **dirty**: it differs from the on-disk copy. Because the pool is write-back, dirty pages must eventually reach the data file, and *who* does that writing matters.
-
-Three actors flush dirty buffers in Postgres:
-
-1. **Backend eviction (the slow path you want to avoid).** If a backend's clock-sweep picks a dirty victim, that backend must write the page itself before reusing the frame — synchronous I/O on the query's critical path. Foreground write latency is the symptom of a pool that is dirtying pages faster than they are being cleaned.
-2. **The background writer (`bgwriter`).** A dedicated process that walks *ahead* of the clock hand, writing out dirty buffers that are likely to be evicted soon, so backends find clean victims and never block on write. It trickles writes continuously (`bgwriter_delay`, `bgwriter_lru_maxpages`), smoothing I/O.
-3. **The checkpointer.** Periodically writes *all* dirty buffers as of a checkpoint, establishing a recovery floor (§65.14).
-
-```
-   dirty buffers in shared_buffers
-        │                         │                         │
-   backend evicts a       background writer            checkpointer
-   dirty victim           cleans ahead of hand         flushes ALL dirty
-   (BAD: on query path)   (GOOD: hides latency)        as of checkpoint
-        └───────────────────────┴─────────────────────────┘
-                                 ▼
-                          data file (Ch. 34)  ──fsync at checkpoint──▶ durable
+```text
+thread builds record
+  → WAL buffer
+  → write()/pwrite()
+  → kernel cache
+  → filesystem/device queues
+  → durable medium
 ```
 
-Critical ordering rule, and the reason recovery works at all: **a dirty page may not be written to the data file until the WAL records describing its changes are on stable storage** (the write-ahead rule, §65.11). Every page carries a **`pd_lsn`** in its header — the LSN of the last WAL record that modified it. Before writing a page out, the buffer manager ensures the WAL has been flushed up to that page's `pd_lsn`. This is what makes "steal" (§65.10) safe.
+`write()` commonly establishes only that the kernel accepted bytes. `fsync`, `fdatasync`, `O_DSYNC`, write-through modes, barriers, and forced-unit-access operations have platform-specific contracts. A correct engine uses a supported end-to-end protocol and hardware that honors it. Memory fences only order CPU memory operations; they do not flush a filesystem or device cache.
 
-The tension: flush too eagerly and you waste I/O rewriting pages that are about to be dirtied again; flush too lazily and crash recovery has an enormous backlog to redo, and checkpoints become I/O storms. The knobs — `checkpoint_timeout`, `max_wal_size`, `checkpoint_completion_target` (spread the checkpoint's writes over a fraction of the interval, default 0.9, to avoid a spike) — trade recovery time against steady-state I/O smoothness (§65.14).
+## 65.8 LSNs, Idempotence, and Log Records
 
----
+An LSN provides a total log position. Typical relationships are:
 
-## 65.8 Why Recovery Is Needed
+- each update record has an LSN;
+- a page records the latest applied relevant LSN;
+- a transaction record links backward to that transaction's prior log record;
+- a checkpoint records enough state to bound restart work;
+- a compensation log record (CLR) records work performed during undo.
 
-A transaction promises **atomicity** (all-or-nothing) and **durability** (a committed change survives) — the A and D of ACID. Both promises are threatened by the same event: a crash (power loss, kernel panic, `kill -9`, hardware fault) at an arbitrary instant. Recovery is the subsystem that keeps A and D across crashes.
+Redo uses an idempotence test:
 
-Two failure modes must be repaired on restart, and they pull in opposite directions:
-
-- **Lost committed work (durability failure).** Transaction T committed, but its changes were only in the buffer pool (dirty pages not yet flushed) when the machine died. The data file does not reflect T. Recovery must **redo** T's changes.
-- **Surviving uncommitted work (atomicity failure).** Transaction T's dirty pages *were* flushed to the data file (the pool "stole" the frame and wrote it out), but T had not committed — it was still running, or explicitly rolling back, when the crash hit. The data file reflects a partial T. Recovery must **undo** T's changes.
-
-Which of these can happen is dictated entirely by two buffer-management policies — **steal/no-steal** and **force/no-force** (§65.10) — and the answer determines whether the engine needs a redo log, an undo log, or both. The engine cannot simply "flush on commit and hope": a crash *during* the flush leaves the data file half-updated, which is exactly the torn state recovery exists to detect and repair (§65.16).
-
-The tool that makes recovery possible is the **log**: a separate, append-only, sequentially-written record of *intended and completed changes* that reaches stable storage in a controlled order. On restart, the engine reads the log and brings the data files to a consistent state — redoing what committed, undoing what did not. The log, not the data file, is the source of truth for the recent past.
-
----
-
-## 65.9 What to Log: Physical, Logical, Physiological
-
-A log record describes a change, but at what level of abstraction? Three choices, with different sizes, replay costs, and robustness.
-
-- **Physical logging.** Record the *bytes*: "page 42, offset 128, before-image = `0x…`, after-image = `0x…`." Replay is trivial and idempotent (just stamp the after-image), and it is robust — replay does not depend on any code path or index state. But records are large (whole changed regions) and brittle to structural assumptions.
-
-- **Logical logging.** Record the *operation*: "insert row (7, 'Alice') into table `orders`." Compact — one record regardless of how many pages/indexes it touches. But replay must *re-execute* the operation through the access methods, which requires the database to be in a consistent, operational state (all indexes present and correct), and the operation must be deterministic. Logical replay of "insert" also has to update every index, redo B-tree splits, etc. — fragile during recovery.
-
-- **Physiological logging** (the ARIES term, and what Postgres and most real engines use). **Physical across pages, logical within a page**: "on page 42, insert this tuple at line pointer 3" or "on page 42, set the bits at these offsets." Each record names a specific page (physical) but describes the change in terms of that page's internal structure (logical), e.g. "add this index entry to this B-tree page," letting the page's own layout code apply it. This is the sweet spot: records are compact, replay is per-page and idempotent (guarded by the page LSN, §65.11), and it survives the page-format details without re-running whole logical operations across the tree.
-
-Postgres WAL is **physiological**: each WAL record targets specific blocks (by `{rel, fork, blocknum}`) and carries a redo routine per resource manager (`heap`, `btree`, `gin`, …) that knows how to re-apply the change to that page. It is redo-oriented — it records after-images / redo actions, not classic undo before-images (§65.15), because MVCC handles rollback without an undo log.
-
-```
- Physical:      "page P, bytes [a,b) := <after-image>"        big, dumb, idempotent
- Logical:       "INSERT INTO orders VALUES (7,'Alice')"        tiny, must re-execute op
- Physiological: "on page P: insert tuple T at slot 3"          per-page, structure-aware  ← ARIES/Postgres
+```text
+if page.pageLSN < record.LSN:
+    apply record.redo
+    page.pageLSN = record.LSN
+else:
+    skip
 ```
 
----
+Real physiological redo has additional checks: the page must be the intended page incarnation, record-specific preconditions must hold, and torn-page protection may supply a full image. `pageLSN` alone is a teaching abstraction, not a complete page-repair protocol.
 
-## 65.10 Steal/No-Steal and Force/No-Force
+Undo is not simply “apply `before` values backward.” A later transaction may have changed the same logical item. ARIES uses transaction chains, operation semantics, locking assumptions, and CLRs so that restartable undo is correct. Logical MVCC rollback uses version status and garbage collection differently.
 
-Two orthogonal buffer-pool policies decide the entire shape of recovery. This 2×2 is the single most important table in the chapter.
+## 65.9 Crash Windows: What Can Survive?
 
-**Steal vs no-steal** — may a dirty page from an *uncommitted* transaction be written to disk (evicted, "stolen") before that transaction commits?
+Assume steal + no-force and the durable local commit policy:
 
-- **Steal**: yes. The buffer manager may evict any page whenever it needs the frame, even if an open transaction dirtied it. Consequence: an uncommitted change can reach the data file, so a crash may leave uncommitted data on disk → **undo (rollback) capability is required**.
-- **No-steal**: no. Pin every dirty page of an in-flight transaction in memory until it commits. No uncommitted data ever hits disk → **no undo needed**, but the buffer pool must be able to hold all of a transaction's dirty pages, which is impractical for large transactions.
-
-**Force vs no-force** — must all of a transaction's dirty pages be written to disk *at commit* (forced) before commit is acknowledged?
-
-- **Force**: yes. On commit, flush every dirty page to the data file. Then a committed transaction's data is guaranteed on disk → **no redo needed**. But commit now pays random-write I/O for every touched page — slow — and a crash mid-flush is unsafe without more machinery.
-- **No-force**: no. Commit only makes the *log* durable (a small sequential append + `fsync`); the data pages are flushed lazily later. Fast commits, but a committed transaction's data pages may still be in the volatile pool at crash → **redo is required**.
-
-```
-                 │ FORCE (flush data pages at commit)  │ NO-FORCE (flush lazily)
-─────────────────┼─────────────────────────────────────┼──────────────────────────────
- NO-STEAL        │ no redo, no undo                     │ redo only
- (pin dirty      │ (simplest; impractical — pool must   │ (uncommitted never on disk;
-  uncommitted    │  hold all dirty pages)               │  committed may not be → redo)
-  pages)         │                                      │
-─────────────────┼─────────────────────────────────────┼──────────────────────────────
- STEAL           │ undo only                            │ redo + undo   ← ARIES, InnoDB
- (evict any      │ (uncommitted may be on disk → undo;  │ (both problems present;
-  page anytime)  │  committed forced → no redo)         │  most flexible, fastest)  ← the standard
-```
-
-**Real systems almost universally choose steal + no-force**, the bottom-right cell, because it gives the buffer manager total freedom (evict anything, anytime → high memory efficiency) and makes commit cheap (only the log is forced). The price is that recovery needs *both* redo (for committed-but-unflushed work) and undo (for uncommitted-but-flushed work). ARIES and InnoDB implement full redo+undo.
-
-**Postgres is steal + no-force, but redo-only in practice.** It steals (evicts uncommitted dirty pages freely) and does not force data pages at commit (only the WAL is `fsync`ed). Yet it has *no undo log* — because MVCC leaves the old row version in place, "rolling back" an aborted transaction requires no data reversal: the aborted transaction's `xid` is simply marked aborted in the commit log, and its tuple versions become invisible to everyone (§65.15). So Postgres needs redo (WAL replay) but gets undo "for free" from MVCC. This is the deepest contrast in the chapter and worth being able to state precisely.
-
----
-
-## 65.11 Write-Ahead Logging: LSNs and the Write-Ahead Rule
-
-The **write-ahead log (WAL)** is the mechanism that makes steal + no-force safe. Its governing invariant, the **write-ahead rule**, has two parts:
-
-1. **Redo rule (for steal):** before a *dirty data page* is written to the data file, all log records describing changes to that page must already be on stable storage. (So if a stolen, uncommitted page hits disk, the log needed to undo it is guaranteed present.)
-2. **Commit rule (for durability / no-force):** before a transaction is reported **committed**, all its log records — up to and including its commit record — must be on stable storage. (So a committed transaction can always be redone even though its data pages are not yet flushed.)
-
-Put simply: **log before data, and log before acknowledging commit.** The log reaches disk in an order the engine controls; the data pages reach disk whenever convenient.
-
-The ordering is tracked by the **LSN (Log Sequence Number)**: a monotonically increasing identifier for a position in the log. In Postgres the LSN is literally the **byte offset in the WAL stream** (a 64-bit value, printed as `16/B374D848`). Every WAL record has an LSN; every data page header stores **`pd_lsn`**, the LSN of the *last* WAL record that modified that page.
-
-```
-   modify page P in buffer pool:
-      1. build WAL record R describing the change
-      2. append R to WAL buffer, get lsn(R)
-      3. apply the change to page P in the pool
-      4. set P.pd_lsn = lsn(R)          # page "remembers" its latest log position
-      ...
-   later, to write P to the data file:
-      FlushWAL(up to P.pd_lsn)          # write-ahead rule: log first
-      write P to data file
-```
-
-The `pd_lsn` on a page is also what makes **redo idempotent**, which is essential because recovery may replay a record whose effect already reached disk. During redo, for each log record at `lsn(R)` targeting page P, the engine compares: **if `P.pd_lsn >= lsn(R)`, the change is already present — skip it**; only if `P.pd_lsn < lsn(R)` does it re-apply and advance `P.pd_lsn`. This LSN comparison is how ARIES avoids double-applying a redo and how "repeating history" (§65.13) converges to the exact pre-crash state.
-
-The log is the **source of truth**: at commit time the data files may be arbitrarily stale, but the WAL — durable and ordered — contains everything needed to reconstruct them. Replication (Part II) exploits this directly: streaming the WAL to a replica reproduces the primary's state byte-for-byte (physical replication).
-
----
-
-## 65.12 Postgres WAL Mechanics: fsync, Group Commit, synchronous_commit
-
-The WAL is written first into **`wal_buffers`** (a shared-memory ring, default ~1/32 of `shared_buffers`, capped), then flushed to the WAL segment files (16 MB files under `pg_wal/`). A commit does the following:
-
-1. Write the commit record into `wal_buffers`.
-2. Flush the WAL up to that record to the OS, and **`fsync`** (Ch. 34) the WAL file so it is on stable media.
-3. Only then acknowledge `COMMIT` to the client (commit rule, §65.11).
-
-The `fsync` in step 2 is the durability cost, and it is expensive: a real device sync is tens to hundreds of microseconds (and historically much more on spinning disks with write caches). If every commit did its own `fsync`, throughput would cap at the device's sync rate — a few thousand per second on a mediocre disk.
-
-**Group commit** amortizes this. When many backends commit near-simultaneously, one `fsync` flushes all their commit records at once. Postgres implements this partly automatically (a backend that finds a flush already in progress waits and rides it) and partly via **`commit_delay`** / **`commit_siblings`**, which deliberately pause a committer for a few microseconds so more commits pile into the same `fsync`. The trade is identical to Ch. 61 §61.5: a tiny latency penalty per commit for a large throughput gain — one sync serves N transactions.
-
-**`synchronous_commit`** exposes the durability/latency knob directly:
-
-| `synchronous_commit` | Commit waits for… | Loss window on crash |
+| Crash point | Durable evidence | Allowed result after recovery |
 |---|---|---|
-| `on` (default) | local WAL `fsync`ed to disk | none (local) |
-| `off` | WAL written to buffers, **not yet fsynced** | up to `wal_writer_delay` (~a few 100 ms) of *committed* txns |
-| `local` | local flush only (ignore replicas) | none locally; replica may lag |
-| `remote_write` / `on` (with sync replicas) | replica received / flushed WAL | none, survives primary loss |
+| before update WAL is durable | perhaps none | update absent; page must not contain it persistently |
+| update WAL durable, data page not written | update record | redo can reconstruct if transaction wins; loser handled by undo/invisibility |
+| uncommitted dirty page written | update WAL precedes page | loser effect must be undone or hidden |
+| commit appended but not durable | no durable commit record | transaction may be treated as uncommitted |
+| commit durable, before reply | durable commit record | transaction survives; client outcome is unknown and must resolve idempotently |
+| reply sent after durable commit | durable commit record | transaction survives covered crashes |
+| page write torn | WAL/full-image or other repair mechanism | restore a valid page or fail loudly; never accept silent corruption |
 
-`synchronous_commit = off` is the crucial one: it keeps **atomicity and consistency** (the WAL is still ordered and complete, so recovery never sees a torn transaction) while relaxing only **durability** — a crash can lose the last few hundred milliseconds of *committed* transactions, but never corrupts the database or exposes partial transactions. This is a very different, and much safer, trade than turning `fsync` off entirely (which risks corruption). The **WAL writer** process flushes `wal_buffers` periodically (`wal_writer_delay`) so asynchronous commits still reach disk soon.
+The “commit durable, before reply” window matters to API design. The client cannot distinguish “server committed, reply lost” from “server died before commit.” Retrying a non-idempotent operation can duplicate it. Use a transactionally stored idempotency key, unique request ID, or result lookup.
 
-`full_page_writes` (§65.16) and `wal_compression` further shape WAL volume; `max_wal_size` bounds how much WAL accumulates between checkpoints.
+### Core invariants
+
+1. A persistent dirty page never outruns its required durable log prefix.
+2. Durable acknowledgement never outruns the policy's durable commit point.
+3. Recovery applies only complete, validated log records from the durable prefix.
+4. Redo is safe to repeat.
+5. Undo or logical invisibility removes loser transactions from the recovered logical state.
+6. Recovery actions themselves are restartable.
+7. A corrupted or torn page is detected and repaired or rejected.
+
+## 65.10 ARIES as an Architecture
+
+ARIES—Algorithms for Recovery and Isolation Exploiting Semantics—is a particular WAL recovery family, not a generic name for logging. The classic restart shape is:
+
+### Analysis
+
+Scan from checkpoint information to reconstruct:
+
+- transaction table: active, committed, aborting;
+- dirty-page table: pages that may require redo and their earliest relevant LSN;
+- loser transactions requiring undo.
+
+A **fuzzy checkpoint** is taken while transactions and writeback continue. It records a conservative restart state rather than freezing the database into one instantaneous disk image.
+
+### Redo: repeat history
+
+Start at a conservative redo LSN and replay logged actions, including loser actions when required, while using page-LSN and record-specific tests to skip effects already present. The goal is to reconstruct the state at the instant of crash.
+
+Why redo a loser only to undo it? Because recovery need not guess which of its dirty pages reached storage. Repeating history yields one known state; uniform undo then follows transaction chains.
+
+### Undo losers
+
+Walk loser transactions backward. Each undo emits a CLR containing redo information for the undo and a pointer to the next record still requiring undo. If recovery crashes again, redo repeats completed undo actions and resumes rather than undoing them twice.
+
+ARIES also supports partial rollback, nested top-level actions, operation logging, and other machinery beyond this chapter. The important lesson is the proof structure: durable WAL constrains possible disk states; redo reaches a known history state; logged undo removes losers.
+
+> **PostgreSQL boundary.** PostgreSQL is WAL-based and ARIES-influenced, but mapping it to “literal ARIES with its undo phase removed” is misleading. PostgreSQL has product-specific WAL resource managers, crash redo, full-page images, MVCC transaction status, and cleanup. Analyze its actual invariants rather than forcing every component into textbook ARIES vocabulary.
+
+## 65.11 Worked Recovery Trace
+
+Consider pages `P=10` and `Q=7`, both initially at page LSN 0.
+
+| LSN | Record | Buffer effect |
+|---:|---|---|
+| 10 | `T1: P 10→15` | `P=15`, `pageLSN=10` |
+| 20 | `T2: Q 7→9` | `Q=9`, `pageLSN=20` |
+| 30 | `COMMIT T1` | no data-page change |
+| 40 | `T2: P 15→18` | `P=18`, `pageLSN=40` |
+
+Assume WAL is durable through LSN 40. `T1`'s commit was acknowledged. `T2` has no commit record. Before the crash:
+
+- `P` at LSN 10 was written after WAL through 10 became durable;
+- the later `P` update at LSN 40 remains only in memory;
+- `Q` remains only in memory.
+
+Persistent pages at crash are therefore `P=15@10`, `Q=7@0`.
+
+**Analysis** finds `T1` a winner and `T2` a loser.
+
+**Redo** repeats history:
+
+- LSN 10 is skipped because `P.pageLSN == 10`;
+- LSN 20 changes `Q` to `9@20`;
+- LSN 40 changes `P` to `18@40`.
+
+Now the reconstructed crash state is `P=18`, `Q=9`.
+
+**Undo** follows `T2` backward:
+
+- undo LSN 40: `P 18→15`, and log a CLR;
+- undo LSN 20: `Q 9→7`, and log a CLR;
+- log `T2` abort/end.
+
+The recovered logical state is `P=15`, `Q=7`: all of committed `T1`, none of loser `T2`. If recovery crashes after the first CLR, its redo is repeatable and the CLR's next-undo pointer resumes at LSN 20.
+
+This trace deliberately serializes writes to `P`. A generic “copy before-image backward” implementation would be wrong when later committed writes overlap; production algorithms use stronger rules.
+
+## 65.12 A Compact, Validated WAL Model
+
+The following C++23 program validates two WAL gates and the exact trace above. It is intentionally not an ARIES implementation. Its undo shortcut is valid only because every loser update in this trace is the latest reconstructed update to its page.
+
+```cpp
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+
+enum class Kind { update, commit };
+
+struct Record {
+    std::uint64_t lsn;
+    std::size_t tx;
+    Kind kind;
+    std::size_t page;
+    int before;
+    int after;
+};
+
+struct Page {
+    int value;
+    std::uint64_t page_lsn;
+};
+
+constexpr bool may_write_page(std::uint64_t page_lsn,
+                              std::uint64_t durable_lsn) {
+    return page_lsn <= durable_lsn;
+}
+
+constexpr bool may_ack_durable_commit(std::uint64_t commit_lsn,
+                                      std::uint64_t durable_lsn) {
+    return commit_lsn <= durable_lsn;
+}
+
+int main() {
+    constexpr std::array log{
+        Record{10, 1, Kind::update, 0, 10, 15},
+        Record{20, 2, Kind::update, 1,  7,  9},
+        Record{30, 1, Kind::commit, 0,  0,  0},
+        Record{40, 2, Kind::update, 0, 15, 18},
+    };
+
+    static_assert(!may_write_page(40, 30));
+    static_assert(may_write_page(40, 40));
+    static_assert(!may_ack_durable_commit(30, 20));
+    static_assert(may_ack_durable_commit(30, 30));
+
+    std::array pages{Page{15, 10}, Page{7, 0}}; // crash image
+    std::array committed{false, false, false};   // indexed by tx
+
+    for (const auto& r : log) {                  // analysis
+        if (r.kind == Kind::commit) {
+            committed[r.tx] = true;
+        }
+    }
+
+    for (const auto& r : log) {                  // redo history
+        if (r.kind == Kind::update &&
+            pages[r.page].page_lsn < r.lsn) {
+            pages[r.page] = Page{r.after, r.lsn};
+        }
+    }
+    assert(pages[0].value == 18 && pages[1].value == 9);
+
+    for (auto it = log.rbegin(); it != log.rend(); ++it) {
+        const auto& r = *it;
+        if (r.kind == Kind::update && !committed[r.tx]) {
+            assert(pages[r.page].page_lsn == r.lsn);
+            pages[r.page] = Page{r.before, 0};   // trace-only undo
+        }
+    }
+    assert(pages[0].value == 15 && pages[1].value == 7);
+}
+```
+
+What the model proves is narrow but useful:
+
+- neither the page write nor durable acknowledgement may outrun `durable_lsn`;
+- redo reconstructs missing page effects from the durable log;
+- loser removal produces the expected final state for the stated trace.
+
+It does not model checksums, page incarnation, concurrent recovery, CLRs, partial records, media failure, or MVCC visibility. Compact models are valuable only when their boundary is explicit.
+
+## 65.13 Checkpoints, Torn Pages, and Media Recovery
+
+A checkpoint bounds restart work by recording a recovery starting point and advancing persistent page state. It usually spreads writes over time. Forcing every dirty page simultaneously would create latency spikes and require an unrealistic global pause.
+
+Checkpoint frequency trades:
+
+- more frequent: less crash redo, more repeated page writes and checkpoint overhead;
+- less frequent: more WAL retention and longer recovery, smoother foreground operation;
+- poorly paced: bursty I/O and tail-latency cliffs.
+
+A **redo point** is the oldest WAL position restart may need. A **restartpoint** is a checkpoint-like recovery milestone while replaying archived or streamed WAL. Exact names and rules are **[Product/version]**.
+
+### Torn pages
+
+A database page can span multiple atomic storage units. Power loss during a write may leave some sectors old and others new. A record-level redo operation cannot safely assume such a page is structurally valid.
+
+Defenses include:
+
+- full-page images in WAL at strategically chosen times;
+- checksums plus a separate repair source;
+- doublewrite or shadow-copy techniques;
+- storage-supported atomic page writes with a verified contract.
+
+Checksums detect corruption; they do not by themselves repair it. A full-page image can restore a base onto which later redo applies.
+
+### Crash recovery versus media recovery
+
+Crash recovery assumes the data and WAL devices remain available but contain an allowed mix of old and new pages. Media recovery handles lost or corrupted storage:
+
+1. restore a base backup;
+2. replay archived WAL to a target point or end;
+3. establish a new consistent recovery timeline.
+
+Point-in-time recovery can stop before an accidental operation if the base backup and complete required WAL range exist. A WAL archive is not a substitute for testing restores.
 
 ---
 
-## 65.13 ARIES: Analysis, Redo, Undo, and Repeating History
+## 65.14 Module III — Histories and Isolation
 
-**ARIES** (Algorithms for Recovery and Isolation Exploiting Semantics, Mohan et al., IBM, 1992) is the canonical crash-recovery algorithm for a steal + no-force engine with physiological logging. Even where a system deviates (Postgres does), ARIES is the vocabulary interviewers expect. Recovery runs in **three passes over the WAL**:
+A **schedule** or history interleaves operations from transactions. Two operations conflict when they access the same logical item, at least one writes, and their order can change the result.
 
-```
-        crash
-          │
-   ┌──────┴────────────────────────────────────────────────────┐
-   │ 1. ANALYSIS   scan forward from last checkpoint             │
-   │      rebuild the Dirty Page Table (which pages were dirty)  │
-   │      and the Transaction Table (which txns were in flight)  │
-   │      determine RedoLSN = oldest recLSN in DPT (where redo   │
-   │      must start) and the set of losers (uncommitted txns)   │
-   ├────────────────────────────────────────────────────────────┤
-   │ 2. REDO       scan forward from RedoLSN                      │
-   │      REPEAT HISTORY: re-apply EVERY logged change (winners  │
-   │      AND losers), skipping any whose page.pd_lsn >= rec.lsn  │
-   │      → brings the database to its exact pre-crash state      │
-   ├────────────────────────────────────────────────────────────┤
-   │ 3. UNDO       scan backward                                  │
-   │      roll back the losers (uncommitted txns), writing a CLR  │
-   │      for each undone action so undo itself is redo-safe      │
-   └────────────────────────────────────────────────────────────┘
-```
+A history is **conflict-serializable** if its precedence graph is acyclic:
 
-**Analysis** reconstructs, from the last checkpoint forward, two structures: the **Dirty Page Table (DPT)** — for each dirty page, the `recLSN`, the earliest LSN that dirtied it since it was last clean — and the **Transaction Table** — the set of transactions in flight and their state. The smallest `recLSN` in the DPT is the **RedoLSN**: no change before it can still be missing from disk, so redo starts there.
+1. create one node per transaction;
+2. add `Ti → Tj` when a conflicting operation of `Ti` precedes one of `Tj`;
+3. a cycle proves no conflict-equivalent serial order exists.
 
-**Redo — "repeat history."** ARIES's signature idea: redo re-applies **every** change in the log from RedoLSN forward, for *both* committed and uncommitted transactions, unconditionally (subject to the page-LSN idempotence check of §65.11). This deliberately re-creates the *exact* state at the moment of the crash, including changes made by transactions that will be rolled back in the next phase. Why redo losers too? Because it makes the undo phase uniform: undo can assume history is fully present and simply walk transactions backward, rather than reasoning about which partial effects reached disk. Repeating history is what lets ARIES support fine-grained (row-level) locking and physiological logging cleanly.
+Serializability is a property of committed effects and observations, not a promise that transactions literally run one at a time. Concurrency control may block, validate and abort, maintain versions, or combine those techniques.
 
-**Undo.** Now roll back the losers (uncommitted at crash), applying their changes in reverse. Each undone action is itself logged as a **Compensation Log Record (CLR)** — a redo-only record describing the *undo* action, with an `UndoNextLSN` pointer to the next earlier action still to undo. CLRs solve the "crash during recovery" problem: if the system crashes *again* mid-undo, the next recovery redoes the CLRs (undo already done stays done) and continues undoing from where `UndoNextLSN` left off, never redoing an undo. Undo work is therefore **bounded and non-repeating** — you never undo the same action twice, no matter how many nested crashes occur.
+### Common anomalies
 
-The three ARIES principles to recite: **(1) Write-ahead logging** (§65.11); **(2) Repeating history during redo** (restore exact pre-crash state, then undo); **(3) Logging changes during undo** via CLRs (so undo is idempotent under repeated crashes).
+| Anomaly | Minimal shape | Threat |
+|---|---|---|
+| dirty read | `T2` reads `T1`'s uncommitted write; `T1` aborts | observes nonexistent state |
+| nonrepeatable read | `T1` reads X; `T2` commits X; `T1` rereads X | one transaction sees two row values |
+| phantom | `T1` runs predicate; `T2` inserts matching row; `T1` reruns | result set changes |
+| lost update | both derive writes from same old X; one overwrites the other | accepted intent disappears |
+| write skew | both read invariant set, then update disjoint items | cross-row invariant breaks |
+| serialization anomaly | committed history has no equivalent serial order | application reasoning fails |
 
----
+The SQL standard defines isolation levels by required phenomena, but implementations may provide stronger behavior. Names do not fully determine lost-update or write-skew behavior. Document the product and version.
 
-## 65.14 Checkpoints, Fuzzy Checkpoints, and Restartpoints
+### Isolation-level orientation
 
-Without checkpoints, recovery would have to replay the WAL from the beginning of time. A **checkpoint** bounds recovery work by establishing a position in the WAL such that everything before it is guaranteed applied to the data files — so redo can *start* at (roughly) the checkpoint instead of the epoch.
-
-A naive **"sharp" checkpoint** would stop all transactions, flush every dirty buffer, and record "all data ≤ LSN X is on disk." Correct, but it freezes the database during the flush — unacceptable.
-
-A **fuzzy checkpoint** (what real systems use) runs *concurrently* with transactions. It does not stop the world; instead it records a checkpoint record that captures the DPT and active-transaction table at the checkpoint's start, and flushes dirty buffers in the background over an interval. Because transactions keep running and dirtying pages during the flush, the checkpoint is "fuzzy" — the on-disk state is not a clean snapshot — but the recorded DPT tells recovery precisely which pages might still be behind, so Analysis (§65.13) starts from the checkpoint and Redo starts from the oldest `recLSN`, not from the checkpoint LSN itself.
-
-**In Postgres**, the **checkpointer** process performs a checkpoint every `checkpoint_timeout` (default 5 min) or when WAL since the last checkpoint approaches `max_wal_size`, whichever first. It:
-
-1. Writes a checkpoint *start* WAL record, remembering the current WAL insert position (the **redo point**).
-2. Writes **all** buffers dirty as of the start to the data files — spread over `checkpoint_completion_target` × the interval (default 0.9) to avoid an I/O spike.
-3. `fsync`s the data files, then writes a checkpoint record and updates `pg_control` with the new redo point.
-
-After a crash, Postgres begins redo at the **redo point** recorded in `pg_control` and replays WAL forward. Recovery time is therefore proportional to WAL generated since the last checkpoint — the fundamental **tuning trade**: frequent checkpoints → short recovery but more full-page writes and steady I/O; infrequent checkpoints → less write overhead but longer recovery and larger checkpoint spikes.
-
-On a **replica** (or during archive recovery), the equivalent is a **restartpoint**: the standby cannot create its own checkpoints (it is replaying the primary's WAL) but periodically performs a restartpoint at a replayed checkpoint record, flushing buffers so that if the *standby* crashes it can restart redo from a recent point rather than the beginning of the stream.
-
----
-
-## 65.15 Mapping Postgres onto ARIES: Redo-Only Recovery via MVCC
-
-Postgres is the great deviation from textbook ARIES, and articulating exactly how is a top-tier interview answer.
-
-Postgres implements **redo (WAL replay)** faithfully — Analysis + Redo, repeating history via page-LSN idempotence — but has **no undo phase and no undo log at all** during crash recovery. There is no Transaction Table rollback pass, no CLRs, no before-images to reverse. Why can it skip the entire third ARIES phase?
-
-**Because MVCC keeps old versions instead of overwriting (Ch. 61 §61.7).** An `UPDATE` writes a *new* tuple version and marks the old one's `xmax`; a `DELETE` sets `xmax`; neither destroys the prior state. Visibility is decided per-tuple by the inserting/deleting transaction ids (`xmin`/`xmax`) checked against the reader's snapshot and against the **commit log** (`pg_xact`, formerly `clog`), a small array recording each transaction's fate (in-progress / committed / aborted).
-
-So "undoing" an aborted or crashed transaction requires *no data modification*:
-
-- A crashed transaction never wrote a commit record, so on recovery its `xid` is treated as **aborted** in `pg_xact`.
-- Its inserted tuple versions have `xmin` = that aborted xid → **invisible to everyone**, forever. Its deletions (setting `xmax` = aborted xid) are simply ignored, so the old versions remain visible.
-- No page needs reverting. The aborted versions are just dead tuples, reclaimed later by **VACUUM** (Ch. 61 §61.14) — undo is deferred, incremental, and done by garbage collection rather than a recovery pass.
-
-```
- ARIES / InnoDB / Oracle:                    PostgreSQL MVCC:
-   UPDATE overwrites row in place              UPDATE writes NEW version, old kept
-   → old value saved to UNDO log/rollback seg  → both versions on the heap page
-   ROLLBACK / crash: replay undo to restore    ROLLBACK / crash: mark xid aborted;
-   RECOVERY: redo THEN undo (3 phases)           new versions invisible; NO undo pass
-                                               RECOVERY: redo only (2 phases)
-   cost: undo log, purge threads               cost: dead tuples, VACUUM, bloat
-```
-
-Contrast the alternatives explicitly:
-
-- **InnoDB** overwrites the row in the clustered index in place and saves the pre-image to a **rollback segment / undo log** (in the system tablespace / undo tablespaces). It builds old MVCC read-views *by walking the undo log backward*. Rollback and crash-undo both replay undo; a **purge** thread later discards undo no longer needed. So InnoDB is classic ARIES redo+undo — undo does double duty for both rollback and MVCC snapshots.
-- **Oracle** similarly uses **undo/rollback segments** and reconstructs consistent reads from undo, and produces the "ORA-01555 snapshot too old" error when a long query needs undo that has been overwritten — the direct analogue of Postgres bloat pressure.
-
-The trade in one line: **Postgres pays for MVCC in disk space and VACUUM (undo is garbage collection); InnoDB/Oracle pay for MVCC in undo-log machinery and a redo+undo recovery, but reclaim space in place.** Same isolation guarantees, opposite cost structure.
-
-(Postgres has experimented with an undo-based storage engine, **zheap**, precisely to get in-place updates and avoid bloat — adopting the InnoDB-style undo model under the pluggable table-AM. Its existence underlines that the redo-only property is a consequence of the *heap's* MVCC choice, not of Postgres's WAL.)
-
----
-
-## 65.16 The Torn-Page Problem and Full-Page Writes
-
-A crash can strike *during* a page write. A Postgres page is 8 KB but the device writes in 512 B or 4 KB sectors atomically — so an 8 KB write is several sector writes, and a power loss can leave a page half old, half new: a **torn page** (a.k.a. partial write). Physiological WAL replay assumes it is applying a delta to a *consistent* base page; a torn base page would corrupt the redo.
-
-```
- 8 KB page = 2 × 4 KB device sectors. Power fails after sector 0, before sector 1:
-   ┌───────────────┬───────────────┐
-   │ sector 0: NEW │ sector 1: OLD  │   ← torn: neither the old nor the new page,
-   └───────────────┴───────────────┘     and WAL redo of a delta onto it corrupts.
-```
-
-Postgres's defense is **full-page writes** (`full_page_writes = on`, the default). The rule: **the first time a page is modified after a checkpoint, the entire page image is written into the WAL** (a full-page image, FPI), not just the delta. Subsequent modifications of the same page before the next checkpoint log only the delta.
-
-During redo, when Postgres encounters a WAL record carrying a full-page image, it **overwrites the whole page** with that image rather than applying a delta — so even if the on-disk page was torn, redo restores a known-good full copy, and all later deltas apply cleanly on top. Because a page is only guaranteed consistent on disk as of the last checkpoint, one FPI per page per checkpoint interval is exactly sufficient.
-
-Costs and interactions:
-
-- **WAL volume balloons right after each checkpoint** (every first-touch page logs 8 KB). This is a major reason `full_page_writes` and checkpoint frequency interact: more frequent checkpoints → more FPIs → more WAL. `wal_compression` compresses FPIs to blunt this.
-- It is also why the first run of a benchmark right after a checkpoint is slower — the FPI surge.
-- **When can it be disabled?** Only if the storage guarantees atomic 8 KB writes — e.g. ZFS/btrfs with copy-on-write, or hardware with battery-backed atomic page writes. InnoDB solves the same problem differently with the **doublewrite buffer**: it writes each page first to a sequential doublewrite area, `fsync`s, then to its real location; on recovery a torn page in place is recovered from its clean copy in the doublewrite buffer. Two solutions to one problem — Postgres logs the whole page in the WAL; InnoDB stages it in a separate area first.
-
-InnoDB additionally has **crash-safe page checksums / LSN-in-header-and-trailer** to *detect* torn pages; Postgres detects corruption via optional page checksums (`data_checksums`).
-
----
-
-## 65.17 Serializability and Schedules
-
-Now to the C in ACID's neighbor, **isolation**. Concurrency control's gold standard is **serializability**: the result of executing transactions concurrently must equal the result of *some* serial (one-at-a-time) order. Serializability is the correctness criterion; isolation levels (§65.19) are the deliberately weaker approximations of it.
-
-A **schedule** is an interleaving of the operations (reads/writes) of concurrent transactions. A schedule is **serial** if each transaction runs to completion before the next starts. A **serializable** schedule is one *equivalent* to some serial schedule — but "equivalent" needs a definition:
-
-- **Conflict serializability.** Two operations *conflict* if they are from different transactions, touch the same item, and at least one is a write (write–write, write–read, read–write). A schedule is conflict-serializable if it can be transformed into a serial schedule by swapping *non-conflicting* adjacent operations. This is decided by the **precedence graph** (a.k.a. serialization / conflict graph): a node per transaction, an edge Tᵢ → Tⱼ whenever an operation of Tᵢ conflicts with and precedes an operation of Tⱼ on the same item. **A schedule is conflict-serializable iff its precedence graph is acyclic.** A cycle means no serial order is consistent with the observed conflicts.
-
-```
- Precedence graph:  edge Ti → Tj  if Ti's op precedes & conflicts Tj's op on same item
-        T1 ──▶ T2          acyclic  → conflict-serializable (order T1,T2,T3)
-         ▲      │
-         └──────┘  T3       a cycle (T1→T2→T3→T1) → NOT serializable
-```
-
-- **View serializability** is strictly weaker (larger class): two schedules are view-equivalent if every read reads the value from the same writer, and the final write of each item is the same. Every conflict-serializable schedule is view-serializable, but not vice versa (view-serializability admits schedules with "blind writes" that conflict-serializability rejects). Deciding view-serializability is NP-complete, so **practical schedulers enforce conflict-serializability** (via locking or via the precedence-graph testing of SSI, §65.22) — it is efficiently checkable and only slightly conservative.
-
-Additional schedule properties matter for recovery: a **recoverable** schedule never lets a transaction commit before a transaction whose data it read has committed; **cascadeless** (avoids-cascading-aborts, ACA) schedules only read committed data, so one abort never forces others to abort. Strict schedules (the basis of Strict 2PL, §65.24) additionally forbid reading *or writing* an item written by an uncommitted transaction.
-
----
-
-## 65.18 Read and Write Anomalies
-
-Weakening isolation admits specific **anomalies**. Interviewers expect you to define each precisely and draw its timeline. Read (r) and write (w) are indexed by transaction.
-
-**Dirty write** (w–w): T2 overwrites a value written by uncommitted T1. If T1 aborts, its rollback may undo T2's write or leave an inconsistent mix. Forbidden by *every* real isolation level (even Read Uncommitted).
-
-**Dirty read** (r after uncommitted w): T2 reads a value T1 wrote but has not committed; if T1 aborts, T2 read a value that never existed.
-```
- T1: w(x=20) ................ ABORT
- T2:            r(x)=20              ← read a value that was rolled back
-```
-
-**Non-repeatable read / fuzzy read** (r–w–r): T1 reads x, T2 updates and commits x, T1 reads x again and gets a different value — the same row changed under T1's feet.
-```
- T1: r(x)=10 ....................... r(x)=20   (differs!)
- T2:           w(x=20) COMMIT
-```
-
-**Phantom read**: T1 runs a *predicate* query (e.g. `WHERE age>30`), T2 inserts/deletes a row matching that predicate and commits, T1 re-runs the query and the *set of rows* changes — a new row "appears." Distinct from non-repeatable read: it is about rows entering/leaving a result set, not a single row's value changing. Defeating phantoms requires locking *ranges/predicates*, not just rows.
-```
- T1: SELECT count(*) WHERE age>30  → 5 ............ same query → 6  (phantom)
- T2:                     INSERT (age=40) COMMIT
-```
-
-**Lost update** (r–r–w–w): T1 and T2 both read x=10, both compute x+1, both write 11; one update is lost (should be 12). Classic under naive read-modify-write without locking or version checks.
-
-**Write skew** (the signature Snapshot-Isolation anomaly): two transactions read an *overlapping* set, then each writes a *different* item, and the combination violates a constraint that each alone preserved. Canonical: two doctors on call; a rule says ≥1 must remain on call. Each reads "2 on call," each takes themselves off (writing *different* rows), both commit → 0 on call. Neither transaction saw the other's write because they wrote different rows — so no write–write conflict, and Snapshot Isolation permits it.
-```
- constraint: on_call(Alice) OR on_call(Bob)  must hold
- T1: r(Alice=on,Bob=on) ... w(Alice=off) COMMIT
- T2: r(Alice=on,Bob=on) ....... w(Bob=off) COMMIT      → both off: constraint broken
-```
-
-**Read-only anomaly** (Fekete et al.): even a *read-only* transaction can observe a state inconsistent with any serial order under Snapshot Isolation, given the right interleaving of two read-write transactions — proving SI is not serializable even for readers, and motivating SSI (§65.22).
-
----
-
-## 65.19 Isolation Levels and the Anomaly Table
-
-The SQL standard (SQL-92) defines four isolation levels by which anomalies each *forbids*. The definitions are phrased in terms of the "big three" phenomena; the standard's table is the one to memorize.
-
-| Isolation level | Dirty read | Non-repeatable read | Phantom read |
+| Requested idea | Snapshot cadence / control | Usually prevented | Still investigate |
 |---|---|---|---|
-| **Read Uncommitted** | possible | possible | possible |
-| **Read Committed** | prevented | possible | possible |
-| **Repeatable Read** | prevented | prevented | possible |
-| **Serializable** | prevented | prevented | prevented |
+| Read Uncommitted | product-specific | little required by standard | dirty and all later anomalies |
+| Read Committed | often statement snapshot or short read locks | dirty read | nonrepeatable read, phantom, write skew |
+| Repeatable Read | transaction snapshot or long read locks | dirty/nonrepeatable reads | product-specific phantom and write skew behavior |
+| Serializable | 2PL, SSI, OCC/certification, or hybrid | nonserializable committed history | abort/retry and operational costs |
 
-The standard's flaw, exposed by Berenson et al. (1995, "A Critique of ANSI SQL Isolation Levels"): it defines levels by the *lock-based* implementation's phenomena and omits anomalies that **Snapshot Isolation** exhibits — namely **write skew** and lost-update/read-only anomalies. SI prevents all three standard phenomena yet is *not* serializable. So the four-row table is necessary but not sufficient; a complete answer names write skew as the level the standard forgot.
+“Serializable” guarantees that successfully committed transactions can be ordered serially. It does not guarantee that every attempt commits or that reads never block.
 
-A fuller table including SI and the extra anomalies:
+## 65.15 Concurrency-Control Families
 
-| Level | Dirty read | Lost update | Non-repeatable | Phantom | Write skew |
-|---|---|---|---|---|---|
-| Read Uncommitted | poss.* | poss. | poss. | poss. | poss. |
-| Read Committed | no | poss. | poss. | poss. | poss. |
-| Snapshot Isolation | no | no | no | no | **possible** |
-| Serializable | no | no | no | no | no |
+### Pessimistic locking and 2PL
 
-(*In Postgres, even Read Uncommitted forbids dirty reads — §65.20.)
+Pessimistic control waits before a conflicting action. Shared/exclusive locks are the basic form. **Two-phase locking (2PL)** has:
 
-The general implementation lever: **stronger isolation = holding conflict-preventing controls longer / over wider scopes** (longer read locks, range/predicate locks), costing concurrency. Read Committed releases read locks immediately; Repeatable Read holds them to commit; Serializable additionally prevents phantoms via range/predicate locking (lock-based) or conflict-cycle detection (SSI).
+- a growing phase in which locks are acquired;
+- a shrinking phase after the first release, in which no new locks are acquired.
+
+2PL yields conflict-serializability. Strict 2PL retains exclusive locks through commit/abort, preventing other transactions from observing or overwriting uncommitted writes. Rigorous variants retain all locks.
+
+Lock granularity ranges from row/key through page and table to predicate/range. Fine locks improve concurrency but cost metadata and acquisition work. Intention modes summarize lower-level intentions so table and row locking can coexist. Advisory locks encode application-defined coordination; the database does not infer the protected invariant.
+
+### Deadlocks
+
+If `T1` holds A and waits for B while `T2` holds B and waits for A, the wait-for graph contains a cycle. Remedies include:
+
+- consistent resource order, where practical;
+- prevention schemes based on transaction age;
+- timeout as a coarse escape hatch;
+- cycle detection followed by victim abort.
+
+Detection must include the relevant wait queues and lock conversions. A deadlock timeout is not the same as a statement timeout, and its configured value is **[Product/version]**. Applications should make abort-and-retry safe.
+
+Latches can deadlock too, but engines generally prevent that with strict acquisition protocols because transaction-scale detection is too expensive and slow for tiny critical sections.
+
+### Optimistic concurrency control
+
+OCC typically performs:
+
+1. **read:** compute using a private read/write set;
+2. **validate:** ensure overlapping commits do not invalidate the computation;
+3. **write:** publish changes, or abort and retry.
+
+It avoids waits under low contention but wastes work under conflict. Timestamp-ordering and certification systems are related families with different validation rules.
+
+### MVCC
+
+MVCC keeps multiple logical versions. A snapshot plus transaction status determines visibility:
+
+```text
+visible(version, snapshot)
+  = creator is visible to snapshot
+    and deleter/replacer is not visible to snapshot
+```
+
+That formula is conceptual. Self-visible writes, command ordering, prepared transactions, aborted subtransactions, and special status values complicate a real engine.
+
+MVCC lets a reader use an older committed version rather than block behind a writer. It does not eliminate:
+
+- writer-writer conflict handling;
+- version reclamation;
+- index entries pointing to multiple versions;
+- snapshot bookkeeping;
+- serializability anomalies.
+
+Old versions can be reclaimed only when no relevant snapshot, replica, decoder, or prepared transaction can need them. Long-lived horizons turn logical concurrency into physical bloat.
+
+## 65.16 Worked Isolation Trace: Write Skew
+
+Invariant: at least one doctor must remain on call.
+
+```text
+initial: Alice=on, Bob=on
+
+T1 snapshot: reads Alice=on, Bob=on
+T2 snapshot: reads Alice=on, Bob=on
+
+T1 writes Alice=off
+T2 writes Bob=off
+
+T1 commits
+T2 commits
+final: Alice=off, Bob=off
+```
+
+Each transaction preserves the invariant relative to its snapshot. They write different rows, so a “first committer wins on the same row” rule sees no write-write collision. Yet both commits create a cycle:
+
+```text
+T1 read Bob before T2 wrote Bob: T1 ─rw→ T2
+T2 read Alice before T1 wrote Alice: T2 ─rw→ T1
+```
+
+This is write skew, not a lost update. No write overwrote the other; the missing conflict is at the predicate or invariant level.
+
+Solutions include:
+
+- serializable isolation with retry;
+- an explicit lock on one shared invariant row;
+- a schema-level constraint that the engine can enforce atomically;
+- carefully locking every row representing the predicate, while handling empty-set phantoms.
+
+A check constraint on each individual doctor row cannot express “at least one across this set.” Correctness belongs where the invariant can be serialized.
+
+### Integration: one update from statement to crash safety
+
+Now join the three modules:
+
+1. The transaction reads versions permitted by its snapshot or obtains logical locks.
+2. The executor locates a page, pins its frame, and acquires the appropriate content latch.
+3. It constructs the new version or in-place change and the associated WAL record.
+4. WAL insertion assigns an LSN. The page is changed, marked dirty, and tagged with that LSN under the engine's protocol.
+5. The latch is released; the pin is released when the caller no longer needs the mapping. Transaction locks may remain.
+6. A writer may flush the page only after WAL is durable through its page LSN.
+7. On commit, concurrency control confirms the transaction may commit—perhaps after validation or serialization checks—and a commit record/status transition is produced.
+8. Under the selected durable policy, WAL is flushed through the commit point before success is reported. Group commit may batch many transactions.
+9. Logical locks and visibility state are released/published according to the engine's ordering.
+10. Later, checkpoints bound recovery; reclamation removes versions older than every visibility horizon.
+
+Step 9 is intentionally not reduced to one universal order. Some engines make a transaction visible only after durable commit; asynchronous policies and replicated systems distinguish local visibility, local durability, remote flush, and remote apply. The correctness requirement is that readers and recovery agree with the documented commit state machine.
 
 ---
 
-## 65.20 PostgreSQL's Real Isolation Behavior
+**Skippable PostgreSQL 18 reference begins here.**
 
-Postgres does not implement isolation with the standard's read/write locks; it uses **MVCC snapshots**, and its actual behavior differs from the standard's minimums in ways interviewers reward knowing.
+The rest of the chapter maps the inventory to one product. These are **[PostgreSQL 18]** statements, based on PostgreSQL 18 documentation available in July 2026. Internal names and operational defaults can change; verify the deployed major version, settings, platform, and source tree.
 
-- **Read Uncommitted → treated as Read Committed.** Postgres *never* permits dirty reads at any level — an MVCC reader only ever sees committed versions (its snapshot filters by commit status). Requesting Read Uncommitted silently gives Read Committed. So the top row of the standard table is unreachable in Postgres.
+## 65.17 PostgreSQL MVCC and Transaction Metadata
 
-- **Read Committed (the default).** Each *statement* takes a fresh snapshot at its start. Within one statement the view is stable; across statements in the same transaction it advances, so non-repeatable reads and phantoms are visible between statements. A subtlety unique to RC + MVCC: on a write conflict (updating a row another transaction just updated and committed), Postgres does an **EPQ ("EvalPlanQual") re-check** — it re-reads the *latest committed* version and re-applies the `WHERE` to it, rather than aborting. This can produce results that look non-serializable and surprises people.
+PostgreSQL heap tuples carry transaction-related fields including creator `xmin`, deletion/replacement `xmax`, and command information. A snapshot captures an XID visibility horizon and transactions in progress. At a high level, the visibility test asks:
 
-- **Repeatable Read = Snapshot Isolation.** Postgres takes **one snapshot at the first statement** of the transaction and holds it for the whole transaction — a consistent point-in-time view. This is strictly *stronger* than the standard's RR: it prevents phantoms too (a snapshot cannot see rows committed after it). But it is exactly SI, so it **permits write skew** and the read-only anomaly. Postgres RR also uses **first-updater-wins**: if two RR transactions update the same row, the second to reach it aborts with a serialization failure (`could not serialize access`) rather than silently losing an update — so lost update is prevented, but the app must retry.
+1. Did the inserting transaction commit, abort, remain in progress, or belong to this transaction?
+2. Was that insertion visible to this snapshot?
+3. Is there a deleting/updating transaction, and was its action visible to this snapshot?
 
-- **Serializable = SSI (Serializable Snapshot Isolation).** Postgres 9.1+ implements true serializability *on top of* SI by detecting dangerous conflict-graph structures at runtime and aborting a transaction to break the cycle (§65.22). It adds no read locks that block writers — reads remain non-blocking MVCC reads — but tracks read/write dependencies with lightweight **predicate (SIRead) locks** and aborts one participant of a would-be non-serializable execution. Cost: potential serialization-failure retries; benefit: full serializability with reader concurrency.
+Commit status is stored in transaction-status machinery commonly discussed through `pg_xact`. Tuple **hint bits** can cache status facts in heap pages, so a later reader can dirty a page while recording a hint. Subtransaction parentage involves `pg_subtrans`; overflowed subtransaction state can make visibility checks and recovery behavior more expensive.
 
-```
- Postgres level        Snapshot taken            Prevents                     Anomaly left
- ─────────────────────────────────────────────────────────────────────────────────────────
- Read Committed        per STATEMENT              dirty read                   non-repeatable,
- (default)                                                                     phantom, write skew
- Repeatable Read       once per TRANSACTION       + non-repeatable, phantom    write skew,
- (= Snapshot Isol.)      (first statement)          (+ lost update via FUW)    read-only anomaly
- Serializable (SSI)    once per TRANSACTION        + write skew (all)          none (fully serializable)
-                        + dependency tracking
-```
+Several small, page-oriented status areas use SLRU-style caching rather than the ordinary relation buffer pool. Treat `pg_xact`, subtransaction status, commit timestamps, notification state, and MultiXact state as distinct stores with their own wraparound and I/O characteristics. Active transaction state is coordinated through structures commonly discussed as `ProcArray`; cluster-wide visibility horizons are derived from active and retained state, not from a wall clock. Names such as “global xmin” describe a horizon concept, while the exact fields and calculations are version-specific.
 
-The practical upshot: Postgres RR is safe against everything *except* write skew; if your invariant spans multiple rows that different transactions might each update, you need **Serializable** or explicit locking (`SELECT ... FOR UPDATE`).
+**Command IDs** order changes made by one transaction so statements can see the appropriate earlier self-effects. Savepoints create subtransactions for rollback semantics, but deep savepoint nesting is not free.
 
----
+### Horizons, freezing, and wraparound
 
-## 65.21 MVCC Deep Dive: Snapshots, xmin/xmax, Visibility
+Normal PostgreSQL XIDs occupy a finite circular space. “Older” comparisons are meaningful only within a bounded window. Vacuum freezes sufficiently old committed tuple state so future visibility no longer depends on treating that ordinary XID as permanently old.
 
-MVCC (multi-version concurrency control) is how Postgres gives readers a consistent view without blocking writers and writers without blocking readers — the headline property: **readers never block writers, writers never block readers** (only writer–writer on the same row conflicts). Each row exists as multiple **versions** (Ch. 61 §61.7); a transaction's **snapshot** selects the correct version of each row.
+The oldest possibly relevant snapshot forms a reclamation horizon. Active backends, prepared transactions, standby feedback, and logical decoding/replication slots can retain horizons. A stale horizon has two coupled symptoms:
 
-**Transaction ids and command ids.** Every write transaction gets a monotonically increasing 32-bit **`xid`** (transaction id). Within a transaction, statements get an increasing **`cid`** (command id) so a statement doesn't see its own later effects incorrectly. Each heap tuple header stores:
+- dead tuples and catalog rows cannot be reclaimed;
+- anti-wraparound work becomes urgent.
 
-- **`xmin`** — the xid that inserted this version.
-- **`xmax`** — the xid that deleted/updated-away this version (0 if live).
-- **`t_cid`, `t_ctid`** — command id and pointer to the next version.
-- **infomask hint bits** (below).
+Operational rule: monitor XID and MultiXact age as correctness budgets, not merely as bloat metrics. An anti-wraparound vacuum may receive special treatment because failing to advance the horizon eventually threatens database availability.
 
-**The snapshot.** A snapshot captured at a point in time is essentially `{xmin, xmax, xip[]}`:
+### MultiXacts and row locks
 
-- `xmin` (snapshot) = oldest xid still running when the snapshot was taken; anything older is definitely finished.
-- `xmax` (snapshot) = first xid not yet assigned; anything ≥ this had not started, so is invisible.
-- `xip[]` = the list of xids **in progress** at snapshot time (between snapshot `xmin` and `xmax`) — these are invisible even though their range overlaps.
+Several transactions can hold compatible row-level locks on one tuple. PostgreSQL can represent the group with a MultiXact ID whose member data lives in dedicated status storage. This avoids modeling every row lock as a conventional heavyweight lock-table entry, but introduces a second finite ID space that also needs vacuum/freeze discipline.
 
-```
- xid axis:  |<-- committed & visible -->|<-- in flight (xip) -->|<-- future -->|
-            0 ................ snap.xmin ... [xip list] ... snap.xmax ..........
-            └ definitely done             └ maybe running        └ not started (invisible)
-```
+Do not simplify this to “all PostgreSQL row locks live only in `xmax`.” Tuple header fields, MultiXact member storage, heavyweight transaction-ID waits, and lock manager state cooperate.
 
-**Visibility rule** for a tuple to be visible to a snapshot S (simplified):
+## 65.18 PostgreSQL Isolation, Locks, and SSI
 
-1. Its `xmin` must have **committed** *and* be visible to S (xmin < S.xmax, not in S.xip, and its commit is recorded), **and**
-2. Its `xmax` is either 0 (never deleted), **or** the deleting xid is *not* visible to S (still in flight, aborted, or in S.xip) — i.e. the delete hasn't "happened" from S's viewpoint.
+PostgreSQL 18 documents:
 
-So a reader with an old snapshot sees the *old* version (its `xmax` deleter is not yet visible) while a concurrent writer's new version (higher `xmin`) is invisible — no blocking, no locks.
+- Read Uncommitted behaves like Read Committed.
+- Read Committed normally takes a new snapshot per command.
+- Repeatable Read uses one transaction snapshot and is implemented as snapshot isolation; serialization anomalies remain possible.
+- Serializable adds Serializable Snapshot Isolation (SSI) monitoring and can abort transactions whose dependency pattern risks a nonserializable result.
 
-**Commit log (`pg_xact` / clog) and hint bits.** To check "did xid N commit?", Postgres consults **`pg_xact`** (formerly `clog`), a densely packed array with 2 bits per transaction (in-progress / committed / aborted / sub-committed). This lookup is on the visibility hot path, so Postgres caches the answer in the tuple itself as **hint bits** (`HEAP_XMIN_COMMITTED`, `HEAP_XMAX_COMMITTED`, etc.) in the `infomask`. The *first* reader of a tuple after the writer committed consults `pg_xact`, then stamps the hint bit; later readers skip `pg_xact`. This is why a `SELECT` can dirty pages (setting hint bits is a page modification) and cause surprising write I/O on a "read-only" query right after a bulk load — a classic gotcha.
+PostgreSQL's SSI **predicate locks** appear as `SIReadLock` state. They record reads so rw-antidependencies can be detected; they do not block writers like conventional locks. Tracking may coarsen from tuple/page to relation granularity, trading memory for more false-positive serialization failures. Applications must retry the whole transaction on SQLSTATE `40001`.
 
-**Frozen tuples and wraparound.** Because xids are 32-bit and wrap around ~4 billion, old tuples must be **frozen** (marked "committed and visible to everyone," historically `xmin = FrozenXID`, now via a frozen infomask bit) by VACUUM before their xid is within 2 billion of the current one, or the database halts to prevent wraparound corruption. This ties MVCC visibility directly back to VACUUM (Ch. 61 §61.14).
+PostgreSQL also exposes:
 
----
+- table lock modes with a documented conflict matrix;
+- row lock modes used by DML and `SELECT ... FOR ...`;
+- page-level locks used internally and normally released quickly;
+- transaction-scoped or session-scoped advisory locks;
+- heavyweight locks and fast paths for selected common cases;
+- LWLocks and spinlocks for internal in-memory synchronization.
 
-## 65.22 SSI and Write-Skew Detection
+The first four are logical coordination interfaces or effects. LWLocks/spinlocks are latches. Conflating them yields bad explanations of both deadlock and isolation.
 
-Serializable Snapshot Isolation (Cahill/Röhm/Fekete, 2008; Postgres 9.1) makes Snapshot Isolation fully serializable by catching the specific structure that causes SI's anomalies, without adding blocking read locks.
+PostgreSQL detects deadlocks among heavyweight waits and aborts a participant. Detection timing and victim choice are implementation/configuration matters. Use a consistent application lock order to reduce cycles, and still handle deadlock errors because plans and hidden lock acquisition can vary.
 
-The theory: every non-serializable SI execution contains a **"dangerous structure"** in the conflict graph — two consecutive **rw-antidependency** edges forming a specific pattern: T1 →rw T2 →rw T3, where a *pivot* transaction T2 has both an incoming and an outgoing rw-dependency, and T3 committed first (or T3 = T1). An **rw-antidependency** (read-write conflict) exists when T_a reads a version that T_b then overwrites — T_a "should have" come before T_b. If two such edges meet at a pivot, the schedule may have a cycle → not serializable. SSI tracks these edges at runtime and, when a dangerous structure appears, **aborts the pivot** to break it.
+## 65.19 PostgreSQL Buffers and WAL
 
-```
- Dangerous structure (necessary for an SI cycle):
-        T1 ──rw──▶ T2 ──rw──▶ T3
-                   ▲ pivot: has in+out rw edges → abort T2 to be safe
- Write skew is exactly this with T1,T3 being each other (two txns each reading what
- the other writes): T_a ──rw──▶ T_b ──rw──▶ T_a  → SSI aborts one.
-```
+A PostgreSQL shared-buffer identity is represented by a buffer tag that identifies a relation fork and block. Pins protect frame reuse; content locks protect page bytes; lookup and buffer metadata use additional synchronization. Shared-buffer lookup is partitioned, and replacement uses a clock-sweep family with usage counts. Bulk access paths may use small buffer access strategy rings to limit cache pollution.
 
-To detect rw-antidependencies, Postgres tracks **what each serializable transaction read** using **predicate locks** implemented as **SIRead locks** (`SIReadLock`) — non-blocking "soft" locks recorded in a dedicated shared structure (`pg_serializable` / the predicate lock manager). An SIReadLock does *not* block anyone; it is a *marker* that "this transaction read this page/tuple/range," so that when another transaction writes there, the rw-edge is recorded. Predicate locks are taken at tuple, page, or relation granularity, escalating (tuple → page → relation) under memory pressure — coarser granularity means more false positives (unnecessary aborts) but bounded memory.
+These details explain behavior, not universal tuning constants. PostgreSQL also relies on the operating-system cache. Memory percentage recommendations in documentation are starting points, not laws; benchmark the complete memory budget, including connections, sorts, hash operations, maintenance, kernel cache, and other processes.
 
-Consequences and interview points:
+Dirty buffers can be written by foreground and background activity. A checkpoint spreads required writes and establishes recovery metadata. The WAL rule still governs every page: WAL needed for that page image must be flushed first. How a backend reports a file that later needs synchronization to the checkpointer is an internal, version-specific fsync-request path; completion of an ordinary background write is not itself a durable-commit proof.
 
-- SSI can produce **false-positive serialization failures** (abort a transaction that would actually have been fine) because predicate locks are conservative — the app must be prepared to **retry** on `40001 serialization_failure`. Serializable in Postgres is a *contract to retry*, not a promise of no aborts.
-- It keeps reads **non-blocking** — the great advantage over strict two-phase locking, which would take real read locks and serialize readers against writers.
-- Long-running or memory-heavy serializable transactions can force predicate-lock escalation and more aborts; keep serializable transactions short.
+PostgreSQL WAL records are inserted into shared WAL buffers and later written/flushed. The documented WAL contract says data-file changes may be written only after the corresponding WAL is flushed to permanent storage. One WAL flush can serve many commits.
 
-SSI is how Postgres solves the **write-skew** and **read-only** anomalies that plain RR/SI (§65.20) permits — by detecting the conflict cycle rather than by locking rows the transaction never wrote.
+Crash startup obtains checkpoint and recovery coordinates from durable control metadata and then replays validated WAL from the required redo point. Tools such as `pg_controldata` expose selected control-file state, but fields are not a recovery API and must be interpreted with the matching server version.
 
----
+### Commit and `synchronous_commit`
 
-## 65.23 Optimistic Concurrency Control
+For PostgreSQL 18, `synchronous_commit` selects how much WAL processing must complete before success is returned. Local non-`off` modes wait for local WAL flush; replication modes can additionally wait for remote write, flush, or apply. With `off`, success can precede local durable flush, so a crash can lose recent acknowledged transactions without making the recovered database internally inconsistent.
 
-Concurrency control splits into **pessimistic** (assume conflicts, lock/block up front — §65.24) and **optimistic** (assume conflicts are rare, run freely, validate at the end). SSI is one optimistic scheme; the classic **OCC** (Kung & Robinson, 1981) is the template.
+Do not state a fixed loss interval without the actual `wal_writer_delay` and relevant version/configuration. Do not equate `synchronous_commit=off` with `fsync=off`: the former relaxes acknowledgement durability for selected transactions, whereas disabling `fsync` changes the system-wide recovery assumptions and can risk corruption.
 
-OCC runs a transaction in three phases:
+### Full-page writes and checkpoints
 
-```
- ┌──────────┐   ┌────────────┐   ┌──────────┐
- │  READ    │──▶│ VALIDATION │──▶│  WRITE   │
- │ execute  │   │ check no   │   │ install  │
- │ against  │   │ conflict   │   │ changes  │
- │ a private│   │ with txns  │   │ (if valid│
- │ workspace│   │ that       │   │  ; else  │
- │ (buffer  │   │ committed  │   │  ABORT & │
- │  writes) │   │ meanwhile  │   │  retry)  │
- └──────────┘   └────────────┘   └──────────┘
-```
+With `full_page_writes` enabled, PostgreSQL logs a full image on the first modification of a page after a checkpoint so recovery can restore a page whose storage write was partial. This increases WAL volume, often especially after checkpoints. Whether compression helps, and how much, is **[Measured]**.
 
-1. **Read phase.** Execute the transaction against a private copy; buffer all writes locally, tracking a *read set* and *write set*. Nothing is visible to others yet.
-2. **Validation phase.** At commit, check that this transaction's read/write sets do not conflict with any transaction that committed since it started (backward validation) or is validating concurrently (forward validation). If a conflict is found, **abort and restart**.
-3. **Write phase.** If validation passes, atomically install the buffered writes (make them visible).
+Do not advise disabling this protection merely because the storage is “modern.” Require an end-to-end documented atomic-write guarantee or an equivalent recovery mechanism, and validate it under the actual stack.
 
-OCC wins when contention is low: no locking overhead, no deadlocks (there are no locks to deadlock on), readers never block. It loses under high contention: work done in the read phase is *wasted* on abort, and livelock/starvation is possible without backoff. It also needs a validation window that is itself serialized (or carefully lock-managed), which can become the bottleneck.
+### PostgreSQL recovery versus textbook ARIES
 
-Where it shows up: SSI is optimistic (validate via conflict detection, abort on danger); Postgres's **first-updater-wins** under RR is optimistic (proceed, detect the write conflict, abort the loser); many in-memory and distributed systems (FoundationDB, some HANA/Hekaton paths) use OCC because it avoids lock-manager contention that dominates in-memory workloads. The alternative — **MVCC** — is arguably a third category (multi-version), often combined with either optimistic (SSI) or pessimistic (2PL on writes) control.
-
----
-
-## 65.24 Pessimistic Concurrency Control: 2PL and Strict 2PL
-
-The dominant pessimistic scheme is **Two-Phase Locking (2PL)**. Rule: every transaction acquires locks in a **growing phase** and releases them in a **shrinking phase**, and **once it releases any lock it may acquire no more**. The "two phases" are grow-then-shrink over the transaction's lifetime.
-
-```
- locks held
-   ▲            growing            shrinking
-   │          ┌────────────┐
-   │        ┌─┘            └─┐
-   │      ┌─┘                └─┐
-   │    ┌─┘                    └──── (may not acquire after first release)
-   └────┴────────────────────────────────────▶ time
-        acquire locks         release locks
-```
-
-**Theorem: any schedule produced by 2PL is conflict-serializable.** The two-phase discipline guarantees the precedence graph (§65.17) is acyclic — this is why 2PL is the canonical way to *implement* serializability with locks. Locks come in modes (**shared** S for reads, **exclusive** X for writes) with a compatibility matrix: S/S compatible, S/X and X/X incompatible.
-
-Variants tighten *when* locks release:
-
-- **Basic 2PL** may release a lock during the shrinking phase before commit. Problem: another transaction can read the just-unlocked data, and if the first transaction then aborts, **cascading aborts** ensue. Also allows dirty reads of not-yet-committed writes released early.
-- **Strict 2PL (S2PL)** holds all **exclusive (write) locks until commit/abort** (releasing shared locks may still happen earlier). This makes schedules **strict** (no reading/writing uncommitted data) → **no cascading aborts**, and recoverable. This is what most lock-based systems actually use.
-- **Strong Strict 2PL / Rigorous 2PL (SS2PL)** holds **all** locks (shared and exclusive) until commit/abort. Simplest to reason about; commit order = serialization order. This is the textbook "2PL" most databases implement (it's what "held until commit" usually means).
-
-2PL's costs are **blocking** (a transaction waits for conflicting locks — latency) and **deadlock** (§65.25), which 2PL does not prevent. Its guarantee is strong (serializability) but its concurrency for read-heavy workloads is poor because readers block writers and vice versa — the exact problem MVCC/SSI avoids. This is why Postgres uses MVCC for reads and only takes real 2PL-style locks for *writes* and explicit lock requests; DB2 and SQL Server (in their default non-snapshot modes) are more classically 2PL.
-
----
-
-## 65.25 Deadlocks: Detection vs Prevention
-
-Any lock-based scheme can **deadlock**: T1 holds lock A and waits for B; T2 holds B and waits for A; neither proceeds. Deadlock is a cycle in the **wait-for graph** (node per transaction, edge Tᵢ → Tⱼ if Tᵢ waits for a lock held by Tⱼ).
-
-```
- wait-for graph:   T1 ──waits-for──▶ T2
-                    ▲                  │
-                    └──────waits-for───┘   cycle = deadlock
-```
-
-Two strategies:
-
-**Deadlock prevention** — structure lock acquisition so cycles cannot form:
-
-- **Lock ordering**: always acquire locks in a global order (e.g. by object id). No cycle can form (same principle as lock hierarchies in Ch. 24). Requires knowing the lock set in advance — often impractical for ad-hoc SQL.
-- **Timestamp schemes** using transaction age to decide who waits vs who dies:
-  - **Wait-Die** (non-preemptive): if an *older* transaction requests a lock held by a *younger* one, it waits; if a *younger* requests one held by an older, it **dies** (aborts and retries). Older transactions never abort due to a younger one.
-  - **Wound-Wait** (preemptive): if an *older* requests a lock held by a *younger*, it **wounds** (aborts) the younger; if a *younger* requests one held by an older, it waits. Younger transactions never wound older ones.
-  Both use a consistent age ordering so cycles cannot form; both may abort transactions that would not actually have deadlocked.
-
-**Deadlock detection** — allow deadlocks, find and break them:
-
-- Periodically (or on a wait timeout) build the wait-for graph and search for a cycle; if found, choose a **victim** and abort it to break the cycle.
-
-**Postgres uses detection, not prevention.** When a backend blocks on a heavyweight lock, it starts a timer of **`deadlock_timeout`** (default **1 second**). Only if it is *still* waiting after that does it run the deadlock detector: build the wait-for graph among all backends, look for a cycle, and if one exists, abort one transaction (the one whose abort breaks the cycle, roughly the one that detected it) with `ERROR: deadlock detected`. The 1-second delay is deliberate — most lock waits resolve quickly, so it avoids running the (relatively expensive) global graph search on every brief wait. The detector runs lazily, only for waits that outlast the timeout. Tuning `deadlock_timeout` too low wastes CPU on graph checks; too high delays breaking real deadlocks.
-
-Applications reduce deadlocks by acquiring locks in a consistent order (e.g. always update rows by ascending primary key) — the same discipline as prevention, applied by convention rather than by the engine.
-
----
-
-## 65.26 Lock Granularity and the Heavyweight Lock Manager
-
-Locks trade **concurrency against overhead** along a granularity axis: coarse (table-level) locks are cheap to manage but throttle concurrency; fine (row-level) locks maximize concurrency but cost memory and CPU to track millions of them.
-
-```
- coarse ◀──────────────────────────────────────────────▶ fine
- database  tablespace  table  page  row/tuple            (predicate/key-range)
- few locks, low concurrency          many locks, high concurrency, more overhead
-```
-
-Systems that lock at fine granularity use **intention locks** and **lock escalation** (SQL Server, DB2, InnoDB) to manage the explosion: an intention-exclusive (IX) lock on the table signals "I hold X locks on some rows below," so a table-level lock request can detect the conflict without scanning every row lock; when row locks on one table exceed a threshold, the engine **escalates** to a single coarser lock, trading concurrency for memory.
-
-**Postgres has two distinct lock systems**, and confusing them is a common error:
-
-- **Heavyweight locks (the lock manager, `LOCK` / `pg_locks`).** Transaction-duration, deadlock-detected, stored in a shared hash table partitioned into 16 partitions (each guarded by an `LWLock`) to reduce contention. These cover **table-level lock modes** (8 modes, from `ACCESS SHARE` taken by `SELECT`, through `ROW EXCLUSIVE` by DML, to `ACCESS EXCLUSIVE` by `DROP`/`ALTER`/`TRUNCATE`), advisory locks, and object locks. The 8×8 conflict matrix decides who blocks whom (e.g. `ACCESS SHARE` vs `ACCESS EXCLUSIVE` conflict — a `SELECT` blocks a `TRUNCATE` and vice versa).
-
-- **Row-level (tuple) locks — mostly *not* in the lock manager.** Postgres records a row lock **in the tuple itself** via `xmax` and infomask bits, so millions of row locks cost no lock-manager memory — the row *is* its own lock. `SELECT ... FOR UPDATE` (exclusive) and `FOR SHARE` (shared) set the row's `xmax` to the locking xid; a conflicting writer sees `xmax` set by a live transaction and waits on it. Because a single `xmax` field can name only one xid, when **multiple** transactions lock the same row in shared mode, Postgres allocates a **multixact** (`MultiXactId`) — a shared structure listing all the lockers — and stores the multixact id in `xmax`. Multixacts have their own SLRU logs (`pg_multixact`) and their own wraparound/freezing concerns, a real production pitfall under heavy `FOR SHARE`/foreign-key workloads.
-
-So a Postgres `UPDATE` takes: an `ACCESS SHARE`/`ROW EXCLUSIVE` heavyweight lock on the *table* (cheap, one per table), and a per-*row* lock recorded in each tuple's `xmax` (cheap, no lock-manager entry) — plus, if it must wait, a transient wait registered so the deadlock detector can see it. This hybrid is why Postgres scales to many concurrent row-level writers without a lock table blowing up.
-
----
-
-## 65.27 Latches vs Locks, Latch Crabbing, and B-link Trees
-
-The final and most-confused distinction: **locks** vs **latches**. Petrov (and every serious DB text) insists on the separation.
-
-| | **Lock** (logical) | **Latch** (physical) |
+| Concern | Textbook ARIES shape | PostgreSQL 18 orientation |
 |---|---|---|
-| Protects | logical database contents (rows, tables, predicates) | in-memory data structures (a page, a hash bucket, the buffer descriptor) |
-| Duration | **transaction** — held to commit/abort | **operation** — held for a few instructions |
-| Managed by | the lock manager; appears in `pg_locks` | the code directly; not tracked per-transaction |
-| Deadlock | **detected** (wait-for graph) | **avoided by protocol** (never detected) |
-| Modes | S/X + intention, 8 table modes | shared/exclusive (reader-writer) |
-| Analogue | a database concept | a mutex/rwlock (Ch. 24) |
+| restart | analysis, repeat-history redo, loser undo | control-file/recovery metadata plus WAL redo |
+| rollback | undo records and CLRs restore loser effects | MVCC status makes loser tuple versions invisible; cleanup later |
+| page repair | page LSN plus logged actions | WAL resource-manager redo and full-page images |
+| checkpoints | fuzzy transaction/dirty-page state | PostgreSQL checkpoint and redo-point rules |
+| garbage | undo restores/reclaims logical state | vacuum/pruning reclaim dead versions |
 
-A **lock** is a transaction-level, logically-meaningful, potentially long-held construct managed by the lock manager (§65.26). A **latch** is a short-lived, physical mutual-exclusion primitive protecting an in-memory structure during the handful of instructions that read or modify it — exactly the mutexes and reader-writer locks of Ch. 24. Latches are *not* transaction-scoped: a page latch is taken, the page bytes are changed, the latch is released — all within one operation, long before commit.
+This table is a comparison, not a claim of component-for-component equivalence. PostgreSQL has non-MVCC physical structures and specialized WAL redo rules; “aborted tuples are invisible” is not a complete recovery algorithm.
 
-**Postgres's three latch tiers** (all in shared memory, all from Ch. 24's toolkit):
+## 65.20 Vacuum, HOT, Pruning, and Bloat
 
-- **Spinlocks** — the lowest level, a busy-wait `TAS`/CAS loop (Ch. 23) held for *only a few instructions* (e.g. to update a buffer descriptor's state word). No queueing, no deadlock detection; you must never do anything that could block while holding one.
-- **LWLocks (lightweight locks)** — reader/writer latches with a wait queue, used for the buffer `content_lock`, WAL insertion, the buffer-mapping partitions, `pg_xact` SLRU access, etc. These are the workhorse latches. They can be held in shared or exclusive mode; they are released quickly and never held across a wait for I/O in a way that could deadlock (acquisition order is disciplined).
-- **Heavyweight locks** — the transaction-duration *locks* of §65.26 (not latches at all), with full deadlock detection.
+MVCC turns update/delete into version lifecycle management.
 
-**Latch crabbing / lock coupling** is the classic protocol for safely traversing a B-tree (Ch. 62–64) under concurrency using latches:
+- **Page pruning** can remove or redirect tuple-chain items when page-local knowledge proves they are no longer needed.
+- **VACUUM** identifies dead tuples relative to horizons, makes space reusable, maintains auxiliary maps/statistics, and coordinates index cleanup.
+- **HOT updates** can avoid adding new index entries when indexed columns are unchanged and the new version fits under PostgreSQL's HOT rules on the same heap page.
+- **Freezing** removes the need for future ordinary XID age comparisons for old committed tuples.
+- **VACUUM FULL** rewrites and compacts a table under a much stronger lock; ordinary vacuum generally makes internal space reusable without returning all file space to the OS.
 
+“Bloat” is not one number. Diagnose:
+
+| Symptom | Possible cause | Evidence to collect |
+|---|---|---|
+| many dead tuples | updates/deletes outpace cleanup | table stats, vacuum progress, workload rate |
+| file remains large | reusable internal free space | relation size plus page/sample inspection |
+| vacuum cannot remove old versions | old snapshot or retained horizon | backend age, prepared xacts, slots, standby feedback |
+| index much larger than live data suggests | obsolete index entries, splits, key shape | per-index size/use, index inspection |
+| frequent anti-wraparound work | high XID rate or slow horizon advance | XID/MultiXact ages and autovacuum logs |
+
+Vacuum progress views report phases and counters, not a universal completion percentage. Intervention should target the retaining horizon or workload cause before reaching for a rewrite.
+
+## 65.21 Replication and WAL Retention
+
+Physical streaming replication ships WAL-level changes and replays them on a compatible standby. A hot standby can serve read-only queries while replay progresses, but visibility and conflict handling are constrained by recovery. Distinguish:
+
+- WAL generated;
+- WAL sent;
+- WAL received/written;
+- WAL durably flushed remotely;
+- WAL replayed/applied;
+- change visible to a standby query.
+
+Those positions explain why “replicated” is ambiguous.
+
+Replication slots retain what a consumer may still need. A physical slot can retain WAL; a logical slot can retain WAL and catalog/tuple horizons needed for decoding. An abandoned slot can therefore cause unbounded storage growth or prevent cleanup unless configured safeguards intervene. Monitor `restart_lsn`, activity, retained bytes, and relevant `xmin`/`catalog_xmin`.
+
+Logical decoding converts WAL-level information into transactionally ordered logical changes. A reorder buffer assembles changes by transaction because WAL interleaves concurrent activity and uncommitted transactions must not be emitted as ordinary committed changes. Large or long transactions can pressure memory and spill resources. Replica identity controls what old-key information is available for updates/deletes.
+
+Logical replication is not byte-for-byte recovery. It has publication/subscription rules, table/schema concerns, conflict behavior, and sequence/DDL limitations that must be checked for the deployed version.
+
+Prepared transactions and logical decoding add another lifecycle: two-phase decoding can expose prepare/commit-prepared events when configured and supported. Do not assume that an ordinary commit stream covers every distributed transaction state.
+
+---
+
+## 65.22 Recall Card
+
+```text
+BUFFER
+PageId → frame. Pin prevents reuse. Latch protects bytes.
+Lock protects logical data. Dirty ≠ durable.
+
+WAL
+Before page persistence: durableLSN ≥ pageLSN.
+Before durable acknowledgement: durableLSN ≥ commitLSN.
+write() ≠ durable flush. Memory ordering ≠ storage ordering.
+
+RECOVERY
+Durable log prefix is truth.
+ARIES: analysis → repeat-history redo → CLR-based loser undo.
+Other engines may use MVCC invisibility and product-specific redo.
+
+ISOLATION
+Serializable committed history has a serial equivalent.
+MVCC chooses versions; it does not automatically prevent write skew.
+Visibility ≠ publication ≠ durability.
+
+OPERATIONS
+Checkpoints bound redo. Full-page repair handles torn writes.
+Oldest horizons govern vacuum. Slots/old snapshots retain WAL or tuples.
+Replication has receive, write, flush, apply, and visibility positions.
 ```
- Descending a B-tree with latch crabbing (read):
-   latch(root, S)
-   find child; latch(child, S); UNLATCH(root)      ← release parent once child is safe
-   find child; latch(child, S); UNLATCH(parent)
-   ... "crab" down: never hold more than 2 levels at once
+
+## 65.23 Questions
+
+1. A thread release-stores `dirty=true`, another acquire-loads it, and the WAL bytes have been passed to `write()`. Which visibility or durability facts are established, and which are not?
+2. With `pageLSN=900` and `durableLSN=850`, may the buffer manager write the page? What must happen first?
+3. Draw the possible recovered outcomes for a transaction whose commit record is durable but whose success response was lost. How should a client retry safely?
+4. Why does steal + no-force need both a winner-reconstruction mechanism and a loser-removal mechanism? Give two different loser-removal designs.
+5. In the worked trace, why does redo apply T2 before undoing it? What extra machinery makes production undo restartable?
+6. Classify a pin, a content latch, a row lock, and an SSI read marker by protected object and lifetime.
+7. Prove the doctor schedule nonserializable by drawing its dependency cycle. Why would same-row write-conflict detection miss it?
+8. A logical replication slot is inactive while disk use and dead tuples grow. Name the two different retention horizons to inspect and the distinct resources each can retain.
+
+## 65.24 Puzzle
+
+A system reports:
+
+```text
+T committed successfully
+standby has received WAL through T
+primary loses power
+standby is promoted
+T is absent
 ```
 
-You latch a node, then latch its child, and only *after* the child latch is held do you release the parent — like a crab moving one claw at a time, always holding the ground under it. For reads, a shared latch on parent can be released as soon as the child is latched. For **writes**, the hazard is a split/merge that propagates upward: you may need to hold ancestor latches until you are sure the child modification will not cascade up (a node is "safe" if it will not split/merge — not full/not minimal). Optimistic descents take shared latches and only re-descend with exclusive latches if a split is actually needed, because holding exclusive latches from the root down would serialize all writers at the root.
+Is this necessarily a database bug?
 
-**B-link trees (Blink-trees)** (Lehman & Yao, 1981) are the latch-light alternative Postgres actually uses (tie back to Ch. 64). Each B-tree node has a **right-link** pointer to its right sibling and a **high key**. A split adds the new right sibling and links to it *before* updating the parent, so a reader that descended to a node just before it split can detect (via the high key) that its key now lives to the right and simply **follow the right-link** — without holding a latch on the parent. This means a traversal never needs to hold more than **one node latch at a time** (no crabbing on the read path), dramatically reducing latch contention at upper levels. Postgres's nbtree is a B-link tree precisely to keep the hot root and internal pages from becoming a latch bottleneck under concurrent readers and writers.
+No. “Received” may mean bytes reached a process or kernel but were neither durably flushed nor replayed. The acknowledgement policy may have required only local primary durability, or may have allowed asynchronous local commit. The conclusion requires the configured commit mode, the primary's flush point, the standby's write/flush/replay points, and the failure model. Vocabulary is part of the proof.
 
-The unifying picture: **locks give you isolation between *transactions* (logical, long, deadlock-detected); latches give you data-structure integrity between *threads/processes* (physical, short, protocol-safe).** MVCC minimizes the *locks* (readers take none); B-link trees + fine LWLocks minimize the *latches*. Both minimizations are why Postgres sustains high concurrency.
+## 65.25 Exercise: Crash Matrix
 
----
+Extend the C++ model with an enumeration of crash cuts after each log record and three legal page images:
 
-## Summary
+- neither page written;
+- only `P@10` written;
+- both `P@10` and `Q@20` written.
 
-- The **buffer pool** (`shared_buffers`) caches on-disk pages with **write-back** semantics; Postgres also reads through the **OS page cache**, accepting double buffering to reuse kernel readahead/writeback and all free RAM (hence `shared_buffers` ≈ 25% of RAM), whereas InnoDB/Oracle use `O_DIRECT` and own the cache.
-- Pages are **pinned** (refcount) so they can't be evicted while in use; the byte contents are separately protected by a **content latch**. Postgres evicts via **clock-sweep** with `usage_count` 0–5 and confines big scans to a **ring buffer** for scan resistance.
-- Recovery exists to preserve **atomicity + durability** across crashes. **Steal + no-force** (Postgres, ARIES, InnoDB) gives the buffer manager freedom and cheap commits, at the price of needing **redo** (committed-but-unflushed) and, in ARIES, **undo** (uncommitted-but-flushed).
-- **WAL** enforces **log-before-data** and **log-before-commit**, tracked by **LSNs**; a page's `pd_lsn` makes redo **idempotent**. Postgres commits by `fsync`ing WAL, amortized via **group commit**; `synchronous_commit=off` relaxes only durability (bounded loss), never consistency.
-- **ARIES** = analysis → **redo (repeat history for all txns)** → **undo (losers, logging CLRs so undo is crash-safe)**, bounded by **fuzzy checkpoints**. **Postgres maps to redo-only**: MVCC keeps old versions, so an aborted/crashed xid is simply marked aborted in `pg_xact` — **no undo log**; the cost is dead tuples and **VACUUM**. InnoDB/Oracle instead keep **undo/rollback segments**.
-- **Torn pages** are defended by **full-page writes** (first post-checkpoint modification logs the whole page); InnoDB uses a **doublewrite buffer** instead.
-- **Serializability** (acyclic precedence graph) is the gold standard; isolation levels are weaker approximations admitting **dirty read, non-repeatable read, phantom, lost update, write skew, read-only anomaly**. The SQL table omits **write skew**, which **Snapshot Isolation** permits.
-- Postgres: no dirty reads ever; **RR = Snapshot Isolation** (allows write skew); **Serializable = SSI** (detects the dangerous rw-antidependency structure via non-blocking **SIRead/predicate locks** and aborts a pivot). **MVCC**: snapshots `{xmin,xmax,xip}`, tuple `xmin`/`xmax`, `pg_xact` + **hint bits**, freezing to avoid xid wraparound.
-- **2PL** (grow then shrink) guarantees serializability; **Strict/Rigorous 2PL** holds write (or all) locks to commit, avoiding cascading aborts. **OCC** validates at commit and aborts on conflict. Postgres uses **deadlock detection** after `deadlock_timeout` (1 s), not prevention.
-- **Locks** (logical, transaction-duration, deadlock-detected) ≠ **latches** (physical, operation-duration, protocol-safe = Ch. 24 mutexes). Postgres row locks live in the tuple's `xmax` (+ **multixacts** for shared), not the lock table. B-tree traversal uses **latch crabbing**, and Postgres's **B-link tree** needs only one node latch at a time.
+Reject any image whose page LSN exceeds durable LSN. For every remaining image:
 
----
+1. redo the durable prefix;
+2. classify winners by durable commit records;
+3. remove loser effects using a trace-specific safe rule or a proper logged-undo model;
+4. assert that every prefix through LSN 30 recovers `P=15, Q=7`, while prefixes before the commit do not retain `T1`.
 
-## Key Interview Questions
+Then add a crash during undo. The exercise is complete only when a persisted compensation record prevents completed undo from being performed incorrectly after restart.
 
-1. **Why does a disk-based DBMS need a buffer pool at all?** — To exploit the 3–5 order-of-magnitude gap between DRAM (~100 ns), NVMe (~50–100 µs), and disk (~10 ms). It caches hot pages so repeated accesses are memory dereferences, and because workloads are skewed, even a small pool serves most accesses. It uses write-back (not write-through) semantics, which is exactly why a WAL is mandatory.
-2. **Why does Postgres use both `shared_buffers` and the OS page cache, and what's the tuning consequence?** — Postgres does buffered I/O, so pages are cached in `shared_buffers` and again in the kernel page cache (double buffering). It leverages kernel readahead/writeback and lets the page cache use all free RAM as an L2, so `shared_buffers` is tuned to ~25% of RAM, not 80%. InnoDB/Oracle instead use `O_DIRECT` and a large buffer pool they own.
-3. **What is the difference between pinning a buffer and latching its contents?** — The pin (refcount) protects the frame-page association: a pinned page can't be evicted or repointed. The content latch (an LWLock, shared/exclusive) protects the bytes for reading/writing. Many backends can pin and share-latch the same page concurrently; eviction requires refcount 0. Both are physical and short-lived, not transaction locks.
-4. **Why does naive LRU fail for a database buffer pool?** — Two reasons: maintaining recency requires list mutation under a lock on every access (a scalability killer in a shared pool), and it isn't scan-resistant — one large sequential scan touches millions of one-time pages, marking each most-recently-used and evicting the genuine hot set (sequential flooding). CLOCK approximations and ring buffers fix this.
-5. **Explain Postgres's clock-sweep eviction precisely.** — Each buffer has a usage_count 0–5. On unpin, usage_count increments (saturating at 5). A shared clock hand sweeps buffers: pinned (refcount>0) are skipped; usage_count>0 is decremented and skipped (second chance); usage_count==0 and unpinned is the victim. Large scans/VACUUM use a small ring buffer instead, so they can't evict the hot set.
-6. **Who writes dirty pages back to disk in Postgres, and what ordering rule governs it?** — Three actors: a backend that evicts a dirty victim (slow, on the query path), the background writer (cleans ahead of the clock hand), and the checkpointer (flushes all dirty as of a checkpoint). The rule: a page may not be written until the WAL is flushed up to that page's pd_lsn (write-ahead rule), which is what makes steal safe.
-7. **What are the steal/no-steal and force/no-force policies, and what does each imply for recovery?** — Steal: uncommitted dirty pages may reach disk → undo needed. No-steal: they can't → no undo. Force: commit flushes all data pages → no redo. No-force: commit only flushes the log → redo needed. Real systems pick steal + no-force (max buffer freedom, cheap commits), which needs both redo and undo.
-8. **Postgres is steal + no-force, yet has no undo log — how?** — MVCC keeps old row versions in place instead of overwriting. A crashed/aborted transaction wrote no commit record, so its xid is treated as aborted in pg_xact and its tuple versions become invisible to everyone — no page reversal needed. Undo is deferred to VACUUM (garbage collection). So Postgres needs redo (WAL) but gets undo "for free."
-9. **What is an LSN and how does it make redo idempotent?** — A Log Sequence Number identifies a position in the WAL (in Postgres, the byte offset). Every page header stores pd_lsn = the LSN of the last change applied to it. During redo, a record at lsn R is applied to a page only if page.pd_lsn < R; otherwise the change is already present and is skipped. This lets recovery safely replay records whose effects already reached disk.
-10. **State the write-ahead rule.** — Two parts: (1) before a dirty data page is written to disk, all WAL records describing its changes must be durable (makes steal safe); (2) before a transaction is reported committed, all its WAL records including the commit record must be durable (makes no-force durable). In short: log before data, log before acknowledging commit.
-11. **What is group commit and what does `synchronous_commit=off` trade?** — Group commit amortizes one expensive fsync over many concurrent commits. synchronous_commit=off returns commit before the WAL is fsynced, so a crash can lose the last few hundred ms of committed transactions — but it relaxes only durability, never atomicity/consistency: recovery never sees a torn transaction. That's far safer than disabling fsync (which risks corruption).
-12. **Describe the three phases of ARIES.** — Analysis: scan forward from the last checkpoint to rebuild the dirty-page and transaction tables and find where redo starts. Redo: repeat history — re-apply every logged change (committed and uncommitted), guarded by the page-LSN check, restoring the exact pre-crash state. Undo: roll back the losers in reverse, logging CLRs so undo survives further crashes.
-13. **What does "repeating history" mean and why redo uncommitted transactions?** — Redo re-applies all changes, including those of transactions that will be rolled back, to reconstruct the exact pre-crash database state. This makes the undo phase uniform: undo can assume complete history and simply walk transactions backward, rather than reasoning about which partial effects survived. It's what lets ARIES support fine-grained locking and physiological logging.
-14. **What is a CLR and what problem does it solve?** — A Compensation Log Record logs an undo action as a redo-only record with an UndoNextLSN pointer to the next action to undo. If the system crashes during recovery, CLRs are redone (already-done undo stays done) and undo resumes from UndoNextLSN, so no action is ever undone twice. It bounds undo work under repeated crashes.
-15. **How does Postgres crash recovery differ from textbook ARIES?** — Postgres does analysis + redo (repeat history via page LSNs) starting from the redo point in pg_control, but has no undo phase and no undo log, because MVCC handles rollback: a crashed xid is marked aborted and its versions become invisible. InnoDB/Oracle keep undo/rollback segments and do full redo+undo, reclaiming space in place instead of via VACUUM.
-16. **What is a torn page and how does Postgres prevent corruption from it?** — An 8 KB page write spans multiple device sectors; a crash mid-write leaves it part-old, part-new, which would corrupt physiological redo. Postgres logs the full page image the first time a page is modified after each checkpoint (full_page_writes); redo overwrites the whole page from that image. InnoDB instead uses a doublewrite buffer.
-17. **Physical vs logical vs physiological logging — which does Postgres use and why?** — Physical logs bytes (big, idempotent); logical logs operations (tiny, must re-execute, fragile in recovery); physiological is physical-across-pages, logical-within-a-page ("on page P, insert tuple at slot 3"). Postgres WAL is physiological: compact, per-page, idempotent via page LSNs, and robust without re-running whole logical operations.
-18. **What is a fuzzy checkpoint and how does it bound recovery?** — A checkpoint that runs concurrently with transactions rather than freezing them: it records the redo point and dirty-page state, then flushes dirty buffers over an interval (checkpoint_completion_target). Recovery starts redo at the recorded redo point, so recovery time is proportional to WAL since the last checkpoint — the core checkpoint-frequency tuning trade.
-19. **What is conflict serializability and how is it tested?** — A schedule is conflict-serializable if non-conflicting adjacent operations can be swapped to reach a serial order. It's tested with the precedence graph (edge Ti→Tj on each conflicting, ordered same-item op pair): the schedule is conflict-serializable iff the graph is acyclic. It's the efficiently-checkable subset of view serializability (which is NP-complete).
-20. **Define write skew and why Snapshot Isolation permits it.** — Two transactions read an overlapping set, then each writes a different item, jointly violating a constraint each preserved alone (e.g. both doctors go off-call because each only removed themselves). SI gives each a consistent snapshot and only conflicts on write-write to the same row; different rows means no conflict, so both commit. SI isn't serializable — this is the anomaly the SQL standard omitted.
-21. **Give the SQL isolation levels and the anomalies each forbids.** — Read Uncommitted (allows dirty, non-repeatable, phantom), Read Committed (forbids dirty), Repeatable Read (forbids dirty + non-repeatable), Serializable (forbids all three). The standard table is defined by lock-based phenomena and omits write skew, which Snapshot Isolation exhibits despite forbidding all three standard phenomena.
-22. **What does each Postgres isolation level actually do?** — Read Uncommitted acts as Read Committed (no dirty reads ever). Read Committed takes a snapshot per statement. Repeatable Read takes one snapshot per transaction = Snapshot Isolation (prevents phantoms too, but allows write skew; first-updater-wins prevents lost update). Serializable = SSI, fully serializable via conflict-cycle detection with retry on serialization failure.
-23. **How does a Postgres MVCC snapshot decide tuple visibility?** — A snapshot is {xmin, xmax, xip[]}. A tuple is visible if its xmin committed and is visible to the snapshot (not in xip, < snapshot xmax) and its xmax is 0 or refers to a transaction not visible to the snapshot (in flight/aborted/in xip). Commit status comes from pg_xact, cached in the tuple as hint bits to avoid repeated lookups.
-24. **What are hint bits and why can a SELECT cause writes?** — Hint bits (HEAP_XMIN_COMMITTED, etc.) cache a transaction's commit/abort status in the tuple's infomask so later visibility checks skip pg_xact. The first reader after a writer commits looks up pg_xact and stamps the hint bit — a page modification — so a read-only SELECT right after a bulk load can dirty pages and generate write I/O, a common surprise.
-25. **How does Serializable Snapshot Isolation achieve serializability without blocking reads?** — It runs on SI but tracks read/write (rw-antidependency) edges using non-blocking SIRead/predicate locks. Every non-serializable SI execution contains a dangerous structure — a pivot transaction with both an incoming and outgoing rw edge; SSI detects it and aborts the pivot. Reads never block; the cost is possible false-positive serialization-failure retries.
-26. **What are SIRead (predicate) locks, and do they block anything?** — They are markers recording what a serializable transaction read (at tuple/page/relation granularity, escalating under memory pressure). They block nothing; they exist so that when another transaction writes to a read location, the rw-antidependency edge can be detected. Coarser granularity means more false-positive aborts but bounded memory.
-27. **Explain 2PL and its strict/rigorous variants.** — Two-Phase Locking acquires all locks in a growing phase and releases in a shrinking phase (no acquire after first release), which guarantees conflict-serializability. Strict 2PL holds exclusive locks until commit (no cascading aborts); rigorous/strong-strict 2PL holds all locks until commit (commit order = serialization order). Basic 2PL allows cascading aborts.
-28. **What is optimistic concurrency control and when does it win?** — OCC runs in read (private workspace, buffered writes), validation (check read/write sets don't conflict with transactions that committed meanwhile), and write (install if valid, else abort/retry) phases. It wins under low contention — no locks, no deadlocks, non-blocking reads — and loses under high contention because aborted work is wasted. SSI and Postgres first-updater-wins are optimistic.
-29. **How does Postgres handle deadlocks?** — Detection, not prevention. A backend blocked on a heavyweight lock waits deadlock_timeout (default 1 s); if still blocked, it runs the deadlock detector, which builds the global wait-for graph and aborts a transaction to break any cycle. The 1-second delay avoids running the expensive graph search on the many lock waits that resolve quickly.
-30. **Where do Postgres row locks live, and what is a multixact?** — In the tuple itself: SELECT FOR UPDATE/FOR SHARE and DML set the row's xmax (and infomask) to the locking xid, so millions of row locks cost no lock-manager memory. When multiple transactions share-lock one row, xmax can't hold them all, so Postgres allocates a MultiXactId listing all lockers (in pg_multixact), which has its own wraparound/freezing concerns.
-31. **Distinguish a lock from a latch.** — A lock is logical: it protects database contents (rows, tables, predicates), is held for the transaction's duration, is managed by the lock manager, and has deadlock detection. A latch is physical: it protects an in-memory structure (a page, a buffer descriptor), is held for a few instructions, is a plain mutex/rwlock (Ch. 24), and avoids deadlock by protocol. Postgres spinlocks and LWLocks are latches; heavyweight locks are locks.
-32. **What is latch crabbing and how do B-link trees improve on it?** — Latch crabbing (lock coupling) descends a B-tree by latching a child before releasing the parent, holding at most two levels at once; writers may hold ancestors until a node is "safe" from splits. B-link trees (Lehman-Yao, used by Postgres nbtree) add right-links and high keys so a reader whose node split can follow the right-link instead of holding the parent latch — only one node latch at a time, cutting contention at the hot upper levels.
-33. **Why does MVCC give better read concurrency than 2PL?** — Under 2PL, readers take shared locks that block writers and vice versa, serializing read-heavy workloads. MVCC serves each reader the correct version from its snapshot without any lock, so readers never block writers and writers never block readers — only writer-writer conflicts on the same row block. Postgres combines MVCC reads with 2PL-style locks only for writes and explicit lock requests.
-34. **What does full-page-writes cost, and when can you disable it?** — Every first modification of a page after a checkpoint logs the whole 8 KB into the WAL, so WAL volume spikes right after each checkpoint and interacts with checkpoint frequency (wal_compression helps). It can be disabled only if storage guarantees atomic 8 KB page writes (e.g. copy-on-write filesystems like ZFS, or hardware atomic writes); otherwise a torn page would corrupt redo.
+## 65.26 Common Traps
 
----
+- **“The page is visible, so it is durable.”** CPU publication, logical visibility, and persistence are separate.
+- **“`write()` committed it.”** Kernel acceptance is not necessarily durable storage, and storage persistence alone is not a transaction commit.
+- **“Every `COMMIT` means durable local flush.”** Asynchronous settings and distributed commit levels deliberately define other acknowledgement points.
+- **“The OS cache is the database buffer pool.”** It lacks database page identity, pins, WAL dependency, and query-aware replacement state.
+- **“A pin is a lock.”** A pin prevents frame reuse; a latch protects memory; a transaction lock constrains histories.
+- **“Steal always requires physical ARIES undo.”** It requires loser effects to be removed from recovered logical state; MVCC invisibility is a different strategy.
+- **“PostgreSQL is redo-only ARIES.”** It is safer to call it WAL-based and ARIES-influenced, then describe its actual recovery and MVCC machinery.
+- **“Snapshot isolation is serializable because every transaction sees a consistent snapshot.”** The write-skew cycle disproves this.
+- **“Predicate locks always block writers.”** PostgreSQL SSI read markers track dependencies without acting like conventional blocking predicate locks.
+- **“Checksums repair torn pages.”** Checksums detect; a full-page image, replica, backup, or other redundancy repairs.
+- **“Vacuum is only a space optimization.”** It also advances visibility/freeze state needed to manage finite transaction ID spaces.
+- **“A replication slot is harmless while idle.”** It can retain WAL, tuple/catalog horizons, or both.
+- **“PostgreSQL defaults are architecture.”** Settings, supported sync methods, lock behavior, and internal structures are product/version/platform facts.
 
-## Common Traps
+## 65.27 Prerequisite Check
 
-- **Assuming Postgres uses O_DIRECT and a huge buffer pool.** It does buffered I/O through the OS page cache (double buffering); `shared_buffers` is tuned to ~25% of RAM precisely to leave room for the kernel cache, unlike InnoDB/Oracle.
-- **Confusing a page pin with a content latch.** The pin (refcount) stops eviction; the content latch guards the bytes. Many backends can pin and share-latch the same page at once; both are physical and released long before commit.
-- **Thinking pure LRU is fine for a buffer pool.** It is not scan-resistant — one big sequential scan evicts the hot set (sequential flooding) — which is why Postgres uses clock-sweep plus ring buffers for large scans.
-- **Saying Postgres has an undo log or does an ARIES undo pass on recovery.** It is redo-only; MVCC makes a crashed/aborted xid's versions invisible without reversing any page, and VACUUM reclaims them later. InnoDB/Oracle are the ones with undo/rollback segments.
-- **Believing steal + no-force needs no logging.** It needs the most: redo (committed-but-unflushed) and, in ARIES, undo (uncommitted-but-flushed). It is chosen because it maximizes buffer freedom and minimizes commit cost, not because it's simple.
-- **Equating `synchronous_commit=off` with `fsync=off`.** The former relaxes only durability (bounded loss of committed txns) while keeping the database consistent and never torn; the latter risks actual corruption. They are not the same knob.
-- **Forgetting write skew when discussing Repeatable Read.** Postgres RR is Snapshot Isolation, which prevents dirty/non-repeatable/phantom reads but permits write skew and the read-only anomaly; only Serializable (SSI) closes them.
-- **Calling Postgres Serializable "lock-based" or claiming it never aborts.** It is SSI: non-blocking reads plus predicate (SIRead) locks and conflict-cycle detection that aborts a pivot; applications must retry on serialization_failure.
-- **Assuming SIRead/predicate locks block writers.** They block nothing; they only record reads so rw-antidependencies can be detected. Coarser granularity means more false-positive aborts, not more blocking.
-- **Treating row locks as lock-manager entries in Postgres.** Row locks live in the tuple's xmax (with multixacts for multiple shared lockers), so they don't consume lock-table memory — unlike table-level heavyweight locks.
-- **Conflating locks and latches.** Locks are logical and transaction-scoped with deadlock detection; latches (spinlocks, LWLocks) are physical, held for a few instructions, and deadlock-free by protocol — they are the mutexes of Ch. 24.
-- **Thinking full_page_writes is always redundant overhead.** It defends against torn pages and is safe to disable only on storage guaranteeing atomic page writes; otherwise it is what keeps physiological redo from corrupting a partially-written page.
-- **Assuming a monotonic auto-increment id avoids all B-tree contention.** It still concentrates inserts on the rightmost leaf and its latch; B-link trees and page-level latching, not the key choice alone, are what keep that hot path from serializing.
+Before continuing to replication consensus or distributed transactions, verify that you can:
+
+- distinguish a database page, buffer frame, and OS-cached file block;
+- explain pin versus latch versus logical lock;
+- state both WAL orderings without saying merely “log first”;
+- enumerate the unknown-outcome crash window around a commit response;
+- derive analysis/redo/undo actions from a short log and page-LSN trace;
+- identify write skew and draw its dependency cycle;
+- explain why a visibility horizon controls physical reclamation;
+- distinguish remote receive, write, flush, replay, and query visibility.
+
+If any item is fuzzy, return to the corresponding module. Distributed protocols multiply these states; they do not remove them.
+
+## 65.28 Primary References
+
+- C. Mohan et al., [“ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging”](https://research.ibm.com/publications/aries-a-transaction-recovery-method-supporting-fine-granularity-locking-and-partial-rollbacks-using-write-ahead-logging), *ACM TODS* 17(1), 1992.
+- PostgreSQL 18, [Write-Ahead Logging](https://www.postgresql.org/docs/18/wal-intro.html) and [WAL configuration](https://www.postgresql.org/docs/18/runtime-config-wal.html).
+- PostgreSQL 18, [Concurrency Control](https://www.postgresql.org/docs/18/mvcc.html) and [Transaction Isolation](https://www.postgresql.org/docs/18/transaction-iso.html).
+- PostgreSQL 18, [Routine Vacuuming](https://www.postgresql.org/docs/18/routine-vacuuming.html), [Logical Decoding](https://www.postgresql.org/docs/18/logicaldecoding.html), and [`pg_replication_slots`](https://www.postgresql.org/docs/18/view-pg-replication-slots.html).

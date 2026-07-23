@@ -1,6 +1,7 @@
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import GithubSlugger from 'github-slugger';
 
 const root = process.cwd();
 const chaptersDir = path.join(root, 'src/content/docs/chapters');
@@ -10,15 +11,6 @@ const bankDir = path.join(root, 'quiz-banks');
 
 const DIFFICULTIES = ['recall', 'application', 'trap'];
 const MIN_EXPLANATION = 80;
-
-function slugify(value) {
-  return value
-    .toLowerCase()
-    .replace(/[`*]/g, '')
-    .replace(/[^\p{L}\p{N}_\s-]/gu, '')
-    .trim()
-    .replace(/\s+/g, '-');
-}
 
 function cleanInline(value) {
   return value
@@ -43,13 +35,14 @@ function yamlString(value) {
 
 function splitSections(markdown) {
   const matches = [...markdown.matchAll(/^##\s+(.+)$/gm)];
+  const slugger = new GithubSlugger();
   return matches.map((match, index) => {
     const title = cleanInline(match[1]);
     const start = match.index + match[0].length;
     const end = matches[index + 1]?.index ?? markdown.length;
     return {
       title,
-      anchor: slugify(match[1]),
+      anchor: slugger.slug(title),
       body: markdown.slice(start, end).trim(),
       numbered: /^\d+\.\d+\s/.test(title),
     };
@@ -136,11 +129,11 @@ function parseInventory(markdown) {
     const groupMatch = line.match(/^##\s+(.+)$/);
     if (groupMatch) {
       current = { label: cleanInline(groupMatch[1]), chapters: [] };
-      groups.push(current);
       continue;
     }
     const chapterMatch = line.match(/^-\s+\*\*Chapter\s+(\d+):\s+(.+?)\*\*$/);
     if (chapterMatch && current) {
+      if (!groups.includes(current)) groups.push(current);
       current.chapters.push({ number: Number(chapterMatch[1]), inventoryTitle: cleanInline(chapterMatch[2]) });
     }
   }

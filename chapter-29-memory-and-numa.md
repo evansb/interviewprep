@@ -1,1021 +1,882 @@
 # Chapter 29 — Memory and NUMA
 
-*Interview-focused revision notes. The theme: below the cache hierarchy the machine stops looking like memory and starts looking like a network — banked, queued, asynchronous, and topology-dependent — and every ordering guarantee the C++ memory model gives you is implemented by buffers and fences in this layer.*
+## Why this matters
+
+Below the last-level cache, a memory request enters a distributed system. Physical-address bits select controllers, channels, ranks, banks, rows, and columns. Controllers queue and reorder requests. On a NUMA machine, the request may cross an on-package or inter-socket fabric before reaching its home memory. A device can add a PCIe path, DMA translation, and another coherence boundary.
+
+Three consequences matter in low-latency systems:
+
+1. “Memory latency” is not one constant. It depends on row state, queueing, contention, coherence ownership, and topology.
+2. Placement is part of the program’s effective data layout. A correct buffer on the wrong NUMA node consumes interconnect bandwidth on every miss.
+3. A local average can hide a remote or contended tail. Placement must be verified from the running process and measured under representative load.
+
+This chapter follows one request from DRAM organization through NUMA placement, then explains remote coherence and device effects. Chapter 28 owns cache structure and coherence protocols; Chapter 32 owns address translation, faults, and huge pages; Chapters 31 and 35 own affinity and deployment recipes. Chapter 30 is the calibrated latency reference.
 
 ---
 
-## 29.1 DRAM Channels, Ranks, Banks, and Rows
+## 90-second screen — Core
 
-DRAM is not a flat array; it is a hierarchy of parallel resources, and its performance is entirely determined by how your access pattern maps onto them.
+- A DRAM access may be a **row hit**, require **activation**, or require **precharge plus activation**. Which case occurs depends on the controller’s address mapping and recent traffic.
+- Bandwidth and latency are different limits. Controller queueing raises latency as offered load approaches the sustainable service rate.
+- Memory-level parallelism hides latency only when requests are independent. A pointer chain exposes approximately one miss latency per step.
+- On Linux’s default local NUMA policy, a newly faulted anonymous page is normally allocated near the CPU that faults it, subject to policy, cpusets, and available memory. Allocation and physical placement are separate events.
+- A remote access may use remote DRAM, a remote cache, or a cache-to-cache ownership transfer. “The page is remote” does not identify the entire path.
+- Thread, memory, and device locality must be planned together. A NIC-local thread reading buffers placed on another node still pays the fabric crossing.
 
-```
-CPU socket
- └─ Memory controller (2-4 per socket)
-     └─ CHANNEL (independent bus, 64-bit DDR / 2×32-bit DDR5 subchannels)
-         └─ DIMM
-             └─ RANK (set of chips accessed together; 1-4 per DIMM)
-                 └─ BANK GROUP (DDR4/5: 4-8 groups)
-                     └─ BANK (4 banks/group → 16-32 banks/rank)
-                         └─ ROW (~64-128 K rows, each 1-8 KB)
-                             └─ COLUMN (the 64 B burst you asked for)
-```
+Be ready to defend two decisions:
 
-| Term | Definition | Why it matters |
+1. Should a region be partitioned, replicated, bound, preferred, or interleaved?
+2. Which measurements prove that the intended threads, pages, traffic, and devices are actually local?
+
+---
+
+## 29.1 Keep guarantees, policies, and measurements separate — Core
+
+Memory discussions become unreliable when four kinds of claim are mixed:
+
+| Claim type | Example | Where authority comes from |
 |---|---|---|
-| **Channel** | An independent memory bus with its own command/data path | **Parallelism and bandwidth**: 8 channels of DDR5-4800 ≈ 8 × 38.4 = **307 GB/s** per socket |
-| **Rank** | A group of chips responding together to one command | Ranks share a channel's bus but can overlap internal operations; more ranks = better bank-level parallelism, slightly worse signal integrity |
-| **Bank group** | DDR4/5 grouping with faster back-to-back access within vs across groups | tCCD_S (short, cross-group) < tCCD_L (long, same group) — the controller schedules to exploit this |
-| **Bank** | An independent array with its own row buffer (sense amplifiers) | **Bank-level parallelism**: 32 banks per rank means 32 rows can be open simultaneously |
-| **Row (page)** | 1–8 KB of cells activated together into the row buffer | Row hit vs miss is the single biggest DRAM latency variable (§29.2) |
+| Standard C++ guarantee | A data race has undefined behavior | ISO C++ rules; Chapter 25 |
+| ISA guarantee | Required ordering of x86 locked operations | Architecture manual |
+| OS policy | Linux local allocation and `mbind` behavior | Kernel documentation and configuration |
+| Implementation observation | Address hashing, queue policy, forwarding restrictions | Vendor documentation or measurement |
+| Workload measurement | Local/remote latency distribution on one host | Reproducible experiment |
 
-### Address interleaving
+This chapter labels platform-specific commands and behavior. Do not convert a measured x86 server result into a C++ guarantee, or a Linux default into a NUMA law.
 
-The memory controller does **not** map physical addresses linearly to channels. It interleaves at a fine granularity — typically **256 B or 4 KB across channels** — so that a sequential scan automatically spreads across all channels and gets the full aggregate bandwidth. Bank and rank bits are similarly scattered through the address, often via an XOR hash to avoid pathological patterns.
+Use costs symbolically until the target is measured:
 
-The consequence you can be asked about: a pathological stride can land every access on **one bank**, serializing everything. If your stride matches the controller's bank-interleave period (commonly some multiple of a few KB), you get bank conflicts and effective bandwidth drops by nearly the bank count. It's the DRAM-level analogue of the cache-set conflict in Ch. 28 §28.3, and it's why huge-power-of-two strides are bad at *every* level of the hierarchy.
-
-### Timing parameters and where latency comes from
-
-DDR5-4800 with typical timings (`CL40-39-39`):
+```text
+serialized miss time       ~= misses × service latency
+one-core miss bandwidth    <= MLP × bytes per completed miss / latency
+remote request time        ~= local path + fabric traversals + remote service + queueing
+controller response time   ~= device service time + waiting time
 ```
-tCL  (CAS latency)      = 40 cycles @ 2400 MHz clock  ≈ 16.7 ns
-tRCD (RAS-to-CAS delay) = 39 cycles                   ≈ 16.3 ns
-tRP  (row precharge)    = 39 cycles                   ≈ 16.3 ns
-tRAS (row active time)  ≈ 32 ns
-```
-- **Row buffer hit** (row already open): tCL ≈ **~17 ns** of DRAM device time
-- **Row buffer empty** (no row open): tRCD + tCL ≈ **~33 ns**
-- **Row buffer conflict** (wrong row open): tRP + tRCD + tCL ≈ **~49 ns**
 
-Add controller queuing, the on-die interconnect (mesh/IF) traversal, and the LLC lookup that preceded it, and you arrive at the ~**70–100 ns** end-to-end local DRAM latency quoted in Ch. 28 §28.1. Note that **DRAM device latency has barely improved in 20 years** (~15 ns tCL in DDR2, ~14–17 ns today); only bandwidth has scaled. This is the single most important structural fact about memory and worth stating explicitly in an interview.
+These are models, not promises of additivity. Requests overlap, paths share resources, prefetch changes the request stream, and coherence may source a line from a cache instead of DRAM. Their value is diagnostic: they name the variable a change is meant to improve.
 
 ---
 
-## 29.2 Row-Buffer Behavior
+## 29.2 DRAM cells, rows, banks, and address selection — Core
 
-Each bank has one **row buffer** (a row of sense amplifiers). Reading DRAM means:
+A DRAM cell stores charge in a capacitor selected by a transistor. Reading disturbs that charge, so the device senses and restores an entire row. Cells also leak and must be refreshed. Software does not issue row commands directly; the memory controller turns physical-address requests into device commands.
 
-1. **ACTIVATE** the row → the entire 1–8 KB row is destructively read into the row buffer (tRCD).
-2. **READ/WRITE** a column from the row buffer (tCL). Repeatable, cheaply, for any column in that row.
-3. **PRECHARGE** to close the row and restore the cells before a different row can be activated (tRP).
+The useful hierarchy is:
 
-So the row buffer is effectively a **direct-mapped, 1–8 KB cache in front of each bank**, and the three outcomes are:
-
-| Outcome | Condition | Cost |
-|---|---|---|
-| **Row hit** | Requested row is open | tCL ≈ 17 ns |
-| **Row empty** | No row open (closed-page policy, or just precharged) | tRCD+tCL ≈ 33 ns |
-| **Row conflict** | A *different* row is open in that bank | tRP+tRCD+tCL ≈ 49 ns |
-
-**Row-buffer locality is why sequential access is fast at the DRAM level too**, independently of prefetching and caches: an 8 KB row holds 128 cache lines, so a sequential scan gets 127 row hits per activation.
-
-### Page policies
-
-| Policy | Behavior | Best for |
-|---|---|---|
-| **Open-page** | Leave the row open after access | Sequential / high-locality workloads (row hits) |
-| **Closed-page** | Precharge immediately after each access | Random workloads (turns every access into "row empty" rather than "row conflict" — cheaper on average) |
-| **Adaptive** | Predict per-bank based on recent hit rate | What real controllers do |
-
-You generally can't control this from software, but you can control locality: **structure data so that concurrent streams don't map to the same bank with different rows.** Many independent random streams (a hash table probe per core, on 32 cores) produce near-100% row conflicts and effective DRAM latency toward the 49 ns device figure plus heavy queuing — which is why *measured* random-access latency under load is often 130–200 ns rather than the quoted 70–80 ns.
-
-### Refresh
-
-DRAM cells leak; every row must be refreshed every **32–64 ms** (tREFI ≈ 3.9 µs between refresh commands, each blocking a rank for tRFC ≈ 350–560 ns on large DDR4/5 devices). During refresh, that rank is unavailable. On a latency-sensitive path this contributes **sub-microsecond jitter that you cannot eliminate** — a genuine, physics-level floor on tail latency, and a good answer to "what's the irreducible source of memory jitter?" Higher temperatures halve the refresh interval (doubling the rate), so a hot server has measurably worse memory tail latency. This is also the mechanism behind **Rowhammer**: repeatedly activating a row leaks charge from adjacent rows faster than refresh restores it.
-
----
-
-## 29.3 Memory Controllers
-
-The **integrated memory controller (IMC)** sits on the CPU die (since Nehalem/Opteron; before that it was in a separate northbridge, which cost ~30 ns extra) and mediates between the LLC/interconnect and the DRAM devices.
-
-Responsibilities:
-
-- **Address decode** — physical address → (channel, rank, bank group, bank, row, column), with interleaving/XOR hashing.
-- **Scheduling** — reorder queued requests to maximize row hits and bus utilization. The standard algorithm is **FR-FCFS** (First-Ready, First-Come-First-Served): among ready requests, prefer **row hits** first, then oldest. This is a *reordering* engine, so DRAM does not service requests in program order — one more layer of reordering below the CPU's own.
-- **Read/write turnaround** — the DDR bus is bidirectional; switching direction costs bus turnaround time (tWTR, tRTW). Controllers therefore **batch reads and writes**, draining a queue of writes at once. This is why a read-heavy workload sharing a controller with a write-heavy one sees latency spikes at write-drain boundaries.
-- **Refresh management**, **ECC** (SECDED, or on-die ECC in DDR5), **power management** (CKE / self-refresh).
-
-### The queuing effect — the number that surprises people
-
-Latency under load is not the idle latency. A memory controller is a queueing system, and as utilization approaches capacity, latency rises hyperbolically:
-
+```text
+CPU request
+  -> memory controller
+     -> channel
+        -> DIMM
+           -> rank
+              -> bank group / bank
+                 -> row buffer
+                    -> column burst
 ```
-latency
-   ▲
-   │                                  ╱
-300ns                            ╱
-   │                        ╱
-150ns                 ╱
-   │        ______╱
- 80ns ──────
-   └────┴────┴────┴────┴────┴────► bandwidth utilization
-        20%  40%  60%  80% 100%
-```
-The **knee is around 60–70% utilization**. Beyond it, latency degrades severely. This is the fundamental tension in low-latency system design: **you must leave memory bandwidth headroom**, because a background process consuming 80% of DRAM bandwidth doubles or triples *your* memory latency without touching a single line you own. The curve is exactly what `Intel MLC` (Memory Latency Checker) plots:
 
-```
-$ mlc --loaded_latency          # latency vs injected bandwidth — draws this curve
-$ mlc --latency_matrix          # per-NUMA-node idle latency matrix
-$ mlc --bandwidth_matrix
-$ pcm-memory                    # live per-channel read/write bandwidth
-```
-Naming MLC's `--loaded_latency` when asked "how would you show that a batch job hurts your trading process?" is a strong, concrete answer.
-
----
-
-## 29.4 Memory-Level Parallelism
-
-**MLP** is the number of independent memory requests in flight simultaneously. Because DRAM latency (~80 ns) vastly exceeds DRAM occupancy per request (~few ns of bus time), throughput is entirely determined by how many misses you can overlap.
-
-```
-effective throughput = MLP / latency
-```
-At 80 ns latency and MLP=1, you get **12.5 million accesses/sec** — 800 MB/s of cache lines. At MLP=10, 125 M/s and 8 GB/s. To saturate 200 GB/s you need thousands of concurrent line fetches across all cores.
-
-### The hardware limits on MLP
-
-| Structure | Typical | Role |
-|---|---|---|
-| **L1 MSHRs / fill buffers (LFBs)** | **10–16 per core** | Outstanding L1 misses. **This is the hard per-core cap.** |
-| L2 outstanding requests | ~32–48 | Superset |
-| Superqueue / offcore requests | 64+ | Per-core to LLC/memory |
-| ROB (Ch. 27 §27.3) | 224–512 | Bounds how far ahead you can find independent misses |
-| Load buffer | 72–192 | Outstanding loads |
-
-With ~12 LFBs and 80 ns latency, a single core tops out around **12 × 64 B / 80 ns ≈ 9.6 GB/s** for demand misses — which is why **a single core cannot saturate a modern server's memory bandwidth** (you need 8–20 cores). That figure ("one core gets about 10 GB/s; the socket has 200+") is a favorite interview number.
-
-### The pointer-chasing catastrophe
-
-```cpp
-while (p) { sum += p->value; p = p->next; }    // MLP = 1
-```
-Each load's *address* depends on the previous load's *result*. No amount of ROB, LFB, or prefetch capacity helps: the accesses are serialized by a data dependence. Runtime = N × latency. For 1 M nodes at 80 ns: **80 ms**, versus ~3 ms for a sequential array scan of the same data. This ~25× ratio is the entire quantitative argument for flat containers.
-
-### Creating MLP
-
-1. **Sequential access** — the prefetcher generates MLP for free.
-2. **Multiple independent streams** — process several arrays or several list heads at once:
-```cpp
-// Traverse K lists in lockstep: MLP = K
-for (int k = 0; k < K; ++k) p[k] = heads[k];
-while (any_alive) for (int k = 0; k < K; ++k) if (p[k]) { s[k] += p[k]->v; p[k] = p[k]->next; }
-```
-3. **Software prefetch of indirect accesses** (Ch. 28 §28.13) — a prefetch is a non-blocking miss, so it directly raises MLP.
-4. **Batching**: gather all the keys first, prefetch all their buckets, then process. This "batched, prefetched hash probe" pattern converts MLP=1 into MLP=batch_size and is worth 3–10× on hash-heavy workloads.
-
-**Measuring MLP:** `l1d_pend_miss.pending / l1d_pend_miss.pending_cycles` on Intel gives average outstanding L1 misses. Values near 1 mean a dependence chain; values near 10+ mean you're saturating the LFBs.
-
----
-
-## 29.5 Memory Bandwidth and Latency
-
-Two independent axes, and workloads are bound by one or the other.
-
-| Metric | Typical modern 2-socket x86-64 server |
+| Component | Role in the path |
 |---|---|
-| Per-channel bandwidth | DDR4-3200: 25.6 GB/s; DDR5-4800: 38.4 GB/s |
-| Channels per socket | 6 (older Xeon) / 8 (SPR, Zen 4) / 12 (Zen 5, Granite Rapids) |
-| **Per-socket peak** | **150–460 GB/s** |
-| Achievable (STREAM Triad) | ~70–85% of peak |
-| **Single-core achievable** | **~8–15 GB/s** (LFB-limited, §29.4) |
-| Local DRAM latency (idle) | 70–100 ns |
-| Local DRAM latency (loaded, 70%) | 150–300 ns |
-| Remote NUMA latency | 120–200 ns idle |
-| L3 latency | 15–20 ns |
+| Controller | Maps addresses, queues requests, schedules commands, manages timing and refresh |
+| Channel | Independent data/command interface contributing bandwidth |
+| Rank | Group of DRAM devices responding together |
+| Bank | Array that can overlap work with other banks, subject to device timing rules |
+| Row buffer | Sense-amplifier state holding the activated row for that bank |
+| Column | Portion transferred from the active row |
 
-*(ARM: Neoverse V2 platforms are comparable per-channel; Apple M-series uses very wide LPDDR — M2 Ultra ~800 GB/s — with somewhat higher latency ~100–110 ns.)*
+Exact channel counts, row sizes, bank-group rules, burst lengths, and timings are part- and configuration-specific. Read the platform’s memory population guide before assuming that installed DIMMs provide the intended channel bandwidth.
 
-### Little's Law applied to memory
+### Population changes the available parallelism
 
+A processor can expose several controllers and channels while a particular machine populates only some of them. Capacity may look correct even though bandwidth and bank/rank parallelism are lower than the processor’s maximum. Conversely, adding ranks can expose more independent banks but can also change electrical loading and the supported transfer rate. The net result is a platform configuration question.
+
+ECC adds redundant information so the memory subsystem can detect and, for supported error patterns, correct corruption. Its capacity and transfer overhead are part of the memory-interface design rather than an extra C++ load. Reliability events can still affect service through retry, logging, page retirement, or machine-check handling. Treat corrected-error counts as an operational signal; do not infer an application latency penalty without a correlated measurement.
+
+When investigating an unexpectedly low streaming ceiling, check in this order:
+
+1. firmware-reported channel/DIMM population;
+2. negotiated memory speed and rank layout;
+3. whether the workload reaches all controllers or is restricted to one NUMA node;
+4. read/write mix and useful-byte ratio;
+5. controller and fabric counters under the measured run.
+
+This prevents an algorithm rewrite intended to recover bandwidth that the physical DIMM layout never supplied.
+
+### Row-buffer states
+
+For one bank:
+
+```text
+closed --activate row R--> R open --column read/write--> R remains open
+R open --precharge-------> closed
+R open --different row---> precharge -> activate new row
 ```
-concurrency = bandwidth × latency
-```
-To sustain 200 GB/s at 80 ns latency you need 200e9 × 80e-9 = **16,000 bytes in flight = 250 cache lines outstanding**. With 12 LFBs per core, that's ~21 cores minimum. This calculation is the rigorous form of "one core can't saturate memory," and producing it on demand is a strong signal.
 
-### Measuring
+This produces three useful cases:
 
-```
-$ ./stream                                  # classic Copy/Scale/Add/Triad
-$ mlc --bandwidth_matrix --latency_matrix   # per-node, both metrics
-$ likwid-bench -t load -w S0:1GB:8          # controlled kernels, per-socket
-$ likwid-perfctr -g MEM ./a.out             # DRAM read/write bandwidth via IMC counters
-$ pcm-memory 1                              # live per-channel utilisation
-$ perf stat -e uncore_imc/data_reads/,uncore_imc/data_writes/ ./a.out
-```
-Note that DRAM bandwidth counters live in the **uncore/IMC**, not the core PMU, so they are per-socket and cannot be attributed to a process by the core PMU alone. MBM (Ch. 28 §28.15) is the per-process alternative.
-
-### Bandwidth-bound vs latency-bound — the diagnostic
-
-| Symptom | Bandwidth-bound | Latency-bound |
+| Case | Prior bank state | Required device work |
 |---|---|---|
-| Scaling with more threads | Flattens hard at N cores | Scales nearly linearly |
-| DRAM counters | Near peak | Far below peak |
-| MLP (`l1d_pend_miss.pending`) | High (10+) | ~1–2 |
-| Fix | Reduce bytes moved: compression, SoA, smaller types, blocking, NT stores | Increase MLP: prefetch, batch, restructure to remove dependence chains |
+| Row hit | Requested row already active | Column command and transfer |
+| Closed/empty bank | No row active | Activate, then column command |
+| Row conflict | Different row active | Precharge, activate, then column command |
 
-Confusing these leads to the classic wasted effort: adding threads to a bandwidth-bound kernel (no gain) or compressing data in a latency-bound one (no gain, plus CPU cost).
+“Sequential access gets row hits” is a tendency, not a guarantee. Cache-line requests may be interleaved across channels and banks; hardware prefetch can create more outstanding traffic; other cores can change the open row before the next request arrives. Controllers may use open-page, closed-page, or adaptive policies.
 
----
+Refresh temporarily consumes device resources and can contribute jitter, but its schedule and granularity depend on the DRAM generation, density, temperature policy, and controller. Quote refresh timings only for a named memory configuration.
 
-## 29.6 Load-Store Queues
+### Physical-address mapping is an implementation detail
 
-The core's memory execution unit maintains queues tracking in-flight memory operations, enforcing dependences that can't be resolved at rename because addresses aren't known yet.
+A controller selects channel, rank, bank, row, and column from physical-address bits, often with XOR hashing. The mapping is designed to spread common streams, but it is not standardized by C++, the OS ABI, or the DRAM interface. It can change with processor generation, firmware settings, channel population, and memory-encryption modes.
 
-| Structure | Alt. names | Holds | Size (Golden Cove) |
-|---|---|---|---|
-| **Load buffer / load queue** | LQ, MOB-load | Every in-flight load, from allocation to retirement | 192 |
-| **Store buffer / store queue** | SQ, STLB (store-to-load buffer) | Every in-flight store: address + data, until retirement **and** drain | 114 |
-| **Fill buffers / MSHRs** | LFB | Outstanding cache-line fills | 10–16 |
-| **Write-combining buffers** | WCB | NT stores and WC-memory writes | 4–10 (often the LFBs, repurposed) |
+Consequences:
 
-The load and store queues exist because a store's address may not be computed when a later load issues. The core must:
-- Check every issuing load against **older stores with matching addresses** → forward the data (§29.9).
-- Check every completing store against **younger loads that already executed** → if one read the location before the store, that load was wrong: **machine clear / replay** (§29.8).
+- a virtual-address stride does not by itself reveal a bank stride because translation chooses physical pages;
+- a power-of-two stride can conflict in a cache, TLB, bank mapping, or all three, but the cause must be measured;
+- reverse-engineered address maps are platform observations, not portable algorithms.
 
-This is an associative search over up to a hundred entries every cycle in both directions, and it is one of the most power-hungry structures in the core.
-
-### Exhaustion signatures
-
-| Full structure | Counter (Intel) | Meaning |
-|---|---|---|
-| Store buffer | `resource_stalls.sb` | Stores retiring faster than they drain — often an uncached/WC region, an unaligned store stream, or many fences |
-| Load buffer | `resource_stalls.lb` (older) / RAT stalls | Very miss-heavy load stream |
-| Fill buffers | `l1d_pend_miss.fb_full` | **You've hit the MLP ceiling** (§29.4) — the machine literally cannot have more misses outstanding |
-
-`l1d_pend_miss.fb_full` being high is a precise, unambiguous statement that you are memory-parallelism-limited, and it's the counter to name when asked how you'd prove it.
-
-### Loads and stores are asymmetric
-
-- **Loads are speculative and can be replayed.** They execute as early as possible.
-- **Stores cannot be undone**, so a store's data is held in the store buffer and written to L1 only **after retirement**. This is what makes the store buffer *the* structure implementing the memory model (§29.7, §29.13).
+Chapter 32 owns virtual-to-physical translation and page mapping. Here the durable rule is to test several access patterns and strides rather than infer the controller map from a diagram.
 
 ---
 
-## 29.7 Store Buffers
+## 29.3 Memory controllers: bandwidth, latency, and queueing — Core
 
-The **store buffer** decouples the core's store issue rate from the cache's write rate. Every store, on every mainstream architecture, goes:
+The controller is a scheduler for constrained parallel resources. It must respect DRAM timing rules while choosing among reads, writes, banks, ranks, channels, and refresh work.
 
+Common implementation goals include:
+
+- serve ready row hits to improve throughput;
+- avoid starving older requests;
+- batch writes to amortize bus-direction changes;
+- spread requests across banks and channels;
+- enforce thermal, reliability, and quality-of-service policy.
+
+The exact algorithm is normally vendor-specific. A label such as “first-ready, first-come-first-served” is a model for reasoning, not proof of a particular server’s policy.
+
+### Latency under offered load
+
+Even if the device service time were fixed, response time would rise as requests queue:
+
+```text
+response time
+    ^
+    |                                  queueing dominates
+    |                           ______/
+    |                    ______/
+    |___________________/
+    +----------------------------------> offered bandwidth
+                  sustainable service rate
 ```
-execute → store buffer (address + data)
-        → [retire: now architecturally committed but still not visible to other cores]
-        → drain to L1d (requires the line in M/E — may need an RFO, §29.10)
-        → visible to other cores
+
+There is no universal utilization percentage at which the curve bends. The knee depends on read/write mix, locality, request size, number of sources, channel population, controller policy, and what latency percentile is being observed.
+
+This explains a common production failure: a batch process does not share the service’s objects, yet it consumes the same controllers and fabric. The service’s misses wait behind unrelated traffic. Cache partitioning cannot fix a saturated memory channel.
+
+### A bandwidth/latency cost model
+
+Let:
+
+- `L` be measured average completion latency for the tested request stream;
+- `M` be average independent misses in flight;
+- `S` be useful bytes obtained per completed miss;
+- `B_service` be the memory subsystem’s sustainable bandwidth for that mix.
+
+Then:
+
+```text
+B_observed <= min(B_service, M × S / L)
 ```
 
-### Why it exists
+The formula supplies two different diagnoses:
 
-Without it, a store missing in L1 would stall the core for the full RFO latency (up to ~250 ns). With it, the store retires immediately and the RFO proceeds in the background. In store-heavy code this is worth an order of magnitude.
+- If `M` is small and bandwidth is far below the platform’s measured service limit, the kernel is latency/dependency limited.
+- If many requests are outstanding and aggregate bandwidth has flattened, reducing bytes or contention matters more than creating more parallel requests.
 
-### Why it is the memory model
+Use useful bytes for `S`, not automatically the cache-line size. A program can fetch a line and use one field, so traffic bandwidth and application bandwidth differ.
 
-The store buffer is the **only** reason x86-TSO is not sequential consistency. Consider Dekker's/store-buffer litmus test (Ch. 25 §25.19):
+Do not use a vendor peak-data-rate calculation as `B_service`. Measure a sustainable value with the same read/write ratio, locality, NUMA placement, thread count, and transfer pattern.
 
+### Design a loaded-controller experiment
+
+An idle pointer chase measures one end of the response curve. To reveal queueing, run a latency-sensitive probe concurrently with a controlled bandwidth generator and sweep the generator’s load.
+
+```text
+probe: one randomized dependent chain on a fixed core/node
+load:  configurable read/write streams on selected cores/nodes
+record: probe distribution + load bandwidth + controller/fabric counters
 ```
-Thread 1:            Thread 2:
-x = 1;               y = 1;
-r1 = y;              r2 = x;
 
-Result r1 == 0 && r2 == 0 is ALLOWED on x86.
-```
-Both stores sit in their respective store buffers; both loads bypass them and read the old value from cache. **StoreLoad reordering** is the one reordering x86 permits, and it is exactly the store buffer being drained lazily. The fix is `mfence` (or a `lock`-prefixed instruction), which drains the store buffer before the load is allowed to execute — costing **~30–40 cycles** on a modern core.
+The experiment must say whether the load uses the same controllers, remote controllers, or the inter-socket links. Increasing the number of loading threads is not a calibrated x-axis if frequency, placement, or achieved bandwidth changes unpredictably; report the achieved traffic rate.
 
-This is why `std::atomic<T>::store(std::memory_order_seq_cst)` on x86 compiles to `xchg` (or `mov` + `mfence`): seq_cst requires draining. `memory_order_release` stores compile to a **plain `mov`** with no fence, because the store buffer is FIFO and preserves StoreStore order for free. That asymmetry — **release stores are free on x86, seq_cst stores cost ~30–40 cycles** — is one of the highest-value facts in this chapter.
+Interpret shapes rather than one threshold:
 
-### Draining and its hazards
+- a smooth local-latency rise with local controller traffic suggests queueing at shared memory resources;
+- an abrupt remote-only change can indicate a fabric or remote-controller boundary;
+- periodic tails correlated with write traffic can suggest read/write scheduling phases, but that conclusion needs vendor events or a controlled read/write-ratio experiment;
+- a flat probe while the load grows may mean the data remains cached, the load uses other controllers, or the generator is not achieving the assumed bandwidth.
 
-- **Retired but undrained stores are unrecoverable** — the core must drain them; it cannot roll back. So a full store buffer stalls retirement (`resource_stalls.sb`).
-- **Uncacheable (UC) stores** drain one at a time, synchronously, at MMIO speed (hundreds of ns each). A hot loop writing UC MMIO registers will pin the store buffer full. This is precisely why NIC drivers map doorbells **WC**, not UC (Ch. 28 §28.5, §29.11).
-- **`sfence`/`mfence` in a loop** serializes drains and destroys store throughput.
-- **The store buffer is per-core and not visible to other cores**, which is why store-to-load forwarding (§29.9) works within a core but a peer core must wait for the drain.
+Run long enough to observe the application’s relevant percentile, randomize trial order, and include an unloaded recovery run to detect thermal or frequency drift. Chapter 43 owns full benchmark methodology; these controls define the memory hypothesis.
 
 ---
 
-## 29.8 Memory Disambiguation
+## 29.4 Memory-level parallelism and load/store machinery — Core
 
-The problem: a load issues while an **older store's address is still unknown**. Two choices:
+Out-of-order cores can overlap independent cache misses. The hardware resources have vendor-specific names and capacities, but the roles are stable:
 
-- **Conservative**: block the load until all older store addresses resolve. Safe, and disastrous for performance — a single unresolved store address stalls all later loads.
-- **Speculative**: predict the load does *not* alias any older unknown store, execute it, and verify later.
+| Resource | What it tracks |
+|---|---|
+| Load queue/buffer | In-flight loads and ordering checks |
+| Store queue/buffer | In-flight stores until ordering and ownership permit completion |
+| Line-fill/miss-status entries | Outstanding cache-line fills |
+| Reorder window | Instructions available for finding independent work |
+| Memory-controller queues | Requests after they leave the core/cache hierarchy |
 
-All modern cores speculate, guided by a **memory disambiguation predictor** (Intel has had one since Core 2). It learns per-load-PC whether that load has historically conflicted with older stores.
+Chapter 27 owns pipeline sizing and execution detail. For this chapter, the question is whether an address can be issued before a preceding miss completes.
 
-### The verification and its cost
+### Dependent versus independent streams
 
-When the older store's address resolves and it turns out to alias a younger load that already executed, the core must recover: on Intel this is a **memory-ordering/disambiguation machine clear** (`machine_clears.disambiguation`), costing ~20–40 cycles, or a load replay. The observable pattern is a hot loop with `machine_clears.*` in the millions/sec.
-
-### 4 K aliasing — the false-positive that bites everyone
-
-The disambiguation check is done on **partial addresses** (bits [11:0]) for speed, because full physical addresses aren't available until translation completes. So a load and an older store whose addresses match in the low 12 bits but differ in the page number are **falsely predicted to conflict**, forcing a stall of ~5 cycles per occurrence.
+The complete C++23 example below illustrates dependency shape; it is not a timing harness:
 
 ```cpp
-void copy(char* dst, const char* src, size_t n) {
-    for (size_t i = 0; i < n; ++i) dst[i] = src[i];
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <vector>
+
+std::uint32_t chase(std::span<const std::uint32_t> next,
+                    std::uint32_t cursor, std::size_t steps) {
+    while (steps-- != 0) cursor = next[cursor];
+    return cursor;
 }
-copy(buf + 4096, buf, N);     // dst and src differ by EXACTLY 4096
-                              // → every load falsely conflicts with the previous store
+
+std::array<std::uint32_t, 4>
+chase_four(std::span<const std::uint32_t> next,
+           std::array<std::uint32_t, 4> cursor, std::size_t steps) {
+    while (steps-- != 0) {
+        for (auto& c : cursor) c = next[c];
+    }
+    return cursor;
+}
+
+int main() {
+    std::vector<std::uint32_t> next{1, 2, 3, 0, 5, 6, 7, 4};
+    assert(chase(next, 0, 4) == 0);
+    const auto result = chase_four(next, {0, 1, 4, 5}, 4);
+    assert((result == std::array<std::uint32_t, 4>{0, 1, 4, 5}));
+}
 ```
-Counter: `ld_blocks_partial.address_alias`. Fix: offset one buffer by a cache line (or any non-multiple of 4096), or use vectorized copies that reduce the store count. This is a real, reproducible effect and a great "explain this benchmark anomaly" question — two buffers separated by exactly a page runs measurably slower than the same buffers separated by 4160 bytes.
 
-### The compiler-level analogue
+Within one cursor, the next address depends on the previous load. Four cursors create four independent chains that the processor may overlap. Whether the compiler and CPU actually sustain four misses depends on optimization, layout, cache state, and available tracking entries.
 
-`__restrict` (Ch. 40 §40.7) tells the *compiler* that pointers don't alias, allowing it to hoist loads above stores at compile time. Hardware disambiguation solves the runtime version of the same problem. Both matter; neither substitutes for the other. Without `__restrict` the compiler emits a runtime overlap check with duplicated vector/scalar loop bodies — recognizing that pattern in generated assembly is a good thing to mention (Ch. 3 §3.8).
+Other ways to expose parallelism include:
+
+- scan contiguous data so hardware prefetch can work ahead;
+- batch independent hash probes;
+- use a structure-of-arrays layout so unused fields do not consume bandwidth;
+- software-prefetch an indirect target far enough ahead, after verifying that the address is known and the prefetch does not evict useful data.
+
+### Memory disambiguation
+
+A younger load may execute before every older store address is fully known. The core predicts whether they alias and checks later. A wrong prediction causes replay or another recovery event. Some implementations use partial address information early, which can create false dependencies for addresses with matching page offsets.
+
+This is a microarchitecture observation, not a C++ guarantee. Diagnose it with vendor-specific events or profiling metrics and an address-layout experiment. Do not prescribe a fixed padding offset across processors.
+
+### Store-to-load forwarding
+
+When a load reads bytes written by an older store still buffered on the same core, the core may forward the value without waiting for the store to reach L1. Favorable cases generally match address, size, and containment. Difficult cases include:
+
+- a wide load assembled from multiple narrow stores;
+- partial overlap rather than containment;
+- a load or store crossing a cache-line boundary;
+- mismatched alignment;
+- memory types or instructions that do not participate in ordinary forwarding.
+
+Exact forwarding rules vary by microarchitecture. Build the final value in registers and store it once when practical; otherwise measure the exact load/store widths and alignments. Forwarding is intra-core. A different core obtains data through coherence, not another core’s store buffer.
 
 ---
 
-## 29.9 Store-to-Load Forwarding
+## 29.5 NUMA topology and the local/remote path — Core
 
-When a load's address matches a **retired-or-not, still-in-store-buffer** older store, the core can supply the data directly from the store buffer rather than waiting for it to reach L1. This is **store-to-load forwarding (STLF)**, and it is essential: without it, every `x = 1; y = x;` pair would cost a full L1 round trip after drain.
+In a cache-coherent NUMA system, CPUs share one address space but do not have uniform access to every memory controller. A NUMA node is an OS representation of CPUs, memory, and their relative locality; some nodes can be memory-only.
 
-**Successful forwarding latency: ~5 cycles** (roughly L1-hit latency; on some cores slightly more). **Failed forwarding: the load must wait for the store to drain to L1 and then read it — ~12–20 extra cycles.**
+```text
+Node 0                                           Node 1
++----------------------+      fabric       +----------------------+
+| cores -- caches      |<----------------->|      caches -- cores |
+|          |           |                   |           |          |
+| memory controllers --+-- local DRAM      | local DRAM -- controllers
+| PCIe root / device A |                   | device B / PCIe root |
++----------------------+                   +----------------------+
+```
 
-### When forwarding fails
+A miss from a core on node 0 can take several paths:
 
-Forwarding requires the load to be **fully contained** within a single store, and usually **same size and alignment**. It fails when:
+```text
+local memory:
+core -> local caches/directory -> local controller -> local DRAM
 
-| Situation | Forwards? |
-|---|---|
-| Store 8 B at addr, load 8 B at addr | ✅ Yes |
-| Store 8 B at addr, load 4 B at addr (contained, aligned) | ✅ Usually yes |
-| Store 4 B at addr, **load 8 B at addr** (load is larger) | ❌ **No** — stall |
-| Two 4 B stores, one 8 B load covering both | ❌ **No** — a load can only forward from *one* store |
-| Store 8 B at addr, load 4 B at addr+4 (offset) | ⚠️ Modern cores yes, older no |
-| Store crosses a cache line, load overlaps | ❌ No |
-| NT store → load | ❌ No |
+remote memory:
+core -> local fabric endpoint -> inter-node fabric
+     -> remote home/cache/controller -> return fabric path
 
-Counter: `ld_blocks.store_forward` on Intel.
+cache-to-cache:
+requester -> directory/home lookup -> owning cache
+          -> data/ownership transfer -> requester
+```
 
-### The classic C++ failure
+The physical page’s home node helps determine where memory is allocated and serviced, but cache coherence can source a line from another core. Therefore “remote DRAM latency” and “cross-node modified-line transfer” are distinct measurements.
+
+### Distances are topology hints
+
+On Linux, `numactl --hardware` reports nodes, CPUs, sizes, free memory, and a distance matrix. Firmware-provided distance values are relative costs, not nanoseconds. Virtual machines can expose synthetic topology, and firmware data can be incomplete.
+
+Use the matrix to form a hypothesis, then measure:
+
+- local and remote dependent-load latency;
+- local and remote streaming bandwidth;
+- cache-to-cache transfer between chosen core pairs;
+- performance with the real application access mix.
+
+Within one socket, chiplets, meshes, cache clusters, and sub-NUMA modes can also make distances non-uniform. Vendor names and firmware switches change; inspect the exact topology instead of assuming that “same socket” means one cost.
+
+---
+
+## 29.6 First touch, memory policy, and migration — Core
+
+### OS policy — Linux
+
+Under Linux’s default local allocation policy, a physical page is normally allocated from memory local to the CPU handling the allocation fault, subject to:
+
+- the task or virtual-memory-area NUMA policy;
+- cpuset/cgroup allowed-memory nodes;
+- memory availability and fallback rules;
+- mapping type and sharing;
+- automatic NUMA balancing or explicit later migration.
+
+This is the precise form of **first touch**. Reserving virtual address space does not necessarily allocate every physical page. Changing a memory policy normally affects future allocations; already faulted pages remain where they are unless a migration operation or balancing mechanism moves them.
+
+Chapter 32 owns demand paging and fault mechanics. The NUMA consequence is that initialization chooses placement.
+
+### The serial-initialization trap
+
+```text
+1. coordinator reserves a large anonymous region
+2. coordinator writes every page while running on node 0
+3. workers on nodes 0 and 1 process disjoint halves
+4. node-1 workers repeatedly fetch their half across the fabric
+```
+
+Parallel first touch uses the same partition for initialization and steady-state processing. It works only if worker placement is already established and the mapping has not been populated earlier by value initialization, allocator behavior, prefaulting, or restoration from a file.
+
+This intentionally incomplete C++ fragment shows the page-touch operation, not thread-affinity setup:
 
 ```cpp
-union U { float f; uint32_t i; };
-U u; u.f = x;
-uint32_t bits = u.i;              // store 4 B as float, load 4 B as int — same size: OK
-                                  // BUT: also crosses int/FP domains (Ch. 27 §27.14)
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <span>
 
-// The real killer — type punning across sizes:
-struct Msg { uint32_t a, b; };
-Msg m; m.a = 1; m.b = 2;
-uint64_t both = *reinterpret_cast<uint64_t*>(&m);   // two 4B stores, one 8B load
-                                                     // → STLF FAILURE, ~15 cycle stall
-```
-Serializer/deserializer code that writes fields individually and then reads the whole message as a block hits this constantly. So does a small `std::string`/SSO buffer written byte-by-byte then read as a word. `std::bit_cast` doesn't help — it's the *store widths* that matter, not the cast.
-
-**Fixes:** write and read at the same granularity; or build the value in a register and store once; or introduce enough distance between the store and the load that the store has drained (which the OoO window may do for you anyway).
-
-A related low-latency case: an SPSC ring buffer where the producer writes a payload field-by-field and the consumer reads it as a wide vector. Because they're on **different cores**, forwarding isn't involved at all — the consumer waits for coherence, not forwarding. Knowing that STLF is strictly intra-core is a precise distinction interviewers probe.
-
----
-
-## 29.10 Read For Ownership
-
-To write a cache line, a core must hold it in **M** or **E** state (Ch. 28 §28.7). If it holds it in **S** or not at all, it issues a **Read For Ownership (RFO)**: a request that both fetches the data *and* invalidates every other copy, waiting for invalidation acknowledgements.
-
-```
-Core 0: store to X (line in S, also in cores 1,2,3)
-   → RFO on the interconnect
-   → directory/snoop filter sends INVALIDATE to cores 1,2,3
-   → cores 1,2,3 respond INVALID-ACK (and one supplies data if it had it in M/O)
-   → Core 0 receives data, transitions to M, store drains from the store buffer
+void touch_partition(std::span<std::byte> region,
+                     std::size_t page_size,
+                     std::size_t worker,
+                     std::size_t workers) {
+    assert(page_size != 0 && workers != 0 && worker < workers);
+    assert(region.size() % page_size == 0);
+    const auto pages = region.size() / page_size;
+    const auto base = pages / workers;
+    const auto extra = pages % workers;
+    const auto first = worker * base + std::min(worker, extra);
+    const auto last = first + base + (worker < extra ? 1 : 0);
+    for (auto page = first; page < last; ++page) {
+        region[page * page_size] = std::byte{0};
+    }
+}
 ```
 
-### Costs
+The assertions express the input preconditions; workers own disjoint balanced partitions. On Linux under the intended policy, each worker must already run on the node meant to own its pages. The function touches one byte per page; a production initialization must also establish the required object lifetimes and values.
 
-| Case | Cost |
-|---|---|
-| Line already in M or E | ~0 extra (silent) |
-| Line in S in this core, S elsewhere | Invalidate-only ("upgrade"), ~40–80 cycles |
-| Line in another core's M (HITM), same socket | ~70–110 cycles (~25–35 ns) |
-| Line in another socket | 150–300 ns |
-| Line not cached anywhere | Full DRAM latency, ~80 ns |
+### Placement policies are workload choices
 
-**RFO is the hidden cost of every write**, and it explains several things at once:
-
-1. **Write-allocate's 2× traffic** (Ch. 28 §28.6) — the RFO is a full line read even when you overwrite all 64 bytes.
-2. **Why false sharing hurts so much** — each write on each core RFOs the line away from the other, so the line ping-pongs, with a full invalidation round trip per write.
-3. **Why read-mostly shared data is free** — S-state copies coexist; no RFO occurs until someone writes.
-4. **Why `fetch_add` on a contended counter is ~100× slower than an uncontended one.**
-
-### Avoiding RFOs
-
-- **Non-temporal stores** (Ch. 28 §28.14) — write through WC buffers, no ownership acquired, no invalidation of *your own* caches. (Coherence is still maintained; the WC flush invalidates other copies, but no line is read.)
-- **`prefetchw` / `__builtin_prefetch(p, 1)`** — start the RFO early so it overlaps with other work. Genuinely useful in histogram/counter-update loops.
-- **Full-line write detection** (`rep stosb`/ERMSB, some AVX-512 stores) — hardware skips the read when it knows the whole line is overwritten.
-- **Don't share the line.** Per-core data (Ch. 28 §28.8).
-
----
-
-## 29.11 Write Combining
-
-**Write combining** merges multiple small writes to the same 64-byte region into one bus transaction, in a dedicated **write-combining buffer** (4–10 per core, 64 B each).
-
-It applies to:
-- Memory explicitly typed **WC** by the PAT/MTRRs (framebuffers, PCIe BARs, NIC doorbell pages).
-- **Non-temporal stores** to normal WB memory (`movntdq` etc., Ch. 28 §28.14).
-
-### Semantics — the part that matters
-
-WC memory is **weakly ordered**, and this is the documented exception to x86-TSO:
-- Writes may be **combined and reordered** among themselves.
-- They become visible only when the buffer is **flushed**: when full, on `sfence`/`mfence`/`lock`, on a serializing instruction, on a context switch, or when the buffer is needed for another region.
-
-Consequences you must be able to state:
-
-```cpp
-// Kernel-bypass TX doorbell, WC-mapped BAR:
-write_descriptor(ring, pkt);      // WB memory
-_mm_sfence();                     // ensure descriptor is visible to the NIC BEFORE the doorbell
-*doorbell = producer_index;       // WC store
-_mm_sfence();                     // FLUSH the WC buffer — otherwise the write may sit
-                                  // in the buffer indefinitely and the packet never goes out
-```
-The failure mode of a missing final `sfence` is spectacular and confusing: **the packet is transmitted only when some unrelated later write happens to flush the buffer**, producing latency that depends on subsequent activity. This is a real class of bug in DPDK/ef_vi-style code and a fine war story to have.
-
-### Efficiency rules
-
-- **Write full 64-byte lines, sequentially.** A partially-filled buffer flushes as multiple partial writes and loses most of the benefit — with PCIe MMIO, a partial flush can turn one TLP into several, which is dramatically worse.
-- **Limit concurrent WC streams to ≲ the buffer count** (4). More streams evict each other prematurely.
-- Don't read from WC memory — WC reads are uncached and slow (hundreds of ns), and a read forces a flush.
-
-### Why doorbells are WC, not UC
-
-A **UC** store is uncached, un-combined, and strongly ordered: each one is a separate PCIe transaction with full serialization, hundreds of nanoseconds, and it blocks the store buffer. A **WC** store is buffered and can be combined; a 64-byte descriptor written as four 16-byte WC stores becomes a **single 64-byte PCIe write**, which is both faster and (on many NICs) required for the "write the whole descriptor in one TLP" fast path. Understanding that the mapping type is a first-class performance decision is exactly what a kernel-bypass interview is looking for.
-
----
-
-## 29.12 Split-Line and Split-Page Accesses
-
-An access that **straddles a boundary** requires two lookups and two transactions.
-
-| Straddle | Cost |
-|---|---|
-| Within a cache line (aligned or not) | **Free** on modern x86 — the L1 handles unaligned access within a line at full speed |
-| **Split cache line** (crosses a 64 B boundary) | Two L1 accesses; ~**2× latency**, half throughput. Counter: `ld_blocks.no_sr`, `misalign_mem_ref.loads` |
-| **Split 4 K page** | Two TLB lookups plus possibly two page walks. Historically ~**100+ cycles**; Skylake+ reduced it to ~5–10 cycles for loads, but stores and older cores are still costly |
-| **Split line with an atomic RMW** | **SPLIT LOCK** — see below |
-| Unaligned SIMD (`movups` on aligned data) | Free on Nehalem+ if not split; only the *split* costs |
-
-### Split locks — the whole-machine stall
-
-An atomic read-modify-write (`lock xadd`, `lock cmpxchg`, `xchg`) whose operand crosses a cache line cannot be made atomic by the normal mechanism (holding the line in M state). The CPU falls back to asserting a **bus lock**, which on modern systems means **serializing the entire coherence fabric — stalling every core on the socket** for the duration.
-
-Measured cost: **~1,000 cycles for the issuing core and tens of microseconds of aggregate disruption**; a loop doing split-locked atomics can degrade an entire machine's throughput by 10× or more. It is one of very few things a userspace process can do to hurt every other process on the box.
-
-Linux has detection and mitigation:
-```bash
-# Kernel cmdline / runtime:
-split_lock_detect=warn      # log the offender (dmesg: "split lock detected")
-split_lock_detect=fatal     # SIGBUS the offender
-split_lock_detect=ratelimit:N  # throttle the process
-$ dmesg | grep -i "split lock"
-$ perf stat -e sq_misc.split_lock ./a.out        # Intel counter
-```
-The C++ rule that prevents it: **`std::atomic<T>` is always naturally aligned by the implementation** (`alignof(std::atomic<T>) >= sizeof(T)` for lock-free sizes) — so you only get split locks by defeating it: packed structs (`#pragma pack`), atomics inside `__attribute__((packed))` types, `std::atomic_ref` on a misaligned member, hand-rolled `lock cmpxchg` inline asm, or an atomic in a wire-format struct parsed in place (Ch. 3 §3.12). ARM avoids the whole category: unaligned exclusive/atomic instructions simply **fault**.
-
-### Practical guidance
-
-- Assert alignment on anything atomic: `static_assert(alignof(T) >= sizeof(T))`.
-- For 16-byte atomics (`cmpxchg16b`), require 16-byte alignment explicitly — a tagged pointer pair (Ch. 26 §26.11) misaligned to 8 is a split lock on every operation.
-- In parsers, `memcpy` fields out rather than taking references into a packed buffer (Ch. 3 §3.12).
-
----
-
-## 29.13 x86 TSO
-
-**x86-TSO (Total Store Order)** is the memory model of x86-64. Stated precisely:
-
-| Reordering | Allowed on x86? |
-|---|---|
-| Load → Load | **No** |
-| Load → Store | **No** |
-| Store → Store | **No** |
-| **Store → Load** | **YES** (the only one) |
-| Loads/stores to the *same* address | Never reordered (coherence) |
-
-Plus: **stores are not visible to other cores before they are visible to the issuing core** (a core sees its own stores early, via store-to-load forwarding), and there is a **total order on all stores** that all cores agree on — hence "total store order." Independent stores by different cores appear in one global order; this is what makes IRIW (independent reads of independent writes) impossible on x86.
-
-Exceptions to TSO: **non-temporal stores**, **WC memory**, and `movnt`-family instructions (§29.11), plus `clflushopt`. These require explicit `sfence`.
-
-### The mapping to C++ atomics on x86-64
-
-| C++ operation | x86-64 codegen | Cost |
+| Policy | Benefit | Cost / failure mode |
 |---|---|---|
-| `load(relaxed / acquire / seq_cst)` | plain `mov` | **Free** — all loads are acquire on x86 |
-| `store(relaxed / release)` | plain `mov` | **Free** — the store buffer is FIFO |
-| `store(seq_cst)` | `xchg` (or `mov`+`mfence`) | **~30–40 cycles** — must drain the store buffer |
-| `fetch_add`, `exchange`, `compare_exchange` (any order) | `lock`-prefixed | **~20 cycles** uncontended; RMW is always fully ordered on x86 |
-| `atomic_thread_fence(acquire/release)` | nothing (compiler barrier only) | Free |
-| `atomic_thread_fence(seq_cst)` | `mfence` | ~30–40 cycles |
+| Partition by node | Local reads/writes and scalable bandwidth | Cross-partition work needs routing or remote access |
+| Replicate read-mostly data | Local reads on every node | Memory footprint and update/version protocol |
+| Bind to one node | Predictable locality | Allocation can fail or capacity can be constrained |
+| Prefer one node | Locality with fallback | Some pages may silently be remote under pressure |
+| Interleave pages | Aggregate bandwidth for uniform parallel scans | Every thread sees a mix of local and remote pages |
+| Automatic migration/balancing | Adapts to changing access | Sampling, page movement, and translation/coherence disruption |
 
-**The two consequences that matter:**
+Interleave is not “NUMA optimization” in general. It is useful when many threads consume a shared streaming region and aggregate bandwidth matters more than per-thread local latency. It is harmful for a partition that could have remained local.
 
-1. **Acquire/release costs nothing on x86 beyond a compiler barrier.** Code that "works" with `relaxed` on x86 may be broken on ARM. Never validate memory-ordering correctness on x86 alone — use TSan, run on ARM, or model-check (Ch. 57 §57.11).
-2. **seq_cst stores are the one genuinely expensive default.** Changing a hot `store(seq_cst)` to `store(release)` is a real, measurable win (~30 cycles per store) and one of the highest-yield atomics optimizations on x86.
+### Allocator and lifetime effects
 
----
+An allocator can return a block whose pages were faulted or reused by another thread. Freeing and reallocating virtual storage does not guarantee physical relocation. Thread-local caches reduce allocator contention but do not alone establish NUMA ownership.
 
-## 29.14 Weak Hardware Memory Ordering
+For a node-owned arena:
 
-**ARM (AArch64), POWER, and RISC-V** are weakly ordered: essentially *any* pair of accesses to *different* addresses may be reordered by hardware unless a barrier or an ordered instruction forbids it.
+1. establish the worker’s CPU placement using the deployment mechanism owned by Chapter 31;
+2. apply the intended memory policy;
+3. reserve and touch the pages from that worker;
+4. keep allocation, use, and reclamation within the node where possible;
+5. verify the resulting pages, not merely the allocator’s configuration.
 
-| Reordering | x86-TSO | ARMv8 | POWER |
-|---|---|---|---|
-| Load → Load | No | **Yes** | **Yes** |
-| Load → Store | No | **Yes** | **Yes** |
-| Store → Store | No | **Yes** | **Yes** |
-| Store → Load | Yes | **Yes** | **Yes** |
-| IRIW (non-multi-copy-atomic) | Impossible | ARMv8 is **other-multi-copy-atomic** (so IRIW is forbidden) | **Possible** — POWER is not multi-copy-atomic |
+Shared and file-backed mappings have different policy rules. Consult the Linux memory-policy documentation for the exact mapping and kernel version rather than extending anonymous-memory first-touch claims to every mapping.
 
-**Multi-copy atomicity** is the property that a store becomes visible to all other cores at the same instant. x86 has it; ARMv8 has "other-multi-copy-atomicity" (all *other* cores see it simultaneously, though the issuing core sees it earlier); POWER does not, which is why POWER needs `sync` where ARM needs only `dmb ish` and why the C++ memory model's `seq_cst` is expensive on POWER.
+### Migration and automatic NUMA balancing
 
-### ARM's ordered load/store instructions
+Page placement can change after first touch. Linux can migrate pages explicitly through memory-policy/migration interfaces, during memory-management operations, or through automatic NUMA balancing when enabled and applicable. Migration copies page contents, updates mappings and accounting, and coordinates translations and concurrent access. The resulting disturbance depends on page size, sharing, dirty state, access rate, kernel version, and topology.
 
-ARMv8 provides acquire/release *semantics on the instruction itself*, which is cheaper than a separate barrier:
+Automatic balancing trades adaptation for work at times chosen by the kernel. It can help a long-running workload whose threads or access phases move. It can hurt a latency-sensitive workload that already has deliberate stable placement. Neither “always disable it” nor “let the kernel fix NUMA” is a complete policy.
 
-```asm
-ldar  x0, [x1]     ; load-acquire   — no later access moves before it
-stlr  x0, [x1]     ; store-release  — no earlier access moves after it
-ldaxr / stlxr      ; exclusive (LL/SC) load-acquire / store-release
-casal x0, x1, [x2] ; ARMv8.1 LSE compare-and-swap, acquire+release
-ldadd / ldaddal    ; ARMv8.1 LSE atomic add (far better under contention than LL/SC)
-```
-**ARMv8.1 LSE atomics matter enormously**: the older LL/SC (`ldxr`/`stxr`) loop can livelock under contention and requires a retry loop, while LSE atomics are single instructions executed *at the point of coherence* (potentially in the interconnect/LLC), giving far better scaling. Compile with `-march=armv8.1-a` or `-moutline-atomics` (which dispatches at runtime) — a real, commonly-missed performance flag on ARM servers.
+Evaluate it with:
 
-### Practical consequences for portable C++
-
-```cpp
-std::atomic<Node*> head;
-// Publication:
-node->data = 42;
-head.store(node, std::memory_order_release);    // x86: plain str. ARM: stlr.
-// Consumption:
-Node* n = head.load(std::memory_order_acquire); // x86: plain ldr. ARM: ldar.
-int v = n->data;                                 // ARM: WITHOUT acquire, this load
-                                                 // may be reordered BEFORE the head load
-```
-On x86 the `relaxed` version of this is accidentally correct. On ARM it is genuinely broken — you can read a null/garbage `data` through a valid pointer. **The single most common real-world weak-memory bug is a missing acquire on the consumer side of a publication**, and it is invisible on x86.
-
-Cost comparison (approximate, ARM Neoverse): `ldar`/`stlr` ~ a few cycles more than plain; `dmb ish` (full barrier) ~10–20 cycles; `dmb ishld` (load barrier) cheaper. Relative to x86's ~30–40-cycle `mfence`, ARM barriers are cheaper individually but you need more of them.
-
----
-
-## 29.15 Hardware Memory Barriers
-
-A **barrier/fence** constrains the order in which memory operations become visible. Distinguish sharply from a **compiler barrier** (`asm volatile("" ::: "memory")`, `std::atomic_signal_fence`), which constrains only the compiler and emits no instructions.
-
-### x86-64
-
-| Instruction | Orders | Cost | Use |
-|---|---|---|---|
-| `mfence` | All loads and stores (full barrier) | **~30–40 cycles** | seq_cst fence; drain the store buffer |
-| `sfence` | Stores only (StoreStore) | ~5–10 cycles | **Only** needed for NT stores / WC memory; a no-op for normal WB stores |
-| `lfence` | Loads only (LoadLoad); also **serializes instruction execution** | ~5–20 cycles | Rarely needed for ordering; used for `rdtsc` serialization (Ch. 43 §43.12) and Spectre-v1 mitigation |
-| `lock`-prefixed op | Full barrier as a side effect | ~20 cycles | **Cheaper than `mfence`** — `lock add $0, (%rsp)` is a well-known faster full fence, used by the Linux kernel and some libstdc++ paths |
-| `xchg` | Implicitly locked, full barrier | ~20 cycles | How seq_cst stores are emitted |
-
-The "`lock add $0,(%rsp)` is cheaper than `mfence`" fact is a favorite: it does the same store-buffer drain but avoids `mfence`'s additional serialization against non-temporal operations, and it touches a line certain to be in M state (the top of your own stack).
-
-### ARM/AArch64
-
-| Instruction | Orders |
+| Question | Evidence |
 |---|---|
-| `dmb ish` | Full barrier, inner-shareable domain |
-| `dmb ishld` | Load-load and load-store (acquire-ish) |
-| `dmb ishst` | Store-store (release-ish) |
-| `dsb` | Data synchronization barrier — also waits for completion (used for TLB/cache maintenance, not for normal ordering) |
-| `isb` | Instruction synchronization barrier — flushes the pipeline; needed after modifying system registers or code |
+| Are pages initially misplaced? | Mapping-level placement immediately after initialization |
+| Does the access owner remain stable? | Thread/node and phase trace |
+| Are pages migrating? | Kernel NUMA-balancing/migration statistics and repeated location samples |
+| Does locality improve? | Falling remote-access traffic after migration |
+| What is the disruption? | Application tail distribution correlated with migration activity |
+| Can placement be correct at startup instead? | Parallel-touch or explicit-policy comparison |
 
-`ldar`/`stlr` (§29.14) are preferred over explicit `dmb` because they're cheaper and more precise.
-
-### The C++ mapping (Ch. 25 §25.14)
-
-```cpp
-std::atomic_thread_fence(std::memory_order_acquire);  // x86: nothing. ARM: dmb ishld.
-std::atomic_thread_fence(std::memory_order_release);  // x86: nothing. ARM: dmb ish.
-std::atomic_thread_fence(std::memory_order_seq_cst);  // x86: mfence. ARM: dmb ish.
-std::atomic_signal_fence(std::memory_order_seq_cst);  // NOTHING anywhere — compiler only
-```
-
-**`volatile` is not a barrier** (Ch. 25 §25.21). It prevents the *compiler* from eliding or reordering accesses to the volatile object relative to each other, but emits no fence and constrains the *hardware* not at all. Using `volatile` for inter-thread communication is a data race and is broken on ARM. It remains correct for MMIO (where the memory type provides the ordering) and for `sig_atomic_t` with signal handlers.
+Explicit migration after applying a policy is also not free and can fail partially under constraints. Check the API’s result at page granularity where required, verify the final distribution, and define what the program does if the target node lacks capacity. Chapter 32 covers the translation and page-size consequences; this chapter treats migration as a placement transition with observable cost.
 
 ---
 
-## 29.16 Locked Instructions and Atomic Operations
+## 29.7 Worked placement experiment and diagnosis — Core
 
-An **atomic read-modify-write** must make the read and write indivisible with respect to other cores. On x86, the `lock` prefix does this.
+Consider a two-node service:
 
-### The mechanism
+- a NIC is attached near node 1;
+- a receive thread runs on node 1;
+- a parser runs on node 1;
+- a coordinator on node 0 creates and initializes the packet pool;
+- latency worsens when traffic exceeds the caches.
 
-The modern implementation is **not** a bus lock. The core:
-1. Acquires the line in **M** state (RFO, §29.10).
-2. **Holds the line** — refuses to respond to snoops for it — for the duration of the RMW.
-3. Completes the read-modify-write.
-4. Releases.
+The hypothesis is not “NUMA is slow.” It is:
 
-Bus locking is only used when the operand **crosses a cache line** (§29.12, split lock) or targets uncacheable memory.
-
-### Costs
-
-| Operation | Uncontended (line in M) | Contended (HITM, same socket) | Cross-socket |
-|---|---|---|---|
-| `lock xadd` / `lock inc` | **~20 cycles** | ~70–110 cycles | 150–300 ns |
-| `lock cmpxchg` (success) | ~20 cycles | ~70–110 cycles | 150–300 ns |
-| `lock cmpxchg` (fail, retry loop) | ~20 cycles/attempt | Worse — livelock-prone | Worse |
-| `xchg` (implicitly locked) | ~20 cycles | Same | Same |
-| `cmpxchg16b` | ~25–30 cycles | Worse | Worse |
-| Uncontended `pthread_mutex` lock+unlock | ~20–40 cycles (two atomics, no syscall) | — | — |
-| Contended mutex → futex syscall | **~1–3 µs** (syscall + context switch) | — | — |
-
-The last row is the important contrast: an *uncontended* mutex is just two atomic operations, ~10 ns. A *contended* one costs a syscall and a context switch, 1000× more. This is the entire justification for spin-then-park (Ch. 24 §24.15) and for lock-free designs on the hot path.
-
-### `lock` implies a full barrier
-
-Every `lock`-prefixed instruction is a full memory barrier on x86 — which is why all `std::atomic` RMW operations, regardless of the requested memory order, cost the same on x86. `fetch_add(1, relaxed)` and `fetch_add(1, seq_cst)` generate **identical code**. This surprises people who expect `relaxed` to be cheaper; on x86 relaxed only helps by permitting *compiler* reorderings. On ARM with LSE, `ldadd` vs `ldaddal` genuinely differ.
-
-### CAS loop pathology
-
-```cpp
-while (!head.compare_exchange_weak(expected, desired, std::memory_order_release,
-                                                      std::memory_order_relaxed)) { }
-```
-Under contention, every attempt RFOs the line away from other cores. With N threads, the line ping-pongs N times per successful update and throughput *decreases* with more threads. Mitigations: exponential backoff with `pause`, read the value with a plain load before attempting the CAS (avoid RFO when the CAS would obviously fail — the "test and test-and-set" pattern), reduce contention structurally, or use `fetch_add`-style operations that always succeed. Note also that `compare_exchange_weak` may fail **spuriously** on LL/SC architectures (ARM/POWER) — that's why the weak form exists and why it must always be in a loop (Ch. 25 §25.6).
-
----
-
-## 29.17 NUMA Topology
-
-**NUMA** (Non-Uniform Memory Access): memory attached to one socket (or one die/CCX) is faster for that socket's cores than memory attached to another.
-
-```
-┌────────── Socket 0 ──────────┐   UPI/IF   ┌────────── Socket 1 ──────────┐
-│ cores 0-31   LLC   IMC ──DRAM│◄──────────►│DRAM── IMC   LLC   cores 32-63│
-│              PCIe ──NIC0     │  ~30-40    │     NIC1── PCIe              │
-└──────────────────────────────┘   GB/s     └──────────────────────────────┘
-   local: ~80 ns                                remote: ~140 ns
+```text
+the coordinator first-touched the pool on node 0,
+so node-1 receive/parser misses cross the fabric to node-0 memory
+and compete for fabric/controller capacity under load
 ```
 
-| Access | Latency | Bandwidth |
+### Build a controlled matrix
+
+Hold code, frequency policy, page size, data set, and access pattern constant. Use the CPU-placement method from Chapter 31 and a Linux memory policy to construct:
+
+| Worker node | Memory node | Expected path |
 |---|---|---|
-| Local DRAM | ~80 ns | Full (e.g. 200 GB/s) |
-| Remote DRAM (1 hop) | **~130–200 ns (1.6–2.2×)** | Interconnect-limited (~30–60 GB/s) |
-| Remote LLC (HITM) | ~150–300 ns | — |
+| 0 | 0 | local baseline |
+| 0 | 1 | remote |
+| 1 | 1 | local baseline |
+| 1 | 0 | remote |
 
-### Sub-NUMA clustering and chiplets
+Measure at least two kernels:
 
-Modern parts are NUMA *within* a socket:
-- **Intel SNC** (Sub-NUMA Clustering) splits a socket's mesh + LLC + memory controllers into 2–4 NUMA nodes, reducing average on-die latency by shortening mesh hops. Enabling SNC and pinning correctly is a real ~10–15% memory-latency win; enabling it *without* pinning makes things worse.
-- **AMD NPS** (Nodes Per Socket) 1/2/4 does the same for Zen's chiplet layout, and **CCX/CCD boundaries** matter independently: cross-CCD traffic goes over Infinity Fabric even within one NUMA node (Ch. 28 §28.1).
+1. a randomized dependent chain, which exposes service latency with little MLP;
+2. a streaming or multi-stream kernel, which exposes sustainable bandwidth and controller/fabric saturation.
 
-### Inspecting topology
+Run idle and with controlled local/remote background traffic. Report median and tail distributions, not one mean. Record the machine, firmware topology, memory population, kernel, compiler, page configuration, core pair, data size, and trial duration.
 
-```
-$ numactl --hardware
-node distances:      # 10 = local, 21 = one hop (relative, not ns)
-node   0   1
-  0:  10  21
-  1:  21  10
-$ lscpu -e                                  # CPU → node/socket/core/cache mapping
-$ numastat -m                               # per-node memory usage, numa_miss/numa_foreign
-$ lstopo                                     # hwloc: full topology incl. PCIe device locality
-$ cat /sys/class/net/eth0/device/numa_node   # which node the NIC is on
-$ mlc --latency_matrix                       # actual measured ns, not the SLIT distances
-```
-The `node distances` are firmware-declared **relative** values from the ACPI SLIT table — not nanoseconds and not always accurate. Always measure with MLC.
+### Verify placement before trusting timing
 
-### The counters that reveal a problem
-
-`numastat` reports `numa_miss` (allocations that went to a non-preferred node) and `numa_foreign` (allocations on this node preferred elsewhere). Nonzero and growing means your memory policy is failing. On Intel, `offcore_response` with a remote-DRAM mask, or the simpler `perf mem report` which labels samples "Remote RAM."
-
----
-
-## 29.18 First-Touch Allocation
-
-**Linux allocates physical pages on first *write* (or first touch), not on `malloc`/`mmap`.** `mmap` creates a VMA; the physical page is allocated by the page-fault handler, on the node of the **CPU that touched it first**, under the default `MPOL_DEFAULT` (local) policy.
-
-This is the single most consequential NUMA fact for application programmers.
-
-### The canonical bug
-
-```cpp
-// Thread 0 (main) allocates and initializes everything:
-auto* data = static_cast<double*>(malloc(N * sizeof(double)));
-for (size_t i = 0; i < N; ++i) data[i] = 0.0;      // ALL pages land on node 0
-
-#pragma omp parallel for
-for (size_t i = 0; i < N; ++i) data[i] = f(data[i]);  // half the threads run on node 1
-                                                      // → 100% remote access, ~2× slower
-```
-The fix is **parallel first touch**: initialize with the same parallel decomposition used later, so each thread faults in its own pages locally.
-
-```cpp
-#pragma omp parallel for
-for (size_t i = 0; i < N; ++i) data[i] = 0.0;      // each thread touches its own range
-```
-
-### Explicit control
-
-```cpp
-// Process-level:
-$ numactl --cpunodebind=0 --membind=0 ./trader
-$ numactl --interleave=all ./throughput_job          // spread for bandwidth, not latency
-
-// Programmatic:
-#include <numa.h>
-numa_set_preferred(0);
-void* p = numa_alloc_onnode(size, 0);
-// or POSIX-ish:
-mbind(addr, len, MPOL_BIND, &nodemask, maxnode, MPOL_MF_MOVE | MPOL_MF_STRICT);
-set_mempolicy(MPOL_BIND, &nodemask, maxnode);
-move_pages(0, count, pages, nodes, status, MPOL_MF_MOVE);   // migrate after the fact
-```
-
-### Interaction with allocators and huge pages
-
-- A general-purpose allocator (Ch. 7 §7.12) recycles freed memory across threads, so a block freed by a node-0 thread can be handed to a node-1 thread — **silently remote forever**. Per-NUMA-node arenas are the fix; jemalloc and tcmalloc have per-CPU/per-arena support, and the low-latency answer is a **per-thread arena allocated and first-touched by that thread at startup** (Ch. 8 §8.6).
-- **`MAP_POPULATE`** or explicit prefaulting at startup makes first touch happen deterministically, at a controlled time, on the right thread — combining NUMA placement with page-fault elimination (Ch. 28 §28.11).
-- **Transparent huge pages** interact badly: a 2 MB THP is allocated on one node, so a 2 MB region touched by threads on two nodes is entirely local to one of them. `khugepaged` collapsing pages later can also *move* data. For latency-critical regions, prefer explicit hugetlbfs pages with an explicit policy (Ch. 32 §32.10).
-
----
-
-## 29.19 Remote-Memory Access
-
-What actually happens on a remote access:
-
-```
-core (node 0) → L1 → L2 → LLC(node 0) miss
-              → home agent / directory determines the line's home node
-              → UPI/Infinity Fabric to node 1
-              → node 1's LLC lookup (may hit! that's a remote-LLC hit)
-              → node 1's IMC → DRAM
-              → data returns over the interconnect
-```
-
-| Path | Typical latency |
-|---|---|
-| Local LLC hit | 15–20 ns |
-| Local DRAM | ~80 ns |
-| **Remote LLC hit** | ~100–150 ns |
-| **Remote DRAM** | ~130–200 ns |
-| Remote HITM (dirty in a remote core) | **200–350 ns** |
-
-The **remote HITM** case is the worst and the most commonly overlooked: a cache line actively written by threads on both sockets costs 200–350 ns per transfer. A single shared atomic counter touched from both sockets can cap a whole application's throughput at ~3–5 M ops/sec.
-
-### Bandwidth asymmetry
-
-Interconnect bandwidth is a fraction of local memory bandwidth: UPI at ~20–24 GT/s gives roughly **30–50 GB/s per link**, versus 200–400 GB/s local. So a workload whose memory is entirely remote is not merely 2× slower in latency — it may be **5–8× worse in bandwidth**, and the interconnect becomes a global bottleneck affecting everyone on the machine.
-
-### Design rules for latency-critical systems
-
-1. **Pin threads and memory to the same node** (`numactl --cpunodebind=N --membind=N`), and verify with `numastat -p <pid>`.
-2. **Put the NIC, its interrupt affinity, its DMA buffers, and the handling thread all on the same node** (§29.21).
-3. **Never let a hot shared structure span nodes.** Replicate read-mostly data per node rather than sharing it.
-4. **Disable automatic NUMA balancing** for latency-critical processes (`kernel.numa_balancing=0`) — it migrates pages at unpredictable times, causing TLB shootdowns and multi-microsecond stalls (Ch. 32 §32.27).
-5. **Consider single-socket machines.** Many HFT deployments deliberately use one high-core-count socket, or leave the second socket entirely idle, because eliminating the NUMA dimension eliminates a whole class of tail-latency variance. Stating that as an architectural choice — not just a tuning tweak — reads very well.
-
----
-
-## 29.20 CPU Interconnects
-
-| Interconnect | Vendor / era | Topology | Bandwidth |
-|---|---|---|---|
-| **QPI** (QuickPath) | Intel, Nehalem–Broadwell | Point-to-point, ring on-die | ~9.6 GT/s, ~25 GB/s/link |
-| **UPI** (Ultra Path) | Intel, Skylake-SP+ | Point-to-point; **mesh** on-die | 10.4–24 GT/s, ~30–50 GB/s/link; 2–4 links/socket |
-| **Infinity Fabric** | AMD, Zen | Chiplet-based; IOD hub + CCDs | ~50–100 GB/s; **also the intra-socket CCD fabric** |
-| **CCIX / CXL** | Cross-vendor | Over PHY | CXL 2.0/3.0 for coherent device/memory attach |
-| **AMBA CHI** | ARM (Neoverse) | Mesh (CMN-700) | Vendor-configurable |
-| **NVLink / Infinity Fabric (GPU)** | NVIDIA/AMD | GPU-GPU/CPU | 300–900 GB/s |
-
-### On-die topology matters too
-
-Intel moved from a **ring** (up to Broadwell: simple, low-latency for small core counts, but latency grows linearly and the ring saturates past ~12 cores) to a **2D mesh** (Skylake-SP onward: scales to 40+ cores, but adds hops — LLC latency became ~50–60 cycles and *variable* depending on which LLC slice holds your line). That variability is a real source of latency dispersion: two cores accessing the same LLC slice have different latencies depending on mesh distance. SNC (§29.17) exists to bound it.
-
-AMD's chiplet design means an LLC access can be: **within the CCX** (fast, ~40 cycles), **to another CCD** (over Infinity Fabric via the IO die, ~100+ ns), or remote-socket. There is no "another core's L3" that is cheap on AMD — the L3 is per-CCX.
-
-### CXL — the coming thing
-
-**CXL** (Compute Express Link) rides on PCIe PHY and adds cache-coherent protocols (CXL.cache, CXL.mem) so accelerators and *memory expanders* can be coherently attached. CXL-attached memory is a **new, slower NUMA tier at ~170–400 ns**, appearing to Linux as a memory-only NUMA node. It's relevant to the interview mainly as: "the NUMA hierarchy is getting deeper, and tiered-memory policies (`demotion`, `NUMA` tiering in recent kernels) are how the kernel manages it." Nothing latency-critical should live on CXL memory.
-
----
-
-## 29.21 Thread, Memory, and NIC NUMA Locality
-
-The synthesis. A packet's journey through a badly-configured 2-socket box crosses the interconnect three times:
-
-```
-NIC (PCIe on node 0) ──DMA──► RX buffer allocated on node 1   ← cross #1
-IRQ delivered to a core on node 1, but the poll thread runs on node 0 ← cross #2
-Order book / arena allocated on node 1, hot thread on node 0  ← cross #3
-```
-Each crossing adds 50–120 ns and interconnect bandwidth. The correctly-configured version has **everything on one node**:
+Linux read-only inspection:
 
 ```bash
-# 1. Which node is the NIC on?
-$ cat /sys/class/net/eth0/device/numa_node
-0
-$ lstopo                                 # visual confirmation of PCIe locality
-
-# 2. Pin IRQs for the NIC's queues to cores on that node
-$ cat /proc/interrupts | grep eth0
-$ echo 4 > /proc/irq/<N>/smp_affinity_list      # core 4, node 0
-#   (stop irqbalance first, or it will undo this: systemctl stop irqbalance)
-
-# 3. Pin the application thread and its memory to node 0
-$ numactl --cpunodebind=0 --membind=0 ./trader
-#   plus sched_setaffinity to a specific isolated core (Ch. 31 §31.17)
-
-# 4. Ring buffers / DMA memory allocated by a thread already pinned to node 0
-#    (first touch, §29.18) — and huge-page-backed (Ch. 32 §32.10)
-
-# 5. Verify
-$ numastat -p $(pgrep trader)            # expect ~all pages on node 0
-$ perf mem report                         # expect no "Remote RAM" samples
+numactl --hardware
+numactl --show
+numastat -p "$PID"
+cat "/proc/$PID/numa_maps"
+cat /sys/class/net/eth0/device/numa_node
 ```
 
-### The subtleties worth stating
+These commands answer different questions:
 
-- **PCIe slot choice is a latency decision.** A NIC in a slot wired to socket 1 while your process runs on socket 0 costs an interconnect traversal on **every packet**, in both directions. In colocated deployments the slot assignment is checked at build time.
-- **RSS/RFS queue-to-core mapping** (Ch. 46 §46.12–§46.14) must place each queue's interrupt and its consuming thread on the same node *and* ideally the same core.
-- **DDIO writes into the LLC of the socket the NIC is attached to** (§29.24) — so a remote thread reading that data takes a remote LLC hit (~100–150 ns) instead of a local one (~20 ns). This makes NIC-node affinity matter *more* on DDIO-enabled systems, not less.
-- **Interrupt coalescing and busy-polling** interact: a busy-polling thread (Ch. 47 §47.11) reading the RX ring directly must be on the NIC's node, or every descriptor poll is a remote read.
-- **The single-socket answer.** If everything must be on node 0 anyway, the second socket is only a liability. Many production HFT boxes are single-socket high-frequency parts for exactly this reason.
+- `numactl --hardware`: firmware/kernel topology and relative distances;
+- `numactl --show`: policy and allowed sets for the inspecting process;
+- `numastat -p`: per-process page distribution summary;
+- `/proc/PID/numa_maps`: mapping-level policy and placement detail;
+- device `numa_node`: kernel-reported locality for that PCIe device, where known.
+
+Tool availability and fields vary by Linux distribution and kernel. A device may report `-1` when locality is unknown; that is not node 1.
+
+### Distinguish competing explanations
+
+| Observation | More consistent with | Next check |
+|---|---|---|
+| Pages mostly on node 0; worker on node 1 | Placement error | Repeat after parallel first touch |
+| Placement local, remote HITM/cache transfers high | Shared-line ownership traffic | `perf c2c` or vendor coherence counters |
+| Local and remote both worsen under background stream | Controller/fabric queueing | Per-socket memory bandwidth and loaded-latency curve |
+| Dependent chain slow, stream bandwidth healthy | Latency/MLP limit | Batch or restructure independent probes |
+| Stream plateaus, dependent chain unchanged | Bandwidth limit | Reduce bytes or add local channels/nodes |
+| Placement changes during run | Migration/balancing or workload movement | Page-location samples over time |
+
+`perf mem`, `perf c2c`, and uncore events are hardware- and kernel-dependent. Unsupported sampling, skid, and event semantics must be documented. For Intel systems, Intel Memory Latency Checker can produce idle matrices and loaded-latency experiments; it is a vendor tool, not a portable truth source.
+
+### Decide and verify the fix
+
+For this scenario, the likely fix is to have the node-1 owner first-touch its pool after placement is established. Confirmation requires:
+
+- pages shift to node 1 in placement inspection;
+- remote bandwidth and remote-access samples fall;
+- the application’s latency distribution improves under the same offered load;
+- node-1 memory capacity and bandwidth remain within headroom.
+
+If pages are already local but ownership traffic remains, first touch is not the fix. Partition or replicate the hot shared data, or change the communication protocol. A successful placement experiment can falsify the original hypothesis; that is useful.
 
 ---
 
-## 29.22 PCIe and DMA
+## 29.8 Remote coherence, read-for-ownership, and sharing — Core
 
-**PCIe** is a serial, packet-switched, point-to-point interconnect. Devices are reached through a root complex; transactions are **TLPs** (Transaction Layer Packets).
+NUMA affects more than DRAM misses. Cache coherence tracks which caches hold a line and which core may modify it. Chapter 28 owns the protocol states; this section follows their topology cost.
 
-| Generation | Per-lane | x8 | x16 |
-|---|---|---|---|
-| PCIe 3.0 | ~985 MB/s | ~7.9 GB/s | ~15.8 GB/s |
-| PCIe 4.0 | ~1.97 GB/s | ~15.8 GB/s | ~31.5 GB/s |
-| PCIe 5.0 | ~3.94 GB/s | ~31.5 GB/s | ~63 GB/s |
+### Reads
 
-**Latency, which is what matters here:** a PCIe round trip (CPU → device → CPU) is **~500 ns to 2 µs**; a one-way DMA write from device to host memory/LLC is **~300–800 ns**. This is an order of magnitude above DRAM latency and is a hard floor on any NIC interaction.
+A read miss can be satisfied by:
 
-### Posted vs non-posted — the critical distinction
+- a local cache or last-level slice;
+- local memory;
+- a remote cache holding a clean or dirty copy;
+- remote memory;
+- a home/directory lookup followed by another hop.
 
-| Type | Waits for completion? | Latency | Examples |
-|---|---|---|---|
-| **Posted write** | **No** — fire and forget | ~100–300 ns to issue | MMIO write (doorbell), device→host DMA write |
-| **Non-posted read** | **Yes** — requires a completion TLP | **~500 ns – 2 µs round trip** | **MMIO read**, device→host DMA read |
+The order of these costs is not universal. A remote cache response can beat or lose to local DRAM depending on topology, cache state, congestion, and implementation. Measure named paths rather than memorize one ladder.
 
-**An MMIO read is catastrophically expensive.** A driver polling a device register in a loop pays a microsecond per poll and stalls the core (the load can't retire). This is why every well-designed fast-path driver **never reads device registers on the hot path**; instead the device **DMA-writes a completion/status into host memory**, and the CPU polls host memory (a cache hit or an L3/DDIO hit, tens of ns). Recognizing "poll host memory, never MMIO" as the fundamental fast-path rule is a strong kernel-bypass answer (Ch. 47 §47.13).
+### Writes and ownership
 
-### DMA
+Before modifying an ordinary write-back line, a core obtains exclusive ownership. A read-for-ownership request can require invalidating other sharers or transferring a dirty line from its current owner.
 
-**Direct Memory Access**: the device reads/writes host memory without CPU involvement.
-
-- **Coherent DMA** on x86: DMA writes snoop the caches, so no software cache maintenance is needed. On many ARM SoCs DMA is **non-coherent** and drivers must `dma_sync_*`/`clean`/`invalidate` cache lines explicitly — a genuine portability difference.
-- **Descriptor rings** (Ch. 46 §46.3): the driver writes descriptors (address + length) into a ring in host memory, then rings the doorbell (a WC MMIO posted write, §29.11). The device DMA-reads the descriptors, DMA-writes the packet data, and DMA-writes a completion. The CPU polls the completion in host memory.
-- **Ordering**: PCIe guarantees that posted writes to the same path complete in order, which is what makes "write descriptor, then write doorbell" safe — provided the CPU-side stores were ordered by an `sfence` first (§29.11).
-
-### Latency budget context
-
+```text
+Core A owns line X modified
+        |
+        | Core B wants to write X
+        v
+home/directory locates A
+        |
+        +---- request / snoop across fabric ----> A
+        <---- data + ownership / acknowledgments
+Core B may now modify X
 ```
-NIC wire→host DMA complete            ~300-800 ns
-CPU notices (poll host memory)        ~20-100 ns
-Parse + decide (hot path)             ~200-1000 ns
-Write TX descriptor + doorbell        ~100-300 ns (posted)
-NIC reads descriptor + DMA payload    ~300-800 ns
-NIC serializes onto the wire (Ch.39)  ~80 ns for a 100B frame at 10 GbE
-```
-Total tick-to-trade for a software path is therefore ~1–5 µs, of which **PCIe is often the largest single component** — which is the entire commercial case for FPGA NICs (Ch. 48 §48.1–§48.2), where the decision is made on the NIC and PCIe is never crossed.
 
----
+If A and B alternate writes, the line repeatedly crosses the fabric. The payload can be one counter byte; coherence moves at line granularity. This is true sharing when both modify the same logical value and false sharing when they modify independent fields on the same line.
 
-## 29.23 IOMMU
+Remote write contention consumes:
 
-The **IOMMU** (Intel VT-d, AMD-Vi, ARM SMMU) is an MMU for devices: it translates **device (I/O virtual) addresses** to physical addresses and enforces access permissions.
+- interconnect bandwidth;
+- directory/snoop resources;
+- invalidation acknowledgments;
+- store-buffer time while ownership is pending;
+- retry work for contended atomic read-modify-write operations.
 
-Purposes:
-1. **Protection** — a buggy or malicious device (or a driver bug) cannot DMA over arbitrary physical memory. Without an IOMMU, any device with bus-master capability owns the machine (the Thunderbolt/FireWire DMA-attack class).
-2. **Virtualization** — a VM can be given direct device access (PCI passthrough / SR-IOV VFs) with the IOMMU mapping guest-physical to host-physical.
-3. **Addressing** — lets a 32-bit-capable device reach memory above 4 GB without bounce buffers.
+Padding fixes false sharing but not a globally shared counter. For true sharing, shard updates by node/core, batch them, or assign one owner and send messages.
 
-### The performance cost — the part interviews care about
+### Home placement and current ownership are different
 
-Every DMA access must be translated, which means an **IOTLB** lookup and, on a miss, an I/O page-table walk. The costs:
+It helps to track two notions:
 
-| Effect | Impact |
+- the **home/placement** associated with the physical memory and directory/controller route;
+- the **current coherence owner or sharers** of the cache line.
+
+A page can be allocated on node 0 while a core on node 1 holds one of its lines modified. A third core’s request may consult the home information and obtain data from that owner. Moving the page does not automatically eliminate a protocol in which writers continue to alternate across nodes.
+
+Use three experiments to separate the effects:
+
+1. read a cold page locally and remotely to characterize memory placement;
+2. have one core write, then another read, to characterize transfer of a modified line;
+3. alternate atomic or ordinary ownership between cores to characterize repeated ping-pong.
+
+Keep payload, core pair, cache state, and synchronization protocol explicit. The second and third experiments are coherence tests, not DRAM tests, even if the backing page is remote. This distinction prevents a common diagnostic error: applying page migration to a shared-line ownership problem.
+
+### Placement patterns
+
+| Data behavior | Preferred starting point |
 |---|---|
-| IOTLB hit | Small, tens of ns, usually hidden in PCIe latency |
-| **IOTLB miss → I/O page walk** | **hundreds of ns**, added to every affected DMA |
-| **Map/unmap on every I/O** (strict mode) | Expensive: page-table updates + **IOTLB invalidation**, which is a device round trip. This is the big one for high-PPS workloads |
-| IOTLB size | Small (tens to a few hundred entries) — easily thrashed by many scattered DMA buffers |
+| Read-only after startup | One shared copy if cache capacity/path is adequate; otherwise per-node replica |
+| Read-mostly, versioned updates | Per-node immutable copies with explicit publication |
+| Partitionable mutable state | Owner-computes partition with node-local storage |
+| One global mutable scalar | Question the design; shard/aggregate if semantics allow |
+| Producer-consumer stream across nodes | Place queue/control fields deliberately; measure handoff and payload paths |
 
-Linux modes:
+Replication trades remote reads for memory and update complexity. It is most attractive when updates are rare and readers tolerate an explicit version transition. Replicating mutable state without a reconciliation rule replaces a performance problem with a correctness problem.
+
+---
+
+## 29.9 Hardware ordering at the useful level — Role-specific
+
+Correct concurrent C++ is specified by the C++ abstract machine, not by direct reliance on a processor’s memory model. Use atomics and memory orders from Chapter 25. Hardware ordering explains cost and helps review generated code; it does not excuse a data race.
+
+### Architecture — x86-64 TSO
+
+A useful x86 write-back-memory model is:
+
+- ordinary loads are not reordered with older ordinary loads;
+- ordinary stores become globally visible in store order;
+- a later load to another address can complete before an older store becomes globally visible;
+- a core can forward its own buffered store to a matching later load;
+- locked operations and fences have ordering defined by the architecture manuals.
+
+The store buffer explains how store-to-load reordering can be observed, but it is not the architectural definition and not the “only reason” x86 differs from sequential consistency. Cacheability type, non-temporal instructions, locked operations, and serializing instructions have separate architectural rules.
+
+Do not state that every locked instruction has one fixed cost or that every acquire/release operation is “free” on x86. Compiler mapping, operand state, contention, memory type, and microarchitecture determine emitted instructions and measured cost. The architectural ordering guarantee is the stable fact.
+
+### Weakly ordered architectures
+
+AArch64 and POWER permit more observations than x86 TSO, but not an undifferentiated “anything can reorder.” Their architecture manuals specify dependencies, acquire/release instructions, barriers, shareability domains, and memory types. The compiler maps C++ atomics to a sequence valid for the selected target and options.
+
+Review rules:
+
+- missing C++ synchronization is a source-level bug even if an x86 test passes;
+- an explicit CPU barrier intrinsic is not a substitute for a C++ happens-before edge;
+- device memory uses platform-specific ordering rules distinct from normal cacheable memory;
+- generated-code comparisons must name compiler, flags, ISA level, and target.
+
+This chapter stops at the hardware consequence. Chapter 25 owns the language proof, and Chapter 26 applies it to lock-free structures.
+
+---
+
+## 29.10 Split accesses and write combining — Role-specific
+
+### Split-line and split-page accesses
+
+An access spanning two cache lines can require two cache lookups and two line fills. An access spanning pages can require translation work for both pages. Whether an unaligned access contained within one line has a penalty depends on ISA and microarchitecture.
+
+For atomic operations, the situation is stricter:
+
+- `std::atomic<T>` and `std::atomic_ref<T>` have alignment and representation requirements;
+- violating `atomic_ref`’s required alignment is a program error;
+- whether a supported aligned atomic is lock-free is implementation-defined and queryable;
+- x86 has special, costly handling for some locked accesses crossing cache-line boundaries, while other ISAs may reject misaligned atomic accesses.
+
+Do not create atomics inside packed wire layouts. Decode into properly aligned native storage. A `static_assert` should check the exact type’s documented requirement, such as `std::atomic_ref<T>::required_alignment`, rather than assume alignment equals size.
+
+### Write combining
+
+Write-combining buffers merge adjacent writes before sending them onward. They are relevant to:
+
+- non-temporal/streaming stores to normal memory;
+- mappings with a write-combining memory type;
+- some device doorbell or framebuffer paths.
+
+Benefits require a streaming, write-only pattern large enough to avoid useful cache allocation. Costs include weak ordering, finite combining-buffer capacity, partial-line traffic, and poor read behavior. Exact flush and fence requirements depend on ISA, memory type, device, driver, and transport.
+
+Therefore a generic C++ snippet containing `_mm_sfence()` and an MMIO pointer is not a portable device-publication recipe. Follow the device/driver API and architecture manual. Chapter 47 owns the complete descriptor/doorbell protocol.
+
+---
+
+## 29.11 Thread, memory, NIC, and DMA locality — Role-specific
+
+A packet-processing path has several placements:
+
+```text
+NIC PCIe attachment
+   -> DMA target pages
+      -> interrupt or polling core
+         -> packet-processing thread
+            -> downstream queue/state
+```
+
+Aligning only the thread is insufficient. A local CPU can read a remote DMA buffer, update a remote queue, or contend on a line owned by another socket.
+
+The placement objective is:
+
+```text
+minimize fabric crossings on the dominant path
+while preserving capacity, failover, and workload balance
+```
+
+That may mean NIC-local receive queues and pools, then an explicit cross-node handoff to node-owned strategy state. It does not always mean putting the whole process on the NIC’s node; that node may lack enough cores or memory bandwidth.
+
+### PCIe and DMA
+
+DMA lets a device read or write host memory without a CPU copying each byte. The device uses addresses established by the OS/driver mapping API. PCIe topology determines which root complex and NUMA node are near the device.
+
+**I/O coherence is a platform contract.** Many server platforms provide coherent DMA to ordinary host memory, but the exact scope and required cache maintenance depend on architecture, interconnect, firmware, device, and mapping API. Do not teach “x86 coherent, ARM non-coherent” as a universal split. Drivers use the platform DMA API precisely because it abstracts these differences.
+
+CPU/device ordering is also distinct from CPU/CPU ordering. Publishing descriptors, ringing a doorbell, and consuming completions must follow the driver/framework’s barriers and ownership protocol. C++ atomics alone do not define MMIO semantics.
+
+### IOMMU
+
+An IOMMU translates device-visible I/O virtual addresses and enforces access permissions. Its translation cache is commonly called an IOTLB. Costs can arise from:
+
+- IOTLB misses and page-table walks;
+- mapping/unmapping work;
+- invalidation and synchronization;
+- limited translation reach for many small pages.
+
+Long-lived mappings can amortize control-path work, but they do not make translation or invalidation universally free. Security/isolation policy determines whether bypass or identity-like modes are permitted. Chapter 47 owns framework-specific mapping setup.
+
+### Device inspection — Linux
+
+Read-only topology checks:
+
 ```bash
-intel_iommu=on iommu=pt            # passthrough: identity-map trusted devices → near-zero cost
-iommu.strict=0                     # lazy/deferred invalidation: batch IOTLB flushes
-                                   #   (faster, but a freed buffer stays DMA-accessible briefly)
-intel_iommu=off                    # fully disabled
-$ dmesg | grep -i -e DMAR -e IOMMU
+cat /sys/class/net/eth0/device/numa_node
+lspci -tv
+lstopo
 ```
 
-**`iommu=pt` (passthrough)** is the standard low-latency setting: the IOMMU stays enabled for devices that need it (VMs) but host-owned devices get an identity mapping, removing per-DMA translation cost while retaining the ability to isolate anything you explicitly want isolated. Fully disabling the IOMMU is faster still but forfeits all protection and breaks VFIO/DPDK's safe modes.
-
-**DPDK specifics** (Ch. 47 §47.2): DPDK uses **VFIO** (which requires an IOMMU) or the legacy, unsafe `igb_uio`/`uio_pci_generic`. With VFIO, DPDK maps its huge-page pool into the IOMMU **once at startup**, so there is no per-packet map/unmap and the IOTLB is well-behaved — **huge pages here also mean fewer IOTLB entries**, which is a second, distinct reason DPDK mandates them. That link — hugepages → IOTLB coverage → sustained PPS — is precisely the kind of connected reasoning that distinguishes candidates.
+Interrupt routing, queue steering, polling-core placement, and service isolation belong to Chapters 31, 35, 46, and 47. This chapter supplies the memory-path hypothesis those procedures should validate.
 
 ---
 
-## 29.24 Intel DDIO
+## 29.12 CPU interconnects, DDIO, and memory tiers — Reference
 
-**Data Direct I/O** lets a PCIe device DMA **directly into the LLC** rather than into DRAM, and read from the LLC directly. Enabled by default on Xeon E5/Scalable and later; AMD's analogue is **SDCI** on recent EPYC, and ARM has **Cache Stashing** in CMN interconnects.
+This section is skippable. Product names help interpret platform manuals, but they are not portable abstractions.
 
-### Why it matters
+### CPU fabrics
 
-Without DDIO:
+Intel UPI, AMD Infinity Fabric, and Arm coherent mesh/interconnect products connect sockets, dies, caches, controllers, and I/O agents in different configurations. Hop count, link width/speed, routing, snoop mode, and congestion affect remote paths. Treat each system’s topology as data.
+
+Useful measurements include:
+
+- link utilization by direction;
+- local versus remote controller traffic;
+- cache-to-cache transfers by core pair;
+- retries or congestion indicators where documented;
+- latency/bandwidth matrices under idle and loaded conditions.
+
+Event names and attribution are vendor- and generation-specific. Uncore counters often describe a socket or fabric, not one process.
+
+### Intel DDIO
+
+Intel Data Direct I/O on supported server platforms can place some PCIe device writes into the last-level cache rather than requiring an immediate DRAM round trip. Scope, allocation, configurability, and observability vary by processor generation and firmware.
+
+Potential benefit:
+
+```text
+NIC DMA write -> LLC-resident line -> local polling core reads line
 ```
-NIC DMA writes packet → DRAM  (~300-800 ns PCIe + DRAM write)
-CPU reads packet → L1 miss → L2 miss → L3 miss → DRAM read (~80 ns)
-```
-With DDIO:
-```
-NIC DMA writes packet → LLC directly (allocates in LLC)
-CPU reads packet → L3 hit (~15-20 ns)
-```
-**Saves ~60–80 ns per packet on receive** and, crucially, eliminates DRAM bandwidth for the packet's round trip. On transmit, the NIC can read the descriptor and payload from the LLC without a DRAM access.
 
-### The constraints and the failure mode
+Potential failure:
 
-- **DDIO uses a limited number of LLC ways** — historically **2 of 20** (~10% of the LLC) for I/O writes. If your RX ring plus buffer pool exceeds that allocation, the packets are written to LLC, immediately evicted before the CPU reads them, and you get the DRAM path anyway *plus* the eviction traffic.
-- **"DDIO thrashing"** is the resulting pathology: at high packet rates with large ring buffers, DDIO's benefit inverts and it actively pollutes the LLC. The fix is **smaller RX rings and buffer pools** so the working set fits DDIO's ways — a counterintuitive tuning direction ("make the ring smaller to go faster") that is exactly the kind of thing an interviewer probes. Intel exposes the DDIO way allocation through an MSR (`IIO LLC WAYS`, 0xC8B) on some parts, adjustable via RDT-adjacent tooling.
-- **DDIO is socket-local.** The NIC writes into the LLC of the socket it is attached to. A consumer thread on the other socket takes a **remote LLC hit (~100–150 ns)** instead of a local one (~20 ns) — so DDIO makes NIC-node affinity (§29.21) *more* important, not less.
-- **DDIO interacts with kernel bypass**: DPDK/ef_vi ring sizing, mbuf pool sizing, and burst size all determine whether the hot buffers stay within DDIO's ways. Typical guidance is rings of 512–1024 descriptors rather than 4096, and reusing a small pool of buffers so the same lines stay resident.
+```text
+DMA working set exceeds effective cache allocation
+-> useful application lines displaced or packet lines evicted before use
+```
 
-**Measuring:** Intel PCM's `pcm-iio` and `pcm.x` report DDIO hit/miss rates (the "IIO" section shows inbound writes hitting or missing the LLC). A rising DDIO miss rate as packet rate increases is the thrashing signature.
+Verify that the processor and device path support the feature, identify the relevant cache/fabric domain, and compare counters plus application latency while varying ring/pool size. Do not assume a fixed number of ways or that every device write is injected identically.
+
+### CXL and memory-only nodes
+
+CXL revisions define several coherent device and memory capabilities over a PCIe-based physical/link foundation. A CXL memory device may be exposed by the OS as a memory tier or memory-only NUMA node, depending on platform firmware, kernel support, provisioning, and mode.
+
+Do not classify all CXL memory as one latency tier. Device technology, switch topology, link generation/width, interleaving, and host controller matter. Name the CXL version and platform, then measure latency, bandwidth, failure behavior, and migration policy. Keep latency-critical allocations off a slower tier only after placement controls and verification demonstrate that the policy works.
 
 ---
 
-## Key Interview Questions
+## 29.13 Operational measurement checklist — Reference
 
-1. **Why hasn't DRAM latency improved in 20 years while bandwidth has 10×'d?** — Device timings (tCL/tRCD/tRP) are set by cell physics and sense-amp behavior at ~15 ns each; bandwidth scales by widening and clocking the interface and adding channels.
-2. **Explain row hit, row empty, and row conflict with numbers.** — ~17 ns (tCL), ~33 ns (tRCD+tCL), ~49 ns (tRP+tRCD+tCL). Sequential access gets ~127 row hits per 8 KB row activation.
-3. **Why does memory latency get worse when another process uses bandwidth?** — The memory controller is a queueing system; latency knees upward past ~60–70% utilization. Demonstrate with `mlc --loaded_latency`.
-4. **Why can't one core saturate a server's memory bandwidth?** — ~10–16 LFBs cap outstanding misses; 12 lines × 64 B / 80 ns ≈ 10 GB/s per core. By Little's Law, 200 GB/s at 80 ns needs 250 lines in flight ≈ 20+ cores.
-5. **Why is linked-list traversal ~25× slower than an array scan of the same data?** — MLP = 1: each address depends on the previous load's result, so runtime is N × full latency with no overlap and no prefetching possible.
-6. **What is the store buffer and why is it the memory model?** — It holds retired-but-not-visible stores; its lazy drain is exactly the StoreLoad reordering that x86-TSO permits, and `mfence` exists to drain it.
-7. **Why is a release store free on x86 but a seq_cst store ~30–40 cycles?** — The store buffer is FIFO (StoreStore preserved for free), but seq_cst forbids StoreLoad reordering, requiring a drain via `xchg`/`mfence`.
-8. **What is 4 K aliasing?** — Disambiguation compares only address bits [11:0], so a load and an older store exactly 4096 bytes apart falsely conflict, ~5 cycles each. Offset one buffer by a line.
-9. **When does store-to-load forwarding fail, and what does it cost?** — When the load isn't fully contained in one store (larger load, two stores covering it, line-crossing); ~12–20 extra cycles. Classic case: write two `uint32_t`s, read one `uint64_t`.
-10. **What is an RFO and why does it make writes expensive?** — Read For Ownership: fetch the line *and* invalidate all other copies before writing. It causes write-allocate's 2× traffic and is the mechanism of false-sharing ping-pong.
-11. **Why are NIC doorbells mapped write-combining rather than uncacheable?** — UC stores are serialized, hundreds of ns each, and block the store buffer; WC buffers combine a 64 B descriptor write into one PCIe TLP. The price is weak ordering — you need `sfence` before *and* after.
-12. **What is a split lock and why is it catastrophic?** — An atomic RMW crossing a cache line falls back to a bus lock that stalls every core on the socket; ~1000 cycles locally and machine-wide disruption. Detect with `split_lock_detect` and `sq_misc.split_lock`; prevent with natural alignment.
-13. **State x86-TSO precisely.** — Only Store→Load may be reordered; there is a total order on stores; NT stores and WC memory are the exceptions.
-14. **What breaks when you port x86-validated lock-free code to ARM?** — Load→Load and Store→Store reordering become possible; a missing acquire on the consumer side of a publication reads garbage through a valid pointer. Validate with TSan or on real ARM, never on x86 alone.
-15. **Why is `lock add $0,(%rsp)` used instead of `mfence`?** — It performs the same store-buffer drain with less serialization overhead and touches a line certain to be in M state; measurably cheaper.
-16. **On x86, is `fetch_add(relaxed)` cheaper than `fetch_add(seq_cst)`?** — No — identical code; every `lock`-prefixed op is a full barrier. Relaxed only relaxes the *compiler*. On ARM with LSE (`ldadd` vs `ldaddal`) they genuinely differ.
-17. **What is first-touch allocation and what's the classic bug?** — Pages are placed on the node of the first toucher; initializing an array single-threaded then processing it in parallel makes half the accesses remote. Fix: parallel first touch with the same decomposition.
-18. **How much does a remote NUMA access cost?** — ~130–200 ns vs ~80 ns local (1.6–2.2×), remote HITM 200–350 ns, and interconnect bandwidth is 5–8× below local.
-19. **Why is `perf mem report` useful for NUMA?** — It labels each sampled load with where it was serviced from, including "Remote RAM" — direct evidence of misplacement.
-20. **Why is an MMIO read so expensive, and what's the fast-path alternative?** — It's a non-posted PCIe transaction: 500 ns–2 µs round trip that stalls the core. The device should DMA a completion into host memory and the CPU should poll that instead.
-21. **What does the IOMMU cost and what is `iommu=pt`?** — IOTLB misses cause I/O page walks (hundreds of ns); strict-mode map/unmap per I/O adds invalidation round trips. `iommu=pt` identity-maps host devices, retaining isolation where needed at near-zero cost. DPDK maps its hugepage pool once at startup for the same reason.
-22. **What is DDIO and how can it hurt?** — NIC DMA lands directly in the LLC (~15–20 ns for the CPU instead of ~80 ns), but it's limited to ~2 of 20 ways; oversized RX rings thrash it, so *smaller* rings can be faster. It's also socket-local, making NIC-node affinity more important.
-23. **Describe the fully NUMA-correct packet path.** — NIC's node determined from sysfs; IRQ affinity to a core on that node with irqbalance off; thread pinned to an isolated core on that node; buffers first-touched by that thread on huge pages; verified with `numastat -p` and `perf mem report`.
-24. **What's the irreducible source of DRAM jitter?** — Refresh: every rank is unavailable for tRFC (~350–560 ns) every ~3.9 µs, and the rate doubles at high temperature.
+Use the smallest tool that answers each question:
 
----
+| Question | Linux/platform evidence |
+|---|---|
+| What nodes, CPUs, and relative distances exist? | `numactl --hardware`, `lscpu`, `lstopo` |
+| What policy constrains this process? | `numactl --show`, cpuset/cgroup configuration |
+| Where are this process’s pages? | `numastat -p PID`, `/proc/PID/numa_maps` |
+| Which node is reported for the NIC? | `/sys/class/net/DEV/device/numa_node` |
+| Are cache lines moving between cores/sockets? | `perf c2c` or documented vendor events |
+| Are sampled loads local or remote? | `perf mem` where supported |
+| Are controllers or links saturated? | Vendor uncore memory/fabric counters |
+| What is the local/remote response curve under load? | Controlled benchmark; vendor tools where applicable |
 
-## Common Traps
+Record:
 
-- **Assuming DRAM latency is a constant** — it's ~17/33/49 ns of device time depending on row state, plus queueing that explodes past 70% bandwidth utilization.
-- **Benchmarking memory latency on an idle machine** and planning capacity from it.
-- **Adding threads to a bandwidth-bound kernel** or compressing data in a latency-bound one — diagnose with MLP (`l1d_pend_miss.pending`) and DRAM counters first.
-- **Believing prefetch fixes pointer chasing** — the address isn't known until the previous load returns.
-- **Two buffers exactly 4096 bytes apart** — 4 K aliasing on every access.
-- **Writing a struct field-by-field and reading it as a wide word** — store-to-load forwarding failure, ~15 cycles.
-- **Assuming `volatile` orders memory** — it emits no fence and is broken on ARM.
-- **Validating lock-free code only on x86** — acquire/release are free there, so missing barriers are invisible.
-- **Expecting `relaxed` RMW to be cheaper on x86** — every `lock` op is a full barrier.
-- **Atomics inside packed structs or `atomic_ref` on a misaligned member** — split lock, whole-socket stall.
-- **16-byte atomics (tagged pointers) not 16-byte aligned** — split lock on every operation.
-- **NT stores or WC doorbell writes without `sfence`** — data published before it's visible, or a doorbell that never rings until unrelated activity flushes the buffer.
-- **Reading from WC or UC memory on the hot path** — hundreds of ns, and it forces a buffer flush.
-- **Polling an MMIO register in a loop** — microseconds per poll; poll host memory instead.
-- **Single-threaded initialization of data processed in parallel** — everything lands on one NUMA node.
-- **A general-purpose allocator recycling memory across NUMA nodes** — silently remote forever; use per-thread/per-node arenas first-touched at startup.
-- **Leaving `numa_balancing` on for a latency-critical process** — unpredictable page migration and TLB shootdowns.
-- **Ignoring which socket the NIC is plugged into** — an interconnect crossing on every packet, in both directions.
-- **Letting `irqbalance` run** — it silently undoes your IRQ affinity.
-- **Oversizing RX rings "for safety"** — DDIO thrashing; the packets are evicted from LLC before you read them.
-- **Trusting ACPI SLIT `node distances` as nanoseconds** — they're relative firmware values; measure with MLC.
-- **Assuming DMA is coherent** — it is on x86, frequently not on ARM SoCs.
+- CPU and firmware model/configuration;
+- DIMM population and speed;
+- kernel, NUMA policy, cpuset, and balancing state;
+- CPU and memory node used by each trial;
+- mapping/page configuration;
+- access pattern, data size, read/write mix, and MLP;
+- background load and socket placement;
+- repetitions and percentile method.
+
+Do not compare “local” from one machine with “remote” from another and attribute the difference solely to NUMA. The experiment must reverse placement on the same host or otherwise control platform differences.
+
+Rollback matters. Binding can cause allocation failure under pressure; replication consumes capacity; interleaving can worsen latency; disabling migration can preserve a placement bug. Each change needs a capacity check, failure policy, monitoring signal, and reversible deployment step.
 
 ---
 
-## Compact Recall Summary
+## Recall card — Core
 
-**DRAM.** Channel → rank → bank group → bank → row. Device latency is tCL ≈ 17 ns (row hit), +tRCD (row empty, 33 ns), +tRP (row conflict, 49 ns) — **essentially unchanged in 20 years**; only bandwidth scaled (8–12 channels, 150–460 GB/s/socket). Controllers reorder with FR-FCFS, batch read/write turnarounds, and refresh every rank for ~350–560 ns every ~3.9 µs (irreducible jitter, worse when hot). **Latency knees upward past ~60–70% bandwidth utilization** — `mlc --loaded_latency` draws the curve.
+- DRAM work is organized by controllers, channels, ranks, banks, rows, and columns.
+- Row hit, closed-bank access, and row conflict require different command sequences.
+- Controller queueing makes response time load-dependent; there is no universal saturation knee.
+- `B <= min(B_service, MLP × useful_bytes / latency)` separates service-bandwidth and dependency limits.
+- Load/store forwarding and disambiguation rules are microarchitecture-specific observations.
+- NUMA locality is a path involving core, cache/home, fabric, controller, memory, and sometimes a device.
+- On Linux default local policy, the CPU faulting a new anonymous page normally influences its node; policy and allowed-node constraints qualify first touch.
+- Partition mutable state, replicate suitable read-mostly state, and interleave only when aggregate bandwidth justifies mixed locality.
+- Remote coherence ownership can dominate even when page placement is correct.
+- I/O coherence, MMIO ordering, IOMMU behavior, DDIO, and CXL require platform/version labels.
 
-**MLP.** Throughput = MLP / latency. Per-core MLP is capped by **10–16 fill buffers** → ~10 GB/s per core; Little's Law says 200 GB/s at 80 ns needs 250 lines in flight, i.e. 20+ cores. Pointer chasing is MLP=1 and therefore ~25× slower than a scan. Create MLP with sequential access, multiple streams, batched software prefetch. `l1d_pend_miss.fb_full` proves the ceiling.
+---
 
-**Core memory queues.** Load buffer (~192) and store buffer (~114) track in-flight accesses. Stores drain to L1 **only after retirement** — the store buffer *is* the memory model. Disambiguation speculates that loads don't alias unresolved older stores; 4 K aliasing is its false-positive. Store-to-load forwarding is ~5 cycles when the load is fully contained in one store, ~12–20 extra when not.
+## Common traps — Core
 
-**Writes.** Every write needs the line in M/E → **RFO** (fetch + invalidate all copies), which causes write-allocate's 2× traffic and false-sharing ping-pong. Avoid with NT stores, `prefetchw`, full-line writes, or not sharing. **Write combining** (WC memory / NT stores) is weakly ordered even on x86 and needs `sfence`; it's why NIC doorbells are WC, not UC.
+- Quoting one DRAM or remote-memory latency as a machine-independent constant.
+- Treating advertised memory data rate as sustainable application bandwidth.
+- Omitting useful-byte ratio from the MLP bandwidth model.
+- Assuming a virtual-address stride uniquely selects a DRAM bank.
+- Initializing every page on one coordinator before node-partitioned processing.
+- Applying a new memory policy and assuming existing pages moved.
+- Assuming thread-local allocator caches imply NUMA-local physical pages.
+- Using interleave as a default fix for latency-sensitive partitioned state.
+- Calling every remote access “remote DRAM” when a cache may supply the line.
+- Padding a truly shared counter and expecting ownership traffic to disappear.
+- Calling the store buffer the architectural definition of x86 TSO.
+- Treating ordinary C++ atomics as an MMIO or DMA-ordering API.
+- Assuming DMA coherence from the CPU architecture name alone.
+- Reading firmware NUMA distance values as nanoseconds.
+- Running a placement benchmark without first verifying the pages.
 
-**Ordering.** x86-TSO permits **only Store→Load** reordering and is multi-copy-atomic. Therefore acquire loads and release stores are plain `mov`s (free), seq_cst stores cost ~30–40 cycles, and every `lock` op is a full barrier at ~20 cycles uncontended. ARM/POWER reorder everything; use `ldar`/`stlr` and prefer **ARMv8.1 LSE atomics** (`-moutline-atomics`) over LL/SC. A missing consumer-side acquire is invisible on x86 and fatal on ARM. Split locks (atomic crossing a line) fall back to a bus lock and stall the whole socket — ~1000 cycles plus machine-wide disruption.
+---
 
-**NUMA.** Local ~80 ns, remote ~130–200 ns, remote HITM 200–350 ns, interconnect bandwidth 5–8× below local; sub-NUMA (SNC/NPS) and AMD CCX boundaries create NUMA *inside* a socket. **First touch** places pages, so parallel initialization is mandatory and recycling allocators silently strand memory remotely. Pin thread + memory + NIC + IRQ to one node, disable `numa_balancing` and `irqbalance`, verify with `numastat -p` and `perf mem report`. Many HFT boxes are single-socket precisely to delete this dimension.
+## Reasoning questions
 
-**I/O.** PCIe posted writes are ~100–300 ns; **non-posted MMIO reads are 500 ns–2 µs** — never poll a device register, poll a DMA-written completion in host memory. IOMMU adds IOTLB misses and, in strict mode, per-I/O map/unmap invalidations; `iommu=pt` plus a once-mapped hugepage pool (DPDK/VFIO) is the low-latency configuration. **DDIO** DMAs into the LLC (~15–20 ns instead of ~80 ns) but uses only ~2 of 20 ways, is socket-local, and thrashes with oversized rings — smaller RX rings can be measurably faster.
+1. Trace a row hit and a row conflict from controller command to data transfer. Which extra work distinguishes them?
+2. A streaming kernel reaches high bandwidth while a pointer chain does not. Use the MLP model to explain why.
+3. Why can an unrelated process increase memory latency without sharing any virtual or physical pages with the service?
+4. A region was bound to node 1 after initialization but remains mostly on node 0. Give two mechanisms that explain the observation.
+5. When is interleaving preferable to first-touch partitioning, and what latency property does it give up?
+6. A node-local process still reports cross-socket cache-to-cache transfers. What data-layout or ownership problems would you investigate?
+7. Why does a generation-specific store-forwarding rule belong in a measurement note rather than a portable optimization rule?
+8. What evidence distinguishes remote DRAM traffic, remote cache ownership transfer, and controller saturation?
+9. A NIC is local to node 1, but packet processing on node 1 still crosses the fabric. List three placement causes.
+10. What must be labeled before making a claim about DDIO, CXL memory, or IOMMU cost?
+
+---
+
+## Code-reading puzzle
+
+The workers are correctly placed before `process`, and each consumes a disjoint half. This intentionally incomplete fragment omits application types and thread-launch machinery:
+
+```cpp
+std::vector<Record> records(count); // construction occurs on coordinator
+start_worker_on_node(0, [&] { process(records.first_half()); });
+start_worker_on_node(1, [&] { process(records.second_half()); });
+```
+
+Assume Linux default local policy and that `Record` value initialization writes the backing pages. Explain why the code can be race-free and still create remote traffic. Does replacing `std::vector` with a raw allocator automatically fix it? Redesign initialization while preserving object lifetime and state which placement observation would confirm the fix.
+
+---
+
+## Implementation exercise
+
+Build the four-cell placement matrix from Section 29.7 on a NUMA Linux host:
+
+1. discover topology and select one core on each of two nodes;
+2. create local and remote page placements without changing the access kernel;
+3. implement a randomized dependent chain and four independent chains;
+4. add a streaming read and a mixed read/write kernel;
+5. verify page location before each timed trial;
+6. repeat idle and with controlled bandwidth load;
+7. report median, p99, sustainable bandwidth, and relevant remote/controller counters.
+
+State all platform details and policy assumptions. Explain each result with row behavior, MLP, queueing, or fabric/coherence paths. If the machine has only one NUMA node, use two core clusters to measure cache-to-cache locality and explicitly label the experiment as non-NUMA rather than inventing a remote-memory result.
+
+---
+
+## Prerequisite for Chapter 30
+
+Chapter 30 turns these mechanisms into calibrated orders of magnitude. Before continuing, be able to explain—without quoting a number—why a row conflict differs from a row hit, why a dependent chain cannot fill memory bandwidth, how first touch influences Linux page placement, and why a remote modified-line transfer is not the same experiment as remote DRAM.

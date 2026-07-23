@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Object representation is the full `sizeof(T)` sequence of `unsigned char`; value representation is the subset of bits determining the value. They diverge exactly by padding. The tempting 'both are 8' answer treats padding as value-carrying — it is not, and that is precisely why `memcmp` on this struct is unreliable.",
-      "sourceAnchor": "31-object-and-value-representation",
+      "sourceAnchor": "32-object-and-value-representation--core",
       "difficulty": "recall"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The storage is a byte but only one bit is a value bit, so `0x02` corresponds to no value of the type and the read is undefined. The promotion answer is tempting because promotion really does happen, but promotion of a valid `bool` is deterministic — the anomaly comes from the invalid representation, not from conversion rules.",
-      "sourceAnchor": "31-object-and-value-representation",
+      "sourceAnchor": "32-object-and-value-representation--core",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Indeterminate values are UB to read, with the single carve-out for `unsigned char`/`std::byte`, which yields an unspecified value instead. The '`= {}` zeroes padding' answer is the widespread misconception: `= {}` zeroes members, not padding, so value-initialization does not launder the indeterminacy away.",
-      "sourceAnchor": "32-padding-and-indeterminate-values",
+      "sourceAnchor": "34-padding-and-indeterminate-values--core",
       "difficulty": "recall"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "CAS is a byte-wise comparison of the object representation, so garbage padding in the expected value never matches and the loop never terminates. The 'requires unique object representations' answer is the near-miss: `atomic<T>` requires only *trivially copyable*, not unique object representations, so a padded type compiles fine and fails at runtime. Fix by adding explicit padding members or CASing an integer.",
-      "sourceAnchor": "32-padding-and-indeterminate-values",
+      "sourceAnchor": "34-padding-and-indeterminate-values--core",
       "difficulty": "trap"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Only `has_unique_object_representations_v` speaks about padding bits and representation uniqueness. Trivial copyability is the seductive wrong answer: `struct S { char c; int i; };` is trivially copyable yet full of padding, so `memcpy` is safe while `memcmp` is not. Note the trait is also false for anything containing `float`/`double`, since `+0.0` and `-0.0` compare equal with different bytes.",
-      "sourceAnchor": "32-padding-and-indeterminate-values",
+      "sourceAnchor": "34-padding-and-indeterminate-values--core",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Arrays are contiguous, so element `i` sits at `base + i * sizeof(T)`; only a size that is a multiple of the alignment keeps every element aligned. This is exactly what forces tail padding, making `struct { int; char; }` 8 rather than 5. The `memcpy` answer is a real-sounding benefit but not the reason — wide copies are legal regardless of the size relation.",
-      "sourceAnchor": "33-size-and-alignment",
+      "sourceAnchor": "33-size-alignment-and-member-layout--core",
       "difficulty": "recall"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Independent variables on one 64-byte line cause each write to invalidate the other core's copy, serializing logically independent work at roughly 100ns per operation. The split-lock distractor describes a different pathology — that requires an atomic that *straddles* a line boundary, whereas here each atomic is perfectly aligned and merely shares a line with its neighbour.",
-      "sourceAnchor": "33-size-and-alignment",
+      "sourceAnchor": "33-size-alignment-and-member-layout--core",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The standard permits strengthening only; a weaker request is ill-formed, which is why packing is a compiler extension rather than a language feature. The 'alignment never affects `sizeof`' answer is subtly wrong in a common way: `alignas(64)` on a class rounds `sizeof` up to 64 too, because size must stay a multiple of alignment.",
-      "sourceAnchor": "33-size-and-alignment",
+      "sourceAnchor": "33-size-alignment-and-member-layout--core",
       "difficulty": "recall"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Misaligned access is UB in C++ everywhere; the compiler is entitled to assume alignment and emit aligned SIMD, so 'x86 allows it' is not a defense. GCC flags this with `-Waddress-of-packed-member`. The 'UB only on ARM' answer is the popular rationalization — UB is a property of the abstract machine, not of what a given CPU happens to tolerate.",
-      "sourceAnchor": "33-size-and-alignment",
+      "sourceAnchor": "33-size-alignment-and-member-layout--core",
       "difficulty": "trap"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Laying out in order gives a[1] pad[7] b[8] c[1] pad[3] d[4] = 24; sorting by decreasing alignment gives b[8] d[4] a[1] c[1] pad[2] = 16. The 'reordering gives 14 bytes' answer is the natural off-by-a-concept: the members sum to 14, but tail padding must round the size up to a multiple of `alignof` (8), so 16 is the floor, not 14.",
-      "sourceAnchor": "34-member-layout-and-tail-padding",
+      "sourceAnchor": "33-size-alignment-and-member-layout--core",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Tail padding of a non-standard-layout base subobject is available to the derived class, so `d` lands at offset 5 and the size stays 8. The 'compiler reorders `d` before `c`' answer reaches the right number by the wrong mechanism — C++ never reorders members to save space; the saving comes purely from reuse. The practical hazard is that `memcpy`ing `sizeof(Base)` bytes over a `Derived` now clobbers `d`.",
-      "sourceAnchor": "34-member-layout-and-tail-padding",
+      "sourceAnchor": "33-size-alignment-and-member-layout--core",
       "difficulty": "application"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An empty *member* must have a unique address, so it takes a byte plus 3 bytes of padding before the `int`; the Empty Base Optimization lets an empty *base* take none. The '`sizeof(A) == 5`' answer gets the member cost right but forgets alignment: `i` must land at offset 4, so `A` is 8, not 5. C++20's `[[no_unique_address]]` brings the base behaviour to members.",
-      "sourceAnchor": "34-member-layout-and-tail-padding",
+      "sourceAnchor": "33-size-alignment-and-member-layout--core",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Adjacent bit-fields with no zero-width field between them are one memory location, so concurrent writes race even though the fields are logically independent — the read-modify-write of the storage unit clobbers the neighbour. The `volatile` answer is a common misconception: `volatile` orders nothing and provides no atomicity in the C++ memory model.",
-      "sourceAnchor": "34-member-layout-and-tail-padding",
+      "sourceAnchor": "33-size-alignment-and-member-layout--core",
       "difficulty": "trap"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An in-class initializer means the default constructor has work to do, but it says nothing about copying, so `B` remains trivially copyable. `C` is the mirror image and the tempting swap — a user-provided copy constructor destroys trivial *copyability* while its implicit default constructor stays trivial. Conflating these two axes is one of the chapter's named traps.",
-      "sourceAnchor": "35-trivial-and-trivially-copyable-types",
+      "sourceAnchor": "35-type-properties-ask-the-right-question--core",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Register passing is available only to trivially copyable types; a non-trivial destructor forces memory passing even for a tiny type — which is why `unique_ptr` is not zero-overhead at ABI boundaries despite being pointer-sized. The vtable answer is wrong on its face: only *virtual* functions add a vptr, and a plain destructor adds nothing to the layout.",
-      "sourceAnchor": "35-trivial-and-trivially-copyable-types",
+      "sourceAnchor": "35-type-properties-ask-the-right-question--core",
       "difficulty": "application"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The implication runs one way only: anything `memcpy` preserves can also be moved-and-destroyed by `memcpy`, so trivially copyable types are relocatable. The converse fails, which is the whole reason P1144/P2786 needed a separate trait — relocation is move-plus-destroy-source, which an SSO string satisfies despite its interior pointer making byte copies invalid. The reversed-implication option is the tempting one precisely because relocation *sounds* like the stronger property.",
-      "sourceAnchor": "35-trivial-and-trivially-copyable-types",
+      "sourceAnchor": "35-type-properties-ask-the-right-question--core",
       "difficulty": "trap"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Standard layout requires all non-static data members to share one access control, so mixing `public` and `private` disqualifies `NSL`. The constructor and NSDMI options are the classic confusion with *triviality*: user-provided constructors and in-class initializers cost triviality, not standard layout. And `SLd` is fine because all the data still lives in exactly one class of the chain.",
-      "sourceAnchor": "36-standard-layout-types",
+      "sourceAnchor": "35-type-properties-ask-the-right-question--core",
       "difficulty": "application"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "POD bundled two orthogonal properties, which is why `std::is_pod` was deprecated in favour of `is_trivially_copyable` and `is_standard_layout`. The 'synonym for trivially copyable' answer is the most tempting since that is the property people usually want, but POD was strictly stronger — it also demanded standard layout, and aggregates are a third, unrelated notion.",
-      "sourceAnchor": "36-standard-layout-types",
+      "sourceAnchor": "35-type-properties-ask-the-right-question--core",
       "difficulty": "recall"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Lifetime formally begins when an object is created, and nothing in that snippet created one — which meant allocators, ring buffers, deserializers, and `std::vector` itself were all technically UB. C++20's implicit object creation (P0593) made `malloc` create the `int`. The alignment answer is wrong on the facts: `malloc` returns storage suitably aligned for any object of fundamental alignment.",
-      "sourceAnchor": "37-implicit-lifetime-types",
+      "sourceAnchor": "36-implicit-lifetime-and-storage-reuse--core",
       "difficulty": "recall"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`start_lifetime_as` is exactly the zero-code declaration that existing bytes are an object, needed because `read()` is not one of the implicitly-creating operations. `bit_cast` is the tempting near-miss: it does produce a `Header`, but by *copying* the bytes into a new object rather than adopting them in place. `launder` only refreshes a pointer to an object that already exists, and placement `new` overwrites the bytes you just read.",
-      "sourceAnchor": "37-implicit-lifetime-types",
+      "sourceAnchor": "36-implicit-lifetime-and-storage-reuse--core",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The implicitly-creating set is the allocation functions, `memcpy`/`memmove`, `bit_cast`, and beginning the lifetime of a `unsigned char`/`std::byte` array. `launder` is not in it — it presupposes an object already exists at the address and merely defeats the compiler's assumption that it is still the *old* one, which is why it cannot rescue a `reinterpret_cast` over foreign bytes.",
-      "sourceAnchor": "37-implicit-lifetime-types",
+      "sourceAnchor": "36-implicit-lifetime-and-storage-reuse--core",
       "difficulty": "recall"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Strict aliasing lets the compiler assume a store through `float*` cannot affect a value loaded through `int*`, so the reads and writes get reordered or elided. The 'narrowing value conversion' answer describes what a `static_cast` would do, not a `reinterpret_cast` — the cast really does reinterpret bits; the breakage is the optimizer's aliasing assumption, not a conversion. `std::bit_cast` or `memcpy` is the correct spelling.",
-      "sourceAnchor": "38-type-punning-and-strict-aliasing",
+      "sourceAnchor": "37-type-accessibility-aliasing-and-legal-punning--core",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "C explicitly blesses reading a non-active member; C++ never adopted that and the read is UB, though the major compilers document it as working. The 'UB in both C and C++' answer overstates the case in a plausible way: the common initial sequence rule is real but far narrower — it only licenses reading *shared leading members* of layout-compatible standard-layout structs, not arbitrary reinterpretation.",
-      "sourceAnchor": "38-type-punning-and-strict-aliasing",
+      "sourceAnchor": "37-type-accessibility-aliasing-and-legal-punning--core",
       "difficulty": "recall"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The exemption lets a `char`/`unsigned char`/`std::byte` glvalue access any object, but it grants nothing in the reverse direction: raw bytes do not become an `int` object just because you point an `int*` at them. The 'a `char` array may be aliased as any type' answer inverts the rule exactly, which is why it reads convincingly — it is the direction that actually requires the C++23 lifetime tool.",
-      "sourceAnchor": "38-type-punning-and-strict-aliasing",
+      "sourceAnchor": "37-type-accessibility-aliasing-and-legal-punning--core",
       "difficulty": "trap"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Indexing bytes and shifting never consults the host's byte order, so no `#ifdef` is needed, and it avoids both the strict-aliasing violation of the cast and the possibly misaligned load — while compilers still fold it to a load plus `BSWAP`. The performance answer is wrong on its premise: `ntohl` is typically a macro or intrinsic, so speed is not the differentiator; correctness is.",
-      "sourceAnchor": "39-endianness-and-byte-swapping",
+      "sourceAnchor": "39-endianness-and-byte-swapping--role-specific",
       "difficulty": "application"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Almost everything about bit-fields is implementation-defined, including which end of the storage unit allocation starts from, so the same declarations map to different bits under a different ABI. The 'bit-fields are always MSB-first' answer is the confident-sounding falsehood: the standard fixes no allocation order at all, which is exactly why the chapter says never to use bit-fields for wire formats.",
-      "sourceAnchor": "39-endianness-and-byte-swapping",
+      "sourceAnchor": "39-endianness-and-byte-swapping--role-specific",
       "difficulty": "trap"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A pointer carries an origin object as well as an address, and one-past-the-end of `a` may never be used to touch `b` even when the bit patterns match. The 'the comparison itself is UB' answer is a near-miss worth separating: relational comparison (`<`) across distinct objects is unspecified, but `==` is well-defined — the comparison is fine, it is the *access* that is not.",
-      "sourceAnchor": "310-pointer-arithmetic-and-provenance",
+      "sourceAnchor": "38-pointer-arithmetic-and-provenance--deep-dive",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Only the one-past-the-end position is defined, and only as a value — dereferencing it is UB, which rules out writing through the end position with `*s = 0;`. The `a - 1` answer is the tempting symmetry: there is no one-before-the-beginning, which is precisely why `std::reverse_iterator` stores the *next* position and dereferences `*(it - 1)`. Merely computing `a + 11` is already undefined, no dereference required.",
-      "sourceAnchor": "310-pointer-arithmetic-and-provenance",
+      "sourceAnchor": "38-pointer-arithmetic-and-provenance--deep-dive",
       "difficulty": "application"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The common initial sequence is the longest run of leading members with layout-compatible types, and reading it through the inactive member is explicitly permitted when both structs are standard-layout and the union is visible. The 'neither member may be read' answer overcorrects with the general union-punning rule — that rule is real, but this carve-out is exactly what makes tagged unions and the `struct sockaddr` family legal.",
-      "sourceAnchor": "311-layout-compatibility-and-offsetof",
+      "sourceAnchor": "310-layout-compatibility-and-offsetof--reference",
       "difficulty": "application"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Standard layout is the condition that makes offsets fixed and computable, and `container_of` — subtracting the offset from a member's address — is why the macro exists, powering the Linux kernel's `list_head` and Boost.Intrusive. The 'any complete `T`, for virtual-inheritance offsets' answer is the exact inversion of the truth: virtual bases are the case where `offsetof` genuinely breaks, because a member's offset is not a compile-time constant at all.",
-      "sourceAnchor": "311-layout-compatibility-and-offsetof",
+      "sourceAnchor": "310-layout-compatibility-and-offsetof--reference",
       "difficulty": "recall"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "`has_unique_object_representations_v` is false if any padding bit exists anywhere in the type, making it the strongest single assertion in the wire-format checklist. Standard layout is the tempting choice because it is the other name in every ABI discussion, but it fixes member *order and offsets* while saying nothing about holes between them — a standard-layout struct can be mostly padding.",
-      "sourceAnchor": "312-abi-safe-wire-and-shared-memory-layouts",
+      "sourceAnchor": "311-abi-safe-wire-and-shared-memory-layouts--role-specific",
       "difficulty": "application"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Non-lock-free atomics fall back to a table of mutexes inside the process, so each process locks a different mutex and the operations are not mutually atomic — silently. `static_assert(std::atomic<T>::is_always_lock_free)` is mandatory here. The 'atomic stores a vtable pointer' answer invents a vtable: `std::atomic` has no virtual functions; the process-local state lives in the library's lock table, not in the object.",
-      "sourceAnchor": "312-abi-safe-wire-and-shared-memory-layouts",
+      "sourceAnchor": "311-abi-safe-wire-and-shared-memory-layouts--role-specific",
       "difficulty": "trap"
     }
   ]

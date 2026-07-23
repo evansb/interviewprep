@@ -12,7 +12,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The pool caches hot pages and lets a dirty page linger in memory after commit, exploiting the large DRAM-to-disk latency gap. Because the authoritative page may still be volatile at crash time, a WAL is mandatory to reconstruct it.",
-      "sourceAnchor": "651-why-a-buffer-pool-exists",
+      "sourceAnchor": "652-module-i--why-the-database-owns-a-buffer-pool",
       "difficulty": "application"
     },
     {
@@ -26,7 +26,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Postgres does buffered I/O, so pages are cached in shared_buffers and again in the kernel page cache (double buffering). Capping shared_buffers leaves room for the page cache to serve misses as memcpys rather than device I/O.",
-      "sourceAnchor": "652-the-buffer-pool-vs-the-os-page-cache",
+      "sourceAnchor": "653-the-buffer-pool-is-not-the-kernel-page-cache",
       "difficulty": "application"
     },
     {
@@ -40,7 +40,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A pin increments refcount and protects the frame-to-page association so eviction is blocked, saying nothing about who reads the bytes. The content lock (an LWLock) separately protects the bytes in shared or exclusive mode; both are short-lived and physical.",
-      "sourceAnchor": "654-pinning-and-the-pin-count",
+      "sourceAnchor": "654-buffer-pool-invariants-and-costs",
       "difficulty": "application"
     },
     {
@@ -54,7 +54,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Pure LRU suffers sequential flooding: a big scan touches each page once and treats it as most-recently-used, evicting the frequently-accessed working set. It also needs list mutation under a lock on every access, which does not scale.",
-      "sourceAnchor": "655-page-replacement-policies",
+      "sourceAnchor": "654-buffer-pool-invariants-and-costs",
       "difficulty": "application"
     },
     {
@@ -68,7 +68,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The clock hand decrements a positive usage_count and moves on (a second chance), only evicting an unpinned buffer once usage_count reaches zero. A page touched five times survives five full sweeps, folding a bit of frequency weighting into CLOCK.",
-      "sourceAnchor": "656-postgress-clock-sweep-with-usage-counts",
+      "sourceAnchor": "6519-postgresql-buffers-and-wal",
       "difficulty": "application"
     },
     {
@@ -82,7 +82,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Large scans, VACUUM, and bulk COPY use a small ring of buffers a few hundred KB in size, cycling through the same frames. This ring strategy is Postgres's direct answer to sequential flooding, so a huge scan cannot pollute the main pool.",
-      "sourceAnchor": "656-postgress-clock-sweep-with-usage-counts",
+      "sourceAnchor": "6519-postgresql-buffers-and-wal",
       "difficulty": "recall"
     },
     {
@@ -96,7 +96,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The write-ahead rule requires that the WAL be durable up to the page's pd_lsn before the page is written, so a stolen or crashed page always has its log on disk. Each page header stores the LSN of the last WAL record that modified it.",
-      "sourceAnchor": "657-dirty-pages-write-back-the-background-writer-and-checkpointer",
+      "sourceAnchor": "6519-postgresql-buffers-and-wal",
       "difficulty": "application"
     },
     {
@@ -110,7 +110,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Under no-force, commit only makes the log durable; the dirty data pages are flushed lazily. If a crash occurs before they reach disk, the committed changes exist only in the WAL, so recovery must redo them from the log.",
-      "sourceAnchor": "658-why-recovery-is-needed",
+      "sourceAnchor": "6513-checkpoints-torn-pages-and-media-recovery",
       "difficulty": "application"
     },
     {
@@ -124,7 +124,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Physiological logging targets a specific page by identifier (physical) but describes the change using that page's layout, such as inserting a tuple at a slot (logical). Records stay compact and replay is per-page and idempotent, without re-running whole logical operations.",
-      "sourceAnchor": "659-what-to-log-physical-logical-physiological",
+      "sourceAnchor": "658-lsns-idempotence-and-log-records",
       "difficulty": "recall"
     },
     {
@@ -138,7 +138,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Steal lets the buffer manager evict any dirty page even from an in-flight transaction, so a crash can leave uncommitted changes on disk. Recovery must undo those changes to restore atomicity, which is why steal engines need rollback capability.",
-      "sourceAnchor": "6510-stealno-steal-and-forceno-force",
+      "sourceAnchor": "656-stealno-steal-and-forceno-force",
       "difficulty": "application"
     },
     {
@@ -152,7 +152,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Steal + no-force maximizes memory efficiency (evict anything anytime) and minimizes commit latency (only the sequential log is forced). The price is that recovery needs both redo, for committed-but-unflushed work, and undo, for uncommitted-but-flushed work.",
-      "sourceAnchor": "6510-stealno-steal-and-forceno-force",
+      "sourceAnchor": "656-stealno-steal-and-forceno-force",
       "difficulty": "recall"
     },
     {
@@ -166,7 +166,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Each page stores pd_lsn, the LSN of its last applied change. Redo compares the record's LSN against pd_lsn and re-applies only if the record is newer, so a record whose effect already reached disk is safely skipped. This lets recovery replay records freely.",
-      "sourceAnchor": "6511-write-ahead-logging-lsns-and-the-write-ahead-rule",
+      "sourceAnchor": "657-wal-the-two-orderings",
       "difficulty": "application"
     },
     {
@@ -180,7 +180,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The commit rule makes no-force durable: acknowledging commit requires the WAL up to and including the commit record to be durable, so a committed transaction can always be redone even though its data pages may still be lingering in the volatile buffer pool.",
-      "sourceAnchor": "6511-write-ahead-logging-lsns-and-the-write-ahead-rule",
+      "sourceAnchor": "657-wal-the-two-orderings",
       "difficulty": "recall"
     },
     {
@@ -194,7 +194,7 @@
       ],
       "correctIndex": 0,
       "explanation": "With synchronous_commit off, commit returns before the WAL is fsynced, so a crash may lose a bounded window of committed transactions. The WAL is still ordered and complete, so recovery never sees a torn transaction, unlike disabling fsync, which risks corruption.",
-      "sourceAnchor": "6512-postgres-wal-mechanics-fsync-group-commit-synchronous_commit",
+      "sourceAnchor": "6519-postgresql-buffers-and-wal",
       "difficulty": "application"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "correctIndex": 0,
       "explanation": "An fsync costs tens to hundreds of microseconds, so a per-commit fsync caps throughput at the device's sync rate. Group commit flushes many backends' commit records with a single fsync, trading a tiny latency penalty for large throughput gains.",
-      "sourceAnchor": "6512-postgres-wal-mechanics-fsync-group-commit-synchronous_commit",
+      "sourceAnchor": "6519-postgresql-buffers-and-wal",
       "difficulty": "recall"
     },
     {
@@ -222,7 +222,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Repeating history restores the precise state at the moment of the crash, including changes by transactions that will be rolled back. This makes undo uniform: it can assume complete history and simply reverse losers, which is what enables fine-grained locking and physiological logging.",
-      "sourceAnchor": "6513-aries-analysis-redo-undo-and-repeating-history",
+      "sourceAnchor": "6510-aries-as-an-architecture",
       "difficulty": "application"
     },
     {
@@ -236,7 +236,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A CLR logs each undo action as a redo-only record pointing via UndoNextLSN to the next action to undo. If recovery crashes again, CLRs are redone (already-done undo stays done) and undo resumes from UndoNextLSN, bounding undo work under repeated crashes.",
-      "sourceAnchor": "6513-aries-analysis-redo-undo-and-repeating-history",
+      "sourceAnchor": "6510-aries-as-an-architecture",
       "difficulty": "recall"
     },
     {
@@ -250,7 +250,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A fuzzy checkpoint does not freeze the database; it records the redo point and dirty-page information and flushes buffers gradually while transactions keep running. Recovery starts redo at the recorded redo point, so recovery time scales with WAL generated since the last checkpoint.",
-      "sourceAnchor": "6514-checkpoints-fuzzy-checkpoints-and-restartpoints",
+      "sourceAnchor": "6513-checkpoints-torn-pages-and-media-recovery",
       "difficulty": "recall"
     },
     {
@@ -264,7 +264,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because updates write new versions rather than overwriting, rolling back requires no page reversal: a crashed xid never wrote a commit record, so it is treated as aborted and its tuple versions are invisible to everyone. VACUUM reclaims them later, so undo is deferred garbage collection.",
-      "sourceAnchor": "6515-mapping-postgres-onto-aries-redo-only-recovery-via-mvcc",
+      "sourceAnchor": "6510-aries-as-an-architecture",
       "difficulty": "trap"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Because a page write is several sector writes, a crash can tear a page part-old and part-new, which would corrupt physiological redo. Full-page writes log the entire page image the first time it is modified after each checkpoint, and redo overwrites the page from that image.",
-      "sourceAnchor": "6516-the-torn-page-problem-and-full-page-writes",
+      "sourceAnchor": "6513-checkpoints-torn-pages-and-media-recovery",
       "difficulty": "application"
     },
     {
@@ -292,7 +292,7 @@
       ],
       "correctIndex": 0,
       "explanation": "InnoDB writes each page first to a sequential doublewrite area and fsyncs it, then to its real location. On recovery a torn page found in place is restored from its clean doublewrite copy, whereas Postgres instead embeds the whole page image in the WAL.",
-      "sourceAnchor": "6516-the-torn-page-problem-and-full-page-writes",
+      "sourceAnchor": "6513-checkpoints-torn-pages-and-media-recovery",
       "difficulty": "recall"
     },
     {
@@ -306,7 +306,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The precedence graph has a node per transaction and an edge Ti to Tj whenever an operation of Ti conflicts with and precedes one of Tj on the same item. An acyclic graph means a consistent serial order exists; a cycle means no serial order matches the observed conflicts.",
-      "sourceAnchor": "6517-serializability-and-schedules",
+      "sourceAnchor": "6514-module-iii--histories-and-isolation",
       "difficulty": "application"
     },
     {
@@ -320,7 +320,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A non-repeatable read is a single existing row whose value changes between two reads. A phantom is about rows entering or leaving a predicate's result set, so defeating phantoms requires locking ranges or predicates rather than just individual rows.",
-      "sourceAnchor": "6518-read-and-write-anomalies",
+      "sourceAnchor": "6514-module-iii--histories-and-isolation",
       "difficulty": "application"
     },
     {
@@ -334,7 +334,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Each transaction reads an overlapping set and writes a different row, so there is no write-write conflict and Snapshot Isolation permits both to commit, jointly breaking an invariant each preserved alone. This write skew is exactly what the SQL standard's anomaly table omits.",
-      "sourceAnchor": "6518-read-and-write-anomalies",
+      "sourceAnchor": "6514-module-iii--histories-and-isolation",
       "difficulty": "trap"
     },
     {
@@ -348,7 +348,7 @@
       ],
       "correctIndex": 0,
       "explanation": "The standard defines levels by the phenomena of a lock-based implementation and omits write skew and the read-only anomaly. Snapshot Isolation prevents dirty, non-repeatable, and phantom reads yet is still not serializable, precisely because it allows write skew.",
-      "sourceAnchor": "6519-isolation-levels-and-the-anomaly-table",
+      "sourceAnchor": "6514-module-iii--histories-and-isolation",
       "difficulty": "trap"
     },
     {
@@ -362,7 +362,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Postgres never permits dirty reads: a snapshot filters to committed versions only, so requesting Read Uncommitted silently yields Read Committed behavior. The standard's weakest level is simply unreachable in Postgres.",
-      "sourceAnchor": "6520-postgresqls-real-isolation-behavior",
+      "sourceAnchor": "6518-postgresql-isolation-locks-and-ssi",
       "difficulty": "trap"
     },
     {
@@ -376,7 +376,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Postgres RR takes a single snapshot at the transaction's first statement and holds it, which is Snapshot Isolation. This is stronger than the standard's RR because it prevents phantoms, but SI still permits write skew and the read-only anomaly.",
-      "sourceAnchor": "6520-postgresqls-real-isolation-behavior",
+      "sourceAnchor": "6518-postgresql-isolation-locks-and-ssi",
       "difficulty": "application"
     },
     {
@@ -390,7 +390,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A snapshot is essentially {xmin, xmax, xip}: xmin is the oldest still-running xid, xmax is the first not-yet-assigned xid, and xip lists the in-flight xids between them. A tuple's xmin/xmax are checked against this to select the correct version.",
-      "sourceAnchor": "6521-mvcc-deep-dive-snapshots-xminxmax-visibility",
+      "sourceAnchor": "6517-postgresql-mvcc-and-transaction-metadata",
       "difficulty": "recall"
     },
     {
@@ -404,7 +404,7 @@
       ],
       "correctIndex": 0,
       "explanation": "To check commit status, the first reader consults pg_xact and caches the result in the tuple's infomask as hint bits so later readers can skip the lookup. Setting a hint bit modifies the page, so a read-only query after a load can dirty pages and cause writes.",
-      "sourceAnchor": "6521-mvcc-deep-dive-snapshots-xminxmax-visibility",
+      "sourceAnchor": "6517-postgresql-mvcc-and-transaction-metadata",
       "difficulty": "trap"
     },
     {
@@ -418,7 +418,7 @@
       ],
       "correctIndex": 0,
       "explanation": "SSI keeps reads non-blocking and tracks read/write conflict edges using SIRead locks. Every non-serializable SI execution contains a pivot transaction with both an incoming and outgoing rw edge; SSI detects that dangerous structure and aborts the pivot to break the cycle.",
-      "sourceAnchor": "6522-ssi-and-write-skew-detection",
+      "sourceAnchor": "6518-postgresql-isolation-locks-and-ssi",
       "difficulty": "application"
     },
     {
@@ -432,7 +432,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Acquiring all locks in a growing phase then releasing in a shrinking phase yields conflict-serializable schedules. Basic 2PL can release early and cause cascading aborts; strict 2PL holds exclusive locks until commit, and rigorous 2PL holds all locks until commit.",
-      "sourceAnchor": "6524-pessimistic-concurrency-control-2pl-and-strict-2pl",
+      "sourceAnchor": "6515-concurrency-control-families",
       "difficulty": "recall"
     },
     {
@@ -446,7 +446,7 @@
       ],
       "correctIndex": 0,
       "explanation": "Postgres uses detection, not prevention. A backend blocked on a heavyweight lock starts a deadlock_timeout timer (default one second); only if still waiting does it build the global wait-for graph and, if a cycle exists, abort a transaction. The delay avoids graph searches on brief waits.",
-      "sourceAnchor": "6525-deadlocks-detection-vs-prevention",
+      "sourceAnchor": "6515-concurrency-control-families",
       "difficulty": "application"
     },
     {
@@ -460,7 +460,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A row lock lives in the tuple itself via xmax and infomask bits, so millions of row locks cost no lock-manager memory. Because xmax names only one xid, multiple shared lockers require a MultiXactId listing them all, stored in pg_multixact with its own wraparound concerns.",
-      "sourceAnchor": "6526-lock-granularity-and-the-heavyweight-lock-manager",
+      "sourceAnchor": "6518-postgresql-isolation-locks-and-ssi",
       "difficulty": "recall"
     },
     {
@@ -474,7 +474,7 @@
       ],
       "correctIndex": 0,
       "explanation": "A lock guards logical contents (rows, tables, predicates) for the whole transaction and is managed with deadlock detection. A latch is a short-lived mutex or reader-writer lock guarding an in-memory structure for a handful of instructions, avoiding deadlock by acquisition protocol.",
-      "sourceAnchor": "6527-latches-vs-locks-latch-crabbing-and-b-link-trees",
+      "sourceAnchor": "6515-concurrency-control-families",
       "difficulty": "application"
     },
     {
@@ -488,7 +488,7 @@
       ],
       "correctIndex": 0,
       "explanation": "In a B-link tree each node has a right-link to its sibling and a high key. A reader that descended just before a split detects via the high key that its key moved right and follows the link, so it never holds more than one node latch, easing contention at hot upper levels.",
-      "sourceAnchor": "6527-latches-vs-locks-latch-crabbing-and-b-link-trees",
+      "sourceAnchor": "6515-concurrency-control-families",
       "difficulty": "application"
     },
     {
@@ -502,7 +502,7 @@
       ],
       "correctIndex": 0,
       "explanation": "OCC runs a transaction against a private workspace, validates at commit that its read/write sets do not conflict with transactions that committed meanwhile, then installs writes or aborts and retries. It wins when contention is low because there are no locks or deadlocks, and loses when aborts waste work.",
-      "sourceAnchor": "6523-optimistic-concurrency-control",
+      "sourceAnchor": "6515-concurrency-control-families",
       "difficulty": "recall"
     }
   ]
